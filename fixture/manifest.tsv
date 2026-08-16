@@ -17,6 +17,9 @@ core-attribute-normalization	valid/core/attribute_normalization.xml	well-formed	
 core-comments	valid/core/comment_edges.xml	well-formed	XML1.0-5e	document,comments	yes	Legal comments with isolated hyphens
 core-pi	valid/core/processing_instruction.xml	well-formed	XML1.0-5e	document,pi	yes	Processing instructions in all legal regions
 core-explicit-empty	valid/core/empty_explicit.xml	well-formed	XML1.0-5e	document,element_matching	yes	Explicit and self-closing empty elements
+shape-core-records	valid/core/shape_records.xml	well-formed	XML1.0-5e	document,attributes,element_matching,cdata,predefined_entities,numeric_references,utf8	yes	Varied record shape with nesting references CDATA and Unicode
+shape-core-attributes-wide	valid/core/shape_attributes_wide.xml	well-formed	XML1.0-5e	document,attributes	yes	Wide start tag with many source-ordered attributes
+shape-core-depth	valid/core/shape_depth.xml	well-formed	XML1.0-5e	document,element_matching	yes	Eight-level active nesting with a text leaf
 encoding-utf8-bom	valid/encoding/utf8-bom.xml	well-formed	XML1.0-5e	document,utf8	no	UTF-8 byte order mark and multibyte text
 encoding-utf8-boundaries	valid/encoding/utf8-codepoint-boundaries.xml	well-formed	XML1.0-5e	document,utf8	no	Lowest legal two three and four byte UTF-8 sequences plus U+10FFFF
 encoding-utf16le	valid/encoding/utf16le-bom.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 little-endian document with required byte order mark
@@ -32,6 +35,7 @@ ns-default-attributes	valid/namespaces/default_does_not_apply_to_attributes.xml	
 ns-xml-prefix	valid/namespaces/xml_prefix.xml	namespace-valid	NS1.0-3e	document,namespaces	no	Predeclared xml prefix
 ns-default-undeclare	valid/namespaces/default_undeclaration.xml	namespace-valid	NS1.0-3e	document,namespaces	no	Default namespace undeclaration
 ns-equivalent-uri	valid/namespaces/equivalent_uri_spelling.xml	namespace-valid	NS1.0-3e	document,namespaces,numeric_references	no	Equivalent escaped namespace names
+shape-ns-churn	valid/namespaces/shape_namespace_churn.xml	namespace-valid	NS1.0-3e	document,namespaces,attributes,element_matching	no	Frequent prefix rebinding and default namespace changes
 dtd-empty	valid/dtd/empty.xml	dtd-valid	XML1.0-5e	dtd	no	EMPTY element declaration
 dtd-sequence	valid/dtd/sequence.xml	dtd-valid	XML1.0-5e	dtd	no	Sequence content model
 dtd-choice-repeat	valid/dtd/choice_and_repetition.xml	dtd-valid	XML1.0-5e	dtd	no	Choice and repetition content model
@@ -43,6 +47,8 @@ dtd-enumeration	valid/dtd/enumeration.xml	dtd-valid	XML1.0-5e	dtd	no	Enumerated 
 dtd-external	valid/dtd/external.xml	dtd-valid	XML1.0-5e	dtd,external_dtd	no	Local external DTD
 dtd-bounded-expansion	valid/dtd/bounded_entity_expansion.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	no	Bounded three-level internal entity expansion with 1000 output bytes
 dtd-parameter-entity	valid/dtd/parameter_entity_declaration.xml	dtd-valid	XML1.0-5e	dtd,internal_parameter_entities	no	Internal parameter entity supplies an element declaration
+shape-dtd-density	valid/dtd/shape_declaration_density.xml	dtd-valid	XML1.0-5e	dtd,attributes	no	Declaration-dense catalog with IDs defaults and repeated metadata
+shape-dtd-entities	valid/dtd/shape_entities.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	no	Repeated internal general entity expansion
 bad-empty	invalid/not_well_formed/empty.xml	not-well-formed	XML1.0-5e	check_document_element	no	Empty document
 bad-whitespace-only	invalid/not_well_formed/whitespace_only.xml	not-well-formed	XML1.0-5e	check_document_element	no	Whitespace without document element
 bad-text-only	invalid/not_well_formed/text_only.xml	not-well-formed	XML1.0-5e	check_document_element	no	Character data without document element
@@ -77,6 +83,8 @@ bad-end-name-space	invalid/not_well_formed/space_in_end_tag.xml	not-well-formed	
 bad-attribute-truncated	invalid/not_well_formed/truncated_attribute.xml	not-well-formed	XML1.0-5e	check_attribute_syntax	no	Truncated quoted attribute
 bad-start-tag-truncated	invalid/not_well_formed/truncated_start_tag.xml	not-well-formed	XML1.0-5e	check_complete_start_tag	no	Truncated start tag
 bad-entity-truncated	invalid/not_well_formed/truncated_entity.xml	not-well-formed	XML1.0-5e	check_entity_reference_syntax	no	Entity reference without semicolon
+bad-shape-duplicate-attribute	invalid/not_well_formed/shape_duplicate_attribute_late.xml	not-well-formed	XML1.0-5e	check_duplicate_attributes	no	Duplicate attribute after a wide start tag prefix
+bad-shape-mismatch-late	invalid/not_well_formed/shape_mismatch_late.xml	not-well-formed	XML1.0-5e	check_element_matching	no	Mismatched closing tag after valid nested records
 encoding-bad-utf8-continuation	invalid/encoding/utf8-lone-continuation.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	Lone UTF-8 continuation byte
 encoding-bad-utf8-overlong	invalid/encoding/utf8-overlong.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	Overlong UTF-8 encoding
 encoding-bad-utf8-truncated	invalid/encoding/utf8-truncated.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	Truncated UTF-8 multibyte sequence

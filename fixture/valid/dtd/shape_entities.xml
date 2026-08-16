@@ -1,0 +1,7 @@
+<!DOCTYPE root [
+  <!ELEMENT root (entry+)>
+  <!ELEMENT entry (#PCDATA)>
+  <!ENTITY product "z-xml">
+  <!ENTITY greeting "hello &product;">
+]>
+<root><entry>&greeting;</entry><entry>&product;</entry></root>

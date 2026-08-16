@@ -1,0 +1,9 @@
+<r:root xmlns:r="urn:root" xmlns:a="urn:outer-a" xmlns:b="urn:outer-b" xmlns="urn:default">
+  <a:item a:kind="one">
+    <inner xmlns:a="urn:inner-a" xmlns="urn:inner-default">
+      <a:item b:kind="two"/>
+    </inner>
+  </a:item>
+  <b:item xmlns:b="urn:inner-b" b:kind="three"/>
+  <plain xmlns=""><leaf xmlns="urn:leaf"/></plain>
+</r:root>

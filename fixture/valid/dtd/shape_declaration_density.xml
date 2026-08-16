@@ -1,0 +1,12 @@
+<!DOCTYPE catalog [
+  <!ELEMENT catalog (entry+)>
+  <!ELEMENT entry (title,meta*)>
+  <!ELEMENT title (#PCDATA)>
+  <!ELEMENT meta EMPTY>
+  <!ATTLIST entry id ID #REQUIRED status (new|old) "new">
+  <!ATTLIST meta key CDATA #REQUIRED>
+]>
+<catalog>
+  <entry id="e1"><title>One</title><meta key="x"/></entry>
+  <entry id="e2" status="old"><title>Two</title><meta key="y"/><meta key="z"/></entry>
+</catalog>

@@ -1,0 +1,10 @@
+<catalog>
+  <entry id="a" kind="short">alpha</entry>
+  <entry id='medium-id' kind='mixed'>
+    <title>Title &amp; &#x03bb;</title>
+    <meta key="one" value="1"/>
+    <meta key='two' value='2'/>
+    <![CDATA[tail <raw>]]>
+  </entry>
+  <entry id="longer-id-0003" kind="unicode">é λ 🙂</entry>
+</catalog>

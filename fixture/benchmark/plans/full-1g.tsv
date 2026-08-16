@@ -5,6 +5,8 @@ text	1,16,64,256,1024	-
 markup	1,16,64,256,1024	-
 wide	1,16,64,256	-
 attributes	1,16,64,256	-
+attributes-varied	1,16,64,256	-
+records	1,16,64,256,1024	-
 mixed	1,16,64,256,1024	-
 escaped	1,16,64,256	-
 unicode	1,16,64,256,1024	-
