@@ -16,38 +16,73 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     public_tests_module.addImport("z_xml", z_xml);
-    const stage3_fixtures = b.addOptions();
-    stage3_fixtures.addOption(
+    const reader_fixtures = b.addOptions();
+    reader_fixtures.addOption(
         []const u8,
         "nested",
         @embedFile("fixture/valid/core/nested.xml"),
     );
-    stage3_fixtures.addOption(
+    reader_fixtures.addOption(
         []const u8,
         "empty_explicit",
         @embedFile("fixture/valid/core/empty_explicit.xml"),
     );
-    stage3_fixtures.addOption(
+    reader_fixtures.addOption(
         []const u8,
         "mismatched",
         @embedFile("fixture/invalid/not_well_formed/mismatched_tags.xml"),
     );
-    stage3_fixtures.addOption(
+    reader_fixtures.addOption(
         []const u8,
         "unexpected_end",
         @embedFile("fixture/invalid/not_well_formed/unexpected_end.xml"),
     );
-    stage3_fixtures.addOption(
+    reader_fixtures.addOption(
         []const u8,
         "unclosed",
         @embedFile("fixture/invalid/not_well_formed/unclosed_element.xml"),
     );
-    stage3_fixtures.addOption(
+    reader_fixtures.addOption(
         []const u8,
         "end_space",
         @embedFile("fixture/invalid/not_well_formed/space_in_end_tag.xml"),
     );
-    public_tests_module.addOptions("stage3_fixtures", stage3_fixtures);
+    reader_fixtures.addOption(
+        []const u8,
+        "attributes",
+        @embedFile("fixture/valid/core/attributes.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "attribute_normalization",
+        @embedFile("fixture/valid/core/attribute_normalization.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "duplicate_attribute",
+        @embedFile("fixture/invalid/not_well_formed/duplicate_attribute.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "unquoted_attribute",
+        @embedFile("fixture/invalid/not_well_formed/unquoted_attribute.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "missing_equals",
+        @embedFile("fixture/invalid/not_well_formed/missing_equals.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "attribute_lt",
+        @embedFile("fixture/invalid/not_well_formed/attribute_lt.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "truncated_attribute",
+        @embedFile("fixture/invalid/not_well_formed/truncated_attribute.xml"),
+    );
+    public_tests_module.addOptions("reader_fixtures", reader_fixtures);
 
     const public_tests = b.addTest(.{
         .root_module = public_tests_module,

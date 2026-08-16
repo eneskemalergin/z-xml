@@ -2,7 +2,7 @@
 //!
 //! The public API is specialized by a compile-time configuration. The first
 //! implementation stage establishes the type, ownership, lifecycle, and
-//! diagnostic contracts before XML grammar support is added.
+//! diagnostic contracts while XML grammar support advances by verified stage.
 
 const reader = @import("reader.zig");
 const io = @import("io.zig");
@@ -50,6 +50,10 @@ pub const Options = reader.Options;
 pub const Location = reader.Location;
 /// Returns the specialized diagnostic type.
 pub const Diagnostic = reader.Diagnostic;
+/// Returns the specialized element or attribute name type.
+pub const Name = reader.Name;
+/// Returns the specialized source attribute type.
+pub const Attribute = reader.Attribute;
 /// Returns a pull reader over one final slice.
 pub const SliceReader = io.SliceReader;
 /// Returns a pull adapter over a buffered Zig reader.

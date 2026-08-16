@@ -19,11 +19,12 @@ pub fn main() void {
 
 fn printLayout(comptime name: []const u8, comptime config: xml.Config) void {
     std.debug.print(
-        "{s}\treader={d}\tevent={d}\tlocation={d}\n",
+        "{s}\treader={d}\tevent={d}\tattribute={d}\tlocation={d}\n",
         .{
             name,
             @sizeOf(xml.Reader(config)),
             @sizeOf(xml.Event(config)),
+            @sizeOf(xml.Attribute(config)),
             @sizeOf(xml.Location(config)),
         },
     );

@@ -160,7 +160,7 @@ pub const Lifecycle = enum {
     deinitialized,
 };
 
-/// Initial limits represented in the lifecycle spike.
+/// Runtime limits implemented by the current reader stage.
 pub const Limits = struct {
     /// Maximum simultaneously open element count.
     max_depth: usize = 256,
@@ -168,6 +168,16 @@ pub const Limits = struct {
     max_open_name_bytes: usize = 1024 * 1024,
     /// Maximum bytes accepted in one unfinished token.
     max_partial_token_bytes: usize = 64 * 1024,
+    /// Maximum source attributes accepted on one element.
+    max_attributes_per_element: usize = 256,
+    /// Maximum raw bytes accepted in one attribute name.
+    max_attribute_name_bytes: usize = 64 * 1024,
+    /// Maximum semantic bytes accepted in one attribute value.
+    max_attribute_value_bytes: usize = 1024 * 1024,
+    /// Maximum aggregate name and value bytes accepted on one element.
+    max_attribute_bytes_per_element: usize = 1024 * 1024,
+    /// Maximum source bytes accepted in one complete start tag.
+    max_start_tag_bytes: usize = 1024 * 1024,
     /// Maximum bytes exposed by one future fragmented event.
     max_fragment_bytes: usize = 64 * 1024,
     /// Maximum owned capacity retained across a retain reset.
@@ -177,6 +187,11 @@ pub const Limits = struct {
         return self.max_depth > 0 and
             self.max_open_name_bytes > 0 and
             self.max_partial_token_bytes > 0 and
+            self.max_attributes_per_element > 0 and
+            self.max_attribute_name_bytes > 0 and
+            self.max_attribute_value_bytes > 0 and
+            self.max_attribute_bytes_per_element > 0 and
+            self.max_start_tag_bytes > 0 and
             self.max_fragment_bytes > 0;
     }
 };
@@ -191,7 +206,15 @@ pub const MemoryUsage = struct {
     open_name_bytes: usize = 0,
     /// Raw-name arena capacity measured in bytes.
     open_name_capacity: usize = 0,
-    /// General scratch capacity measured in bytes.
+    /// Source attributes retained for the current start element.
+    attribute_count: usize = 0,
+    /// Reusable source-attribute record capacity measured in slots.
+    attribute_record_capacity: usize = 0,
+    /// Reusable public-attribute capacity measured in slots.
+    attribute_event_capacity: usize = 0,
+    /// Active attribute name and value bytes.
+    attribute_bytes: usize = 0,
+    /// Attribute byte-scratch capacity measured in bytes.
     scratch_capacity: usize = 0,
     /// Namespace storage capacity measured in bytes.
     namespace_capacity: usize = 0,
@@ -203,13 +226,16 @@ pub const MemoryUsage = struct {
     retained_capacity: usize = 0,
 };
 
-/// Stable diagnostic category for the compiled lifecycle API.
+/// Stable diagnostic category for the current reader API.
 pub const DiagnosticCode = enum {
     invalid_state,
     unsupported_stage,
     empty_document,
     unexpected_document_text,
     malformed_start_tag,
+    malformed_attribute,
+    attribute_less_than,
+    duplicate_attribute,
     malformed_end_tag,
     unexpected_end_tag,
     mismatched_end_tag,
@@ -220,6 +246,11 @@ pub const DiagnosticCode = enum {
     depth_limit,
     open_name_limit,
     partial_token_limit,
+    attribute_count_limit,
+    attribute_name_limit,
+    attribute_value_limit,
+    attribute_bytes_limit,
+    start_tag_limit,
     read_failed,
 };
 
@@ -288,13 +319,23 @@ const ExpandedName = struct {
     namespace_uri: ?[]const u8,
 };
 
-fn Name(comptime config: Config) type {
+/// Element or attribute name specialized to the selected namespace profile.
+pub fn Name(comptime config: Config) type {
     return if (config.profile.hasNamespaces()) ExpandedName else RawName;
+}
+
+/// Source attribute whose slices follow the enclosing event lifetime.
+pub fn Attribute(comptime config: Config) type {
+    return struct {
+        name: Name(config),
+        value: []const u8,
+    };
 }
 
 fn StartElement(comptime config: Config) type {
     return struct {
         name: Name(config),
+        attributes: []const Attribute(config),
         empty_element_syntax: bool,
     };
 }
@@ -463,9 +504,16 @@ const VerticalState = enum {
     after_root_markup,
     start_name,
     start_after_space,
+    attribute_name,
+    attribute_after_name,
+    attribute_before_value,
+    attribute_value,
+    start_after_attribute,
     empty_slash,
     emit_start_element,
     emit_empty_start_element,
+    release_start_attributes,
+    release_empty_attributes,
     emit_end_element,
     end_expect_name,
     end_name,
@@ -479,6 +527,15 @@ fn OpenElementFrame(comptime config: Config) type {
     return struct {
         name_offset: usize,
         name_len: usize,
+        start: Location(config),
+    };
+}
+
+fn AttributeRecord(comptime config: Config) type {
+    return struct {
+        name_offset: usize,
+        name_len: usize,
+        value_len: usize,
         start: Location(config),
     };
 }
@@ -498,6 +555,7 @@ pub fn Reader(comptime config: Config) type {
     return struct {
         const Self = @This();
         const no_end_mismatch = std.math.maxInt(usize);
+        const linear_duplicate_threshold = 64;
 
         allocator: std.mem.Allocator,
         options: Options(config),
@@ -513,9 +571,13 @@ pub fn Reader(comptime config: Config) type {
         failure: ?Failure = null,
         open_elements: std.ArrayList(OpenElementFrame(config)) = .empty,
         open_names: std.ArrayList(u8) = .empty,
+        attribute_records: std.ArrayList(AttributeRecord(config)) = .empty,
+        attribute_bytes: std.ArrayList(u8) = .empty,
+        event_attributes: std.ArrayList(Attribute(config)) = .empty,
         token_start: Location(config) = .{},
         token_name_len: usize = 0,
         end_mismatch_index: usize = no_end_mismatch,
+        attribute_quote: u8 = 0,
 
         /// Initializes a reader without allocating.
         pub fn init(allocator: std.mem.Allocator, options: Options(config)) InitError!Self {
@@ -546,6 +608,7 @@ pub fn Reader(comptime config: Config) type {
                     } else {
                         self.open_elements.clearRetainingCapacity();
                         self.open_names.clearRetainingCapacity();
+                        self.clearAttributesRetainingCapacity();
                     }
                 },
                 .release_memory => self.releaseStorage(),
@@ -563,6 +626,7 @@ pub fn Reader(comptime config: Config) type {
             self.token_start = .{};
             self.token_name_len = 0;
             self.end_mismatch_index = no_end_mismatch;
+            self.attribute_quote = 0;
         }
 
         /// Installs one caller-owned input chunk.
@@ -588,6 +652,9 @@ pub fn Reader(comptime config: Config) type {
                 .failed => return self.failureError(),
                 .done => return .done,
                 .producing => {},
+            }
+            if (comptime config.profile != .xml10_utf8_no_dtd) {
+                return self.fail(.unsupported_stage, .unsupported_feature);
             }
 
             while (true) {
@@ -724,14 +791,15 @@ pub fn Reader(comptime config: Config) type {
                         try self.appendStartNameRun(self.input[run_start..run_end]);
 
                         if (self.cursor < self.input.len) {
+                            try self.requireStartTagByte();
                             const byte = self.input[self.cursor];
                             if (byte == '/') {
-                                self.consumeByte(byte);
+                                self.consumeStartTagByte(byte);
                                 self.vertical_state = .empty_slash;
                                 continue;
                             }
                             if (byte == '>') {
-                                self.consumeByte(byte);
+                                self.consumeStartTagByte(byte);
                                 try self.finishStartElement(false);
                                 continue;
                             }
@@ -747,28 +815,149 @@ pub fn Reader(comptime config: Config) type {
                         return self.needInput();
                     },
                     .start_after_space => {
-                        self.consumeWhitespaceRun();
+                        try self.consumeStartTagWhitespaceRun();
                         if (self.cursor == self.input.len) {
                             if (self.final_input) {
                                 return self.fail(.incomplete_input, .invalid_xml);
                             }
                             return self.needInput();
                         }
+                        try self.requireStartTagByte();
                         const byte = self.input[self.cursor];
                         if (byte == '>') {
-                            self.consumeByte(byte);
+                            self.consumeStartTagByte(byte);
                             try self.finishStartElement(false);
                             continue;
                         }
                         if (byte == '/') {
-                            self.consumeByte(byte);
+                            self.consumeStartTagByte(byte);
                             self.vertical_state = .empty_slash;
                             continue;
                         }
                         if (isAsciiNameStart(byte)) {
+                            try self.beginAttribute();
+                            continue;
+                        }
+                        if (byte >= 0x80) {
                             return self.fail(.unsupported_stage, .unsupported_feature);
                         }
-                        return self.fail(.malformed_start_tag, .invalid_xml);
+                        return self.fail(.malformed_attribute, .invalid_xml);
+                    },
+                    .attribute_name => {
+                        const run_start = self.cursor;
+                        var run_end = run_start;
+                        while (run_end < self.input.len and isAsciiNameChar(self.input[run_end])) {
+                            run_end += 1;
+                        }
+                        try self.appendAttributeNameRun(self.input[run_start..run_end]);
+
+                        if (self.cursor < self.input.len) {
+                            try self.requireStartTagByte();
+                            const byte = self.input[self.cursor];
+                            if (byte == '=') {
+                                self.consumeStartTagByte(byte);
+                                self.vertical_state = .attribute_before_value;
+                                continue;
+                            }
+                            if (isXmlWhitespace(byte)) {
+                                self.vertical_state = .attribute_after_name;
+                                continue;
+                            }
+                            if (byte >= 0x80) {
+                                return self.fail(.unsupported_stage, .unsupported_feature);
+                            }
+                            return self.fail(.malformed_attribute, .invalid_xml);
+                        }
+                        if (self.final_input) {
+                            return self.fail(.incomplete_input, .invalid_xml);
+                        }
+                        return self.needInput();
+                    },
+                    .attribute_after_name => {
+                        try self.consumeStartTagWhitespaceRun();
+                        if (self.cursor == self.input.len) {
+                            if (self.final_input) {
+                                return self.fail(.incomplete_input, .invalid_xml);
+                            }
+                            return self.needInput();
+                        }
+                        try self.requireStartTagByte();
+                        if (self.input[self.cursor] != '=') {
+                            return self.fail(.malformed_attribute, .invalid_xml);
+                        }
+                        self.consumeStartTagByte('=');
+                        self.vertical_state = .attribute_before_value;
+                    },
+                    .attribute_before_value => {
+                        try self.consumeStartTagWhitespaceRun();
+                        if (self.cursor == self.input.len) {
+                            if (self.final_input) {
+                                return self.fail(.incomplete_input, .invalid_xml);
+                            }
+                            return self.needInput();
+                        }
+                        try self.requireStartTagByte();
+                        const byte = self.input[self.cursor];
+                        if (byte != '\'' and byte != '"') {
+                            return self.fail(.malformed_attribute, .invalid_xml);
+                        }
+                        self.attribute_quote = byte;
+                        self.consumeStartTagByte(byte);
+                        self.vertical_state = .attribute_value;
+                    },
+                    .attribute_value => {
+                        const run_start = self.cursor;
+                        var run_end = run_start;
+                        while (run_end < self.input.len and
+                            isStage4AttributeValueByte(self.input[run_end], self.attribute_quote))
+                        {
+                            run_end += 1;
+                        }
+                        try self.appendAttributeValueRun(self.input[run_start..run_end]);
+
+                        if (self.cursor < self.input.len) {
+                            try self.requireStartTagByte();
+                            const byte = self.input[self.cursor];
+                            if (byte == self.attribute_quote) {
+                                self.consumeStartTagByte(byte);
+                                self.finishAttribute();
+                                self.vertical_state = .start_after_attribute;
+                                continue;
+                            }
+                            if (byte == '<') {
+                                return self.fail(.attribute_less_than, .invalid_xml);
+                            }
+                            return self.fail(.unsupported_stage, .unsupported_feature);
+                        }
+                        if (self.final_input) {
+                            return self.fail(.incomplete_input, .invalid_xml);
+                        }
+                        return self.needInput();
+                    },
+                    .start_after_attribute => {
+                        if (self.cursor == self.input.len) {
+                            if (self.final_input) {
+                                return self.fail(.incomplete_input, .invalid_xml);
+                            }
+                            return self.needInput();
+                        }
+                        try self.requireStartTagByte();
+                        const byte = self.input[self.cursor];
+                        if (byte == '>') {
+                            self.consumeStartTagByte(byte);
+                            try self.finishStartElement(false);
+                            continue;
+                        }
+                        if (byte == '/') {
+                            self.consumeStartTagByte(byte);
+                            self.vertical_state = .empty_slash;
+                            continue;
+                        }
+                        if (isXmlWhitespace(byte)) {
+                            self.vertical_state = .start_after_space;
+                            continue;
+                        }
+                        return self.fail(.malformed_attribute, .invalid_xml);
                     },
                     .empty_slash => {
                         if (self.cursor == self.input.len) {
@@ -777,17 +966,19 @@ pub fn Reader(comptime config: Config) type {
                             }
                             return self.needInput();
                         }
+                        try self.requireStartTagByte();
                         if (self.input[self.cursor] != '>') {
                             return self.fail(.malformed_start_tag, .invalid_xml);
                         }
-                        self.consumeByte('>');
+                        self.consumeStartTagByte('>');
                         try self.finishStartElement(true);
                     },
                     .emit_start_element => {
-                        self.vertical_state = .content;
+                        self.vertical_state = .release_start_attributes;
                         return self.eventStep(
                             .{ .start_element = .{
                                 .name = self.topName(),
+                                .attributes = self.event_attributes.items,
                                 .empty_element_syntax = false,
                             } },
                             self.token_start,
@@ -795,15 +986,24 @@ pub fn Reader(comptime config: Config) type {
                         );
                     },
                     .emit_empty_start_element => {
-                        self.vertical_state = .emit_end_element;
+                        self.vertical_state = .release_empty_attributes;
                         return self.eventStep(
                             .{ .start_element = .{
                                 .name = self.topName(),
+                                .attributes = self.event_attributes.items,
                                 .empty_element_syntax = true,
                             } },
                             self.token_start,
                             self.currentLocation(),
                         );
+                    },
+                    .release_start_attributes => {
+                        self.clearAttributesRetainingCapacity();
+                        self.vertical_state = .content;
+                    },
+                    .release_empty_attributes => {
+                        self.clearAttributesRetainingCapacity();
+                        self.vertical_state = .emit_end_element;
                     },
                     .emit_end_element => {
                         self.vertical_state = .release_closed_element;
@@ -905,26 +1105,53 @@ pub fn Reader(comptime config: Config) type {
                 .parser_stack_capacity = self.open_elements.capacity,
                 .open_name_bytes = self.open_names.items.len,
                 .open_name_capacity = self.open_names.capacity,
+                .attribute_count = self.attribute_records.items.len,
+                .attribute_record_capacity = self.attribute_records.capacity,
+                .attribute_event_capacity = self.event_attributes.capacity,
+                .attribute_bytes = self.attribute_bytes.items.len,
+                .scratch_capacity = self.attribute_bytes.capacity,
                 .retained_capacity = self.retainedCapacity(),
             };
         }
 
         fn retainedCapacity(self: *const Self) usize {
             const stack_bytes = self.open_elements.capacity *| @sizeOf(OpenElementFrame(config));
-            return stack_bytes +| self.open_names.capacity;
+            const record_bytes = self.attribute_records.capacity *| @sizeOf(AttributeRecord(config));
+            const event_bytes = self.event_attributes.capacity *| @sizeOf(Attribute(config));
+            return stack_bytes +|
+                self.open_names.capacity +|
+                record_bytes +|
+                self.attribute_bytes.capacity +|
+                event_bytes;
         }
 
         fn releaseStorage(self: *Self) void {
             self.open_elements.deinit(self.allocator);
             self.open_names.deinit(self.allocator);
+            self.attribute_records.deinit(self.allocator);
+            self.attribute_bytes.deinit(self.allocator);
+            self.event_attributes.deinit(self.allocator);
             self.open_elements = .empty;
             self.open_names = .empty;
+            self.attribute_records = .empty;
+            self.attribute_bytes = .empty;
+            self.event_attributes = .empty;
+        }
+
+        fn clearAttributesRetainingCapacity(self: *Self) void {
+            self.attribute_records.clearRetainingCapacity();
+            self.attribute_bytes.clearRetainingCapacity();
+            self.event_attributes.clearRetainingCapacity();
+            self.attribute_quote = 0;
         }
 
         fn beginStartElement(self: *Self) ReadError!void {
             if (self.open_elements.items.len == self.options.limits.max_depth) {
                 return self.failVoid(.depth_limit, .limit_exceeded);
             }
+            std.debug.assert(self.attribute_records.items.len == 0);
+            std.debug.assert(self.attribute_bytes.items.len == 0);
+            std.debug.assert(self.event_attributes.items.len == 0);
             self.token_name_len = 0;
             self.vertical_state = .start_name;
         }
@@ -940,24 +1167,32 @@ pub fn Reader(comptime config: Config) type {
                 self.options.limits.max_open_name_bytes,
                 self.open_names.items.len,
             ) catch unreachable;
-            const accepted_len = @min(run.len, @min(partial_remaining, open_remaining));
+            const start_tag_remaining = self.startTagRemaining();
+            const accepted_len = @min(
+                run.len,
+                @min(partial_remaining, @min(open_remaining, start_tag_remaining)),
+            );
             if (accepted_len > 0) {
                 self.open_names.appendSlice(
                     self.allocator,
                     run[0..accepted_len],
                 ) catch return self.failOutOfMemory();
-                self.consumeRun(run[0..accepted_len]);
+                self.consumeStartTagRun(run[0..accepted_len]);
                 self.token_name_len += accepted_len;
             }
             if (accepted_len != run.len) {
                 if (self.token_name_len == self.options.limits.max_partial_token_bytes) {
                     return self.failVoid(.partial_token_limit, .limit_exceeded);
                 }
-                return self.failVoid(.open_name_limit, .limit_exceeded);
+                if (self.open_names.items.len == self.options.limits.max_open_name_bytes) {
+                    return self.failVoid(.open_name_limit, .limit_exceeded);
+                }
+                return self.failVoid(.start_tag_limit, .limit_exceeded);
             }
         }
 
         fn finishStartElement(self: *Self, empty_element: bool) ReadError!void {
+            try self.prepareEventAttributes();
             self.open_elements.append(self.allocator, .{
                 .name_offset = self.open_names.items.len - self.token_name_len,
                 .name_len = self.token_name_len,
@@ -967,6 +1202,208 @@ pub fn Reader(comptime config: Config) type {
                 .emit_empty_start_element
             else
                 .emit_start_element;
+        }
+
+        fn beginAttribute(self: *Self) ReadError!void {
+            if (self.attribute_records.items.len ==
+                self.options.limits.max_attributes_per_element)
+            {
+                return self.failVoid(.attribute_count_limit, .limit_exceeded);
+            }
+            if (self.attribute_bytes.items.len ==
+                self.options.limits.max_attribute_bytes_per_element)
+            {
+                return self.failVoid(.attribute_bytes_limit, .limit_exceeded);
+            }
+            try self.requireStartTagByte();
+            self.attribute_records.append(self.allocator, .{
+                .name_offset = self.attribute_bytes.items.len,
+                .name_len = 0,
+                .value_len = 0,
+                .start = self.currentLocation(),
+            }) catch return self.failOutOfMemory();
+            self.vertical_state = .attribute_name;
+        }
+
+        fn appendAttributeNameRun(self: *Self, run: []const u8) ReadError!void {
+            const record = &self.attribute_records.items[self.attribute_records.items.len - 1];
+            const name_remaining = std.math.sub(
+                usize,
+                self.options.limits.max_attribute_name_bytes,
+                record.name_len,
+            ) catch unreachable;
+            const aggregate_remaining = std.math.sub(
+                usize,
+                self.options.limits.max_attribute_bytes_per_element,
+                self.attribute_bytes.items.len,
+            ) catch unreachable;
+            const accepted_len = @min(
+                run.len,
+                @min(name_remaining, @min(aggregate_remaining, self.startTagRemaining())),
+            );
+            if (accepted_len > 0) {
+                self.attribute_bytes.appendSlice(
+                    self.allocator,
+                    run[0..accepted_len],
+                ) catch return self.failOutOfMemory();
+                self.consumeStartTagRun(run[0..accepted_len]);
+                record.name_len += accepted_len;
+            }
+            if (accepted_len != run.len) {
+                if (record.name_len == self.options.limits.max_attribute_name_bytes) {
+                    return self.failVoid(.attribute_name_limit, .limit_exceeded);
+                }
+                if (self.attribute_bytes.items.len ==
+                    self.options.limits.max_attribute_bytes_per_element)
+                {
+                    return self.failVoid(.attribute_bytes_limit, .limit_exceeded);
+                }
+                return self.failVoid(.start_tag_limit, .limit_exceeded);
+            }
+        }
+
+        fn appendAttributeValueRun(self: *Self, run: []const u8) ReadError!void {
+            const record = &self.attribute_records.items[self.attribute_records.items.len - 1];
+            const value_offset = record.name_offset + record.name_len;
+            const value_len = self.attribute_bytes.items.len - value_offset;
+            const value_remaining = std.math.sub(
+                usize,
+                self.options.limits.max_attribute_value_bytes,
+                value_len,
+            ) catch unreachable;
+            const aggregate_remaining = std.math.sub(
+                usize,
+                self.options.limits.max_attribute_bytes_per_element,
+                self.attribute_bytes.items.len,
+            ) catch unreachable;
+            const accepted_len = @min(
+                run.len,
+                @min(value_remaining, @min(aggregate_remaining, self.startTagRemaining())),
+            );
+            if (accepted_len > 0) {
+                self.attribute_bytes.appendSlice(
+                    self.allocator,
+                    run[0..accepted_len],
+                ) catch return self.failOutOfMemory();
+                self.consumeStartTagRun(run[0..accepted_len]);
+            }
+            if (accepted_len != run.len) {
+                if (value_len + accepted_len ==
+                    self.options.limits.max_attribute_value_bytes)
+                {
+                    return self.failVoid(.attribute_value_limit, .limit_exceeded);
+                }
+                if (self.attribute_bytes.items.len ==
+                    self.options.limits.max_attribute_bytes_per_element)
+                {
+                    return self.failVoid(.attribute_bytes_limit, .limit_exceeded);
+                }
+                return self.failVoid(.start_tag_limit, .limit_exceeded);
+            }
+        }
+
+        fn finishAttribute(self: *Self) void {
+            const record = &self.attribute_records.items[self.attribute_records.items.len - 1];
+            const value_offset = record.name_offset + record.name_len;
+            record.value_len = self.attribute_bytes.items.len - value_offset;
+        }
+
+        fn prepareEventAttributes(self: *Self) ReadError!void {
+            try self.rejectDuplicateAttributes();
+            self.event_attributes.clearRetainingCapacity();
+            self.event_attributes.ensureTotalCapacity(
+                self.allocator,
+                self.attribute_records.items.len,
+            ) catch return self.failOutOfMemory();
+            for (self.attribute_records.items) |record| {
+                const raw_name = self.attributeRawName(record);
+                const value_offset = record.name_offset + record.name_len;
+                self.event_attributes.appendAssumeCapacity(.{
+                    .name = nameFromRaw(config, raw_name),
+                    .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
+                });
+            }
+        }
+
+        fn rejectDuplicateAttributes(self: *Self) ReadError!void {
+            const records = self.attribute_records.items;
+            if (records.len <= linear_duplicate_threshold) {
+                for (records, 0..) |record, index| {
+                    for (records[0..index]) |previous| {
+                        if (std.mem.eql(
+                            u8,
+                            self.attributeRawName(record),
+                            self.attributeRawName(previous),
+                        )) {
+                            return self.failRelated(
+                                .duplicate_attribute,
+                                .invalid_xml,
+                                record.start,
+                                previous.start,
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+
+            std.sort.heap(
+                AttributeRecord(config),
+                records,
+                self,
+                attributeRecordNameLessThan,
+            );
+            for (records[1..], records[0 .. records.len - 1]) |record, previous| {
+                if (std.mem.eql(
+                    u8,
+                    self.attributeRawName(record),
+                    self.attributeRawName(previous),
+                )) {
+                    return self.failRelated(
+                        .duplicate_attribute,
+                        .invalid_xml,
+                        record.start,
+                        previous.start,
+                    );
+                }
+            }
+            std.sort.heap(
+                AttributeRecord(config),
+                records,
+                {},
+                attributeRecordSourceLessThan,
+            );
+        }
+
+        fn attributeRecordNameLessThan(
+            self: *Self,
+            left: AttributeRecord(config),
+            right: AttributeRecord(config),
+        ) bool {
+            return switch (std.mem.order(
+                u8,
+                self.attributeRawName(left),
+                self.attributeRawName(right),
+            )) {
+                .lt => true,
+                .gt => false,
+                .eq => left.start.byte_offset < right.start.byte_offset,
+            };
+        }
+
+        fn attributeRecordSourceLessThan(
+            _: void,
+            left: AttributeRecord(config),
+            right: AttributeRecord(config),
+        ) bool {
+            return left.start.byte_offset < right.start.byte_offset;
+        }
+
+        fn attributeRawName(
+            self: *const Self,
+            record: AttributeRecord(config),
+        ) []const u8 {
+            return self.attribute_bytes.items[record.name_offset..][0..record.name_len];
         }
 
         fn compareAndConsumeEndName(self: *Self, run: []const u8) ReadError!void {
@@ -1030,6 +1467,49 @@ pub fn Reader(comptime config: Config) type {
             return self.open_names.items[frame.name_offset..][0..frame.name_len];
         }
 
+        fn startTagBytes(self: *const Self) usize {
+            const byte_count = self.source_byte_offset - self.token_start.byte_offset;
+            return std.math.cast(usize, byte_count) orelse std.math.maxInt(usize);
+        }
+
+        fn startTagRemaining(self: *const Self) usize {
+            return std.math.sub(
+                usize,
+                self.options.limits.max_start_tag_bytes,
+                self.startTagBytes(),
+            ) catch 0;
+        }
+
+        fn requireStartTagByte(self: *Self) ReadError!void {
+            if (self.startTagRemaining() == 0) {
+                return self.failVoid(.start_tag_limit, .limit_exceeded);
+            }
+        }
+
+        fn consumeStartTagByte(self: *Self, byte: u8) void {
+            std.debug.assert(self.startTagRemaining() > 0);
+            self.consumeByte(byte);
+        }
+
+        fn consumeStartTagRun(self: *Self, run: []const u8) void {
+            std.debug.assert(run.len <= self.startTagRemaining());
+            self.consumeRun(run);
+        }
+
+        fn consumeStartTagWhitespaceRun(self: *Self) ReadError!void {
+            const start = self.cursor;
+            var end = start;
+            while (end < self.input.len and isXmlWhitespace(self.input[end])) {
+                end += 1;
+            }
+            const run = self.input[start..end];
+            const accepted_len = @min(run.len, self.startTagRemaining());
+            self.consumeStartTagRun(run[0..accepted_len]);
+            if (accepted_len != run.len) {
+                return self.failVoid(.start_tag_limit, .limit_exceeded);
+            }
+        }
+
         fn consumeByte(self: *Self, byte: u8) void {
             std.debug.assert(self.cursor < self.input.len);
             std.debug.assert(self.input[self.cursor] == byte);
@@ -1090,16 +1570,7 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn topName(self: *const Self) Name(config) {
-            const raw = self.topRawName();
-            if (comptime config.profile.hasNamespaces()) {
-                return .{
-                    .raw = raw,
-                    .prefix = null,
-                    .local = raw,
-                    .namespace_uri = null,
-                };
-            }
-            return .{ .raw = raw };
+            return nameFromRaw(config, self.topRawName());
         }
 
         fn endMismatchLocation(self: *const Self) Location(config) {
@@ -1232,4 +1703,20 @@ fn isAsciiNameStart(byte: u8) bool {
 
 fn isAsciiNameChar(byte: u8) bool {
     return isAsciiNameStart(byte) or std.ascii.isDigit(byte) or byte == '-' or byte == '.';
+}
+
+fn isStage4AttributeValueByte(byte: u8, quote: u8) bool {
+    return byte >= ' ' and byte < 0x80 and byte != quote and byte != '&' and byte != '<';
+}
+
+fn nameFromRaw(comptime config: Config, raw: []const u8) Name(config) {
+    if (comptime config.profile.hasNamespaces()) {
+        return .{
+            .raw = raw,
+            .prefix = null,
+            .local = raw,
+            .namespace_uri = null,
+        };
+    }
+    return .{ .raw = raw };
 }
