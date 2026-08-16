@@ -1,0 +1,6 @@
+<!DOCTYPE root [
+  <!ELEMENT root EMPTY>
+  <!ENTITY % loop "%loop;">
+  %loop;
+]>
+<root/>

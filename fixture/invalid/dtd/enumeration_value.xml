@@ -1,0 +1,5 @@
+<!DOCTYPE item [
+<!ELEMENT item EMPTY>
+<!ATTLIST item state (new|active|done) #REQUIRED>
+]>
+<item state="unknown"/>

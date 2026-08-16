@@ -1,0 +1,5 @@
+<!DOCTYPE item [
+<!ELEMENT item EMPTY>
+<!ATTLIST item fixed CDATA #FIXED "expected">
+]>
+<item fixed="different"/>

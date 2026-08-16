@@ -1,0 +1,6 @@
+<!DOCTYPE root [
+  <!ELEMENT root (#PCDATA)>
+  <!NOTATION bin SYSTEM "application/octet-stream">
+  <!ENTITY payload SYSTEM "payload.bin" NDATA bin>
+]>
+<root>&payload;</root>

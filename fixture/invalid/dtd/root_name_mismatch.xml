@@ -1,0 +1,5 @@
+<!DOCTYPE expected [
+<!ELEMENT expected EMPTY>
+<!ELEMENT actual EMPTY>
+]>
+<actual/>

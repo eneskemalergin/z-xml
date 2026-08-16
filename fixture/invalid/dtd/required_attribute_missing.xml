@@ -1,0 +1,5 @@
+<!DOCTYPE item [
+<!ELEMENT item EMPTY>
+<!ATTLIST item required CDATA #REQUIRED>
+]>
+<item/>

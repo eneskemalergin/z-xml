@@ -1,0 +1,5 @@
+<!DOCTYPE root [
+<!ELEMENT root (#PCDATA)>
+<!ENTITY project "z-xml">
+]>
+<root>&project;</root>

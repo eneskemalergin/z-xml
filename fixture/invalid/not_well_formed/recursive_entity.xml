@@ -1,0 +1,5 @@
+<!DOCTYPE root [
+  <!ELEMENT root (#PCDATA)>
+  <!ENTITY loop "&loop;">
+]>
+<root>&loop;</root>

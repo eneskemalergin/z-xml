@@ -1,0 +1,3 @@
+<!ELEMENT catalog (entry+)>
+<!ELEMENT entry EMPTY>
+<!ATTLIST entry id ID #REQUIRED>

@@ -1,0 +1,6 @@
+<!DOCTYPE graph [
+<!ELEMENT graph (node+)>
+<!ELEMENT node EMPTY>
+<!ATTLIST node id ID #REQUIRED>
+]>
+<graph><node id="same"/><node id="same"/></graph>

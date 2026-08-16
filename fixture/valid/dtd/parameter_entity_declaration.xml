@@ -1,0 +1,6 @@
+<!DOCTYPE root [
+  <!ENTITY % child-declaration "<!ELEMENT child EMPTY>">
+  %child-declaration;
+  <!ELEMENT root (child)>
+]>
+<root><child/></root>

@@ -1,0 +1,5 @@
+<!DOCTYPE root [
+<!ELEMENT root (declared)>
+<!ELEMENT declared EMPTY>
+]>
+<root><undeclared/></root>

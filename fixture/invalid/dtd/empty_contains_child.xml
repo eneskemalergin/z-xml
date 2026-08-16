@@ -1,0 +1,5 @@
+<!DOCTYPE root [
+<!ELEMENT root EMPTY>
+<!ELEMENT child EMPTY>
+]>
+<root><child/></root>

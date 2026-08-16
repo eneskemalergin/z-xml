@@ -1,0 +1,6 @@
+<!DOCTYPE graph [
+<!ELEMENT graph (node+)>
+<!ELEMENT node EMPTY>
+<!ATTLIST node id ID #REQUIRED link IDREF #IMPLIED>
+]>
+<graph><node id="one" link="missing"/></graph>

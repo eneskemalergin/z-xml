@@ -1,0 +1,1 @@
+<root xmlns:p="urn:outer"><p:item/><scope xmlns:p="urn:inner"><p:item/></scope><p:item/></root>

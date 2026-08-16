@@ -1,0 +1,6 @@
+<!DOCTYPE list [
+<!ELEMENT list (alpha|beta)*>
+<!ELEMENT alpha EMPTY>
+<!ELEMENT beta EMPTY>
+]>
+<list><alpha/><beta/><alpha/></list>

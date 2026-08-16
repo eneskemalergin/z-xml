@@ -1,0 +1,5 @@
+<!DOCTYPE item [
+<!ELEMENT item EMPTY>
+<!ATTLIST item required CDATA #REQUIRED implied CDATA #IMPLIED fixed CDATA #FIXED "fixed" defaulted CDATA "default">
+]>
+<item required="present" fixed="fixed"/>
