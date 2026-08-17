@@ -7,6 +7,8 @@ const fixtures = @import("reader_fixtures");
 const CORE_CONFIG = xml.Configs.XML10_UTF8_NO_DTD;
 const FAST_CONFIG = xml.Configs.XML10_UTF8_NO_DTD_FAST;
 const NS_CONFIG = xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD;
+const GENERAL_CONFIG = xml.Configs.XML10_NO_DTD;
+const GENERAL_FAST_CONFIG = xml.Configs.XML10_NO_DTD_FAST;
 const CoreReader = xml.Reader(CORE_CONFIG);
 
 const Summary = struct {
@@ -19,6 +21,7 @@ const Summary = struct {
     const attribute_end_marker = 0xff;
 
     sequence: u64 = 0,
+    source_encoding: xml.SourceEncoding = .utf8,
     declared_version: [32]u8 = @splat(0),
     declared_version_len: usize = 0,
     declared_encoding: [32]u8 = @splat(0),
@@ -56,6 +59,7 @@ const Summary = struct {
             .document_start => |document| {
                 self.sequence *%= 10;
                 self.sequence +%= 1;
+                self.source_encoding = document.source_encoding;
                 if (document.declared_version) |version| {
                     if (version.len > self.declared_version.len) {
                         return error.DeclaredVersionSummaryTooLarge;
@@ -403,6 +407,7 @@ fn expectSummarySchedulesWithOptions(
 
 fn expectSummaryMetrics(expected: Summary, actual: Summary) !void {
     try std.testing.expectEqual(expected.sequence, actual.sequence);
+    try std.testing.expectEqual(expected.source_encoding, actual.source_encoding);
     try std.testing.expectEqualStrings(
         expected.declared_version[0..expected.declared_version_len],
         actual.declared_version[0..actual.declared_version_len],
@@ -462,6 +467,80 @@ fn expectSemanticSchedules(
     try std.testing.expectEqual(attributes, whole.attributes);
     try std.testing.expectEqualStrings(text, whole.text_bytes[0..whole.text_bytes_len]);
     try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, input, whole);
+}
+
+const TestEndian = enum { little, big };
+
+fn encodeUtf16(
+    allocator: std.mem.Allocator,
+    utf8: []const u8,
+    endian: TestEndian,
+    include_signature: bool,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    if (include_signature) {
+        try output.appendSlice(
+            allocator,
+            if (endian == .little) "\xff\xfe" else "\xfe\xff",
+        );
+    }
+    var iterator = (try std.unicode.Utf8View.init(utf8)).iterator();
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (codepoint < 0x10000) {
+            try appendUtf16Unit(&output, allocator, @intCast(codepoint), endian);
+        } else {
+            const value = @as(u32, codepoint) - 0x10000;
+            try appendUtf16Unit(
+                &output,
+                allocator,
+                @intCast(0xd800 + (value >> 10)),
+                endian,
+            );
+            try appendUtf16Unit(
+                &output,
+                allocator,
+                @intCast(0xdc00 + (value & 0x3ff)),
+                endian,
+            );
+        }
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+fn appendUtf16Unit(
+    output: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    unit: u16,
+    endian: TestEndian,
+) !void {
+    const low: u8 = @truncate(unit);
+    const high: u8 = @truncate(unit >> 8);
+    if (endian == .little) {
+        try output.appendSlice(allocator, &.{ low, high });
+    } else {
+        try output.appendSlice(allocator, &.{ high, low });
+    }
+}
+
+fn allocationUtf16Parse(allocator: std.mem.Allocator) !void {
+    const parts = [_][]const u8{fixtures.utf16le_bom};
+    _ = try parseParts(GENERAL_CONFIG, allocator, .{}, &parts);
+}
+
+fn drainGeneralChunks(reader: *xml.Reader(GENERAL_FAST_CONFIG), input: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const end = @min(offset + 257, input.len);
+        try reader.feed(input[offset..end], end == input.len);
+        offset = end;
+        while (true) switch (try reader.next()) {
+            .event => {},
+            .need_input => break,
+            .done => return,
+        };
+    }
+    return error.MissingDone;
 }
 
 fn expectEvents(input: []const u8, expected: []const ExpectedEvent) !void {
@@ -582,6 +661,49 @@ fn expectCoreFailureParts(
         }
     }
     return error.ExpectedFailure;
+}
+
+fn expectGeneralFailureParts(
+    parts: []const []const u8,
+    code: xml.DiagnosticCode,
+    offset: u64,
+) !void {
+    const Reader = xml.Reader(GENERAL_FAST_CONFIG);
+    var reader = try Reader.init(std.testing.allocator, .{});
+    defer reader.deinit();
+
+    for (parts, 0..) |part, part_index| {
+        try reader.feed(part, part_index + 1 == parts.len);
+        while (true) {
+            const step = reader.next() catch |actual_error| {
+                try std.testing.expectEqual(error.InvalidXml, actual_error);
+                const diagnostic = reader.diagnostic().?;
+                try std.testing.expectEqual(code, diagnostic.code);
+                try std.testing.expectEqual(offset, diagnostic.primary.byte_offset);
+                try std.testing.expectError(error.InvalidXml, reader.next());
+                return;
+            };
+            switch (step) {
+                .event => {},
+                .need_input => break,
+                .done => return error.ExpectedFailure,
+            }
+        }
+    }
+    return error.ExpectedFailure;
+}
+
+fn expectGeneralFailureSchedules(
+    input: []const u8,
+    code: xml.DiagnosticCode,
+    offset: u64,
+) !void {
+    const whole = [_][]const u8{input};
+    try expectGeneralFailureParts(&whole, code, offset);
+    for (1..input.len) |split| {
+        const parts = [_][]const u8{ input[0..split], input[split..] };
+        try expectGeneralFailureParts(&parts, code, offset);
+    }
 }
 
 const FailureChunkSchedule = union(enum) {
@@ -1103,6 +1225,10 @@ test "config - representative profiles: compile specialized public types" {
         xml.Configs.XML10_UTF8_NO_DTD_LOCATED,
         xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD,
         xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST,
+        xml.Configs.XML10_NO_DTD,
+        xml.Configs.XML10_NO_DTD_FAST,
+        xml.Configs.XML10_NAMESPACES_NO_DTD,
+        xml.Configs.XML10_NAMESPACES_NO_DTD_FAST,
         xml.Configs.XML10_NONVALIDATING,
         xml.Configs.XML10_NAMESPACES_NONVALIDATING,
         xml.Configs.XML10_VALIDATING,
@@ -2105,6 +2231,200 @@ test "[property] - [UTF-8]: BOM and scalar widths survive every split" {
         1,
         0,
     );
+}
+
+test "[property] - [UTF-16]: byte order code units and surrogates survive every split" {
+    const little_parts = [_][]const u8{fixtures.utf16le_bom};
+    const little = try parseParts(GENERAL_CONFIG, std.testing.allocator, .{}, &little_parts);
+    try std.testing.expectEqual(xml.SourceEncoding.utf16_le, little.source_encoding);
+    try std.testing.expectEqualStrings("UTF-16", little.declared_encoding[0..little.declared_encoding_len]);
+    try std.testing.expectEqualStrings("λ🙂", little.text_bytes[0..little.text_bytes_len]);
+    try expectSummarySchedulesWithOptions(GENERAL_CONFIG, .{}, fixtures.utf16le_bom, little);
+
+    const big_parts = [_][]const u8{fixtures.utf16be_bom};
+    const big = try parseParts(GENERAL_CONFIG, std.testing.allocator, .{}, &big_parts);
+    try std.testing.expectEqual(xml.SourceEncoding.utf16_be, big.source_encoding);
+    try std.testing.expectEqualStrings("UTF-16", big.declared_encoding[0..big.declared_encoding_len]);
+    try std.testing.expectEqualStrings("λ🙂", big.text_bytes[0..big.text_bytes_len]);
+    try expectSummarySchedulesWithOptions(GENERAL_CONFIG, .{}, fixtures.utf16be_bom, big);
+}
+
+test "[property] - [general UTF-8]: direct source path agrees across schedules" {
+    const input = "<根 a='é'>x\r\ny🙂</根>";
+    const parts = [_][]const u8{input};
+    const summary = try parseParts(GENERAL_CONFIG, std.testing.allocator, .{}, &parts);
+    try std.testing.expectEqual(xml.SourceEncoding.utf8, summary.source_encoding);
+    try std.testing.expectEqualStrings("x\ny🙂", summary.text_bytes[0..summary.text_bytes_len]);
+    try expectSummarySchedulesWithOptions(GENERAL_CONFIG, .{}, input, summary);
+}
+
+test "[failure] - [UTF-16]: odd bytes and unpaired surrogates have stable source offsets" {
+    try expectGeneralFailureSchedules(
+        fixtures.utf16le_odd_byte,
+        .malformed_encoding,
+        fixtures.utf16le_odd_byte.len - 1,
+    );
+    try expectGeneralFailureSchedules(
+        fixtures.utf16le_unpaired_high,
+        .malformed_encoding,
+        14,
+    );
+    try expectGeneralFailureSchedules(
+        fixtures.utf16be_unpaired_low,
+        .malformed_encoding,
+        14,
+    );
+}
+
+test "[property] - [UTF-16 declaration]: explicit endian labels agree with detection" {
+    inline for (.{
+        .{ .endian = TestEndian.little, .label = "UTF-16LE", .encoding = xml.SourceEncoding.utf16_le },
+        .{ .endian = TestEndian.big, .label = "UTF-16BE", .encoding = xml.SourceEncoding.utf16_be },
+    }) |case| {
+        const source = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "<?xml version='1.0' encoding='{s}'?><根 a='é'>x\r\ny🙂</根>",
+            .{case.label},
+        );
+        defer std.testing.allocator.free(source);
+        const encoded = try encodeUtf16(std.testing.allocator, source, case.endian, true);
+        defer std.testing.allocator.free(encoded);
+        const parts = [_][]const u8{encoded};
+        const summary = try parseParts(GENERAL_CONFIG, std.testing.allocator, .{}, &parts);
+        try std.testing.expectEqual(case.encoding, summary.source_encoding);
+        try std.testing.expectEqualStrings(
+            case.label,
+            summary.declared_encoding[0..summary.declared_encoding_len],
+        );
+        try std.testing.expectEqualStrings("x\ny🙂", summary.text_bytes[0..summary.text_bytes_len]);
+        try expectSummarySchedulesWithOptions(GENERAL_CONFIG, .{}, encoded, summary);
+    }
+}
+
+test "[failure] - [encoding detection]: missing signatures and declaration conflicts are exact" {
+    const no_signature = try encodeUtf16(std.testing.allocator, "<?xml version='1.0'?><r/>", .big, false);
+    defer std.testing.allocator.free(no_signature);
+    try expectGeneralFailureSchedules(no_signature, .missing_encoding_signature, 0);
+
+    const mismatch_source = "<?xml version='1.0' encoding='UTF-16BE'?><r/>";
+    const mismatch = try encodeUtf16(
+        std.testing.allocator,
+        mismatch_source,
+        .little,
+        true,
+    );
+    defer std.testing.allocator.free(mismatch);
+    const encoding_index = std.mem.indexOf(u8, mismatch_source, "UTF-16BE").?;
+    try expectGeneralFailureSchedules(
+        mismatch,
+        .encoding_mismatch,
+        2 + 2 * encoding_index,
+    );
+
+    try expectGeneralFailureSchedules(
+        fixtures.declared_utf16,
+        .encoding_mismatch,
+        std.mem.indexOf(u8, fixtures.declared_utf16, "UTF-16").?,
+    );
+}
+
+test "[integration] - [buffered UTF-16]: one-byte source reads preserve semantics" {
+    var io_buffer: [5]u8 = undefined;
+    var source: std.testing.Reader = .init(&io_buffer, &.{.{ .buffer = fixtures.utf16le_bom }});
+    source.artificial_limit = .limited(1);
+    var input = try xml.IoReader(GENERAL_CONFIG).init(
+        std.testing.allocator,
+        .{},
+        &source.interface,
+    );
+    defer input.deinit();
+    var summary: Summary = .{};
+    while (true) switch (try input.next()) {
+        .event => |event| try summary.observe(event),
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(xml.SourceEncoding.utf16_le, summary.source_encoding);
+    try std.testing.expectEqualStrings("λ🙂", summary.text_bytes[0..summary.text_bytes_len]);
+}
+
+test "[integration] - [UTF-16 namespaces]: decoded names use the namespace reader" {
+    const source = "<根 xmlns:p='urn:x'><p:子 a='値'/></根>";
+    const encoded = try encodeUtf16(std.testing.allocator, source, .little, true);
+    defer std.testing.allocator.free(encoded);
+    const parts = [_][]const u8{encoded};
+    const summary = try parseParts(
+        xml.Configs.XML10_NAMESPACES_NO_DTD,
+        std.testing.allocator,
+        .{},
+        &parts,
+    );
+    try std.testing.expectEqual(@as(usize, 2), summary.starts);
+    try std.testing.expectEqual(@as(usize, 1), summary.namespace_declarations);
+    try std.testing.expectEqual(@as(usize, 1), summary.attributes);
+}
+
+test "[failure] - [UTF-16 storage]: every allocation failure cleans up" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        allocationUtf16Parse,
+        .{},
+    );
+}
+
+test "[property] - [UTF-16 memory]: decoded storage is independent of document length" {
+    var document: std.ArrayList(u8) = .empty;
+    defer document.deinit(std.testing.allocator);
+    try document.appendSlice(std.testing.allocator, "<r>");
+    try document.appendNTimes(std.testing.allocator, 'x', 512 * 1024);
+    try document.appendSlice(std.testing.allocator, "</r>");
+    const encoded = try encodeUtf16(
+        std.testing.allocator,
+        document.items,
+        .little,
+        true,
+    );
+    defer std.testing.allocator.free(encoded);
+
+    var reader = try xml.Reader(GENERAL_FAST_CONFIG).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try drainGeneralChunks(&reader, encoded);
+    const capacity = reader.memoryUsage().decoder_capacity;
+    try std.testing.expectEqual(@as(usize, 2 * 16 * 1024), capacity);
+
+    try reader.reset(.retain_capacity);
+    try drainGeneralChunks(&reader, fixtures.utf16le_bom);
+    try std.testing.expectEqual(capacity, reader.memoryUsage().decoder_capacity);
+    try reader.reset(.release_memory);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().decoder_capacity);
+}
+
+test "[failure] - [UTF-16 locations]: grammar diagnostics use original byte offsets" {
+    const source = "<r>\r\n<x></y></r>";
+    const encoded = try encodeUtf16(std.testing.allocator, source, .little, true);
+    defer std.testing.allocator.free(encoded);
+    const mismatch_index = std.mem.indexOf(u8, source, "y").?;
+    try expectProfileFailureSchedules(
+        GENERAL_CONFIG,
+        .{},
+        encoded,
+        error.InvalidXml,
+        .mismatched_end_tag,
+        2 + 2 * mismatch_index,
+        2 + 2 * std.mem.indexOf(u8, source, "<x").?,
+    );
+
+    const parts = [_][]const u8{encoded};
+    const Reader = xml.Reader(GENERAL_CONFIG);
+    var reader = try Reader.init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(parts[0], true);
+    while (true) {
+        _ = reader.next() catch break;
+    }
+    const diagnostic = reader.diagnostic().?;
+    try std.testing.expectEqual(@as(u64, 2), diagnostic.primary.line);
+    try std.testing.expectEqual(@as(u64, 11), diagnostic.primary.byte_column);
 }
 
 test "[property] - [line normalization]: CR and CRLF produce one LF" {

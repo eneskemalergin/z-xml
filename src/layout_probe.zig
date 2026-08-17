@@ -12,6 +12,13 @@ pub fn main() void {
         "xml10-utf8-ns-no-dtd-fast",
         xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST,
     );
+    printLayout("xml10-no-dtd", xml.Configs.XML10_NO_DTD);
+    printLayout("xml10-no-dtd-fast", xml.Configs.XML10_NO_DTD_FAST);
+    printLayout("xml10-ns-no-dtd", xml.Configs.XML10_NAMESPACES_NO_DTD);
+    printLayout(
+        "xml10-ns-no-dtd-fast",
+        xml.Configs.XML10_NAMESPACES_NO_DTD_FAST,
+    );
     printLayout("xml10-nonvalidating", xml.Configs.XML10_NONVALIDATING);
     printLayout("xml10-validating", xml.Configs.XML10_VALIDATING);
     printLayout(

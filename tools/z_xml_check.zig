@@ -1,10 +1,15 @@
-//! Streaming corpus adapter for the implemented XML 1.0 UTF-8 no-DTD profile.
+//! Streaming corpus adapter for implemented XML 1.0 no-DTD profiles.
 
 const std = @import("std");
 const xml = @import("z_xml");
 const check_options = @import("check_options");
 
-const CONFIG = if (check_options.namespaces)
+const CONFIG = if (check_options.general_encodings)
+    if (check_options.namespaces)
+        xml.Configs.XML10_NAMESPACES_NO_DTD_FAST
+    else
+        xml.Configs.XML10_NO_DTD_FAST
+else if (check_options.namespaces)
     xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST
 else
     xml.Configs.XML10_UTF8_NO_DTD_FAST;

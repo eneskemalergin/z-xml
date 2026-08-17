@@ -10,6 +10,9 @@ from pathlib import Path
 
 def fixture_bytes() -> dict[str, bytes]:
     utf16_document = '<?xml version="1.0" encoding="UTF-16"?><root>\u03bb\U0001f642</root>'
+    utf16le_document = '<?xml version="1.0" encoding="UTF-16LE"?><root>\u03bb\U0001f642</root>'
+    utf16be_document = '<?xml version="1.0" encoding="UTF-16BE"?><root>\u03bb\U0001f642</root>'
+    utf16_markup = "<\u6839 \u5c5e\u6027='\u503c'>one\r\ntwo\U0001f642</\u6839>"
     return {
         "valid/encoding/utf8-bom.xml": b"\xef\xbb\xbf<root>\xc3\xa9\xf0\x9f\x99\x82</root>",
         "valid/encoding/utf8-codepoint-boundaries.xml": (
@@ -17,6 +20,16 @@ def fixture_bytes() -> dict[str, bytes]:
         ),
         "valid/encoding/utf16le-bom.xml": b"\xff\xfe" + utf16_document.encode("utf-16-le"),
         "valid/encoding/utf16be-bom.xml": b"\xfe\xff" + utf16_document.encode("utf-16-be"),
+        "valid/encoding/utf16le-explicit.xml": (
+            b"\xff\xfe" + utf16le_document.encode("utf-16-le")
+        ),
+        "valid/encoding/utf16be-explicit.xml": (
+            b"\xfe\xff" + utf16be_document.encode("utf-16-be")
+        ),
+        "valid/encoding/utf16le-markup.xml": b"\xff\xfe" + utf16_markup.encode("utf-16-le"),
+        "valid/encoding/utf16be-no-declaration.xml": (
+            b"\xfe\xff" + "<root/>".encode("utf-16-be")
+        ),
         "valid/encoding/iso-8859-1.xml": (
             b'<?xml version="1.0" encoding="ISO-8859-1"?><root>caf\xe9</root>'
         ),
@@ -42,6 +55,15 @@ def fixture_bytes() -> dict[str, bytes]:
         "invalid/encoding/utf16be-unpaired-low-surrogate.xml": (
             b"\xfe\xff" + "<root>".encode("utf-16-be") + b"\xdc\x00" + "</root>".encode("utf-16-be")
         ),
+        "invalid/encoding/utf16le-missing-signature.xml": utf16_document.encode("utf-16-le"),
+        "invalid/encoding/utf16be-missing-signature.xml": utf16_document.encode("utf-16-be"),
+        "invalid/encoding/utf16le-declared-be.xml": (
+            b"\xff\xfe" + utf16be_document.encode("utf-16-le")
+        ),
+        "invalid/encoding/utf16be-declared-le.xml": (
+            b"\xfe\xff" + utf16le_document.encode("utf-16-be")
+        ),
+        "invalid/encoding/utf16le-high-surrogate-final.xml": b"\xff\xfe\x00\xd8",
         "invalid/encoding/declared-utf16-but-utf8.xml": (
             b'<?xml version="1.0" encoding="UTF-16"?><root/>'
         ),

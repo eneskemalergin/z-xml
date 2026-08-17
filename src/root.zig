@@ -1,9 +1,11 @@
 //! A bounded, incremental XML reader for Zig.
 //!
 //! The public API is specialized by a compile-time configuration. The current
-//! implementation provides XML 1.0 UTF-8 no-DTD raw-name and namespace readers.
+//! implementation provides XML 1.0 no-DTD raw-name and namespace readers with
+//! UTF-8-only and general UTF-8 or UTF-16 source profiles.
 
 const reader = @import("reader.zig");
+const encoding = @import("encoding.zig");
 const io = @import("io.zig");
 
 /// Compile-time reader configuration.
@@ -32,6 +34,12 @@ pub const DiagnosticCode = reader.DiagnosticCode;
 pub const XmlVersion = reader.XmlVersion;
 /// Detected source encoding reported at document start.
 pub const SourceEncoding = reader.SourceEncoding;
+/// Caller-owned incremental source transcoder.
+pub const Transcoder = encoding.Transcoder;
+/// One bounded caller-transcoder result.
+pub const TranscodeStep = encoding.TranscodeStep;
+/// Invalid caller-transcoder result error.
+pub const TranscoderError = encoding.TranscoderError;
 /// Semantic origin reported by text fragments.
 pub const TextOrigin = reader.TextOrigin;
 /// Input-feed misuse errors.

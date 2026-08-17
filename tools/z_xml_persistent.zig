@@ -1,14 +1,24 @@
-//! Persistent raw-name and namespace benchmark adapter for XML 1.0 UTF-8 no-DTD profiles.
+//! Persistent benchmark adapter for XML 1.0 no-DTD profiles.
 
 const std = @import("std");
 const xml = @import("z_xml");
 const persistent_options = @import("persistent_options");
 
-const CONFIG = if (persistent_options.namespaces)
+const CONFIG = if (persistent_options.general_encodings)
+    if (persistent_options.namespaces)
+        xml.Configs.XML10_NAMESPACES_NO_DTD_FAST
+    else
+        xml.Configs.XML10_NO_DTD_FAST
+else if (persistent_options.namespaces)
     xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST
 else
     xml.Configs.XML10_UTF8_NO_DTD_FAST;
-const ENGINE = if (persistent_options.namespaces) "z-xml-ns" else "z-xml";
+const ENGINE = if (persistent_options.general_encodings)
+    if (persistent_options.namespaces) "z-xml-general-ns" else "z-xml-general"
+else if (persistent_options.namespaces)
+    "z-xml-ns"
+else
+    "z-xml";
 const DEFAULT_CHUNK_BYTES = 64 * 1024;
 
 const InputModel = enum {

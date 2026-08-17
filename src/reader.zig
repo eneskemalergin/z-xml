@@ -1,11 +1,14 @@
 //! Compile-time reader shape and lifecycle contract.
 
 const std = @import("std");
+const encoding_module = @import("encoding.zig");
 
 /// XML capability profile selected at compile time.
 pub const Profile = enum {
     xml10_utf8_no_dtd,
     xml10_utf8_ns_no_dtd,
+    xml10_no_dtd,
+    xml10_ns_no_dtd,
     xml10_nonvalidating,
     xml10_ns_nonvalidating,
     xml10_dtd_validating,
@@ -19,6 +22,7 @@ pub const Profile = enum {
     pub fn hasNamespaces(comptime self: Profile) bool {
         return switch (self) {
             .xml10_utf8_ns_no_dtd,
+            .xml10_ns_no_dtd,
             .xml10_ns_nonvalidating,
             .xml10_ns_dtd_validating,
             .xml11_ns_nonvalidating,
@@ -31,7 +35,11 @@ pub const Profile = enum {
     /// Returns the DTD processing mode required by this profile.
     pub fn dtdMode(comptime self: Profile) DtdMode {
         return switch (self) {
-            .xml10_utf8_no_dtd, .xml10_utf8_ns_no_dtd => .rejected,
+            .xml10_utf8_no_dtd,
+            .xml10_utf8_ns_no_dtd,
+            .xml10_no_dtd,
+            .xml10_ns_no_dtd,
+            => .rejected,
             .xml10_nonvalidating,
             .xml10_ns_nonvalidating,
             .xml11_nonvalidating,
@@ -61,6 +69,18 @@ pub const Profile = enum {
     pub fn isUtf8Only(comptime self: Profile) bool {
         return switch (self) {
             .xml10_utf8_no_dtd, .xml10_utf8_ns_no_dtd => true,
+            else => false,
+        };
+    }
+
+    /// Returns whether this stage implements the profile's complete grammar.
+    pub fn isImplemented(comptime self: Profile) bool {
+        return switch (self) {
+            .xml10_utf8_no_dtd,
+            .xml10_utf8_ns_no_dtd,
+            .xml10_no_dtd,
+            .xml10_ns_no_dtd,
+            => true,
             else => false,
         };
     }
@@ -123,6 +143,24 @@ pub const Configs = struct {
     /// Byte-offset-only namespace-aware XML 1.0 UTF-8 performance profile.
     pub const XML10_UTF8_NAMESPACES_NO_DTD_FAST: Config = .{
         .profile = .xml10_utf8_ns_no_dtd,
+        .diagnostic_location = .byte_offset,
+    };
+    /// Line-aware XML 1.0 UTF-8 and UTF-16 no-DTD profile.
+    pub const XML10_NO_DTD: Config = .{
+        .profile = .xml10_no_dtd,
+    };
+    /// Byte-offset-only XML 1.0 UTF-8 and UTF-16 no-DTD profile.
+    pub const XML10_NO_DTD_FAST: Config = .{
+        .profile = .xml10_no_dtd,
+        .diagnostic_location = .byte_offset,
+    };
+    /// Namespace-aware XML 1.0 UTF-8 and UTF-16 no-DTD profile.
+    pub const XML10_NAMESPACES_NO_DTD: Config = .{
+        .profile = .xml10_ns_no_dtd,
+    };
+    /// Byte-offset-only namespace-aware UTF-8 and UTF-16 no-DTD profile.
+    pub const XML10_NAMESPACES_NO_DTD_FAST: Config = .{
+        .profile = .xml10_ns_no_dtd,
         .diagnostic_location = .byte_offset,
     };
     /// Full non-validating XML 1.0 profile without namespaces.
@@ -257,6 +295,8 @@ pub const MemoryUsage = struct {
     scratch_bytes: usize = 0,
     /// Reusable attribute and markup scratch capacity measured in bytes.
     scratch_capacity: usize = 0,
+    /// Reusable decoded UTF-8 bytes and source-width metadata.
+    decoder_capacity: usize = 0,
     /// Namespace storage capacity measured in bytes.
     namespace_capacity: usize = 0,
     /// Active namespace bindings, including shadowed bindings.
@@ -298,6 +338,9 @@ pub const DiagnosticCode = enum {
     start_tag_limit,
     fragment_limit,
     malformed_utf8,
+    malformed_encoding,
+    missing_encoding_signature,
+    encoding_mismatch,
     forbidden_character,
     malformed_reference,
     invalid_character_reference,
@@ -445,10 +488,8 @@ pub const XmlVersion = enum {
     xml10,
 };
 
-/// Source encoding detected by the UTF-8-only profile.
-pub const SourceEncoding = enum {
-    utf8,
-};
+/// Source encoding detected for the document entity.
+pub const SourceEncoding = encoding_module.SourceEncoding;
 
 /// Origin of one text fragment.
 pub const TextOrigin = enum {
@@ -695,7 +736,7 @@ const ScalarSource = enum {
 };
 
 const DecodedScalar = struct {
-    codepoint: u21,
+    codepoint: u32,
     len: u3,
 };
 
@@ -788,6 +829,39 @@ const Failure = enum {
     read_failed,
 };
 
+const decoded_input_capacity = 16 * 1024;
+
+const EncodingFailure = struct {
+    code: DiagnosticCode,
+    offset: u64,
+    failure: Failure = .invalid_xml,
+};
+
+fn SourceState(comptime config: Config) type {
+    return if (config.profile.isUtf8Only())
+        struct {}
+    else
+        struct {
+            raw_input: []const u8 = &.{},
+            raw_cursor: usize = 0,
+            raw_final: bool = false,
+            raw_offset: u64 = 0,
+            encoding: ?SourceEncoding = null,
+            signature_bytes: [4]u8 = @splat(0),
+            signature_len: usize = 0,
+            decoded: std.ArrayList(u8) = .empty,
+            source_advances: std.ArrayList(u8) = .empty,
+            input_is_direct_utf8: bool = false,
+            pending_byte: ?u8 = null,
+            pending_byte_offset: u64 = 0,
+            high_surrogate: ?u16 = null,
+            high_surrogate_offset: u64 = 0,
+            failure: ?EncodingFailure = null,
+        };
+}
+
+const InternalReadError = ReadError || error{RefillDecodedInput};
+
 /// Incremental reader specialized to `config`.
 pub fn Reader(comptime config: Config) type {
     config.validate();
@@ -805,6 +879,8 @@ pub fn Reader(comptime config: Config) type {
         final_input: bool = false,
         final_was_seen: bool = false,
         source_byte_offset: u64 = 0,
+        source_encoding: SourceEncoding = .utf8,
+        source_state: SourceState(config) = .{},
         position: PositionState(config) = .{},
         first_diagnostic: ?Diagnostic(config) = null,
         vertical_state: VerticalState = .detect_bom,
@@ -898,6 +974,8 @@ pub fn Reader(comptime config: Config) type {
             self.final_input = false;
             self.final_was_seen = false;
             self.source_byte_offset = 0;
+            self.source_encoding = .utf8;
+            self.resetSourceStateRetainingCapacity();
             self.position = .{};
             self.first_diagnostic = null;
             self.vertical_state = .detect_bom;
@@ -952,25 +1030,47 @@ pub fn Reader(comptime config: Config) type {
                 return error.InvalidState;
             }
 
-            self.input = input;
-            self.cursor = 0;
-            self.final_input = final;
+            if (comptime config.profile.isUtf8Only()) {
+                self.input = input;
+                self.cursor = 0;
+                self.final_input = final;
+            } else {
+                self.source_state.raw_input = input;
+                self.source_state.raw_cursor = 0;
+                self.source_state.raw_final = final;
+                self.input = &.{};
+                self.cursor = 0;
+                self.final_input = false;
+            }
             self.final_was_seen = final;
             self.lifecycle = .producing;
         }
 
         /// Produces the next event from the current implementation stage.
         pub fn next(self: *Self) ReadError!Step(config) {
+            while (true) {
+                return self.nextParser() catch |err| switch (err) {
+                    error.RefillDecodedInput => continue,
+                    else => |read_error| return read_error,
+                };
+            }
+        }
+
+        fn nextParser(self: *Self) InternalReadError!Step(config) {
             switch (self.lifecycle) {
                 .ready, .needs_input, .deinitialized => return error.InvalidState,
                 .failed => return self.failureError(),
                 .done => return .done,
                 .producing => {},
             }
-            if (comptime config.profile != .xml10_utf8_no_dtd and
-                config.profile != .xml10_utf8_ns_no_dtd)
-            {
+            if (comptime !config.profile.isImplemented()) {
                 return self.fail(.unsupported_stage, .unsupported_feature);
+            }
+
+            if (comptime !config.profile.isUtf8Only()) {
+                if (self.cursor == self.input.len and !self.final_input) {
+                    return self.needInput();
+                }
             }
 
             while (true) {
@@ -2032,6 +2132,7 @@ pub fn Reader(comptime config: Config) type {
                     self.attribute_bytes.items.len,
                 .scratch_bytes = self.attribute_bytes.items.len,
                 .scratch_capacity = self.attribute_bytes.capacity,
+                .decoder_capacity = self.decoderCapacity(),
                 .namespace_capacity = self.namespaceCapacity(),
                 .namespace_binding_count = self.namespaceBindingCount(),
                 .namespace_bytes = self.namespaceBytes(),
@@ -2048,7 +2149,14 @@ pub fn Reader(comptime config: Config) type {
                 record_bytes +|
                 self.attribute_bytes.capacity +|
                 event_bytes +|
-                self.namespaceCapacity();
+                self.namespaceCapacity() +|
+                self.decoderCapacity();
+        }
+
+        fn decoderCapacity(self: *const Self) usize {
+            if (comptime config.profile.isUtf8Only()) return 0;
+            return self.source_state.decoded.capacity +|
+                self.source_state.source_advances.capacity;
         }
 
         fn namespaceCapacity(self: *const Self) usize {
@@ -2085,12 +2193,36 @@ pub fn Reader(comptime config: Config) type {
                 self.namespace_state.expanded_indices.deinit(self.allocator);
                 self.namespace_state.event_attribute_locations.deinit(self.allocator);
             }
+            if (comptime !config.profile.isUtf8Only()) {
+                self.source_state.decoded.deinit(self.allocator);
+                self.source_state.source_advances.deinit(self.allocator);
+            }
             self.open_elements = .empty;
             self.open_names = .empty;
             self.attribute_records = .empty;
             self.attribute_bytes = .empty;
             self.event_attributes = .empty;
             self.namespace_state = .{};
+            self.source_state = .{};
+        }
+
+        fn resetSourceStateRetainingCapacity(self: *Self) void {
+            if (comptime config.profile.isUtf8Only()) return;
+            self.source_state.raw_input = &.{};
+            self.source_state.raw_cursor = 0;
+            self.source_state.raw_final = false;
+            self.source_state.raw_offset = 0;
+            self.source_state.encoding = null;
+            self.source_state.signature_bytes = @splat(0);
+            self.source_state.signature_len = 0;
+            self.source_state.decoded.clearRetainingCapacity();
+            self.source_state.source_advances.clearRetainingCapacity();
+            self.source_state.input_is_direct_utf8 = false;
+            self.source_state.pending_byte = null;
+            self.source_state.pending_byte_offset = 0;
+            self.source_state.high_surrogate = null;
+            self.source_state.high_surrogate_offset = 0;
+            self.source_state.failure = null;
         }
 
         fn clearAttributesRetainingCapacity(self: *Self) void {
@@ -2123,6 +2255,7 @@ pub fn Reader(comptime config: Config) type {
         fn documentStart(self: *const Self) DocumentStart {
             const bytes = self.attribute_bytes.items;
             return .{
+                .source_encoding = self.source_encoding,
                 .declared_version = if (self.declared_version_len == 0)
                     null
                 else
@@ -2282,11 +2415,15 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn failProcessingInstructionTargetLimit(self: *Self) ReadError {
-            const offset = 2 +| self.options.limits.max_processing_instruction_target_bytes;
+            const target = self.processingInstructionTarget();
+            const prefix_len = @min(
+                target.len,
+                self.options.limits.max_processing_instruction_target_bytes,
+            );
             return self.failAt(
                 .processing_instruction_target_limit,
                 .limit_exceeded,
-                locationWithByteDelta(config, self.token_start, offset),
+                self.locationWithSemanticPrefix(self.token_start, 2, target[0..prefix_len]),
             );
         }
 
@@ -2423,7 +2560,11 @@ pub fn Reader(comptime config: Config) type {
                     return self.failAt(
                         .malformed_ncname,
                         .invalid_xml,
-                        locationWithByteDelta(config, self.token_start, 2 + colon),
+                        self.locationWithSemanticPrefix(
+                            self.token_start,
+                            2,
+                            target[0..colon],
+                        ),
                     );
                 }
             }
@@ -2850,7 +2991,7 @@ pub fn Reader(comptime config: Config) type {
                     return false;
                 }
                 const start = self.delimiter_start;
-                self.delimiter_start = locationWithByteDelta(config, start, 1);
+                self.delimiter_start = self.locationWithSemanticPrefix(start, 0, "]");
                 self.delimiter_len = 1;
                 try self.prepareCdataFragment("]", start);
                 return false;
@@ -3014,7 +3155,11 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn finishDeclaration(self: *Self) ReadError!void {
-            switch (parseXmlDeclaration(self.attribute_bytes.items)) {
+            switch (parseXmlDeclaration(
+                self.attribute_bytes.items,
+                self.source_encoding,
+                !config.profile.isUtf8Only(),
+            )) {
                 .parsed => |parsed| {
                     self.declared_version_offset = parsed.version_offset;
                     self.declared_version_len = parsed.version_len;
@@ -3038,6 +3183,11 @@ pub fn Reader(comptime config: Config) type {
                     .unsupported_feature,
                     self.declarationLocation(index),
                 ),
+                .encoding_mismatch => |index| return self.failAt(
+                    .encoding_mismatch,
+                    .invalid_xml,
+                    self.declarationLocation(index),
+                ),
             }
         }
 
@@ -3045,7 +3195,8 @@ pub fn Reader(comptime config: Config) type {
             var location = self.declaration_data_start;
             var pending_carriage_return = false;
             for (self.attribute_bytes.items[0..@min(index, self.attribute_bytes.items.len)]) |byte| {
-                location.byte_offset += 1;
+                const source_width: u64 = if (self.source_encoding == .utf8) 1 else 2;
+                location.byte_offset += source_width;
                 if (config.diagnostic_location == .line_column) {
                     if (pending_carriage_return and byte == '\n') {
                         location.byte_column = 1;
@@ -3061,7 +3212,7 @@ pub fn Reader(comptime config: Config) type {
                         location.line += 1;
                         location.byte_column = 1;
                     } else {
-                        location.byte_column += 1;
+                        location.byte_column += source_width;
                     }
                 }
             }
@@ -3108,7 +3259,7 @@ pub fn Reader(comptime config: Config) type {
             }
 
             const bytes = self.utf8_bytes[0..self.utf8_expected_len];
-            const codepoint = std.unicode.utf8Decode(bytes) catch unreachable;
+            const codepoint: u32 = std.unicode.utf8Decode(bytes) catch unreachable;
             return .{ .codepoint = codepoint, .len = self.utf8_expected_len };
         }
 
@@ -3910,7 +4061,11 @@ pub fn Reader(comptime config: Config) type {
             self.namespace_state.comparison_work = 0;
 
             const element_raw = self.open_names.items[self.open_names.items.len - self.token_name_len ..];
-            const element_name_start = locationWithByteDelta(config, self.token_start, 1);
+            const element_name_start = self.locationWithSemanticPrefix(
+                self.token_start,
+                1,
+                "",
+            );
             const element_parts = try self.requireQName(element_raw, element_name_start);
             if (element_parts.prefix) |prefix| {
                 if (std.mem.eql(u8, prefix, "xmlns")) {
@@ -4012,18 +4167,34 @@ pub fn Reader(comptime config: Config) type {
                 return self.failAt(
                     .qname_limit,
                     .limit_exceeded,
-                    locationWithByteDelta(
-                        config,
+                    self.locationWithSemanticPrefix(
                         start,
-                        self.options.namespace_limits.max_qname_bytes,
+                        0,
+                        raw[0..self.options.namespace_limits.max_qname_bytes],
                     ),
                 );
             }
             return qnameParts(raw) orelse self.failAt(
                 .malformed_qname,
                 .invalid_xml,
-                locationWithByteDelta(config, start, qnameErrorIndex(raw)),
+                self.locationWithSemanticPrefix(start, 0, raw[0..qnameErrorIndex(raw)]),
             );
+        }
+
+        fn locationWithSemanticPrefix(
+            self: *const Self,
+            location: Location(config),
+            ascii_prefix_len: usize,
+            utf8_prefix: []const u8,
+        ) Location(config) {
+            const delta: u64 = if (self.source_encoding == .utf8)
+                ascii_prefix_len + utf8_prefix.len
+            else
+                2 * @as(u64, @intCast(ascii_prefix_len)) + utf16SourceBytes(utf8_prefix);
+            var result = location;
+            result.byte_offset += delta;
+            if (config.diagnostic_location == .line_column) result.byte_column += delta;
+            return result;
         }
 
         fn addNamespaceDeclaration(
@@ -4558,16 +4729,28 @@ pub fn Reader(comptime config: Config) type {
 
             var source_byte_offset = self.source_byte_offset;
 
+            const direct_utf8 = self.inputUsesDirectOffsets();
+            const source_advances = if (comptime config.profile.isUtf8Only())
+                &.{}
+            else if (direct_utf8)
+                &.{}
+            else
+                self.source_state.source_advances.items[self.cursor..][0..run.len];
+            const source_run_len: u64 = if (direct_utf8)
+                run.len
+            else
+                sumSourceAdvances(source_advances);
+
             if (config.diagnostic_location == .line_column) {
                 if (run.len > 0 and std.mem.indexOfAny(u8, run, "\r\n") == null) {
-                    source_byte_offset += run.len;
+                    source_byte_offset += source_run_len;
                     self.position.pending_carriage_return = false;
                 } else {
                     var line = self.position.line;
                     var line_start_offset = self.position.line_start_offset;
                     var pending_carriage_return = self.position.pending_carriage_return;
-                    for (run) |byte| {
-                        source_byte_offset += 1;
+                    for (run, 0..) |byte, index| {
+                        source_byte_offset += self.sourceAdvanceAt(index);
                         if (pending_carriage_return) {
                             pending_carriage_return = false;
                             if (byte == '\n') {
@@ -4589,11 +4772,22 @@ pub fn Reader(comptime config: Config) type {
                     self.position.pending_carriage_return = pending_carriage_return;
                 }
             } else {
-                source_byte_offset += run.len;
+                source_byte_offset += source_run_len;
             }
 
             self.cursor += run.len;
             self.source_byte_offset = source_byte_offset;
+        }
+
+        fn inputUsesDirectOffsets(self: *const Self) bool {
+            if (comptime config.profile.isUtf8Only()) return true;
+            return self.source_state.input_is_direct_utf8;
+        }
+
+        fn sourceAdvanceAt(self: *const Self, index: usize) u8 {
+            if (comptime config.profile.isUtf8Only()) return 1;
+            if (self.source_state.input_is_direct_utf8) return 1;
+            return self.source_state.source_advances.items[self.cursor + index];
         }
 
         fn topName(self: *const Self) Name(config) {
@@ -4627,7 +4821,12 @@ pub fn Reader(comptime config: Config) type {
         fn endMismatchLocation(self: *const Self) Location(config) {
             std.debug.assert(self.end_mismatch_index != no_end_mismatch);
             var location = self.token_start;
-            const delta: u64 = @intCast(2 + self.end_mismatch_index);
+            const delta: u64 = if (self.source_encoding == .utf8)
+                @intCast(2 + self.end_mismatch_index)
+            else
+                4 + utf16SourceBytes(
+                    self.topRawName()[0..@min(self.end_mismatch_index, self.topRawName().len)],
+                );
             location.byte_offset += delta;
             if (config.diagnostic_location == .line_column) {
                 location.byte_column += delta;
@@ -4651,13 +4850,296 @@ pub fn Reader(comptime config: Config) type {
             return .{ .event = payload };
         }
 
-        fn needInput(self: *Self) Step(config) {
+        fn needInput(self: *Self) InternalReadError!Step(config) {
             std.debug.assert(!self.final_input);
             std.debug.assert(self.cursor == self.input.len);
             self.input = &.{};
             self.cursor = 0;
+            if (comptime !config.profile.isUtf8Only()) {
+                try self.refillDecodedInput();
+                if (self.input.len != 0 or self.final_input) {
+                    return error.RefillDecodedInput;
+                }
+            }
             self.lifecycle = .needs_input;
             return .need_input;
+        }
+
+        fn refillDecodedInput(self: *Self) ReadError!void {
+            if (comptime config.profile.isUtf8Only()) unreachable;
+            const source = &self.source_state;
+            source.decoded.clearRetainingCapacity();
+            source.source_advances.clearRetainingCapacity();
+            source.input_is_direct_utf8 = false;
+            source.decoded.ensureTotalCapacityPrecise(
+                self.allocator,
+                decoded_input_capacity,
+            ) catch return self.failOutOfMemory();
+            source.source_advances.ensureTotalCapacityPrecise(
+                self.allocator,
+                decoded_input_capacity,
+            ) catch return self.failOutOfMemory();
+
+            if (source.failure) |failure| {
+                return self.failAt(
+                    failure.code,
+                    failure.failure,
+                    self.locationAtCurrentLine(failure.offset),
+                );
+            }
+
+            while (source.decoded.items.len < decoded_input_capacity) {
+                if (source.encoding == null) {
+                    if (!self.detectSourceEncoding()) break;
+                    if (source.failure != null) break;
+                    continue;
+                }
+                switch (source.encoding.?) {
+                    .utf8 => self.decodeUtf8SourceRun(),
+                    .utf16_le, .utf16_be => self.decodeUtf16SourceRun(),
+                    .other => unreachable,
+                }
+                if (self.input.len != 0) return;
+                if ((source.encoding == .utf8 and source.decoded.items.len != 0) or
+                    source.failure != null or
+                    source.raw_cursor == source.raw_input.len or
+                    source.decoded.items.len == decoded_input_capacity)
+                {
+                    break;
+                }
+            }
+
+            if (source.decoded.items.len != 0) {
+                self.input = source.decoded.items;
+                return;
+            }
+            if (source.failure) |failure| {
+                return self.failAt(
+                    failure.code,
+                    failure.failure,
+                    self.locationAtCurrentLine(failure.offset),
+                );
+            }
+            if (source.raw_cursor != source.raw_input.len) return;
+            if (!source.raw_final) {
+                source.raw_input = &.{};
+                source.raw_cursor = 0;
+                return;
+            }
+            if (source.encoding == null) _ = self.finishEncodingDetection();
+            if (source.encoding == .utf16_le or source.encoding == .utf16_be) {
+                if (source.pending_byte != null) {
+                    return self.failAt(
+                        .malformed_encoding,
+                        .invalid_xml,
+                        self.locationAtCurrentLine(source.pending_byte_offset),
+                    );
+                }
+                if (source.high_surrogate != null) {
+                    return self.failAt(
+                        .malformed_encoding,
+                        .invalid_xml,
+                        self.locationAtCurrentLine(source.high_surrogate_offset),
+                    );
+                }
+            }
+            self.final_input = true;
+        }
+
+        fn detectSourceEncoding(self: *Self) bool {
+            const source = &self.source_state;
+            while (source.raw_cursor < source.raw_input.len and source.encoding == null and
+                source.failure == null)
+            {
+                const byte = source.raw_input[source.raw_cursor];
+                source.raw_cursor += 1;
+                source.raw_offset += 1;
+                source.signature_bytes[source.signature_len] = byte;
+                source.signature_len += 1;
+
+                if (source.signature_len == 1) {
+                    if (byte != 0 and byte != '<' and byte != 0x4c and
+                        byte != 0xef and byte != 0xfe and byte != 0xff)
+                    {
+                        self.selectSourceEncoding(.utf8, false);
+                    }
+                } else if (source.signature_len == 2) {
+                    const signature = source.signature_bytes[0..2];
+                    if (std.mem.eql(u8, signature, "\xfe\xff")) {
+                        self.selectSourceEncoding(.utf16_be, true);
+                    } else if (std.mem.eql(u8, signature, "\xff\xfe")) {
+                        self.selectSourceEncoding(.utf16_le, true);
+                    } else if (!std.mem.eql(u8, signature, "\xef\xbb") and
+                        !std.mem.eql(u8, signature, "\x00\x3c") and
+                        !std.mem.eql(u8, signature, "\x3c\x00") and
+                        !std.mem.eql(u8, signature, "\x4c\x6f"))
+                    {
+                        self.selectSourceEncoding(.utf8, false);
+                    }
+                } else if (source.signature_len == 3) {
+                    const signature = source.signature_bytes[0..3];
+                    if (std.mem.eql(u8, signature, "\xef\xbb\xbf")) {
+                        self.selectSourceEncoding(.utf8, true);
+                    } else if (!std.mem.eql(u8, signature, "\x00\x3c\x00") and
+                        !std.mem.eql(u8, signature, "\x3c\x00\x3f") and
+                        !std.mem.eql(u8, signature, "\x4c\x6f\xa7"))
+                    {
+                        self.selectSourceEncoding(.utf8, false);
+                    }
+                } else if (std.mem.eql(
+                    u8,
+                    source.signature_bytes[0..4],
+                    "\x00\x3c\x00\x3f",
+                ) or std.mem.eql(
+                    u8,
+                    source.signature_bytes[0..4],
+                    "\x3c\x00\x3f\x00",
+                )) {
+                    source.failure = .{
+                        .code = .missing_encoding_signature,
+                        .offset = 0,
+                    };
+                } else if (std.mem.eql(
+                    u8,
+                    source.signature_bytes[0..4],
+                    "\x4c\x6f\xa7\x94",
+                )) {
+                    source.failure = .{
+                        .code = .unsupported_encoding,
+                        .offset = 0,
+                        .failure = .unsupported_feature,
+                    };
+                } else {
+                    self.selectSourceEncoding(.utf8, std.mem.eql(
+                        u8,
+                        source.signature_bytes[0..4],
+                        "\xef\xbb\xbf",
+                    ));
+                }
+            }
+            if (source.encoding == null and source.raw_final and
+                source.raw_cursor == source.raw_input.len)
+            {
+                return self.finishEncodingDetection();
+            }
+            return source.encoding != null or source.failure != null;
+        }
+
+        fn finishEncodingDetection(self: *Self) bool {
+            if (comptime config.profile.isUtf8Only()) unreachable;
+            if (self.source_state.encoding == null) self.selectSourceEncoding(.utf8, false);
+            return true;
+        }
+
+        fn selectSourceEncoding(
+            self: *Self,
+            encoding: SourceEncoding,
+            signature: bool,
+        ) void {
+            const source = &self.source_state;
+            source.encoding = encoding;
+            self.source_encoding = encoding;
+            if (signature) {
+                self.source_byte_offset = source.signature_len;
+                if (config.diagnostic_location == .line_column) {
+                    self.position.line_start_offset = self.source_byte_offset;
+                }
+                source.signature_len = 0;
+            }
+        }
+
+        fn decodeUtf8SourceRun(self: *Self) void {
+            const source = &self.source_state;
+            while (source.signature_len > 0 and
+                source.decoded.items.len < decoded_input_capacity)
+            {
+                const byte = source.signature_bytes[0];
+                if (source.signature_len > 1) {
+                    std.mem.copyForwards(
+                        u8,
+                        source.signature_bytes[0 .. source.signature_len - 1],
+                        source.signature_bytes[1..source.signature_len],
+                    );
+                }
+                source.signature_len -= 1;
+                self.appendDecodedByte(byte, 1);
+            }
+            if (source.decoded.items.len != 0) return;
+            if (source.raw_cursor < source.raw_input.len) {
+                self.input = source.raw_input[source.raw_cursor..];
+                source.raw_offset += self.input.len;
+                source.raw_cursor = source.raw_input.len;
+                source.input_is_direct_utf8 = true;
+            }
+        }
+
+        fn decodeUtf16SourceRun(self: *Self) void {
+            const source = &self.source_state;
+            while (source.decoded.items.len + 4 <= decoded_input_capacity and
+                source.raw_cursor < source.raw_input.len)
+            {
+                const byte = source.raw_input[source.raw_cursor];
+                const byte_offset = source.raw_offset;
+                source.raw_cursor += 1;
+                source.raw_offset += 1;
+                if (source.pending_byte == null) {
+                    source.pending_byte = byte;
+                    source.pending_byte_offset = byte_offset;
+                    continue;
+                }
+                const first = source.pending_byte.?;
+                const unit_offset = source.pending_byte_offset;
+                source.pending_byte = null;
+                const unit = switch (source.encoding.?) {
+                    .utf16_le => @as(u16, first) | (@as(u16, byte) << 8),
+                    .utf16_be => (@as(u16, first) << 8) | @as(u16, byte),
+                    .utf8, .other => unreachable,
+                };
+                if (source.high_surrogate) |high| {
+                    if (unit < 0xdc00 or unit > 0xdfff) {
+                        source.failure = .{
+                            .code = .malformed_encoding,
+                            .offset = source.high_surrogate_offset,
+                        };
+                        return;
+                    }
+                    const high_value = @as(u32, high) - 0xd800;
+                    const low_value = @as(u32, unit) - 0xdc00;
+                    const codepoint: u21 = @intCast(0x10000 + (high_value << 10) + low_value);
+                    source.high_surrogate = null;
+                    self.appendDecodedScalar(codepoint, 4);
+                } else if (unit >= 0xd800 and unit <= 0xdbff) {
+                    source.high_surrogate = unit;
+                    source.high_surrogate_offset = unit_offset;
+                } else if (unit >= 0xdc00 and unit <= 0xdfff) {
+                    source.failure = .{ .code = .malformed_encoding, .offset = unit_offset };
+                    return;
+                } else {
+                    self.appendDecodedScalar(@intCast(unit), 2);
+                }
+            }
+        }
+
+        fn appendDecodedScalar(self: *Self, codepoint: u21, source_len: u8) void {
+            var bytes: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(codepoint, &bytes) catch unreachable;
+            for (bytes[0..len], 0..) |byte, index| {
+                self.appendDecodedByte(byte, if (index + 1 == len) source_len else 0);
+            }
+        }
+
+        fn appendDecodedByte(self: *Self, byte: u8, source_advance: u8) void {
+            self.source_state.decoded.appendAssumeCapacity(byte);
+            self.source_state.source_advances.appendAssumeCapacity(source_advance);
+        }
+
+        fn locationAtCurrentLine(self: *const Self, offset: u64) Location(config) {
+            var location = self.currentLocation();
+            location.byte_offset = offset;
+            if (config.diagnostic_location == .line_column) {
+                location.byte_column = offset - self.position.line_start_offset + 1;
+            }
+            return location;
         }
 
         fn fail(self: *Self, code: DiagnosticCode, failure: Failure) ReadError {
@@ -4736,6 +5218,7 @@ const DeclarationParse = union(enum) {
     malformed: usize,
     unsupported_version: usize,
     unsupported_encoding: usize,
+    encoding_mismatch: usize,
 };
 
 const ByteRange = struct {
@@ -4743,7 +5226,11 @@ const ByteRange = struct {
     len: usize,
 };
 
-fn parseXmlDeclaration(bytes: []const u8) DeclarationParse {
+fn parseXmlDeclaration(
+    bytes: []const u8,
+    source_encoding: SourceEncoding,
+    supports_utf16: bool,
+) DeclarationParse {
     var index: usize = 0;
     if (!skipRequiredXmlWhitespace(bytes, &index)) return .{ .malformed = index };
     if (!consumeLiteral(bytes, &index, "version")) return .{ .malformed = index };
@@ -4771,7 +5258,40 @@ fn parseXmlDeclaration(bytes: []const u8) DeclarationParse {
         const encoding = consumeQuoted(bytes, &index) orelse return .{ .malformed = index };
         const encoding_bytes = bytes[encoding.offset..][0..encoding.len];
         if (!isEncodingName(encoding_bytes)) return .{ .malformed = encoding.offset };
-        if (!std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-8")) {
+        if (!supports_utf16 and !std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-8")) {
+            return .{ .unsupported_encoding = encoding.offset };
+        }
+        const declared_encoding: ?SourceEncoding = if (std.ascii.eqlIgnoreCase(
+            encoding_bytes,
+            "UTF-8",
+        ))
+            .utf8
+        else if (std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-16"))
+            switch (source_encoding) {
+                .utf16_le => .utf16_le,
+                .utf16_be => .utf16_be,
+                .utf8, .other => null,
+            }
+        else if (std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-16LE"))
+            .utf16_le
+        else if (std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-16BE"))
+            .utf16_be
+        else
+            return .{ .unsupported_encoding = encoding.offset };
+        if (declared_encoding == null or declared_encoding.? != source_encoding) {
+            return .{ .encoding_mismatch = encoding.offset };
+        }
+        if (source_encoding == .utf8 and
+            !std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-8"))
+        {
+            return .{ .encoding_mismatch = encoding.offset };
+        }
+        if (source_encoding != .utf8 and
+            std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-8"))
+        {
+            return .{ .encoding_mismatch = encoding.offset };
+        }
+        if (declared_encoding == null) {
             return .{ .unsupported_encoding = encoding.offset };
         }
         parsed.encoding_offset = encoding.offset;
@@ -4915,6 +5435,21 @@ fn optionalBytesLength(value: ?[]const u8) usize {
     return if (value) |bytes| bytes.len else 0;
 }
 
+fn sumSourceAdvances(advances: []const u8) u64 {
+    var total: u64 = 0;
+    for (advances) |advance| total += advance;
+    return total;
+}
+
+fn utf16SourceBytes(utf8: []const u8) u64 {
+    var total: u64 = 0;
+    var iterator = std.unicode.Utf8View.initUnchecked(utf8).iterator();
+    while (iterator.nextCodepoint()) |codepoint| {
+        total += if (codepoint < 0x10000) 2 else 4;
+    }
+    return total;
+}
+
 fn optionalBytesOrder(left: ?[]const u8, right: ?[]const u8) std.math.Order {
     if (left) |left_bytes| {
         if (right) |right_bytes| return std.mem.order(u8, left_bytes, right_bytes);
@@ -4966,7 +5501,7 @@ fn isOrdinaryAttributeValueByte(byte: u8, quote: u8) bool {
     return byte >= ' ' and byte < 0x80 and byte != quote and byte != '&' and byte != '<';
 }
 
-fn isXml10Char(codepoint: u21) bool {
+fn isXml10Char(codepoint: u32) bool {
     return codepoint == 0x9 or codepoint == 0xa or codepoint == 0xd or
         (codepoint >= 0x20 and codepoint <= 0xd7ff) or
         (codepoint >= 0xe000 and codepoint <= 0xfffd) or
@@ -5243,7 +5778,7 @@ test "[unit] - [content SIMD]: structural scan matches scalar boundaries" {
     }
 }
 
-fn isXml10NameStart(codepoint: u21) bool {
+fn isXml10NameStart(codepoint: u32) bool {
     return codepoint == ':' or
         (codepoint >= 'A' and codepoint <= 'Z') or
         codepoint == '_' or
@@ -5262,7 +5797,7 @@ fn isXml10NameStart(codepoint: u21) bool {
         (codepoint >= 0x10000 and codepoint <= 0xeffff);
 }
 
-fn isXml10NameChar(codepoint: u21) bool {
+fn isXml10NameChar(codepoint: u32) bool {
     return isXml10NameStart(codepoint) or codepoint == '-' or codepoint == '.' or
         (codepoint >= '0' and codepoint <= '9') or codepoint == 0xb7 or
         (codepoint >= 0x300 and codepoint <= 0x36f) or
