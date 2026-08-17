@@ -6,11 +6,12 @@ const fixtures = @import("reader_fixtures");
 
 const CORE_CONFIG = xml.Configs.XML10_UTF8_NO_DTD;
 const FAST_CONFIG = xml.Configs.XML10_UTF8_NO_DTD_FAST;
+const NS_CONFIG = xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD;
 const CoreReader = xml.Reader(CORE_CONFIG);
 
 const Summary = struct {
-    const max_attribute_event_bytes = 512;
-    const max_name_event_bytes = 512;
+    const max_attribute_event_bytes = 4096;
+    const max_name_event_bytes = 4096;
     const max_text_bytes = 4096;
     const max_misc_bytes = 4096;
     const start_element_marker = 0xfe;
@@ -46,11 +47,15 @@ const Summary = struct {
     processing_instruction_bytes_len: usize = 0,
     name_event_bytes: [max_name_event_bytes]u8 = @splat(0),
     name_event_bytes_len: usize = 0,
+    namespace_declarations: usize = 0,
+    namespace_event_bytes: [max_misc_bytes]u8 = @splat(0),
+    namespace_event_bytes_len: usize = 0,
 
     fn observe(self: *Summary, event: anytype) !void {
         switch (event) {
             .document_start => |document| {
-                self.sequence = self.sequence * 10 + 1;
+                self.sequence *%= 10;
+                self.sequence +%= 1;
                 if (document.declared_version) |version| {
                     if (version.len > self.declared_version.len) {
                         return error.DeclaredVersionSummaryTooLarge;
@@ -69,7 +74,8 @@ const Summary = struct {
                 self.standalone_declared = document.standalone_declared;
             },
             .start_element => |start| {
-                self.sequence = self.sequence * 10 + 2;
+                self.sequence *%= 10;
+                self.sequence +%= 2;
                 self.starts += 1;
                 self.empty_starts += @intFromBool(start.empty_element_syntax);
                 self.name_bytes += start.name.raw.len;
@@ -77,6 +83,16 @@ const Summary = struct {
                 try self.appendNameEventBytes("S");
                 try self.appendNameEventBytes(start.name.raw);
                 try self.appendNameEventBytes("\x00");
+                if (@hasField(@TypeOf(start.name), "namespace_uri")) {
+                    try self.appendExpandedName(start.name);
+                    for (start.namespace_declarations) |declaration| {
+                        self.namespace_declarations += 1;
+                        try self.appendNamespaceEventBytes(declaration.prefix orelse "");
+                        try self.appendNamespaceEventBytes("\x00");
+                        try self.appendNamespaceEventBytes(declaration.namespace_uri);
+                        try self.appendNamespaceEventBytes("\xff");
+                    }
+                }
                 try self.appendAttributeEventBytes(&.{start_element_marker});
                 for (start.attributes) |attribute| {
                     self.attribute_name_bytes += attribute.name.raw.len;
@@ -85,15 +101,22 @@ const Summary = struct {
                     try self.appendAttributeEventBytes(&.{name_end_marker});
                     try self.appendAttributeEventBytes(attribute.value);
                     try self.appendAttributeEventBytes(&.{attribute_end_marker});
+                    if (@hasField(@TypeOf(attribute.name), "namespace_uri")) {
+                        try self.appendExpandedName(attribute.name);
+                    }
                 }
             },
             .end_element => |end| {
-                self.sequence = self.sequence * 10 + 3;
+                self.sequence *%= 10;
+                self.sequence +%= 3;
                 self.ends += 1;
                 self.name_bytes += end.name.raw.len;
                 try self.appendNameEventBytes("E");
                 try self.appendNameEventBytes(end.name.raw);
                 try self.appendNameEventBytes("\x00");
+                if (@hasField(@TypeOf(end.name), "namespace_uri")) {
+                    try self.appendExpandedName(end.name);
+                }
             },
             .text => |text| {
                 try self.appendText(text.bytes);
@@ -116,7 +139,10 @@ const Summary = struct {
                     self.processing_instruction_active = false;
                 }
             },
-            .document_end => self.sequence = self.sequence * 10 + 4,
+            .document_end => {
+                self.sequence *%= 10;
+                self.sequence +%= 4;
+            },
         }
     }
 
@@ -142,6 +168,25 @@ const Summary = struct {
         if (end > self.name_event_bytes.len) return error.NameEventSummaryTooLarge;
         @memcpy(self.name_event_bytes[self.name_event_bytes_len..end], bytes);
         self.name_event_bytes_len = end;
+    }
+
+    fn appendNamespaceEventBytes(self: *Summary, bytes: []const u8) !void {
+        const end = std.math.add(usize, self.namespace_event_bytes_len, bytes.len) catch
+            return error.NamespaceEventSummaryTooLarge;
+        if (end > self.namespace_event_bytes.len) return error.NamespaceEventSummaryTooLarge;
+        @memcpy(self.namespace_event_bytes[self.namespace_event_bytes_len..end], bytes);
+        self.namespace_event_bytes_len = end;
+    }
+
+    fn appendExpandedName(self: *Summary, name: anytype) !void {
+        try self.appendNamespaceEventBytes(name.raw);
+        try self.appendNamespaceEventBytes("\x00");
+        try self.appendNamespaceEventBytes(name.prefix orelse "");
+        try self.appendNamespaceEventBytes("\x00");
+        try self.appendNamespaceEventBytes(name.local);
+        try self.appendNamespaceEventBytes("\x00");
+        try self.appendNamespaceEventBytes(name.namespace_uri orelse "");
+        try self.appendNamespaceEventBytes("\xff");
     }
 
     fn appendCommentBytes(self: *Summary, bytes: []const u8) !void {
@@ -375,6 +420,11 @@ fn expectSummaryMetrics(expected: Summary, actual: Summary) !void {
     try std.testing.expectEqual(expected.attributes, actual.attributes);
     try std.testing.expectEqual(expected.attribute_name_bytes, actual.attribute_name_bytes);
     try std.testing.expectEqual(expected.attribute_value_bytes, actual.attribute_value_bytes);
+    try std.testing.expectEqual(expected.namespace_declarations, actual.namespace_declarations);
+    try std.testing.expectEqualStrings(
+        expected.namespace_event_bytes[0..expected.namespace_event_bytes_len],
+        actual.namespace_event_bytes[0..actual.namespace_event_bytes_len],
+    );
     try std.testing.expectEqualStrings(
         expected.text_bytes[0..expected.text_bytes_len],
         actual.text_bytes[0..actual.text_bytes_len],
@@ -654,6 +704,121 @@ fn expectCoreFailureSchedulesWithOptions(
     }
 }
 
+fn expectProfileFailureParts(
+    comptime config: xml.Config,
+    options: xml.Options(config),
+    parts: []const []const u8,
+    expected_error: anyerror,
+    code: xml.DiagnosticCode,
+    offset: u64,
+    related_offset: ?u64,
+) !void {
+    const Reader = xml.Reader(config);
+    var reader = try Reader.init(std.testing.allocator, options);
+    defer reader.deinit();
+    for (parts, 0..) |part, index| {
+        try reader.feed(part, index + 1 == parts.len);
+        while (true) {
+            const step = reader.next() catch |actual_error| {
+                try std.testing.expectEqual(expected_error, actual_error);
+                const diagnostic = reader.diagnostic().?;
+                try std.testing.expectEqual(code, diagnostic.code);
+                try std.testing.expectEqual(offset, diagnostic.primary.byte_offset);
+                if (related_offset) |related| {
+                    try std.testing.expectEqual(related, diagnostic.related.?.byte_offset);
+                } else {
+                    try std.testing.expect(diagnostic.related == null);
+                }
+                try std.testing.expectError(expected_error, reader.next());
+                return;
+            };
+            switch (step) {
+                .event => {},
+                .need_input => break,
+                .done => return error.ExpectedFailure,
+            }
+        }
+    }
+    return error.ExpectedFailure;
+}
+
+fn expectProfileFailureSchedules(
+    comptime config: xml.Config,
+    options: xml.Options(config),
+    input: []const u8,
+    expected_error: anyerror,
+    code: xml.DiagnosticCode,
+    offset: u64,
+    related_offset: ?u64,
+) !void {
+    const whole = [_][]const u8{input};
+    try expectProfileFailureParts(
+        config,
+        options,
+        &whole,
+        expected_error,
+        code,
+        offset,
+        related_offset,
+    );
+    for (1..input.len) |split| {
+        const parts = [_][]const u8{ input[0..split], input[split..] };
+        try expectProfileFailureParts(
+            config,
+            options,
+            &parts,
+            expected_error,
+            code,
+            offset,
+            related_offset,
+        );
+    }
+    inline for (.{ 1, 2, 3, 5, 7 }) |chunk_size| {
+        var parts: [512][]const u8 = undefined;
+        var count: usize = 0;
+        var start: usize = 0;
+        while (start < input.len) : (count += 1) {
+            const end = @min(start + chunk_size, input.len);
+            parts[count] = input[start..end];
+            start = end;
+        }
+        try expectProfileFailureParts(
+            config,
+            options,
+            parts[0..count],
+            expected_error,
+            code,
+            offset,
+            related_offset,
+        );
+    }
+    for (0..8) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const random = prng.random();
+        var parts: [512][]const u8 = undefined;
+        var count: usize = 0;
+        var start: usize = 0;
+        while (start < input.len) : (count += 1) {
+            const size = random.intRangeAtMost(
+                usize,
+                1,
+                @min(@as(usize, 7), input.len - start),
+            );
+            parts[count] = input[start .. start + size];
+            start += size;
+        }
+        try expectProfileFailureParts(
+            config,
+            options,
+            parts[0..count],
+            expected_error,
+            code,
+            offset,
+            related_offset,
+        );
+    }
+}
+
 fn allocationParse(allocator: std.mem.Allocator) !void {
     const parts = [_][]const u8{
         "<a><b><c><d>",
@@ -761,6 +926,35 @@ fn allocationStage6Parse(allocator: std.mem.Allocator) !void {
         "<text>&data",
         summary.cdata_bytes[0..summary.cdata_bytes_len],
     );
+}
+
+fn allocationNamespaceParse(allocator: std.mem.Allocator) !void {
+    const parts = [_][]const u8{fixtures.ns_churn};
+    const summary = try parseParts(NS_CONFIG, allocator, .{}, &parts);
+    try std.testing.expectEqual(@as(usize, 7), summary.starts);
+    try std.testing.expectEqual(@as(usize, 7), summary.ends);
+    try std.testing.expectEqual(@as(usize, 9), summary.namespace_declarations);
+}
+
+fn expectExpandedName(
+    name: xml.Name(NS_CONFIG),
+    raw: []const u8,
+    prefix: ?[]const u8,
+    local: []const u8,
+    namespace_uri: ?[]const u8,
+) !void {
+    try std.testing.expectEqualStrings(raw, name.raw);
+    if (prefix) |expected| {
+        try std.testing.expectEqualStrings(expected, name.prefix.?);
+    } else {
+        try std.testing.expect(name.prefix == null);
+    }
+    try std.testing.expectEqualStrings(local, name.local);
+    if (namespace_uri) |expected| {
+        try std.testing.expectEqualStrings(expected, name.namespace_uri.?);
+    } else {
+        try std.testing.expect(name.namespace_uri == null);
+    }
 }
 
 const TextRun = struct {
@@ -893,12 +1087,22 @@ fn drainCore(reader: *CoreReader) !Summary {
     }
 }
 
+fn drainNamespace(reader: *xml.Reader(NS_CONFIG)) !Summary {
+    var summary: Summary = .{};
+    while (true) switch (try reader.next()) {
+        .event => |event| try summary.observe(event),
+        .need_input => return error.UnexpectedNeedInput,
+        .done => return summary,
+    };
+}
+
 test "config - representative profiles: compile specialized public types" {
     inline for (.{
         xml.Configs.XML10_UTF8_NO_DTD_FAST,
         xml.Configs.XML10_UTF8_NO_DTD,
         xml.Configs.XML10_UTF8_NO_DTD_LOCATED,
         xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD,
+        xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST,
         xml.Configs.XML10_NONVALIDATING,
         xml.Configs.XML10_NAMESPACES_NONVALIDATING,
         xml.Configs.XML10_VALIDATING,
@@ -931,7 +1135,6 @@ test "config - excluded capabilities: specialized types omit impossible fields" 
 
 test "[failure] - [unimplemented profiles]: reject parsing without placeholder semantics" {
     inline for (.{
-        xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD,
         xml.Configs.XML10_NONVALIDATING,
         xml.Configs.XML10_NAMESPACES_NONVALIDATING,
         xml.Configs.XML10_VALIDATING,
@@ -4063,4 +4266,651 @@ test "[failure] - [reader initialization]: zero required limits fail without all
         @field(options.limits, field_name) = 0;
         try std.testing.expectError(error.InvalidOptions, Reader.init(std.testing.allocator, options));
     }
+
+    const NamespaceReader = xml.Reader(NS_CONFIG);
+    var namespace_options: xml.Options(NS_CONFIG) = .{};
+    inline for (.{
+        "max_declarations_per_element",
+        "max_active_bindings",
+        "max_binding_bytes",
+        "max_qname_bytes",
+        "max_comparison_work",
+    }) |field_name| {
+        namespace_options = .{};
+        @field(namespace_options.namespace_limits, field_name) = 0;
+        try std.testing.expectError(
+            error.InvalidOptions,
+            NamespaceReader.init(std.testing.allocator, namespace_options),
+        );
+    }
+}
+
+test "[unit] - [namespace expansion]: declarations and ordinary attributes are distinct" {
+    const Reader = xml.SliceReader(NS_CONFIG);
+    var reader = try Reader.init(std.testing.allocator, .{}, fixtures.ns_default_attributes);
+    defer reader.deinit();
+
+    _ = try reader.next();
+    const start = switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .start_element => |value| value,
+            else => return error.UnexpectedEvent,
+        },
+        else => return error.UnexpectedStep,
+    };
+    try expectExpandedName(start.name, "root", null, "root", "urn:elements");
+    try std.testing.expectEqual(@as(usize, 2), start.namespace_declarations.len);
+    try std.testing.expect(start.namespace_declarations[0].prefix == null);
+    try std.testing.expectEqualStrings(
+        "urn:elements",
+        start.namespace_declarations[0].namespace_uri,
+    );
+    try std.testing.expectEqualStrings("p", start.namespace_declarations[1].prefix.?);
+    try std.testing.expectEqualStrings(
+        "urn:attributes",
+        start.namespace_declarations[1].namespace_uri,
+    );
+    try std.testing.expectEqual(@as(usize, 2), start.attributes.len);
+    try expectExpandedName(start.attributes[0].name, "attribute", null, "attribute", null);
+    try expectExpandedName(
+        start.attributes[1].name,
+        "p:attribute",
+        "p",
+        "attribute",
+        "urn:attributes",
+    );
+}
+
+test "[unit] - [namespace event lifetime]: slices survive source-buffer reuse" {
+    var input: [32]u8 = undefined;
+    var reader = try xml.Reader(NS_CONFIG).init(std.testing.allocator, .{});
+    defer reader.deinit();
+
+    const first = "<p:r xmlns:p='urn:";
+    @memcpy(input[0..first.len], first);
+    try reader.feed(input[0..first.len], false);
+    _ = try reader.next();
+    switch (try reader.next()) {
+        .need_input => {},
+        else => return error.UnexpectedStep,
+    }
+
+    const second = "&#x70;' p:a='v'";
+    @memcpy(input[0..second.len], second);
+    try reader.feed(input[0..second.len], false);
+    switch (try reader.next()) {
+        .need_input => {},
+        else => return error.UnexpectedStep,
+    }
+
+    const final = "/>";
+    @memcpy(input[0..final.len], final);
+    try reader.feed(input[0..final.len], true);
+    const start = switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .start_element => |value| value,
+            else => return error.UnexpectedEvent,
+        },
+        else => return error.UnexpectedStep,
+    };
+
+    try expectExpandedName(start.name, "p:r", "p", "r", "urn:p");
+    try std.testing.expectEqual(@as(usize, 1), start.namespace_declarations.len);
+    try std.testing.expectEqualStrings("p", start.namespace_declarations[0].prefix.?);
+    try std.testing.expectEqualStrings("urn:p", start.namespace_declarations[0].namespace_uri);
+    try std.testing.expectEqual(@as(usize, 1), start.attributes.len);
+    try expectExpandedName(start.attributes[0].name, "p:a", "p", "a", "urn:p");
+    try std.testing.expectEqualStrings("v", start.attributes[0].value);
+
+    switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .end_element => |end| try expectExpandedName(end.name, "p:r", "p", "r", "urn:p"),
+            else => return error.UnexpectedEvent,
+        },
+        else => return error.UnexpectedStep,
+    }
+}
+
+test "[unit] - [namespace scope]: rebinding undeclaration and predefined xml resolve exactly" {
+    const inputs = [_][]const u8{
+        fixtures.ns_rebinding,
+        fixtures.ns_default_undeclare,
+        fixtures.ns_xml_prefix,
+        fixtures.ns_equivalent_uri,
+    };
+    for (inputs) |input| {
+        const parts = [_][]const u8{input};
+        _ = try parseParts(NS_CONFIG, std.testing.allocator, .{}, &parts);
+    }
+
+    var reader = try xml.SliceReader(NS_CONFIG).init(
+        std.testing.allocator,
+        .{},
+        fixtures.ns_rebinding,
+    );
+    defer reader.deinit();
+    var item_index: usize = 0;
+    var end_item_index: usize = 0;
+    const expected_uris = [_][]const u8{ "urn:outer", "urn:inner", "urn:outer" };
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .start_element => |start| if (std.mem.eql(u8, start.name.raw, "p:item")) {
+                try std.testing.expectEqualStrings(
+                    expected_uris[item_index],
+                    start.name.namespace_uri.?,
+                );
+                item_index += 1;
+            },
+            .end_element => |end| if (std.mem.eql(u8, end.name.raw, "p:item")) {
+                try std.testing.expectEqualStrings(
+                    expected_uris[end_item_index],
+                    end.name.namespace_uri.?,
+                );
+                end_item_index += 1;
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(expected_uris.len, item_index);
+    try std.testing.expectEqual(expected_uris.len, end_item_index);
+
+    var undeclare_reader = try xml.SliceReader(NS_CONFIG).init(
+        std.testing.allocator,
+        .{},
+        fixtures.ns_default_undeclare,
+    );
+    defer undeclare_reader.deinit();
+    var start_index: usize = 0;
+    var end_index: usize = 0;
+    while (true) switch (try undeclare_reader.next()) {
+        .event => |event| switch (event) {
+            .start_element => |start| {
+                if (start_index == 0) {
+                    try expectExpandedName(start.name, "root", null, "root", "urn:outer");
+                } else {
+                    try std.testing.expect(start.name.namespace_uri == null);
+                }
+                start_index += 1;
+            },
+            .end_element => |end| {
+                if (end_index == 2) {
+                    try expectExpandedName(end.name, "root", null, "root", "urn:outer");
+                } else {
+                    try std.testing.expect(end.name.namespace_uri == null);
+                }
+                end_index += 1;
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(@as(usize, 3), start_index);
+    try std.testing.expectEqual(@as(usize, 3), end_index);
+
+    var options: xml.Options(NS_CONFIG) = .{};
+    options.namespace_limits.max_active_bindings = 1;
+    options.namespace_limits.max_binding_bytes = 2;
+    var static_reader = try xml.Reader(NS_CONFIG).init(std.testing.allocator, options);
+    defer static_reader.deinit();
+    try static_reader.feed(
+        "<r xmlns:xml='http://www.w3.org/XML/1998/namespace' xmlns:p='u' xml:lang='en'/>",
+        true,
+    );
+    _ = try static_reader.next();
+    const static_start = switch (try static_reader.next()) {
+        .event => |event| switch (event) {
+            .start_element => |start| start,
+            else => return error.UnexpectedEvent,
+        },
+        else => return error.UnexpectedStep,
+    };
+    try std.testing.expectEqual(@as(usize, 2), static_start.namespace_declarations.len);
+    try std.testing.expectEqualStrings(
+        "xml",
+        static_start.namespace_declarations[0].prefix.?,
+    );
+    try std.testing.expectEqualStrings("p", static_start.namespace_declarations[1].prefix.?);
+    try std.testing.expectEqual(@as(usize, 1), static_reader.memoryUsage().namespace_binding_count);
+    try std.testing.expectEqual(@as(usize, 2), static_reader.memoryUsage().namespace_bytes);
+    try expectExpandedName(
+        static_start.attributes[0].name,
+        "xml:lang",
+        "xml",
+        "lang",
+        "http://www.w3.org/XML/1998/namespace",
+    );
+}
+
+test "[unit] - [namespace normalization]: reference-expanded URI values resolve exactly" {
+    var reader = try xml.SliceReader(NS_CONFIG).init(
+        std.testing.allocator,
+        .{},
+        fixtures.ns_equivalent_uri,
+    );
+    defer reader.deinit();
+
+    var declaration_count: usize = 0;
+    var item_count: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .start_element => |start| {
+                for (start.namespace_declarations) |declaration| {
+                    try std.testing.expectEqualStrings(
+                        "urn:example&value",
+                        declaration.namespace_uri,
+                    );
+                    declaration_count += 1;
+                }
+                if (std.mem.eql(u8, start.name.local, "item")) {
+                    try std.testing.expectEqualStrings(
+                        "urn:example&value",
+                        start.name.namespace_uri.?,
+                    );
+                    item_count += 1;
+                }
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(@as(usize, 2), declaration_count);
+    try std.testing.expectEqual(@as(usize, 2), item_count);
+}
+
+test "[property] - [namespace fixtures]: every valid fixture agrees across schedules" {
+    inline for (.{
+        fixtures.ns_default,
+        fixtures.ns_prefixed,
+        fixtures.ns_rebinding,
+        fixtures.ns_default_attributes,
+        fixtures.ns_xml_prefix,
+        fixtures.ns_default_undeclare,
+        fixtures.ns_equivalent_uri,
+        fixtures.ns_churn,
+    }) |input| {
+        const parts = [_][]const u8{input};
+        const expected = try parseParts(NS_CONFIG, std.testing.allocator, .{}, &parts);
+        try expectSummarySchedulesWithOptions(NS_CONFIG, .{}, input, expected);
+    }
+}
+
+test "[failure] - [namespace fixtures]: invalid cases have stable diagnostics across schedules" {
+    const Case = struct {
+        input: []const u8,
+        code: xml.DiagnosticCode,
+        primary: usize,
+        related: ?usize = null,
+    };
+    const cases = [_]Case{
+        .{ .input = fixtures.ns_unbound_element, .code = .unbound_prefix, .primary = 1 },
+        .{ .input = fixtures.ns_unbound_attribute, .code = .unbound_prefix, .primary = 6 },
+        .{
+            .input = fixtures.ns_bad_xml_binding,
+            .code = .illegal_namespace_declaration,
+            .primary = std.mem.indexOf(u8, fixtures.ns_bad_xml_binding, "xmlns:xml").?,
+        },
+        .{
+            .input = fixtures.ns_bad_xmlns_binding,
+            .code = .illegal_namespace_declaration,
+            .primary = std.mem.indexOf(u8, fixtures.ns_bad_xmlns_binding, "xmlns:xmlns").?,
+        },
+        .{ .input = fixtures.ns_xmlns_element, .code = .reserved_namespace_name, .primary = 1 },
+        .{
+            .input = fixtures.ns_duplicate_expanded,
+            .code = .duplicate_expanded_attribute,
+            .primary = std.mem.indexOf(u8, fixtures.ns_duplicate_expanded, "b:value").?,
+            .related = std.mem.indexOf(u8, fixtures.ns_duplicate_expanded, "a:value").?,
+        },
+        .{ .input = fixtures.ns_multiple_colons, .code = .malformed_qname, .primary = 4 },
+        .{
+            .input = fixtures.ns_prefix_undeclare,
+            .code = .illegal_namespace_declaration,
+            .primary = std.mem.lastIndexOf(u8, fixtures.ns_prefix_undeclare, "xmlns:p").?,
+        },
+        .{
+            .input = fixtures.ns_bad_default_uri,
+            .code = .illegal_namespace_declaration,
+            .primary = std.mem.indexOf(u8, fixtures.ns_bad_default_uri, "xmlns").?,
+        },
+    };
+    for (cases) |case| {
+        try expectProfileFailureSchedules(
+            NS_CONFIG,
+            .{},
+            case.input,
+            error.InvalidXml,
+            case.code,
+            case.primary,
+            case.related,
+        );
+    }
+}
+
+test "[failure] - [namespace precedence]: raw duplicates declarations and expansion fail in order" {
+    const raw_duplicate = "<r xmlns:a='u' a:x='1' a:x='2'/>";
+    try expectProfileFailureSchedules(
+        NS_CONFIG,
+        .{},
+        raw_duplicate,
+        error.InvalidXml,
+        .duplicate_attribute,
+        std.mem.lastIndexOf(u8, raw_duplicate, "a:x").?,
+        std.mem.indexOf(u8, raw_duplicate, "a:x").?,
+    );
+
+    const declaration_before_unbound = "<p:r xmlns:xml='bad'/>";
+    try expectProfileFailureSchedules(
+        NS_CONFIG,
+        .{},
+        declaration_before_unbound,
+        error.InvalidXml,
+        .illegal_namespace_declaration,
+        std.mem.indexOf(u8, declaration_before_unbound, "xmlns:xml").?,
+        null,
+    );
+}
+
+test "[failure] - [namespace storage]: every allocation failure cleans up" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        allocationNamespaceParse,
+        .{},
+    );
+}
+
+test "[edge] - [namespace limits]: each boundary accepts at limit and rejects one over" {
+    {
+        const input = "<r xmlns:a='u' xmlns:b='v'/>";
+        var options: xml.Options(NS_CONFIG) = .{};
+        options.namespace_limits.max_declarations_per_element = 2;
+        const parts = [_][]const u8{input};
+        _ = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
+        options.namespace_limits.max_declarations_per_element = 1;
+        try expectProfileFailureSchedules(
+            NS_CONFIG,
+            options,
+            input,
+            error.LimitExceeded,
+            .namespace_declaration_limit,
+            std.mem.indexOf(u8, input, "xmlns:b").?,
+            null,
+        );
+    }
+    {
+        const input = "<r xmlns:a='u'><c xmlns:b='v'/></r>";
+        var options: xml.Options(NS_CONFIG) = .{};
+        options.namespace_limits.max_active_bindings = 2;
+        const parts = [_][]const u8{input};
+        _ = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
+        options.namespace_limits.max_active_bindings = 1;
+        try expectProfileFailureSchedules(
+            NS_CONFIG,
+            options,
+            input,
+            error.LimitExceeded,
+            .namespace_binding_limit,
+            std.mem.indexOf(u8, input, "xmlns:b").?,
+            null,
+        );
+    }
+    {
+        const input = "<r xmlns:a='urn'/>";
+        var options: xml.Options(NS_CONFIG) = .{};
+        options.namespace_limits.max_binding_bytes = 4;
+        const parts = [_][]const u8{input};
+        _ = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
+        options.namespace_limits.max_binding_bytes = 3;
+        try expectProfileFailureSchedules(
+            NS_CONFIG,
+            options,
+            input,
+            error.LimitExceeded,
+            .namespace_binding_bytes_limit,
+            std.mem.indexOf(u8, input, "xmlns:a").?,
+            null,
+        );
+    }
+    {
+        const input = "<root></root>";
+        var options: xml.Options(NS_CONFIG) = .{};
+        options.namespace_limits.max_qname_bytes = 4;
+        const parts = [_][]const u8{input};
+        _ = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
+        options.namespace_limits.max_qname_bytes = 3;
+        try expectProfileFailureSchedules(
+            NS_CONFIG,
+            options,
+            input,
+            error.LimitExceeded,
+            .qname_limit,
+            4,
+            null,
+        );
+    }
+    {
+        const input = "<r></root>";
+        var options: xml.Options(NS_CONFIG) = .{};
+        options.namespace_limits.max_qname_bytes = 3;
+        try expectProfileFailureSchedules(
+            NS_CONFIG,
+            options,
+            input,
+            error.LimitExceeded,
+            .qname_limit,
+            8,
+            null,
+        );
+    }
+    {
+        const input = "<r></🙂>";
+        var options: xml.Options(NS_CONFIG) = .{};
+        options.namespace_limits.max_qname_bytes = 3;
+        try expectProfileFailureSchedules(
+            NS_CONFIG,
+            options,
+            input,
+            error.LimitExceeded,
+            .qname_limit,
+            5,
+            null,
+        );
+    }
+    {
+        const input = "<r xmlns:a='u' a:x='1'/>";
+        var options: xml.Options(NS_CONFIG) = .{};
+        options.namespace_limits.max_comparison_work = 5;
+        const parts = [_][]const u8{input};
+        _ = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
+        options.namespace_limits.max_comparison_work = 4;
+        try expectProfileFailureSchedules(
+            NS_CONFIG,
+            options,
+            input,
+            error.LimitExceeded,
+            .namespace_comparison_limit,
+            std.mem.indexOf(u8, input, "a:x").?,
+            null,
+        );
+    }
+}
+
+test "[failure] - [qualified names]: local parts must begin with NCName characters" {
+    inline for (.{ "<a:1 xmlns:a='u'/>", "<a:-x xmlns:a='u'/>", "<a:.x xmlns:a='u'/>" }) |input| {
+        try expectProfileFailureSchedules(
+            NS_CONFIG,
+            .{},
+            input,
+            error.InvalidXml,
+            .malformed_qname,
+            3,
+            null,
+        );
+    }
+    const pi = "<?a:b bogus?><r/>";
+    try expectProfileFailureSchedules(
+        NS_CONFIG,
+        .{},
+        pi,
+        error.InvalidXml,
+        .malformed_ncname,
+        3,
+        null,
+    );
+    const entity = "<r>&a:b;</r>";
+    try expectProfileFailureSchedules(
+        NS_CONFIG,
+        .{},
+        entity,
+        error.InvalidXml,
+        .malformed_ncname,
+        5,
+        null,
+    );
+}
+
+test "[unit] - [namespace rollback]: closed scopes release active bytes and reset obeys policy" {
+    var reader = try xml.Reader(NS_CONFIG).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed("<r xmlns:a='outer'><c xmlns:a='inner'/></r>", true);
+    var peak_namespace_capacity: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => peak_namespace_capacity = @max(
+            peak_namespace_capacity,
+            reader.memoryUsage().namespace_capacity,
+        ),
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expect(peak_namespace_capacity > 0);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().open_name_bytes);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_binding_count);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_bytes);
+    try reader.reset(.retain_capacity);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().open_name_bytes);
+    try std.testing.expect(reader.memoryUsage().namespace_capacity > 0);
+    try reader.reset(.release_memory);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_capacity);
+}
+
+test "[unit] - [namespace specialization]: raw readers own no namespace state" {
+    try std.testing.expect(
+        @sizeOf(xml.Reader(xml.Configs.XML10_UTF8_NO_DTD_FAST)) <
+            @sizeOf(xml.Reader(xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST)),
+    );
+    var reader = try xml.Reader(xml.Configs.XML10_UTF8_NO_DTD_FAST).init(
+        std.testing.allocator,
+        .{},
+    );
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_capacity);
+    try reader.feed("<r a='v'/>", true);
+    while (true) switch (try reader.next()) {
+        .event => {},
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_capacity);
+}
+
+test "[unit] - [namespace storage]: warm fixed scope performs no allocator operation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var reader = try xml.Reader(NS_CONFIG).init(failing.allocator(), .{});
+    defer reader.deinit();
+
+    try reader.feed(fixtures.ns_churn, true);
+    try std.testing.expectEqual(@as(usize, 7), (try drainNamespace(&reader)).starts);
+    try std.testing.expect(failing.alloc_index > 0);
+
+    try reader.reset(.retain_capacity);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try reader.feed(fixtures.ns_churn, true);
+    try std.testing.expectEqual(@as(usize, 7), (try drainNamespace(&reader)).starts);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "[property] - [namespace scope]: deep rebinding churn rolls back under targeted schedules" {
+    var storage: [16 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    const depth = 128;
+    for (0..depth) |index| try writer.print("<n xmlns:p='urn:{d}'>", .{index});
+    for (0..depth) |_| try writer.writeAll("</n>");
+    const input = writer.buffered();
+
+    const parts = [_][]const u8{input};
+    const expected = try parseParts(NS_CONFIG, std.testing.allocator, .{}, &parts);
+    try std.testing.expectEqual(depth, expected.starts);
+    try std.testing.expectEqual(depth, expected.ends);
+    try std.testing.expectEqual(depth, expected.namespace_declarations);
+    try std.testing.expectEqual(
+        expected,
+        try parseOneByteChunks(NS_CONFIG, std.testing.allocator, .{}, input),
+    );
+    try std.testing.expectEqual(
+        expected,
+        try parseFixedChunks(NS_CONFIG, std.testing.allocator, .{}, input, 17),
+    );
+    try std.testing.expectEqual(
+        expected,
+        try parseRandomChunks(NS_CONFIG, std.testing.allocator, .{}, input, 0x6e73),
+    );
+
+    var reader = try xml.Reader(NS_CONFIG).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(input, true);
+    var peak_bindings: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => peak_bindings = @max(
+            peak_bindings,
+            reader.memoryUsage().namespace_binding_count,
+        ),
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(depth, peak_bindings);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_binding_count);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_bytes);
+}
+
+test "[property] - [expanded attributes]: sorted duplicate path preserves source order" {
+    var storage: [16 * 1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&storage);
+    try writer.writeAll("<r xmlns:a='u' xmlns:b='u'");
+    for (0..65) |index| try writer.print(" a:x{d}='{d}'", .{ index, index });
+    try writer.writeAll("/>");
+    const valid = writer.buffered();
+    const valid_parts = [_][]const u8{valid};
+    const summary = try parseParts(NS_CONFIG, std.testing.allocator, .{}, &valid_parts);
+    try std.testing.expectEqual(@as(usize, 65), summary.attributes);
+    var limited_options: xml.Options(NS_CONFIG) = .{};
+    limited_options.namespace_limits.max_comparison_work = 1000;
+    try expectProfileFailureParts(
+        NS_CONFIG,
+        limited_options,
+        &valid_parts,
+        error.LimitExceeded,
+        .namespace_comparison_limit,
+        valid.len,
+        null,
+    );
+
+    writer = std.Io.Writer.fixed(&storage);
+    try writer.writeAll("<r xmlns:a='u' xmlns:b='u'");
+    for (0..65) |index| try writer.print(" a:x{d}='{d}'", .{ index, index });
+    try writer.writeAll(" b:x0='duplicate'/>");
+    const invalid = writer.buffered();
+    const invalid_parts = [_][]const u8{invalid};
+    try expectProfileFailureParts(
+        NS_CONFIG,
+        .{},
+        &invalid_parts,
+        error.InvalidXml,
+        .duplicate_expanded_attribute,
+        std.mem.indexOf(u8, invalid, "b:x0").?,
+        std.mem.indexOf(u8, invalid, "a:x0").?,
+    );
 }

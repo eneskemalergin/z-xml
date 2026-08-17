@@ -1,8 +1,7 @@
 //! A bounded, incremental XML reader for Zig.
 //!
-//! The public API is specialized by a compile-time configuration. The first
-//! implementation stage establishes the type, ownership, lifecycle, and
-//! diagnostic contracts while XML grammar support advances by verified stage.
+//! The public API is specialized by a compile-time configuration. The current
+//! implementation provides XML 1.0 UTF-8 no-DTD raw-name and namespace readers.
 
 const reader = @import("reader.zig");
 const io = @import("io.zig");
@@ -23,6 +22,8 @@ pub const ResetMode = reader.ResetMode;
 pub const Lifecycle = reader.Lifecycle;
 /// Runtime resource limits.
 pub const Limits = reader.Limits;
+/// Namespace limits omitted from namespace-off options.
+pub const NamespaceLimits = reader.NamespaceLimits;
 /// Reader-owned memory categories.
 pub const MemoryUsage = reader.MemoryUsage;
 /// Stable diagnostic category.
@@ -60,6 +61,8 @@ pub const Diagnostic = reader.Diagnostic;
 pub const Name = reader.Name;
 /// Returns the specialized source attribute type.
 pub const Attribute = reader.Attribute;
+/// Namespace declaration whose slices follow the enclosing event lifetime.
+pub const NamespaceDeclaration = reader.NamespaceDeclaration;
 /// Returns a pull reader over one final slice.
 pub const SliceReader = io.SliceReader;
 /// Returns a pull adapter over a buffered Zig reader.

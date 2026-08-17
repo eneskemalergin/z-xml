@@ -2,8 +2,12 @@
 
 const std = @import("std");
 const xml = @import("z_xml");
+const check_options = @import("check_options");
 
-const CONFIG = xml.Configs.XML10_UTF8_NO_DTD_FAST;
+const CONFIG = if (check_options.namespaces)
+    xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST
+else
+    xml.Configs.XML10_UTF8_NO_DTD_FAST;
 const INPUT_BUFFER_SIZE = 64 * 1024;
 
 const Stats = struct {
@@ -29,6 +33,14 @@ const Stats = struct {
                 self.elements += 1;
                 self.marker(1);
                 self.bytes(start.name.raw);
+                if (@hasField(@TypeOf(start), "namespace_declarations")) {
+                    for (start.namespace_declarations) |declaration| {
+                        self.marker(5);
+                        self.bytes(declaration.prefix orelse "");
+                        self.marker(6);
+                        self.bytes(declaration.namespace_uri);
+                    }
+                }
                 for (start.attributes) |attribute| {
                     self.attributes += 1;
                     self.marker(2);

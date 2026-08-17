@@ -8,6 +8,10 @@ pub fn main() void {
     printLayout("xml10-utf8-no-dtd", xml.Configs.XML10_UTF8_NO_DTD);
     printLayout("xml10-utf8-no-dtd-located", xml.Configs.XML10_UTF8_NO_DTD_LOCATED);
     printLayout("xml10-utf8-ns-no-dtd", xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD);
+    printLayout(
+        "xml10-utf8-ns-no-dtd-fast",
+        xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST,
+    );
     printLayout("xml10-nonvalidating", xml.Configs.XML10_NONVALIDATING);
     printLayout("xml10-validating", xml.Configs.XML10_VALIDATING);
     printLayout(

@@ -120,6 +120,11 @@ pub const Configs = struct {
     pub const XML10_UTF8_NAMESPACES_NO_DTD: Config = .{
         .profile = .xml10_utf8_ns_no_dtd,
     };
+    /// Byte-offset-only namespace-aware XML 1.0 UTF-8 performance profile.
+    pub const XML10_UTF8_NAMESPACES_NO_DTD_FAST: Config = .{
+        .profile = .xml10_utf8_ns_no_dtd,
+        .diagnostic_location = .byte_offset,
+    };
     /// Full non-validating XML 1.0 profile without namespaces.
     pub const XML10_NONVALIDATING: Config = .{
         .profile = .xml10_nonvalidating,
@@ -199,6 +204,37 @@ pub const Limits = struct {
     }
 };
 
+/// Namespace limits specialized out of namespace-off reader options.
+pub fn NamespaceLimits(comptime config: Config) type {
+    return if (config.profile.hasNamespaces())
+        struct {
+            /// Maximum namespace declarations accepted on one element.
+            max_declarations_per_element: usize = 64,
+            /// Maximum active namespace bindings, including shadowed bindings.
+            max_active_bindings: usize = 1024,
+            /// Maximum bytes retained by active namespace bindings.
+            max_binding_bytes: usize = 1024 * 1024,
+            /// Maximum UTF-8 bytes accepted in one qualified name.
+            max_qname_bytes: usize = 64 * 1024,
+            /// Maximum weighted prefix and expanded-name comparison work per start element.
+            max_comparison_work: usize = 1024 * 1024,
+
+            fn validate(self: @This()) bool {
+                return self.max_declarations_per_element > 0 and
+                    self.max_active_bindings > 0 and
+                    self.max_binding_bytes > 0 and
+                    self.max_qname_bytes > 0 and
+                    self.max_comparison_work > 0;
+            }
+        }
+    else
+        struct {
+            fn validate(_: @This()) bool {
+                return true;
+            }
+        };
+}
+
 /// Categories of memory owned by a reader.
 pub const MemoryUsage = struct {
     /// Number of active open-element frames.
@@ -223,6 +259,10 @@ pub const MemoryUsage = struct {
     scratch_capacity: usize = 0,
     /// Namespace storage capacity measured in bytes.
     namespace_capacity: usize = 0,
+    /// Active namespace bindings, including shadowed bindings.
+    namespace_binding_count: usize = 0,
+    /// Active bytes retained by namespace bindings.
+    namespace_bytes: usize = 0,
     /// DTD storage capacity measured in bytes.
     dtd_capacity: usize = 0,
     /// Validation storage capacity measured in bytes.
@@ -272,6 +312,17 @@ pub const DiagnosticCode = enum {
     malformed_processing_instruction,
     incomplete_processing_instruction,
     processing_instruction_target_limit,
+    malformed_qname,
+    malformed_ncname,
+    illegal_namespace_declaration,
+    reserved_namespace_name,
+    unbound_prefix,
+    duplicate_expanded_attribute,
+    namespace_declaration_limit,
+    namespace_binding_limit,
+    namespace_binding_bytes_limit,
+    qname_limit,
+    namespace_comparison_limit,
     malformed_comment,
     unclosed_comment,
     malformed_cdata,
@@ -331,6 +382,7 @@ pub fn Options(comptime config: Config) type {
     config.validate();
     return struct {
         limits: Limits = .{},
+        namespace_limits: NamespaceLimits(config) = .{},
         resolver: ResolverOptions(config) = .{},
         validation: ValidationOptions(config) = .{},
     };
@@ -360,12 +412,26 @@ pub fn Attribute(comptime config: Config) type {
     };
 }
 
+/// One source-ordered namespace declaration whose slices follow the event lifetime.
+pub const NamespaceDeclaration = struct {
+    prefix: ?[]const u8,
+    namespace_uri: []const u8,
+};
+
 fn StartElement(comptime config: Config) type {
-    return struct {
-        name: Name(config),
-        attributes: []const Attribute(config),
-        empty_element_syntax: bool,
-    };
+    return if (config.profile.hasNamespaces())
+        struct {
+            name: Name(config),
+            attributes: []const Attribute(config),
+            namespace_declarations: []const NamespaceDeclaration,
+            empty_element_syntax: bool,
+        }
+    else
+        struct {
+            name: Name(config),
+            attributes: []const Attribute(config),
+            empty_element_syntax: bool,
+        };
 }
 
 fn EndElement(comptime config: Config) type {
@@ -639,12 +705,61 @@ const Utf8Probe = union(enum) {
     invalid: usize,
 };
 
+const NamespaceBinding = struct {
+    prefix_offset: usize,
+    prefix_len: usize,
+    uri_offset: usize,
+    uri_len: usize,
+    previous_binding: ?usize,
+    active_index: usize,
+};
+
+const NamespaceReference = union(enum) {
+    none,
+    predefined_xml,
+    binding: usize,
+};
+
+const QNameParts = struct {
+    prefix: ?[]const u8,
+    local: []const u8,
+};
+
+const xml_namespace_uri = "http://www.w3.org/XML/1998/namespace";
+const xmlns_namespace_uri = "http://www.w3.org/2000/xmlns/";
+
+fn NamespaceState(comptime config: Config) type {
+    return if (config.profile.hasNamespaces())
+        struct {
+            bindings: std.ArrayList(NamespaceBinding) = .empty,
+            active_prefixes: std.ArrayList(usize) = .empty,
+            bytes: std.ArrayList(u8) = .empty,
+            event_declarations: std.ArrayList(NamespaceDeclaration) = .empty,
+            expanded_indices: std.ArrayList(usize) = .empty,
+            event_attribute_locations: std.ArrayList(Location(config)) = .empty,
+            comparison_work: usize = 0,
+            reference_colon: ?Location(config) = null,
+        }
+    else
+        struct {};
+}
+
 fn OpenElementFrame(comptime config: Config) type {
-    return struct {
-        name_offset: usize,
-        name_len: usize,
-        start: Location(config),
-    };
+    return if (config.profile.hasNamespaces())
+        struct {
+            name_offset: usize,
+            name_len: usize,
+            start: Location(config),
+            namespace_binding_mark: usize,
+            namespace_byte_mark: usize,
+            namespace_reference: NamespaceReference,
+        }
+    else
+        struct {
+            name_offset: usize,
+            name_len: usize,
+            start: Location(config),
+        };
 }
 
 fn AttributeRecord(comptime config: Config) type {
@@ -690,6 +805,7 @@ pub fn Reader(comptime config: Config) type {
         attribute_records: std.ArrayList(AttributeRecord(config)) = .empty,
         attribute_bytes: std.ArrayList(u8) = .empty,
         event_attributes: std.ArrayList(Attribute(config)) = .empty,
+        namespace_state: NamespaceState(config) = .{},
         token_start: Location(config) = .{},
         token_name_len: usize = 0,
         end_mismatch_index: usize = no_end_mismatch,
@@ -732,7 +848,9 @@ pub fn Reader(comptime config: Config) type {
 
         /// Initializes a reader without allocating.
         pub fn init(allocator: std.mem.Allocator, options: Options(config)) InitError!Self {
-            if (!options.limits.validate()) return error.InvalidOptions;
+            if (!options.limits.validate() or !options.namespace_limits.validate()) {
+                return error.InvalidOptions;
+            }
             return .{
                 .allocator = allocator,
                 .options = options,
@@ -760,6 +878,7 @@ pub fn Reader(comptime config: Config) type {
                         self.open_elements.clearRetainingCapacity();
                         self.open_names.clearRetainingCapacity();
                         self.clearAttributesRetainingCapacity();
+                        self.clearNamespacesRetainingCapacity();
                     }
                 },
                 .release_memory => self.releaseStorage(),
@@ -839,7 +958,9 @@ pub fn Reader(comptime config: Config) type {
                 .done => return .done,
                 .producing => {},
             }
-            if (comptime config.profile != .xml10_utf8_no_dtd) {
+            if (comptime config.profile != .xml10_utf8_no_dtd and
+                config.profile != .xml10_utf8_ns_no_dtd)
+            {
                 return self.fail(.unsupported_stage, .unsupported_feature);
             }
 
@@ -1589,11 +1710,7 @@ pub fn Reader(comptime config: Config) type {
                     .emit_start_element => {
                         self.vertical_state = .release_start_attributes;
                         return self.eventStep(
-                            .{ .start_element = .{
-                                .name = self.topName(),
-                                .attributes = self.event_attributes.items,
-                                .empty_element_syntax = false,
-                            } },
+                            .{ .start_element = self.startElement(false) },
                             self.token_start,
                             self.currentLocation(),
                         );
@@ -1601,11 +1718,7 @@ pub fn Reader(comptime config: Config) type {
                     .emit_empty_start_element => {
                         self.vertical_state = .release_empty_attributes;
                         return self.eventStep(
-                            .{ .start_element = .{
-                                .name = self.topName(),
-                                .attributes = self.event_attributes.items,
-                                .empty_element_syntax = true,
-                            } },
+                            .{ .start_element = self.startElement(true) },
                             self.token_start,
                             self.currentLocation(),
                         );
@@ -1667,6 +1780,9 @@ pub fn Reader(comptime config: Config) type {
                                 self.token_name_len)
                             {
                                 return self.failVoid(.partial_token_limit, .limit_exceeded);
+                            }
+                            if (scalar_len > self.qnameRemaining(self.token_name_len)) {
+                                return self.failVoid(.qname_limit, .limit_exceeded);
                             }
                             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                                 return self.needInput();
@@ -1906,6 +2022,9 @@ pub fn Reader(comptime config: Config) type {
                     self.attribute_bytes.items.len,
                 .scratch_bytes = self.attribute_bytes.items.len,
                 .scratch_capacity = self.attribute_bytes.capacity,
+                .namespace_capacity = self.namespaceCapacity(),
+                .namespace_binding_count = self.namespaceBindingCount(),
+                .namespace_bytes = self.namespaceBytes(),
                 .retained_capacity = self.retainedCapacity(),
             };
         }
@@ -1918,7 +2037,28 @@ pub fn Reader(comptime config: Config) type {
                 self.open_names.capacity +|
                 record_bytes +|
                 self.attribute_bytes.capacity +|
-                event_bytes;
+                event_bytes +|
+                self.namespaceCapacity();
+        }
+
+        fn namespaceCapacity(self: *const Self) usize {
+            if (comptime !config.profile.hasNamespaces()) return 0;
+            return self.namespace_state.bindings.capacity *| @sizeOf(NamespaceBinding) +|
+                self.namespace_state.active_prefixes.capacity *| @sizeOf(usize) +|
+                self.namespace_state.bytes.capacity +|
+                self.namespace_state.event_declarations.capacity *| @sizeOf(NamespaceDeclaration) +|
+                self.namespace_state.expanded_indices.capacity *| @sizeOf(usize) +|
+                self.namespace_state.event_attribute_locations.capacity *| @sizeOf(Location(config));
+        }
+
+        fn namespaceBindingCount(self: *const Self) usize {
+            if (comptime !config.profile.hasNamespaces()) return 0;
+            return self.namespace_state.bindings.items.len;
+        }
+
+        fn namespaceBytes(self: *const Self) usize {
+            if (comptime !config.profile.hasNamespaces()) return 0;
+            return self.namespace_state.bytes.items.len;
         }
 
         fn releaseStorage(self: *Self) void {
@@ -1927,11 +2067,20 @@ pub fn Reader(comptime config: Config) type {
             self.attribute_records.deinit(self.allocator);
             self.attribute_bytes.deinit(self.allocator);
             self.event_attributes.deinit(self.allocator);
+            if (comptime config.profile.hasNamespaces()) {
+                self.namespace_state.bindings.deinit(self.allocator);
+                self.namespace_state.active_prefixes.deinit(self.allocator);
+                self.namespace_state.bytes.deinit(self.allocator);
+                self.namespace_state.event_declarations.deinit(self.allocator);
+                self.namespace_state.expanded_indices.deinit(self.allocator);
+                self.namespace_state.event_attribute_locations.deinit(self.allocator);
+            }
             self.open_elements = .empty;
             self.open_names = .empty;
             self.attribute_records = .empty;
             self.attribute_bytes = .empty;
             self.event_attributes = .empty;
+            self.namespace_state = .{};
         }
 
         fn clearAttributesRetainingCapacity(self: *Self) void {
@@ -1939,6 +2088,26 @@ pub fn Reader(comptime config: Config) type {
             self.attribute_bytes.clearRetainingCapacity();
             self.event_attributes.clearRetainingCapacity();
             self.attribute_quote = 0;
+            if (comptime config.profile.hasNamespaces()) {
+                self.namespace_state.event_declarations.clearRetainingCapacity();
+                self.namespace_state.expanded_indices.clearRetainingCapacity();
+                self.namespace_state.event_attribute_locations.clearRetainingCapacity();
+                self.namespace_state.comparison_work = 0;
+                self.namespace_state.reference_colon = null;
+            }
+        }
+
+        fn clearNamespacesRetainingCapacity(self: *Self) void {
+            if (comptime config.profile.hasNamespaces()) {
+                self.namespace_state.bindings.clearRetainingCapacity();
+                self.namespace_state.active_prefixes.clearRetainingCapacity();
+                self.namespace_state.bytes.clearRetainingCapacity();
+                self.namespace_state.event_declarations.clearRetainingCapacity();
+                self.namespace_state.expanded_indices.clearRetainingCapacity();
+                self.namespace_state.event_attribute_locations.clearRetainingCapacity();
+                self.namespace_state.comparison_work = 0;
+                self.namespace_state.reference_colon = null;
+            }
         }
 
         fn documentStart(self: *const Self) DocumentStart {
@@ -2239,6 +2408,15 @@ pub fn Reader(comptime config: Config) type {
             }
 
             const target = self.processingInstructionTarget();
+            if (comptime config.profile.hasNamespaces()) {
+                if (std.mem.indexOfScalar(u8, target, ':')) |colon| {
+                    return self.failAt(
+                        .malformed_ncname,
+                        .invalid_xml,
+                        locationWithByteDelta(config, self.token_start, 2 + colon),
+                    );
+                }
+            }
             if (self.processing_instruction_initial and
                 std.mem.eql(u8, target, "xml") and isXmlWhitespace(byte))
             {
@@ -3055,6 +3233,9 @@ pub fn Reader(comptime config: Config) type {
             self.reference_token_bytes = 0;
             self.reference_name = @splat(0);
             self.reference_name_len = 0;
+            if (comptime config.profile.hasNamespaces()) {
+                self.namespace_state.reference_colon = null;
+            }
             try self.consumeReferenceByte('&');
             self.vertical_state = .reference_start;
         }
@@ -3224,6 +3405,11 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn consumeReferenceNameAscii(self: *Self, byte: u8) ReadError!void {
+            if (comptime config.profile.hasNamespaces()) {
+                if (byte == ':' and self.namespace_state.reference_colon == null) {
+                    self.namespace_state.reference_colon = self.currentLocation();
+                }
+            }
             try self.consumeReferenceByte(byte);
             if (self.reference_name_len < self.reference_name.len) {
                 self.reference_name[self.reference_name_len] = byte;
@@ -3255,6 +3441,11 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn finishEntityReference(self: *Self) ReadError!void {
+            if (comptime config.profile.hasNamespaces()) {
+                if (self.namespace_state.reference_colon) |location| {
+                    return self.failAt(.malformed_ncname, .invalid_xml, location);
+                }
+            }
             const bytes = predefinedEntity(
                 self.reference_name[0..@min(self.reference_name_len, self.reference_name.len)],
                 self.reference_name_len,
@@ -3319,9 +3510,13 @@ pub fn Reader(comptime config: Config) type {
                 self.open_names.items.len,
             ) catch unreachable;
             const start_tag_remaining = self.startTagRemaining();
+            const qname_remaining = self.qnameRemaining(self.token_name_len);
             const accepted_len = @min(
                 run.len,
-                @min(partial_remaining, @min(open_remaining, start_tag_remaining)),
+                @min(
+                    partial_remaining,
+                    @min(open_remaining, @min(qname_remaining, start_tag_remaining)),
+                ),
             );
             if (accepted_len > 0) {
                 self.open_names.appendSlice(
@@ -3338,6 +3533,11 @@ pub fn Reader(comptime config: Config) type {
                 if (self.open_names.items.len == self.options.limits.max_open_name_bytes) {
                     return self.failVoid(.open_name_limit, .limit_exceeded);
                 }
+                if (comptime config.profile.hasNamespaces()) {
+                    if (self.token_name_len == self.options.namespace_limits.max_qname_bytes) {
+                        return self.failVoid(.qname_limit, .limit_exceeded);
+                    }
+                }
                 return self.failVoid(.start_tag_limit, .limit_exceeded);
             }
         }
@@ -3351,6 +3551,9 @@ pub fn Reader(comptime config: Config) type {
             if (scalar_len > self.options.limits.max_open_name_bytes - self.open_names.items.len) {
                 return self.failVoid(.open_name_limit, .limit_exceeded);
             }
+            if (scalar_len > self.qnameRemaining(self.token_name_len)) {
+                return self.failVoid(.qname_limit, .limit_exceeded);
+            }
             if (scalar_len > self.startTagRemaining()) {
                 return self.failVoid(.start_tag_limit, .limit_exceeded);
             }
@@ -3363,12 +3566,26 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn finishStartElement(self: *Self, empty_element: bool) ReadError!void {
-            try self.prepareEventAttributes();
-            self.open_elements.append(self.allocator, .{
-                .name_offset = self.open_names.items.len - self.token_name_len,
-                .name_len = self.token_name_len,
-                .start = self.token_start,
-            }) catch return self.failOutOfMemory();
+            if (comptime config.profile.hasNamespaces()) {
+                const binding_mark = self.namespace_state.bindings.items.len;
+                const byte_mark = self.namespace_state.bytes.items.len;
+                const namespace_reference = try self.prepareNamespaceStartElement();
+                self.open_elements.append(self.allocator, .{
+                    .name_offset = self.open_names.items.len - self.token_name_len,
+                    .name_len = self.token_name_len,
+                    .start = self.token_start,
+                    .namespace_binding_mark = binding_mark,
+                    .namespace_byte_mark = byte_mark,
+                    .namespace_reference = namespace_reference,
+                }) catch return self.failOutOfMemory();
+            } else {
+                try self.prepareEventAttributes();
+                self.open_elements.append(self.allocator, .{
+                    .name_offset = self.open_names.items.len - self.token_name_len,
+                    .name_len = self.token_name_len,
+                    .start = self.token_start,
+                }) catch return self.failOutOfMemory();
+            }
             self.vertical_state = if (empty_element)
                 .emit_empty_start_element
             else
@@ -3408,9 +3625,13 @@ pub fn Reader(comptime config: Config) type {
                 self.options.limits.max_attribute_bytes_per_element,
                 self.attribute_bytes.items.len,
             ) catch unreachable;
+            const qname_remaining = self.qnameRemaining(record.name_len);
             const accepted_len = @min(
                 run.len,
-                @min(name_remaining, @min(aggregate_remaining, self.startTagRemaining())),
+                @min(
+                    name_remaining,
+                    @min(aggregate_remaining, @min(qname_remaining, self.startTagRemaining())),
+                ),
             );
             if (accepted_len > 0) {
                 self.attribute_bytes.appendSlice(
@@ -3429,6 +3650,11 @@ pub fn Reader(comptime config: Config) type {
                 {
                     return self.failVoid(.attribute_bytes_limit, .limit_exceeded);
                 }
+                if (comptime config.profile.hasNamespaces()) {
+                    if (record.name_len == self.options.namespace_limits.max_qname_bytes) {
+                        return self.failVoid(.qname_limit, .limit_exceeded);
+                    }
+                }
                 return self.failVoid(.start_tag_limit, .limit_exceeded);
             }
         }
@@ -3445,6 +3671,9 @@ pub fn Reader(comptime config: Config) type {
             {
                 return self.failVoid(.attribute_bytes_limit, .limit_exceeded);
             }
+            if (scalar_len > self.qnameRemaining(record.name_len)) {
+                return self.failVoid(.qname_limit, .limit_exceeded);
+            }
             if (scalar_len > self.startTagRemaining()) {
                 return self.failVoid(.start_tag_limit, .limit_exceeded);
             }
@@ -3456,6 +3685,11 @@ pub fn Reader(comptime config: Config) type {
                 self.utf8_bytes[0..len],
             ) catch return self.failOutOfMemory();
             self.attribute_records.items[self.attribute_records.items.len - 1].name_len += len;
+        }
+
+        fn qnameRemaining(self: *const Self, current_len: usize) usize {
+            if (comptime !config.profile.hasNamespaces()) return std.math.maxInt(usize);
+            return self.options.namespace_limits.max_qname_bytes - current_len;
         }
 
         fn appendAttributeValueRun(self: *Self, run: []const u8) ReadError!void {
@@ -3521,6 +3755,384 @@ pub fn Reader(comptime config: Config) type {
             const record = &self.attribute_records.items[self.attribute_records.items.len - 1];
             const value_offset = record.name_offset + record.name_len;
             record.value_len = self.attribute_bytes.items.len - value_offset;
+        }
+
+        fn prepareNamespaceStartElement(self: *Self) ReadError!NamespaceReference {
+            try self.rejectDuplicateAttributes();
+            self.namespace_state.event_declarations.clearRetainingCapacity();
+            self.namespace_state.expanded_indices.clearRetainingCapacity();
+            self.namespace_state.event_attribute_locations.clearRetainingCapacity();
+            self.namespace_state.comparison_work = 0;
+
+            const element_raw = self.open_names.items[self.open_names.items.len - self.token_name_len ..];
+            const element_name_start = locationWithByteDelta(config, self.token_start, 1);
+            const element_parts = try self.requireQName(element_raw, element_name_start);
+            if (element_parts.prefix) |prefix| {
+                if (std.mem.eql(u8, prefix, "xmlns")) {
+                    return self.failAt(
+                        .reserved_namespace_name,
+                        .invalid_xml,
+                        element_name_start,
+                    );
+                }
+            }
+
+            var declaration_count: usize = 0;
+            for (self.attribute_records.items) |record| {
+                const raw = self.attributeRawName(record);
+                const parts = try self.requireQName(raw, record.start);
+                if (namespaceDeclarationPrefix(raw, parts)) |declared_prefix| {
+                    declaration_count += 1;
+                    if (declaration_count >
+                        self.options.namespace_limits.max_declarations_per_element)
+                    {
+                        return self.failAt(
+                            .namespace_declaration_limit,
+                            .limit_exceeded,
+                            record.start,
+                        );
+                    }
+                    try self.addNamespaceDeclaration(record, declared_prefix);
+                }
+            }
+
+            const element_reference = try self.resolveNamespace(
+                element_parts.prefix orelse "",
+                element_name_start,
+            );
+
+            var ordinary_count: usize = 0;
+            for (self.attribute_records.items) |record| {
+                const raw = self.attributeRawName(record);
+                const parts = qnameParts(raw).?;
+                if (namespaceDeclarationPrefix(raw, parts) == null) ordinary_count += 1;
+            }
+            self.event_attributes.clearRetainingCapacity();
+            self.event_attributes.ensureTotalCapacity(
+                self.allocator,
+                ordinary_count,
+            ) catch return self.failOutOfMemory();
+            self.namespace_state.expanded_indices.ensureTotalCapacity(
+                self.allocator,
+                ordinary_count,
+            ) catch return self.failOutOfMemory();
+            self.namespace_state.event_attribute_locations.ensureTotalCapacity(
+                self.allocator,
+                ordinary_count,
+            ) catch return self.failOutOfMemory();
+
+            for (self.attribute_records.items) |record| {
+                const raw = self.attributeRawName(record);
+                const parts = qnameParts(raw).?;
+                if (namespaceDeclarationPrefix(raw, parts) != null) continue;
+                if (parts.prefix) |prefix| {
+                    if (std.mem.eql(u8, prefix, "xmlns")) {
+                        return self.failAt(
+                            .reserved_namespace_name,
+                            .invalid_xml,
+                            record.start,
+                        );
+                    }
+                }
+                const reference = if (parts.prefix) |prefix|
+                    try self.resolveNamespace(prefix, record.start)
+                else
+                    NamespaceReference.none;
+                const value_offset = record.name_offset + record.name_len;
+                self.event_attributes.appendAssumeCapacity(.{
+                    .name = self.expandedName(raw, parts, reference),
+                    .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
+                });
+                self.namespace_state.expanded_indices.appendAssumeCapacity(
+                    self.event_attributes.items.len - 1,
+                );
+                self.namespace_state.event_attribute_locations.appendAssumeCapacity(record.start);
+            }
+            try self.rejectDuplicateExpandedAttributes();
+            return element_reference;
+        }
+
+        fn requireQName(
+            self: *Self,
+            raw: []const u8,
+            start: Location(config),
+        ) ReadError!QNameParts {
+            if (raw.len > self.options.namespace_limits.max_qname_bytes) {
+                return self.failAt(
+                    .qname_limit,
+                    .limit_exceeded,
+                    locationWithByteDelta(
+                        config,
+                        start,
+                        self.options.namespace_limits.max_qname_bytes,
+                    ),
+                );
+            }
+            return qnameParts(raw) orelse self.failAt(
+                .malformed_qname,
+                .invalid_xml,
+                locationWithByteDelta(config, start, qnameErrorIndex(raw)),
+            );
+        }
+
+        fn addNamespaceDeclaration(
+            self: *Self,
+            record: AttributeRecord(config),
+            declared_prefix: []const u8,
+        ) ReadError!void {
+            const raw = self.attributeRawName(record);
+            const uri_offset = record.name_offset + record.name_len;
+            const uri = self.attribute_bytes.items[uri_offset..][0..record.value_len];
+            const is_default = std.mem.eql(u8, raw, "xmlns");
+
+            if ((!is_default and uri.len == 0) or
+                std.mem.eql(u8, declared_prefix, "xmlns") or
+                std.mem.eql(u8, uri, xmlns_namespace_uri) or
+                (std.mem.eql(u8, declared_prefix, "xml") !=
+                    std.mem.eql(u8, uri, xml_namespace_uri)))
+            {
+                return self.failAt(
+                    .illegal_namespace_declaration,
+                    .invalid_xml,
+                    record.start,
+                );
+            }
+            if (std.mem.eql(u8, declared_prefix, "xml")) {
+                self.namespace_state.event_declarations.append(self.allocator, .{
+                    .prefix = declared_prefix,
+                    .namespace_uri = uri,
+                }) catch return self.failOutOfMemory();
+                return;
+            }
+            if (self.namespace_state.bindings.items.len ==
+                self.options.namespace_limits.max_active_bindings)
+            {
+                return self.failAt(.namespace_binding_limit, .limit_exceeded, record.start);
+            }
+            const added_bytes = std.math.add(usize, declared_prefix.len, uri.len) catch
+                return self.failAt(.namespace_binding_bytes_limit, .limit_exceeded, record.start);
+            if (added_bytes > self.options.namespace_limits.max_binding_bytes -
+                self.namespace_state.bytes.items.len)
+            {
+                return self.failAt(
+                    .namespace_binding_bytes_limit,
+                    .limit_exceeded,
+                    record.start,
+                );
+            }
+
+            const prefix_offset = self.namespace_state.bytes.items.len;
+            self.namespace_state.bytes.appendSlice(self.allocator, declared_prefix) catch
+                return self.failOutOfMemory();
+            const stored_uri_offset = self.namespace_state.bytes.items.len;
+            self.namespace_state.bytes.appendSlice(self.allocator, uri) catch
+                return self.failOutOfMemory();
+            const active = try self.findActivePrefix(declared_prefix, record.start);
+            const binding_index = self.namespace_state.bindings.items.len;
+            self.namespace_state.bindings.append(self.allocator, .{
+                .prefix_offset = prefix_offset,
+                .prefix_len = declared_prefix.len,
+                .uri_offset = stored_uri_offset,
+                .uri_len = uri.len,
+                .previous_binding = if (active.found)
+                    self.namespace_state.active_prefixes.items[active.index]
+                else
+                    null,
+                .active_index = active.index,
+            }) catch return self.failOutOfMemory();
+            if (active.found) {
+                self.namespace_state.active_prefixes.items[active.index] = binding_index;
+            } else {
+                self.namespace_state.active_prefixes.insert(
+                    self.allocator,
+                    active.index,
+                    binding_index,
+                ) catch return self.failOutOfMemory();
+            }
+            self.namespace_state.event_declarations.append(self.allocator, .{
+                .prefix = if (is_default) null else raw["xmlns:".len..],
+                .namespace_uri = uri,
+            }) catch return self.failOutOfMemory();
+        }
+
+        fn resolveNamespace(
+            self: *Self,
+            prefix: []const u8,
+            location: Location(config),
+        ) ReadError!NamespaceReference {
+            if (std.mem.eql(u8, prefix, "xml")) return .predefined_xml;
+            const active = try self.findActivePrefix(prefix, location);
+            if (active.found) {
+                const binding_index = self.namespace_state.active_prefixes.items[active.index];
+                const binding = self.namespace_state.bindings.items[binding_index];
+                return if (binding.uri_len == 0) .none else .{ .binding = binding_index };
+            }
+            if (prefix.len == 0) return .none;
+            return self.failAt(.unbound_prefix, .invalid_xml, location);
+        }
+
+        const ActivePrefixSearch = struct {
+            index: usize,
+            found: bool,
+        };
+
+        fn findActivePrefix(
+            self: *Self,
+            prefix: []const u8,
+            location: Location(config),
+        ) ReadError!ActivePrefixSearch {
+            var low: usize = 0;
+            var high = self.namespace_state.active_prefixes.items.len;
+            while (low < high) {
+                const middle = low + (high - low) / 2;
+                const binding_index = self.namespace_state.active_prefixes.items[middle];
+                const binding = self.namespace_state.bindings.items[binding_index];
+                const stored_prefix = self.namespace_state.bytes.items[binding.prefix_offset..][0..binding.prefix_len];
+                try self.chargeNamespaceComparison(
+                    prefix.len +| stored_prefix.len +| 1,
+                    location,
+                );
+                switch (std.mem.order(u8, stored_prefix, prefix)) {
+                    .lt => low = middle + 1,
+                    .gt => high = middle,
+                    .eq => return .{ .index = middle, .found = true },
+                }
+            }
+            return .{ .index = low, .found = false };
+        }
+
+        fn expandedName(
+            self: *const Self,
+            raw: []const u8,
+            parts: QNameParts,
+            reference: NamespaceReference,
+        ) ExpandedName {
+            return .{
+                .raw = raw,
+                .prefix = parts.prefix,
+                .local = parts.local,
+                .namespace_uri = self.namespaceUri(reference),
+            };
+        }
+
+        fn namespaceUri(self: *const Self, reference: NamespaceReference) ?[]const u8 {
+            return switch (reference) {
+                .none => null,
+                .predefined_xml => xml_namespace_uri,
+                .binding => |index| uri: {
+                    const binding = self.namespace_state.bindings.items[index];
+                    break :uri self.namespace_state.bytes.items[binding.uri_offset..][0..binding.uri_len];
+                },
+            };
+        }
+
+        fn chargeNamespaceComparison(
+            self: *Self,
+            amount: usize,
+            location: Location(config),
+        ) ReadError!void {
+            if (!self.namespaceComparisonAllowed(amount)) {
+                return self.failAt(.namespace_comparison_limit, .limit_exceeded, location);
+            }
+        }
+
+        fn namespaceComparisonAllowed(self: *Self, amount: usize) bool {
+            const remaining = self.options.namespace_limits.max_comparison_work -|
+                self.namespace_state.comparison_work;
+            if (amount > remaining) {
+                return false;
+            }
+            self.namespace_state.comparison_work += amount;
+            return true;
+        }
+
+        fn rejectDuplicateExpandedAttributes(self: *Self) ReadError!void {
+            const attributes = self.event_attributes.items;
+            if (attributes.len <= linear_duplicate_threshold) {
+                for (attributes, 0..) |attribute, index| {
+                    for (attributes[0..index], 0..) |previous, previous_index| {
+                        try self.chargeNamespaceComparison(
+                            expandedComparisonCost(attribute.name, previous.name),
+                            self.currentLocation(),
+                        );
+                        if (expandedNamesEqual(attribute.name, previous.name)) {
+                            return self.failRelated(
+                                .duplicate_expanded_attribute,
+                                .invalid_xml,
+                                self.namespace_state.event_attribute_locations.items[index],
+                                self.namespace_state.event_attribute_locations.items[previous_index],
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+
+            try self.ensureExpandedSortWork(attributes);
+            std.sort.heap(
+                usize,
+                self.namespace_state.expanded_indices.items,
+                self,
+                expandedAttributeIndexLessThan,
+            );
+            const indices = self.namespace_state.expanded_indices.items;
+            for (indices[1..], indices[0 .. indices.len - 1]) |index, previous_index| {
+                const attribute = attributes[index];
+                const previous = attributes[previous_index];
+                try self.chargeNamespaceComparison(
+                    expandedComparisonCost(attribute.name, previous.name),
+                    self.currentLocation(),
+                );
+                if (expandedNamesEqual(attribute.name, previous.name)) {
+                    return self.failRelated(
+                        .duplicate_expanded_attribute,
+                        .invalid_xml,
+                        self.namespace_state.event_attribute_locations.items[index],
+                        self.namespace_state.event_attribute_locations.items[previous_index],
+                    );
+                }
+            }
+        }
+
+        fn expandedAttributeIndexLessThan(
+            self: *Self,
+            left_index: usize,
+            right_index: usize,
+        ) bool {
+            const left = self.event_attributes.items[left_index].name;
+            const right = self.event_attributes.items[right_index].name;
+            const uri_order = optionalBytesOrder(left.namespace_uri, right.namespace_uri);
+            if (uri_order != .eq) return uri_order == .lt;
+            const local_order = std.mem.order(u8, left.local, right.local);
+            if (local_order != .eq) return local_order == .lt;
+            return left_index < right_index;
+        }
+
+        fn ensureExpandedSortWork(
+            self: *Self,
+            attributes: []const Attribute(config),
+        ) ReadError!void {
+            var max_uri_len: usize = 0;
+            var max_local_len: usize = 0;
+            for (attributes) |attribute| {
+                max_uri_len = @max(
+                    max_uri_len,
+                    optionalBytesLength(attribute.name.namespace_uri),
+                );
+                max_local_len = @max(max_local_len, attribute.name.local.len);
+            }
+            var levels: usize = 1;
+            var width = attributes.len;
+            while (width > 1) : (levels +|= 1) width = (width + 1) / 2;
+            // The factor bounds heap-sort comparisons; the final term covers adjacency checks.
+            const comparison_bound = 8 *| attributes.len *| levels +| attributes.len;
+            const cost_bound = 2 *| max_uri_len +| 2 *| max_local_len +| 2;
+            const work_bound = comparison_bound *| cost_bound;
+            const remaining = self.options.namespace_limits.max_comparison_work -|
+                self.namespace_state.comparison_work;
+            if (work_bound > remaining) {
+                return self.fail(.namespace_comparison_limit, .limit_exceeded);
+            }
         }
 
         fn prepareEventAttributes(self: *Self) ReadError!void {
@@ -3622,12 +4234,13 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn compareAndConsumeEndName(self: *Self, run: []const u8) ReadError!void {
-            const remaining = std.math.sub(
+            const partial_remaining = std.math.sub(
                 usize,
                 self.options.limits.max_partial_token_bytes,
                 self.token_name_len,
             ) catch unreachable;
-            const accepted_len = @min(run.len, remaining);
+            const qname_remaining = self.qnameRemaining(self.token_name_len);
+            const accepted_len = @min(run.len, @min(partial_remaining, qname_remaining));
             const accepted = run[0..accepted_len];
             const raw = self.topRawName();
             if (self.end_mismatch_index == no_end_mismatch) {
@@ -3642,7 +4255,10 @@ pub fn Reader(comptime config: Config) type {
             self.token_name_len += accepted_len;
             self.consumeRun(accepted);
             if (accepted_len != run.len) {
-                return self.failVoid(.partial_token_limit, .limit_exceeded);
+                if (self.token_name_len == self.options.limits.max_partial_token_bytes) {
+                    return self.failVoid(.partial_token_limit, .limit_exceeded);
+                }
+                return self.failVoid(.qname_limit, .limit_exceeded);
             }
         }
 
@@ -3650,6 +4266,9 @@ pub fn Reader(comptime config: Config) type {
             const remaining = self.options.limits.max_partial_token_bytes - self.token_name_len;
             if (len > remaining) {
                 return self.failVoid(.partial_token_limit, .limit_exceeded);
+            }
+            if (len > self.qnameRemaining(self.token_name_len)) {
+                return self.failVoid(.qname_limit, .limit_exceeded);
             }
             const raw = self.topRawName();
             if (self.end_mismatch_index == no_end_mismatch) {
@@ -3694,6 +4313,24 @@ pub fn Reader(comptime config: Config) type {
             const frame = self.topFrame();
             self.open_elements.items.len -= 1;
             self.open_names.items.len = frame.name_offset;
+            if (comptime config.profile.hasNamespaces()) {
+                var binding_index = self.namespace_state.bindings.items.len;
+                while (binding_index > frame.namespace_binding_mark) {
+                    binding_index -= 1;
+                    const binding = self.namespace_state.bindings.items[binding_index];
+                    std.debug.assert(
+                        self.namespace_state.active_prefixes.items[binding.active_index] ==
+                            binding_index,
+                    );
+                    if (binding.previous_binding) |previous| {
+                        self.namespace_state.active_prefixes.items[binding.active_index] = previous;
+                    } else {
+                        _ = self.namespace_state.active_prefixes.orderedRemove(binding.active_index);
+                    }
+                }
+                self.namespace_state.bindings.items.len = frame.namespace_binding_mark;
+                self.namespace_state.bytes.items.len = frame.namespace_byte_mark;
+            }
         }
 
         fn topFrame(self: *const Self) OpenElementFrame(config) {
@@ -3809,7 +4446,31 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn topName(self: *const Self) Name(config) {
+            if (comptime config.profile.hasNamespaces()) {
+                const raw = self.topRawName();
+                return self.expandedName(
+                    raw,
+                    qnameParts(raw).?,
+                    self.topFrame().namespace_reference,
+                );
+            }
             return nameFromRaw(config, self.topRawName());
+        }
+
+        fn startElement(self: *const Self, empty: bool) StartElement(config) {
+            if (comptime config.profile.hasNamespaces()) {
+                return .{
+                    .name = self.topName(),
+                    .attributes = self.event_attributes.items,
+                    .namespace_declarations = self.namespace_state.event_declarations.items,
+                    .empty_element_syntax = empty,
+                };
+            }
+            return .{
+                .name = self.topName(),
+                .attributes = self.event_attributes.items,
+                .empty_element_syntax = empty,
+            };
         }
 
         fn endMismatchLocation(self: *const Self) Location(config) {
@@ -4054,6 +4715,66 @@ fn isEncodingName(bytes: []const u8) bool {
 
 fn isAsciiCaseInsensitiveXml(bytes: []const u8) bool {
     return bytes.len == 3 and std.ascii.eqlIgnoreCase(bytes, "xml");
+}
+
+fn qnameParts(raw: []const u8) ?QNameParts {
+    const colon = std.mem.indexOfScalar(u8, raw, ':') orelse
+        return .{ .prefix = null, .local = raw };
+    if (colon == 0 or colon + 1 == raw.len) return null;
+    if (std.mem.indexOfScalarPos(u8, raw, colon + 1, ':') != null) return null;
+    if (!isNcNameStart(raw[colon + 1 ..])) return null;
+    return .{
+        .prefix = raw[0..colon],
+        .local = raw[colon + 1 ..],
+    };
+}
+
+fn qnameErrorIndex(raw: []const u8) usize {
+    const colon = std.mem.indexOfScalar(u8, raw, ':') orelse return 0;
+    if (colon == 0) return 0;
+    if (colon + 1 == raw.len) return colon;
+    if (std.mem.indexOfScalarPos(u8, raw, colon + 1, ':')) |second| return second;
+    return if (isNcNameStart(raw[colon + 1 ..])) colon else colon + 1;
+}
+
+fn isNcNameStart(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    const sequence_len = std.unicode.utf8ByteSequenceLength(bytes[0]) catch return false;
+    if (sequence_len > bytes.len) return false;
+    const codepoint = std.unicode.utf8Decode(bytes[0..sequence_len]) catch return false;
+    return codepoint != ':' and isXml10NameStart(codepoint);
+}
+
+fn namespaceDeclarationPrefix(raw: []const u8, parts: QNameParts) ?[]const u8 {
+    if (std.mem.eql(u8, raw, "xmlns")) return "";
+    if (parts.prefix) |prefix| {
+        if (std.mem.eql(u8, prefix, "xmlns")) return parts.local;
+    }
+    return null;
+}
+
+fn expandedComparisonCost(left: ExpandedName, right: ExpandedName) usize {
+    return optionalBytesLength(left.namespace_uri) +|
+        optionalBytesLength(right.namespace_uri) +|
+        left.local.len +|
+        right.local.len +| 2;
+}
+
+fn optionalBytesLength(value: ?[]const u8) usize {
+    return if (value) |bytes| bytes.len else 0;
+}
+
+fn optionalBytesOrder(left: ?[]const u8, right: ?[]const u8) std.math.Order {
+    if (left) |left_bytes| {
+        if (right) |right_bytes| return std.mem.order(u8, left_bytes, right_bytes);
+        return .gt;
+    }
+    return if (right == null) .eq else .lt;
+}
+
+fn expandedNamesEqual(left: ExpandedName, right: ExpandedName) bool {
+    return optionalBytesOrder(left.namespace_uri, right.namespace_uri) == .eq and
+        std.mem.eql(u8, left.local, right.local);
 }
 
 fn failureToError(failure: Failure) ReadError {

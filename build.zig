@@ -309,6 +309,91 @@ pub fn build(b: *std.Build) void {
         "declared_ascii_high_byte",
         @embedFile("fixture/invalid/encoding/declared-ascii-with-high-byte.xml"),
     );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_default",
+        @embedFile("fixture/valid/namespaces/default.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_prefixed",
+        @embedFile("fixture/valid/namespaces/prefixed.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_rebinding",
+        @embedFile("fixture/valid/namespaces/rebinding.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_default_attributes",
+        @embedFile("fixture/valid/namespaces/default_does_not_apply_to_attributes.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_xml_prefix",
+        @embedFile("fixture/valid/namespaces/xml_prefix.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_default_undeclare",
+        @embedFile("fixture/valid/namespaces/default_undeclaration.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_equivalent_uri",
+        @embedFile("fixture/valid/namespaces/equivalent_uri_spelling.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_churn",
+        @embedFile("fixture/valid/namespaces/shape_namespace_churn.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_unbound_element",
+        @embedFile("fixture/invalid/namespaces/unbound_element_prefix.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_unbound_attribute",
+        @embedFile("fixture/invalid/namespaces/unbound_attribute_prefix.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_bad_xml_binding",
+        @embedFile("fixture/invalid/namespaces/xml_prefix_wrong_uri.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_bad_xmlns_binding",
+        @embedFile("fixture/invalid/namespaces/xmlns_prefix_binding.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_xmlns_element",
+        @embedFile("fixture/invalid/namespaces/xmlns_as_element_prefix.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_duplicate_expanded",
+        @embedFile("fixture/invalid/namespaces/duplicate_expanded_attribute.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_multiple_colons",
+        @embedFile("fixture/invalid/namespaces/multiple_colons.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_prefix_undeclare",
+        @embedFile("fixture/invalid/namespaces/prefixed_undeclaration.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ns_bad_default_uri",
+        @embedFile("fixture/invalid/namespaces/default_bound_to_xmlns_uri.xml"),
+    );
     public_tests_module.addOptions("reader_fixtures", reader_fixtures);
 
     const public_tests = b.addTest(.{
@@ -326,6 +411,9 @@ pub fn build(b: *std.Build) void {
         .strip = optimize == .ReleaseFast,
     });
     check_module.addImport("z_xml", z_xml);
+    const raw_check_options = b.addOptions();
+    raw_check_options.addOption(bool, "namespaces", false);
+    check_module.addOptions("check_options", raw_check_options);
     const check = b.addExecutable(.{
         .name = "z-xml-check",
         .root_module = check_module,
@@ -336,6 +424,27 @@ pub fn build(b: *std.Build) void {
     });
     const run_check_tests = b.addRunArtifact(check_tests);
     test_step.dependOn(&run_check_tests.step);
+
+    const namespace_check_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    namespace_check_module.addImport("z_xml", z_xml);
+    const namespace_check_options = b.addOptions();
+    namespace_check_options.addOption(bool, "namespaces", true);
+    namespace_check_module.addOptions("check_options", namespace_check_options);
+    const namespace_check = b.addExecutable(.{
+        .name = "z-xml-ns-check",
+        .root_module = namespace_check_module,
+    });
+    b.installArtifact(namespace_check);
+    const namespace_check_tests = b.addTest(.{
+        .root_module = namespace_check_module,
+    });
+    const run_namespace_check_tests = b.addRunArtifact(namespace_check_tests);
+    test_step.dependOn(&run_namespace_check_tests.step);
 
     const layout_module = b.createModule(.{
         .root_source_file = b.path("src/layout_probe.zig"),

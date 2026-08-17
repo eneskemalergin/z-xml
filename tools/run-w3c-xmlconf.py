@@ -133,10 +133,7 @@ def input_encoding(path: Path) -> str:
         return "utf32"
     if data.startswith((b"\xfe\xff", b"\xff\xfe")):
         return "utf16"
-    if data.startswith(b"\xef\xbb\xbf"):
-        return "utf8"
-
-    sample = data
+    sample = data[3:] if data.startswith(b"\xef\xbb\xbf") else data
     for encoding in ("ascii", "utf-16", "utf-32"):
         try:
             decoded = data.decode(encoding)
