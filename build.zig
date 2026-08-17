@@ -291,6 +291,31 @@ pub fn build(b: *std.Build) void {
     );
     reader_fixtures.addOption(
         []const u8,
+        "utf16le_bom",
+        @embedFile("fixture/valid/encoding/utf16le-bom.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf16be_bom",
+        @embedFile("fixture/valid/encoding/utf16be-bom.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf16le_odd_byte",
+        @embedFile("fixture/invalid/encoding/utf16le-odd-byte.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf16le_unpaired_high",
+        @embedFile("fixture/invalid/encoding/utf16le-unpaired-high-surrogate.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf16be_unpaired_low",
+        @embedFile("fixture/invalid/encoding/utf16be-unpaired-low-surrogate.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
         "shape_records",
         @embedFile("fixture/valid/core/shape_records.xml"),
     );
@@ -423,6 +448,7 @@ pub fn build(b: *std.Build) void {
     check_module.addImport("z_xml", z_xml);
     const raw_check_options = b.addOptions();
     raw_check_options.addOption(bool, "namespaces", false);
+    raw_check_options.addOption(bool, "general_encodings", false);
     check_module.addOptions("check_options", raw_check_options);
     const check = b.addExecutable(.{
         .name = "z-xml-check",
@@ -444,6 +470,7 @@ pub fn build(b: *std.Build) void {
     namespace_check_module.addImport("z_xml", z_xml);
     const namespace_check_options = b.addOptions();
     namespace_check_options.addOption(bool, "namespaces", true);
+    namespace_check_options.addOption(bool, "general_encodings", false);
     namespace_check_module.addOptions("check_options", namespace_check_options);
     const namespace_check = b.addExecutable(.{
         .name = "z-xml-ns-check",
@@ -456,6 +483,55 @@ pub fn build(b: *std.Build) void {
     const run_namespace_check_tests = b.addRunArtifact(namespace_check_tests);
     test_step.dependOn(&run_namespace_check_tests.step);
 
+    const general_check_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    general_check_module.addImport("z_xml", z_xml);
+    const general_check_options = b.addOptions();
+    general_check_options.addOption(bool, "namespaces", false);
+    general_check_options.addOption(bool, "general_encodings", true);
+    general_check_module.addOptions("check_options", general_check_options);
+    const general_check = b.addExecutable(.{
+        .name = "z-xml-general-check",
+        .root_module = general_check_module,
+    });
+    b.installArtifact(general_check);
+    const general_check_tests = b.addTest(.{
+        .root_module = general_check_module,
+    });
+    const run_general_check_tests = b.addRunArtifact(general_check_tests);
+    test_step.dependOn(&run_general_check_tests.step);
+
+    const general_namespace_check_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    general_namespace_check_module.addImport("z_xml", z_xml);
+    const general_namespace_check_options = b.addOptions();
+    general_namespace_check_options.addOption(bool, "namespaces", true);
+    general_namespace_check_options.addOption(bool, "general_encodings", true);
+    general_namespace_check_module.addOptions(
+        "check_options",
+        general_namespace_check_options,
+    );
+    const general_namespace_check = b.addExecutable(.{
+        .name = "z-xml-general-ns-check",
+        .root_module = general_namespace_check_module,
+    });
+    b.installArtifact(general_namespace_check);
+    const general_namespace_check_tests = b.addTest(.{
+        .root_module = general_namespace_check_module,
+    });
+    const run_general_namespace_check_tests = b.addRunArtifact(
+        general_namespace_check_tests,
+    );
+    test_step.dependOn(&run_general_namespace_check_tests.step);
+
     const persistent_module = b.createModule(.{
         .root_source_file = b.path("tools/z_xml_persistent.zig"),
         .target = target,
@@ -465,6 +541,7 @@ pub fn build(b: *std.Build) void {
     persistent_module.addImport("z_xml", z_xml);
     const persistent_raw_options = b.addOptions();
     persistent_raw_options.addOption(bool, "namespaces", false);
+    persistent_raw_options.addOption(bool, "general_encodings", false);
     persistent_module.addOptions("persistent_options", persistent_raw_options);
     const persistent = b.addExecutable(.{
         .name = "z-xml-persistent",
@@ -486,6 +563,7 @@ pub fn build(b: *std.Build) void {
     namespace_persistent_module.addImport("z_xml", z_xml);
     const persistent_namespace_options = b.addOptions();
     persistent_namespace_options.addOption(bool, "namespaces", true);
+    persistent_namespace_options.addOption(bool, "general_encodings", false);
     namespace_persistent_module.addOptions(
         "persistent_options",
         persistent_namespace_options,
@@ -500,6 +578,28 @@ pub fn build(b: *std.Build) void {
     });
     const run_namespace_persistent_tests = b.addRunArtifact(namespace_persistent_tests);
     test_step.dependOn(&run_namespace_persistent_tests.step);
+
+    const general_persistent_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_persistent.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    general_persistent_module.addImport("z_xml", z_xml);
+    const general_persistent_options = b.addOptions();
+    general_persistent_options.addOption(bool, "namespaces", false);
+    general_persistent_options.addOption(bool, "general_encodings", true);
+    general_persistent_module.addOptions("persistent_options", general_persistent_options);
+    const general_persistent = b.addExecutable(.{
+        .name = "z-xml-general-persistent",
+        .root_module = general_persistent_module,
+    });
+    b.installArtifact(general_persistent);
+    const general_persistent_tests = b.addTest(.{
+        .root_module = general_persistent_module,
+    });
+    const run_general_persistent_tests = b.addRunArtifact(general_persistent_tests);
+    test_step.dependOn(&run_general_persistent_tests.step);
 
     const layout_module = b.createModule(.{
         .root_source_file = b.path("src/layout_probe.zig"),

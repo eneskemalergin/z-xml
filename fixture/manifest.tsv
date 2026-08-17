@@ -24,6 +24,10 @@ encoding-utf8-bom	valid/encoding/utf8-bom.xml	well-formed	XML1.0-5e	document,utf
 encoding-utf8-boundaries	valid/encoding/utf8-codepoint-boundaries.xml	well-formed	XML1.0-5e	document,utf8	no	Lowest legal two three and four byte UTF-8 sequences plus U+10FFFF
 encoding-utf16le	valid/encoding/utf16le-bom.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 little-endian document with required byte order mark
 encoding-utf16be	valid/encoding/utf16be-bom.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 big-endian document with required byte order mark
+encoding-utf16le-explicit	valid/encoding/utf16le-explicit.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 little-endian document with explicit endian declaration
+encoding-utf16be-explicit	valid/encoding/utf16be-explicit.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 big-endian document with explicit endian declaration
+encoding-utf16le-markup	valid/encoding/utf16le-markup.xml	well-formed	XML1.0-5e	document,utf16,unicode_names,attributes	no	UTF-16 names attributes supplementary text and CRLF normalization
+encoding-utf16be-no-declaration	valid/encoding/utf16be-no-declaration.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 big-endian document without an XML declaration
 encoding-latin1	valid/encoding/iso-8859-1.xml	well-formed	XML1.0-5e	document,latin1	no	Declared ISO-8859-1 document with a non-ASCII byte
 encoding-ascii	valid/encoding/ascii-declared.xml	well-formed	XML1.0-5e	document,ascii	no	Declared US-ASCII document
 encoding-cr	valid/encoding/cr-line-endings.xml	well-formed	XML1.0-5e	document	no	Literal carriage-return line endings accepted and normalized by event adapters
@@ -96,6 +100,11 @@ encoding-bad-control	invalid/encoding/literal-control.xml	not-well-formed	XML1.0
 encoding-bad-utf16-odd	invalid/encoding/utf16le-odd-byte.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	Odd byte count in UTF-16 little-endian input
 encoding-bad-utf16-high	invalid/encoding/utf16le-unpaired-high-surrogate.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	Unpaired UTF-16 high surrogate
 encoding-bad-utf16-low	invalid/encoding/utf16be-unpaired-low-surrogate.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	Unpaired UTF-16 low surrogate
+encoding-bad-utf16le-signature	invalid/encoding/utf16le-missing-signature.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	UTF-16 little-endian document without its required signature
+encoding-bad-utf16be-signature	invalid/encoding/utf16be-missing-signature.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	UTF-16 big-endian document without its required signature
+encoding-bad-utf16le-declared-be	invalid/encoding/utf16le-declared-be.xml	not-well-formed	XML1.0-5e	utf16,check_encoding_declaration	no	UTF-16 little-endian signature conflicts with big-endian declaration
+encoding-bad-utf16be-declared-le	invalid/encoding/utf16be-declared-le.xml	not-well-formed	XML1.0-5e	utf16,check_encoding_declaration	no	UTF-16 big-endian signature conflicts with little-endian declaration
+encoding-bad-utf16-high-final	invalid/encoding/utf16le-high-surrogate-final.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	UTF-16 stream ends after a high surrogate
 encoding-bad-declaration-utf16	invalid/encoding/declared-utf16-but-utf8.xml	not-well-formed	XML1.0-5e	utf16,check_encoding_declaration	no	UTF-8 bytes conflict with declared UTF-16 encoding
 encoding-bad-declaration-ascii	invalid/encoding/declared-ascii-with-high-byte.xml	not-well-formed	XML1.0-5e	ascii,check_encoding_declaration	no	Non-ASCII input conflicts with US-ASCII declaration
 bad-recursive-entity	invalid/not_well_formed/recursive_entity.xml	not-well-formed	XML1.0-5e	dtd,internal_entities,check_general_entity_recursion	no	Recursive internal general entity violates the no-recursion constraint
