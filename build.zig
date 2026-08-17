@@ -1,4 +1,4 @@
-//! Builds the z-xml library, public tests, and layout probe.
+//! Builds the z-xml library, public tests, corpus adapter, and layout probe.
 
 const std = @import("std");
 
@@ -316,8 +316,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_public_tests = b.addRunArtifact(public_tests);
 
-    const test_step = b.step("test", "Run public z-xml tests");
+    const test_step = b.step("test", "Run z-xml tests");
     test_step.dependOn(&run_public_tests.step);
+
+    const check_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    check_module.addImport("z_xml", z_xml);
+    const check = b.addExecutable(.{
+        .name = "z-xml-check",
+        .root_module = check_module,
+    });
+    b.installArtifact(check);
+    const check_tests = b.addTest(.{
+        .root_module = check_module,
+    });
+    const run_check_tests = b.addRunArtifact(check_tests);
+    test_step.dependOn(&run_check_tests.step);
 
     const layout_module = b.createModule(.{
         .root_source_file = b.path("src/layout_probe.zig"),

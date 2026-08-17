@@ -173,7 +173,7 @@ def document_text(path: Path, encoding: str) -> str:
         return ""
 
 
-def requirements(case: Case) -> tuple[set[str], str | None]:
+def requirements(target: Target, case: Case) -> tuple[set[str], str | None]:
     versions = case.version.split()
     if "1.0" not in versions:
         return set(), "xml-version"
@@ -181,11 +181,16 @@ def requirements(case: Case) -> tuple[set[str], str | None]:
         return set(), "optional-error"
     if case.case_type not in {"valid", "invalid", "not-wf"}:
         return set(), "unknown-type"
-    if case.namespace == "no":
+    raw_names = "raw_names" in target.features
+    if raw_names and case.namespace != "no":
+        return set(), "namespace-processing-mode"
+    if not raw_names and case.namespace == "no":
         return set(), "namespace-off-mode"
 
     encoding = input_encoding(case.input_path)
-    needed = {"document", "namespaces", encoding}
+    needed = {"document", encoding}
+    if not raw_names:
+        needed.add("namespaces")
     text = document_text(case.input_path, encoding)
     if case.case_type == "invalid" or "<!DOCTYPE" in text:
         needed.add("dtd")
@@ -205,7 +210,7 @@ def expectation(target: Target, case: Case) -> tuple[str, str]:
         editions = case.edition.split()
         if not any(f"xml1_0_{edition}e" in target.features for edition in editions):
             return "out-of-profile", "xml-edition"
-    needed, reason = requirements(case)
+    needed, reason = requirements(target, case)
     if reason is not None:
         if reason == "optional-error":
             return "optional", reason

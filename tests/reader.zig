@@ -1291,6 +1291,25 @@ test "adapter - std Io Reader: greedy buffered refill handles one-byte source re
     try std.testing.expectEqual(@as(usize, 1), summary.attributes);
 }
 
+test "[failure] - [buffered reader]: source failure is stable and allocation-free" {
+    var source_buffer: [1]u8 = undefined;
+    var source = std.Io.Reader.failing;
+    source.buffer = &source_buffer;
+    var input = try xml.IoReader(CORE_CONFIG).init(
+        std.testing.allocator,
+        .{},
+        &source,
+    );
+    defer input.deinit();
+
+    try std.testing.expectError(error.ReadFailed, input.next());
+    const diagnostic = input.diagnostic().?;
+    try std.testing.expectEqual(xml.DiagnosticCode.read_failed, diagnostic.code);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.primary.byte_offset);
+    try std.testing.expectEqual(@as(usize, 0), input.memoryUsage().retained_capacity);
+    try std.testing.expectError(error.ReadFailed, input.next());
+}
+
 test "adapter - push drain: preserves event order and explicit cancellation" {
     var complete: PushContext = .{};
     try xml.drainSlice(
@@ -3773,7 +3792,253 @@ test "reader - retained ceiling: retain reset releases exceptional capacity" {
     try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().retained_capacity);
 }
 
-test "reader - initialization: invalid limits fail without allocation" {
+test "[edge] - [retained capacity]: exact boundary retains and one below releases" {
+    const retained = retained: {
+        var probe = try CoreReader.init(std.testing.allocator, .{});
+        defer probe.deinit();
+        try probe.feed(MANY_ATTRIBUTES, true);
+        _ = try drainCore(&probe);
+        break :retained probe.memoryUsage().retained_capacity;
+    };
+    try std.testing.expect(retained > 0);
+
+    var at_options: xml.Options(CORE_CONFIG) = .{};
+    at_options.limits.max_retained_bytes = retained;
+    var at = try CoreReader.init(std.testing.allocator, at_options);
+    defer at.deinit();
+    try at.feed(MANY_ATTRIBUTES, true);
+    _ = try drainCore(&at);
+    try std.testing.expectEqual(retained, at.memoryUsage().retained_capacity);
+    try at.reset(.retain_capacity);
+    try std.testing.expectEqual(retained, at.memoryUsage().retained_capacity);
+
+    var over_options: xml.Options(CORE_CONFIG) = .{};
+    over_options.limits.max_retained_bytes = retained - 1;
+    var over = try CoreReader.init(std.testing.allocator, over_options);
+    defer over.deinit();
+    try over.feed(MANY_ATTRIBUTES, true);
+    _ = try drainCore(&over);
+    try std.testing.expectEqual(retained, over.memoryUsage().retained_capacity);
+    try over.reset(.retain_capacity);
+    try std.testing.expectEqual(@as(usize, 0), over.memoryUsage().retained_capacity);
+}
+
+test "[property] - [reader schedules]: generated valid shapes agree across schedules" {
+    var input_buffer: [4096]u8 = undefined;
+    for (0..128) |case_index| {
+        var output = std.Io.Writer.fixed(&input_buffer);
+        const children = case_index % 6;
+        try output.print("<root case='{d}'>", .{case_index});
+        for (0..children) |child| {
+            try output.print("<item id='{d}'>value&amp;{d}</item>", .{ child, case_index });
+        }
+        try output.writeAll("</root>");
+        const input = output.buffered();
+        const parts = [_][]const u8{input};
+        const whole = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
+        var expected_text_buffer: [256]u8 = undefined;
+        var expected_text = std.Io.Writer.fixed(&expected_text_buffer);
+        for (0..children) |_| try expected_text.print("value&{d}", .{case_index});
+        try std.testing.expectEqual(children + 1, whole.starts);
+        try std.testing.expectEqual(children + 1, whole.ends);
+        try std.testing.expectEqual(children + 1, whole.attributes);
+        try std.testing.expectEqualStrings(
+            expected_text.buffered(),
+            whole.text_bytes[0..whole.text_bytes_len],
+        );
+        try std.testing.expectEqual(
+            whole,
+            try parseOneByteChunks(CORE_CONFIG, std.testing.allocator, .{}, input),
+        );
+        try std.testing.expectEqual(
+            whole,
+            try parseFixedChunks(CORE_CONFIG, std.testing.allocator, .{}, input, 31),
+        );
+        try std.testing.expectEqual(
+            whole,
+            try parseRandomChunks(CORE_CONFIG, std.testing.allocator, .{}, input, case_index),
+        );
+    }
+}
+
+test "[property] - [persistent reader]: success failure limit and resets remain bounded" {
+    var options: xml.Options(CORE_CONFIG) = .{};
+    options.limits.max_attributes_per_element = 2;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    {
+        var reader = try CoreReader.init(failing.allocator(), options);
+        defer reader.deinit();
+
+        var plateau: usize = 0;
+        var phase: usize = 0;
+        for (0..1024) |iteration| {
+            const input = switch (iteration % 3) {
+                0 => "<root a='1' b='2'><item/></root>",
+                1 => "<root><item></root>",
+                else => "<root a='1' b='2' c='3'/>",
+            };
+            try reader.feed(input, true);
+            const wanted_error: ?anyerror = switch (iteration % 3) {
+                0 => null,
+                1 => error.InvalidXml,
+                else => error.LimitExceeded,
+            };
+            var observed_error: ?anyerror = null;
+            while (true) {
+                const step = reader.next() catch |err| {
+                    observed_error = err;
+                    break;
+                };
+                if (step == .done) break;
+                if (step == .need_input) return error.UnexpectedNeedInput;
+            }
+            try std.testing.expectEqual(wanted_error, observed_error);
+            const retained = reader.memoryUsage().retained_capacity;
+            if (phase < 3) {
+                plateau = @max(plateau, retained);
+            } else {
+                try std.testing.expect(retained <= plateau);
+            }
+            phase += 1;
+
+            if (iteration % 127 == 126) {
+                try reader.reset(.release_memory);
+                try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().retained_capacity);
+                plateau = 0;
+                phase = 0;
+            } else {
+                try reader.reset(.retain_capacity);
+                try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().parser_stack_len);
+                try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().attribute_count);
+                try std.testing.expect(reader.memoryUsage().retained_capacity <= plateau);
+            }
+        }
+    }
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+const FuzzOutcome = struct {
+    disposition: enum { accept, invalid, unsupported, limit },
+    code: ?xml.DiagnosticCode = null,
+    offset: u64 = 0,
+    starts: usize = 0,
+    ends: usize = 0,
+    attributes: usize = 0,
+    text_bytes: usize = 0,
+};
+
+fn arbitraryOutcome(input: []const u8, seed: ?u64) !FuzzOutcome {
+    var options: xml.Options(FAST_CONFIG) = .{};
+    options.limits.max_depth = 16;
+    options.limits.max_open_name_bytes = 256;
+    options.limits.max_partial_token_bytes = 256;
+    options.limits.max_attributes_per_element = 16;
+    options.limits.max_attribute_name_bytes = 128;
+    options.limits.max_attribute_value_bytes = 256;
+    options.limits.max_attribute_bytes_per_element = 512;
+    options.limits.max_start_tag_bytes = 512;
+    options.limits.max_fragment_bytes = 64;
+    options.limits.max_processing_instruction_target_bytes = 64;
+    options.limits.max_retained_bytes = 512;
+
+    const Reader = xml.Reader(FAST_CONFIG);
+    var reader = try Reader.init(std.testing.allocator, options);
+    defer reader.deinit();
+    var outcome: FuzzOutcome = .{ .disposition = .accept };
+    var prng = std.Random.DefaultPrng.init(seed orelse 0);
+    const random = prng.random();
+    var offset: usize = 0;
+    var steps: usize = 0;
+
+    while (offset < input.len or input.len == 0) {
+        const end = if (input.len == 0)
+            0
+        else if (seed == null)
+            input.len
+        else
+            offset + random.intRangeAtMost(usize, 1, @min(@as(usize, 17), input.len - offset));
+        try reader.feed(input[offset..end], end == input.len);
+        offset = end;
+        while (true) {
+            steps += 1;
+            if (steps > input.len * 3 + 16) return error.NonTerminatingParser;
+            const step = reader.next() catch |err| {
+                const diagnostic = reader.diagnostic();
+                return switch (err) {
+                    error.InvalidXml => .{
+                        .disposition = .invalid,
+                        .code = diagnostic.?.code,
+                        .offset = diagnostic.?.primary.byte_offset,
+                    },
+                    error.UnsupportedFeature => .{
+                        .disposition = .unsupported,
+                        .code = diagnostic.?.code,
+                        .offset = diagnostic.?.primary.byte_offset,
+                    },
+                    error.LimitExceeded => .{
+                        .disposition = .limit,
+                        .code = diagnostic.?.code,
+                        .offset = diagnostic.?.primary.byte_offset,
+                    },
+                    else => err,
+                };
+            };
+            switch (step) {
+                .event => |event| switch (event) {
+                    .start_element => |start| {
+                        outcome.starts += 1;
+                        outcome.attributes += start.attributes.len;
+                    },
+                    .end_element => outcome.ends += 1,
+                    .text => |text| outcome.text_bytes += text.bytes.len,
+                    else => {},
+                },
+                .need_input => break,
+                .done => return outcome,
+            }
+        }
+        if (input.len == 0) unreachable;
+    }
+    return error.MissingDone;
+}
+
+fn fuzzArbitraryBytes(_: void, smith: *std.testing.Smith) !void {
+    @disableInstrumentation();
+    var storage: [512]u8 = undefined;
+    const input = storage[0..smith.slice(&storage)];
+    const whole = try arbitraryOutcome(input, null);
+    try std.testing.expectEqual(whole, try arbitraryOutcome(input, 0x7a786d6c));
+}
+
+test "[fuzz] - [arbitrary bytes]: parsing is bounded and schedule invariant" {
+    try std.testing.fuzz({}, fuzzArbitraryBytes, .{
+        .corpus = &.{
+            "<root/>",
+            "<root a='&amp;'>text</root>",
+            "<root><item></root>",
+            "<!DOCTYPE root><root/>",
+            "\xef\xbb\xbf<root>\xf0\x9f\x99\x82</root>",
+            "<root>\xc0\x80</root>",
+        },
+    });
+}
+
+test "[property] - [arbitrary bytes]: deterministic campaign is bounded and schedule invariant" {
+    var prng = std.Random.DefaultPrng.init(0x737461676537);
+    const random = prng.random();
+    var storage: [512]u8 = undefined;
+    for (0..10_000) |iteration| {
+        const len = random.intRangeAtMost(usize, 0, storage.len);
+        random.bytes(storage[0..len]);
+        const whole = try arbitraryOutcome(storage[0..len], null);
+        try std.testing.expectEqual(
+            whole,
+            try arbitraryOutcome(storage[0..len], iteration + 1),
+        );
+    }
+}
+
+test "[failure] - [reader initialization]: zero required limits fail without allocation" {
     const Reader = xml.Reader(xml.Configs.XML10_UTF8_NO_DTD);
     var options: xml.Options(xml.Configs.XML10_UTF8_NO_DTD) = .{};
     options.limits.max_depth = 0;
@@ -3786,10 +4051,13 @@ test "reader - initialization: invalid limits fail without allocation" {
 
     inline for (.{
         "max_attributes_per_element",
+        "max_partial_token_bytes",
         "max_attribute_name_bytes",
         "max_attribute_value_bytes",
         "max_attribute_bytes_per_element",
         "max_start_tag_bytes",
+        "max_fragment_bytes",
+        "max_processing_instruction_target_bytes",
     }) |field_name| {
         options = .{};
         @field(options.limits, field_name) = 0;
