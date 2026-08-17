@@ -9,24 +9,33 @@ from pathlib import Path
 
 
 def fixture_bytes() -> dict[str, bytes]:
-    utf16_document = '<?xml version="1.0" encoding="UTF-16"?><root>\u03bb\U0001f642</root>'
-    utf16le_document = '<?xml version="1.0" encoding="UTF-16LE"?><root>\u03bb\U0001f642</root>'
-    utf16be_document = '<?xml version="1.0" encoding="UTF-16BE"?><root>\u03bb\U0001f642</root>'
+    utf16_document = (
+        '<?xml version="1.0" encoding="UTF-16"?><root>\u03bb\U0001f642</root>'
+    )
+    utf16le_document = (
+        '<?xml version="1.0" encoding="UTF-16LE"?><root>\u03bb\U0001f642</root>'
+    )
+    utf16be_document = (
+        '<?xml version="1.0" encoding="UTF-16BE"?><root>\u03bb\U0001f642</root>'
+    )
     utf16_markup = "<\u6839 \u5c5e\u6027='\u503c'>one\r\ntwo\U0001f642</\u6839>"
     return {
         "valid/encoding/utf8-bom.xml": b"\xef\xbb\xbf<root>\xc3\xa9\xf0\x9f\x99\x82</root>",
         "valid/encoding/utf8-codepoint-boundaries.xml": (
             b"<root>\xc2\x80\xe0\xa0\x80\xf0\x90\x80\x80\xf4\x8f\xbf\xbf</root>"
         ),
-        "valid/encoding/utf16le-bom.xml": b"\xff\xfe" + utf16_document.encode("utf-16-le"),
-        "valid/encoding/utf16be-bom.xml": b"\xfe\xff" + utf16_document.encode("utf-16-be"),
+        "valid/encoding/utf16le-bom.xml": b"\xff\xfe"
+        + utf16_document.encode("utf-16-le"),
+        "valid/encoding/utf16be-bom.xml": b"\xfe\xff"
+        + utf16_document.encode("utf-16-be"),
         "valid/encoding/utf16le-explicit.xml": (
             b"\xff\xfe" + utf16le_document.encode("utf-16-le")
         ),
         "valid/encoding/utf16be-explicit.xml": (
             b"\xfe\xff" + utf16be_document.encode("utf-16-be")
         ),
-        "valid/encoding/utf16le-markup.xml": b"\xff\xfe" + utf16_markup.encode("utf-16-le"),
+        "valid/encoding/utf16le-markup.xml": b"\xff\xfe"
+        + utf16_markup.encode("utf-16-le"),
         "valid/encoding/utf16be-no-declaration.xml": (
             b"\xfe\xff" + "<root/>".encode("utf-16-be")
         ),
@@ -50,13 +59,23 @@ def fixture_bytes() -> dict[str, bytes]:
             b"\xff\xfe" + '<root encoding="UTF-16">x</root>'.encode("utf-16-le")[:-1]
         ),
         "invalid/encoding/utf16le-unpaired-high-surrogate.xml": (
-            b"\xff\xfe" + "<root>".encode("utf-16-le") + b"\x00\xd8" + "</root>".encode("utf-16-le")
+            b"\xff\xfe"
+            + "<root>".encode("utf-16-le")
+            + b"\x00\xd8"
+            + "</root>".encode("utf-16-le")
         ),
         "invalid/encoding/utf16be-unpaired-low-surrogate.xml": (
-            b"\xfe\xff" + "<root>".encode("utf-16-be") + b"\xdc\x00" + "</root>".encode("utf-16-be")
+            b"\xfe\xff"
+            + "<root>".encode("utf-16-be")
+            + b"\xdc\x00"
+            + "</root>".encode("utf-16-be")
         ),
-        "invalid/encoding/utf16le-missing-signature.xml": utf16_document.encode("utf-16-le"),
-        "invalid/encoding/utf16be-missing-signature.xml": utf16_document.encode("utf-16-be"),
+        "invalid/encoding/utf16le-missing-signature.xml": utf16_document.encode(
+            "utf-16-le"
+        ),
+        "invalid/encoding/utf16be-missing-signature.xml": utf16_document.encode(
+            "utf-16-be"
+        ),
         "invalid/encoding/utf16le-declared-be.xml": (
             b"\xff\xfe" + utf16be_document.encode("utf-16-le")
         ),

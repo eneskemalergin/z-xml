@@ -2434,8 +2434,10 @@ pub fn Reader(comptime config: Config) type {
         fn readProcessingInstructionTarget(self: *Self) ReadError!bool {
             const run_start = self.cursor;
             var run_end = run_start;
-            while (run_end < self.input.len and isAsciiNameChar(self.input[run_end])) {
-                run_end += 1;
+            if (self.utf8_len == 0) {
+                while (run_end < self.input.len and isAsciiNameChar(self.input[run_end])) {
+                    run_end += 1;
+                }
             }
             if (run_end != run_start) {
                 if (self.processing_instruction_target_len == 0 and
@@ -5290,9 +5292,6 @@ fn parseXmlDeclaration(
             std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-8"))
         {
             return .{ .encoding_mismatch = encoding.offset };
-        }
-        if (declared_encoding == null) {
-            return .{ .unsupported_encoding = encoding.offset };
         }
         parsed.encoding_offset = encoding.offset;
         parsed.encoding_len = encoding.len;

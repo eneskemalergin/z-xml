@@ -4450,8 +4450,8 @@ const FuzzOutcome = struct {
     text_bytes: usize = 0,
 };
 
-fn arbitraryOutcome(input: []const u8, seed: ?u64) !FuzzOutcome {
-    var options: xml.Options(FAST_CONFIG) = .{};
+fn arbitraryOutcome(comptime config: xml.Config, input: []const u8, seed: ?u64) !FuzzOutcome {
+    var options: xml.Options(config) = .{};
     options.limits.max_depth = 16;
     options.limits.max_open_name_bytes = 256;
     options.limits.max_partial_token_bytes = 256;
@@ -4464,7 +4464,7 @@ fn arbitraryOutcome(input: []const u8, seed: ?u64) !FuzzOutcome {
     options.limits.max_processing_instruction_target_bytes = 64;
     options.limits.max_retained_bytes = 512;
 
-    const Reader = xml.Reader(FAST_CONFIG);
+    const Reader = xml.Reader(config);
     var reader = try Reader.init(std.testing.allocator, options);
     defer reader.deinit();
     var outcome: FuzzOutcome = .{ .disposition = .accept };
@@ -4529,8 +4529,13 @@ fn fuzzArbitraryBytes(_: void, smith: *std.testing.Smith) !void {
     @disableInstrumentation();
     var storage: [512]u8 = undefined;
     const input = storage[0..smith.slice(&storage)];
-    const whole = try arbitraryOutcome(input, null);
-    try std.testing.expectEqual(whole, try arbitraryOutcome(input, 0x7a786d6c));
+    inline for (.{ FAST_CONFIG, GENERAL_FAST_CONFIG }) |config| {
+        const whole = try arbitraryOutcome(config, input, null);
+        try std.testing.expectEqual(
+            whole,
+            try arbitraryOutcome(config, input, 0x7a786d6c),
+        );
+    }
 }
 
 test "[fuzz] - [arbitrary bytes]: parsing is bounded and schedule invariant" {
@@ -4542,6 +4547,10 @@ test "[fuzz] - [arbitrary bytes]: parsing is bounded and schedule invariant" {
             "<!DOCTYPE root><root/>",
             "\xef\xbb\xbf<root>\xf0\x9f\x99\x82</root>",
             "<root>\xc0\x80</root>",
+            fixtures.utf16le_bom,
+            fixtures.utf16le_odd_byte,
+            fixtures.utf16le_unpaired_high,
+            fixtures.utf16be_unpaired_low,
         },
     });
 }
@@ -4553,11 +4562,31 @@ test "[property] - [arbitrary bytes]: deterministic campaign is bounded and sche
     for (0..10_000) |iteration| {
         const len = random.intRangeAtMost(usize, 0, storage.len);
         random.bytes(storage[0..len]);
-        const whole = try arbitraryOutcome(storage[0..len], null);
-        try std.testing.expectEqual(
-            whole,
-            try arbitraryOutcome(storage[0..len], iteration + 1),
-        );
+        inline for (.{ FAST_CONFIG, GENERAL_FAST_CONFIG }) |config| {
+            const whole = try arbitraryOutcome(config, storage[0..len], null);
+            try std.testing.expectEqual(
+                whole,
+                try arbitraryOutcome(config, storage[0..len], iteration + 1),
+            );
+        }
+    }
+}
+
+test "[regression] - [source refill]: malformed UTF-8 offset survives refill" {
+    inline for (.{ FAST_CONFIG, GENERAL_FAST_CONFIG }) |config| {
+        const Reader = xml.Reader(config);
+        var reader = try Reader.init(std.testing.allocator, .{});
+        defer reader.deinit();
+        try reader.feed("<?\xe9\xa5", false);
+        while (true) switch (try reader.next()) {
+            .event => {},
+            .need_input => break,
+            .done => return error.UnexpectedDone,
+        };
+        try reader.feed("p", true);
+        try std.testing.expectError(error.InvalidXml, reader.next());
+        try std.testing.expectEqual(xml.DiagnosticCode.malformed_utf8, reader.diagnostic().?.code);
+        try std.testing.expectEqual(@as(u64, 4), reader.diagnostic().?.primary.byte_offset);
     }
 }
 

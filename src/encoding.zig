@@ -74,6 +74,7 @@ fn testLatin1(
         output[1] = 0xa9;
         return .{ .progress = .{ .consumed = 1, .produced = 2 } };
     }
+    if (output.len == 0) return .need_output;
     output[0] = input[0];
     return .{ .progress = .{ .consumed = 1, .produced = 1 } };
 }
@@ -101,6 +102,8 @@ test "transcoder bridge accepts bounded UTF-8 progress and rejects invalid count
 
     const short = try transcoder.run("\xe9", false, output[0..1]);
     try std.testing.expect(short == .need_output);
+    const empty = try transcoder.run("x", false, output[0..0]);
+    try std.testing.expect(empty == .need_output);
 
     const invalid: Transcoder = .{ .context = null, .runFn = testInvalid };
     try std.testing.expectError(error.InvalidResult, invalid.run("x", true, &output));
