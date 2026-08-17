@@ -1,3 +1,5 @@
+//! Builds the z-xml library, public tests, and layout probe.
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -81,6 +83,131 @@ pub fn build(b: *std.Build) void {
         []const u8,
         "truncated_attribute",
         @embedFile("fixture/invalid/not_well_formed/truncated_attribute.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "mixed_content",
+        @embedFile("fixture/valid/core/mixed_content.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "predefined_entities",
+        @embedFile("fixture/valid/core/predefined_entities.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "numeric_references",
+        @embedFile("fixture/valid/core/numeric_references.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "unicode_text",
+        @embedFile("fixture/valid/core/unicode_text.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "unicode_names",
+        @embedFile("fixture/valid/core/unicode_names.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "name_characters",
+        @embedFile("fixture/valid/core/name_characters.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf8_bom",
+        @embedFile("fixture/valid/encoding/utf8-bom.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf8_boundaries",
+        @embedFile("fixture/valid/encoding/utf8-codepoint-boundaries.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "cr_line_endings",
+        @embedFile("fixture/valid/encoding/cr-line-endings.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "crlf_line_endings",
+        @embedFile("fixture/valid/encoding/crlf-line-endings.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "malformed_character_reference",
+        @embedFile("fixture/invalid/not_well_formed/malformed_character_reference.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "zero_character_reference",
+        @embedFile("fixture/invalid/not_well_formed/zero_character_reference.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "surrogate_character_reference",
+        @embedFile("fixture/invalid/not_well_formed/surrogate_character_reference.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "out_of_range_character_reference",
+        @embedFile("fixture/invalid/not_well_formed/out_of_range_character_reference.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "undefined_entity",
+        @embedFile("fixture/invalid/not_well_formed/undefined_entity.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "truncated_entity",
+        @embedFile("fixture/invalid/not_well_formed/truncated_entity.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "cdata_close_in_text",
+        @embedFile("fixture/invalid/not_well_formed/cdata_close_in_text.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf8_lone_continuation",
+        @embedFile("fixture/invalid/encoding/utf8-lone-continuation.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf8_overlong",
+        @embedFile("fixture/invalid/encoding/utf8-overlong.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf8_truncated",
+        @embedFile("fixture/invalid/encoding/utf8-truncated.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf8_surrogate",
+        @embedFile("fixture/invalid/encoding/utf8-surrogate.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf8_out_of_range",
+        @embedFile("fixture/invalid/encoding/utf8-out-of-range.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "utf8_invalid_byte",
+        @embedFile("fixture/invalid/encoding/utf8-invalid-byte.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "literal_null",
+        @embedFile("fixture/invalid/encoding/literal-null.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "literal_control",
+        @embedFile("fixture/invalid/encoding/literal-control.xml"),
     );
     public_tests_module.addOptions("reader_fixtures", reader_fixtures);
 

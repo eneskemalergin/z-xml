@@ -155,6 +155,32 @@ def generate_repeated(
     end_document(output, stats)
 
 
+def generate_sequence(
+    output: Output,
+    stats: Stats | None,
+    target_bytes: int,
+    records: tuple[tuple[bytes, Callable[[Stats], None]], ...],
+) -> None:
+    """Cycle through varied valid records without retaining the document."""
+    begin_document(output, stats)
+    remaining = target_bytes - DOCUMENT_OVERHEAD
+    index = 0
+    while remaining:
+        raw_record, event = records[index % len(records)]
+        if len(raw_record) > remaining:
+            filler = b"x" * remaining
+            output.write(filler)
+            if stats is not None:
+                stats.text(filler)
+            break
+        output.write(raw_record)
+        if stats is not None:
+            event(stats)
+        remaining -= len(raw_record)
+        index += 1
+    end_document(output, stats)
+
+
 def empty_event(stats: Stats) -> None:
     stats.start(b"n")
     stats.end(b"n")
@@ -196,11 +222,80 @@ def unicode_event(stats: Stats) -> None:
     stats.text("a\u00e9\u03bb\U0001f642".encode())
 
 
+def record_short_event(stats: Stats) -> None:
+    stats.start(b"entry", ((b"id", b"a"), (b"kind", b"short")))
+    stats.text(b"alpha")
+    stats.end(b"entry")
+
+
+def record_mixed_event(stats: Stats) -> None:
+    stats.start(b"entry", ((b"id", b"medium-id"), (b"kind", b"mixed")))
+    stats.start(b"title")
+    stats.text("Title & \u03bb".encode())
+    stats.end(b"title")
+    stats.start(b"meta", ((b"key", b"one"), (b"value", b"1")))
+    stats.end(b"meta")
+    stats.start(b"meta", ((b"key", b"two"), (b"value", b"2")))
+    stats.end(b"meta")
+    stats.text(b"tail <raw>")
+    stats.end(b"entry")
+
+
+def record_unicode_event(stats: Stats) -> None:
+    stats.start(b"entry", ((b"id", b"longer-id-0003"), (b"kind", b"unicode")))
+    stats.text("\u00e9 \u03bb \U0001f642".encode())
+    stats.end(b"entry")
+
+
+RECORDS = (
+    (b'<entry id="a" kind="short">alpha</entry>', record_short_event),
+    (
+        b"<entry id='medium-id' kind='mixed'><title>Title &amp; &#x3bb;</title>"
+        b'<meta key="one" value="1"/><meta key=\'two\' value=\'2\'/>'
+        b"<![CDATA[tail <raw>]]></entry>",
+        record_mixed_event,
+    ),
+    (
+        '<entry id="longer-id-0003" kind="unicode">\u00e9 \u03bb \U0001f642</entry>'.encode(),
+        record_unicode_event,
+    ),
+)
+
+
+def varied_attribute_record(count: int, quote: bytes) -> bytes:
+    attributes = []
+    for index in range(count):
+        name = f"a{index:02d}".encode()
+        value = f"value-{index:02d}".encode()
+        attributes.append(name + b"=" + quote + value + quote)
+    return b"<item " + b" ".join(attributes) + b"/>"
+
+
+def varied_attribute_event(count: int, stats: Stats) -> None:
+    attributes = tuple(
+        (f"a{index:02d}".encode(), f"value-{index:02d}".encode())
+        for index in range(count)
+    )
+    stats.start(b"item", attributes)
+    stats.end(b"item")
+
+
+VARIED_ATTRIBUTES = tuple(
+    (
+        varied_attribute_record(count, b'"' if index % 2 == 0 else b"'"),
+        lambda stats, selected=count: varied_attribute_event(selected, stats),
+    )
+    for index, count in enumerate((1, 4, 8, 16, 24))
+)
+
+
 SHAPES: dict[str, tuple[bytes, Callable[[Stats], None]] | None] = {
     "text": None,
     "markup": (b"<n/>", empty_event),
     "wide": (b'<item id="0000000000">x</item>', wide_event),
     "attributes": (ATTRIBUTE_RECORD, attribute_event),
+    "records": None,
+    "attributes-varied": None,
     "mixed": (
         b'a<item id="0000000000"><![CDATA[x<y>]]></item><!--c--><?p v?>',
         mixed_event,
@@ -214,6 +309,8 @@ SHAPE_FEATURES = {
     "markup": "document,element_matching",
     "wide": "document,attributes,element_matching",
     "attributes": "document,attributes",
+    "records": "document,attributes,element_matching,cdata,predefined_entities,numeric_references,utf8",
+    "attributes-varied": "document,attributes",
     "mixed": "document,attributes,element_matching,cdata,comments,pi",
     "escaped": "document,predefined_entities,numeric_references",
     "unicode": "document,utf8",
@@ -223,6 +320,12 @@ SHAPE_FEATURES = {
 def generate_shape(
     output: Output, stats: Stats | None, shape: str, target_bytes: int
 ) -> None:
+    if shape == "records":
+        generate_sequence(output, stats, target_bytes, RECORDS)
+        return
+    if shape == "attributes-varied":
+        generate_sequence(output, stats, target_bytes, VARIED_ATTRIBUTES)
+        return
     definition = SHAPES[shape]
     if definition is None:
         generate_text(output, stats, target_bytes)

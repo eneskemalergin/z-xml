@@ -178,7 +178,7 @@ pub const Limits = struct {
     max_attribute_bytes_per_element: usize = 1024 * 1024,
     /// Maximum source bytes accepted in one complete start tag.
     max_start_tag_bytes: usize = 1024 * 1024,
-    /// Maximum bytes exposed by one future fragmented event.
+    /// Maximum bytes exposed by one fragmented semantic event.
     max_fragment_bytes: usize = 64 * 1024,
     /// Maximum owned capacity retained across a retain reset.
     max_retained_bytes: usize = 1024 * 1024,
@@ -251,6 +251,13 @@ pub const DiagnosticCode = enum {
     attribute_value_limit,
     attribute_bytes_limit,
     start_tag_limit,
+    fragment_limit,
+    malformed_utf8,
+    forbidden_character,
+    malformed_reference,
+    invalid_character_reference,
+    undeclared_entity,
+    cdata_close_in_text,
     read_failed,
 };
 
@@ -495,10 +502,12 @@ fn PositionState(comptime config: Config) type {
 }
 
 const VerticalState = enum {
+    detect_bom,
     emit_document_start,
     before_root,
     before_root_markup,
     content,
+    content_after_carriage_return,
     content_markup,
     after_root,
     after_root_markup,
@@ -508,6 +517,7 @@ const VerticalState = enum {
     attribute_after_name,
     attribute_before_value,
     attribute_value,
+    attribute_after_carriage_return,
     start_after_attribute,
     empty_slash,
     emit_start_element,
@@ -519,8 +529,41 @@ const VerticalState = enum {
     end_name,
     end_after_space,
     release_closed_element,
+    reference_start,
+    reference_numeric_prefix,
+    reference_numeric,
+    reference_entity,
+    emit_text,
+    release_text,
     emit_document_end,
     complete,
+};
+
+const ReferenceContext = enum {
+    content,
+    attribute,
+};
+
+const ReferenceKind = enum {
+    decimal,
+    hexadecimal,
+};
+
+const ScalarSource = enum {
+    ordinary,
+    start_tag,
+    reference,
+};
+
+const DecodedScalar = struct {
+    codepoint: u21,
+    len: u3,
+};
+
+const Utf8Probe = union(enum) {
+    scalar: DecodedScalar,
+    incomplete,
+    invalid: usize,
 };
 
 fn OpenElementFrame(comptime config: Config) type {
@@ -567,7 +610,7 @@ pub fn Reader(comptime config: Config) type {
         source_byte_offset: u64 = 0,
         position: PositionState(config) = .{},
         first_diagnostic: ?Diagnostic(config) = null,
-        vertical_state: VerticalState = .emit_document_start,
+        vertical_state: VerticalState = .detect_bom,
         failure: ?Failure = null,
         open_elements: std.ArrayList(OpenElementFrame(config)) = .empty,
         open_names: std.ArrayList(u8) = .empty,
@@ -578,6 +621,22 @@ pub fn Reader(comptime config: Config) type {
         token_name_len: usize = 0,
         end_mismatch_index: usize = no_end_mismatch,
         attribute_quote: u8 = 0,
+        utf8_bytes: [4]u8 = @splat(0),
+        utf8_len: u3 = 0,
+        utf8_expected_len: u3 = 0,
+        utf8_start: Location(config) = .{},
+        text_inline: [4]u8 = @splat(0),
+        text_fragment: []const u8 = &.{},
+        text_start: Location(config) = .{},
+        text_close_brackets: u2 = 0,
+        reference_context: ReferenceContext = .content,
+        reference_kind: ReferenceKind = .decimal,
+        reference_start: Location(config) = .{},
+        reference_value: u32 = 0,
+        reference_has_digits: bool = false,
+        reference_token_bytes: usize = 0,
+        reference_name: [5]u8 = @splat(0),
+        reference_name_len: usize = 0,
 
         /// Initializes a reader without allocating.
         pub fn init(allocator: std.mem.Allocator, options: Options(config)) InitError!Self {
@@ -621,12 +680,28 @@ pub fn Reader(comptime config: Config) type {
             self.source_byte_offset = 0;
             self.position = .{};
             self.first_diagnostic = null;
-            self.vertical_state = .emit_document_start;
+            self.vertical_state = .detect_bom;
             self.failure = null;
             self.token_start = .{};
             self.token_name_len = 0;
             self.end_mismatch_index = no_end_mismatch;
             self.attribute_quote = 0;
+            self.utf8_bytes = @splat(0);
+            self.utf8_len = 0;
+            self.utf8_expected_len = 0;
+            self.utf8_start = .{};
+            self.text_inline = @splat(0);
+            self.text_fragment = &.{};
+            self.text_start = .{};
+            self.text_close_brackets = 0;
+            self.reference_context = .content;
+            self.reference_kind = .decimal;
+            self.reference_start = .{};
+            self.reference_value = 0;
+            self.reference_has_digits = false;
+            self.reference_token_bytes = 0;
+            self.reference_name = @splat(0);
+            self.reference_name_len = 0;
         }
 
         /// Installs one caller-owned input chunk.
@@ -659,6 +734,45 @@ pub fn Reader(comptime config: Config) type {
 
             while (true) {
                 switch (self.vertical_state) {
+                    .detect_bom => {
+                        if (self.utf8_len != 0) {
+                            const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
+                                return self.needInput();
+                            const start = self.utf8_start;
+                            if (!isXml10Char(scalar.codepoint)) {
+                                return self.failAt(.forbidden_character, .invalid_xml, start);
+                            }
+                            self.clearUtf8Scalar();
+                            if (scalar.codepoint == 0xfeff) {
+                                self.vertical_state = .emit_document_start;
+                                continue;
+                            }
+                            return self.failAt(.unexpected_document_text, .invalid_xml, start);
+                        }
+                        if (self.cursor == self.input.len) {
+                            if (self.final_input) {
+                                self.vertical_state = .emit_document_start;
+                                continue;
+                            }
+                            return self.needInput();
+                        }
+                        if (self.utf8_len == 0 and self.input[self.cursor] < 0x80) {
+                            self.vertical_state = .emit_document_start;
+                            continue;
+                        }
+                        const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
+                            return self.needInput();
+                        const start = self.utf8_start;
+                        if (!isXml10Char(scalar.codepoint)) {
+                            return self.failAt(.forbidden_character, .invalid_xml, start);
+                        }
+                        self.clearUtf8Scalar();
+                        if (scalar.codepoint == 0xfeff) {
+                            self.vertical_state = .emit_document_start;
+                            continue;
+                        }
+                        return self.failAt(.unexpected_document_text, .invalid_xml, start);
+                    },
                     .emit_document_start => {
                         self.vertical_state = .before_root;
                         const location = self.currentLocation();
@@ -669,6 +783,19 @@ pub fn Reader(comptime config: Config) type {
                         );
                     },
                     .before_root => {
+                        if (self.utf8_len != 0) {
+                            const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
+                                return self.needInput();
+                            const start = self.utf8_start;
+                            if (!isXml10Char(scalar.codepoint)) {
+                                return self.failAt(.forbidden_character, .invalid_xml, start);
+                            }
+                            return self.failAt(
+                                .unexpected_document_text,
+                                .invalid_xml,
+                                start,
+                            );
+                        }
                         self.consumeWhitespaceRun();
                         if (self.cursor == self.input.len) {
                             if (self.final_input) {
@@ -677,6 +804,27 @@ pub fn Reader(comptime config: Config) type {
                             return self.needInput();
                         }
                         if (self.input[self.cursor] != '<') {
+                            const byte = self.input[self.cursor];
+                            if (byte >= 0x80) {
+                                const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
+                                    return self.needInput();
+                                const start = self.utf8_start;
+                                if (!isXml10Char(scalar.codepoint)) {
+                                    return self.failAt(
+                                        .forbidden_character,
+                                        .invalid_xml,
+                                        start,
+                                    );
+                                }
+                                return self.failAt(
+                                    .unexpected_document_text,
+                                    .invalid_xml,
+                                    start,
+                                );
+                            }
+                            if (!isXml10Char(byte)) {
+                                return self.fail(.forbidden_character, .invalid_xml);
+                            }
                             return self.fail(.unexpected_document_text, .invalid_xml);
                         }
                         self.token_start = self.currentLocation();
@@ -697,12 +845,33 @@ pub fn Reader(comptime config: Config) type {
                         if (byte == '/') {
                             return self.fail(.unexpected_end_tag, .invalid_xml);
                         }
+                        if (byte >= 0x80 or isAsciiNameStart(byte)) {
+                            try self.beginStartElement();
+                            continue;
+                        }
+                        if (!isXml10Char(byte)) {
+                            return self.fail(.forbidden_character, .invalid_xml);
+                        }
                         if (!isAsciiNameStart(byte)) {
                             return self.fail(.malformed_start_tag, .invalid_xml);
                         }
-                        try self.beginStartElement();
                     },
                     .content => {
+                        if (self.utf8_len != 0) {
+                            const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
+                                return self.needInput();
+                            const start = self.utf8_start;
+                            if (!isXml10Char(scalar.codepoint)) {
+                                return self.failAt(.forbidden_character, .invalid_xml, start);
+                            }
+                            self.text_close_brackets = 0;
+                            try self.prepareInlineText(
+                                self.utf8_bytes[0..scalar.len],
+                                start,
+                            );
+                            self.clearUtf8Scalar();
+                            continue;
+                        }
                         if (self.cursor == self.input.len) {
                             if (self.final_input) {
                                 const frame = self.topFrame();
@@ -715,12 +884,51 @@ pub fn Reader(comptime config: Config) type {
                             }
                             return self.needInput();
                         }
-                        if (self.input[self.cursor] != '<') {
-                            return self.fail(.unsupported_stage, .unsupported_feature);
+                        const byte = self.input[self.cursor];
+                        if (byte == '<') {
+                            self.text_close_brackets = 0;
+                            self.token_start = self.currentLocation();
+                            self.consumeByte('<');
+                            self.vertical_state = .content_markup;
+                            continue;
                         }
-                        self.token_start = self.currentLocation();
-                        self.consumeByte('<');
-                        self.vertical_state = .content_markup;
+                        if (byte == '&') {
+                            self.text_close_brackets = 0;
+                            try self.beginReference(.content);
+                            continue;
+                        }
+                        if (byte == '\r') {
+                            self.text_close_brackets = 0;
+                            self.text_start = self.currentLocation();
+                            self.consumeByte(byte);
+                            self.vertical_state = .content_after_carriage_return;
+                            continue;
+                        }
+                        if (try self.prepareContentRun()) continue;
+                        const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
+                            return self.needInput();
+                        const start = self.utf8_start;
+                        if (!isXml10Char(scalar.codepoint)) {
+                            return self.failAt(.forbidden_character, .invalid_xml, start);
+                        }
+                        self.text_close_brackets = 0;
+                        try self.prepareInlineText(
+                            self.utf8_bytes[0..scalar.len],
+                            start,
+                        );
+                        self.clearUtf8Scalar();
+                    },
+                    .content_after_carriage_return => {
+                        if (self.cursor == self.input.len and !self.final_input) {
+                            return self.needInput();
+                        }
+                        if (self.cursor < self.input.len and self.input[self.cursor] == '\n') {
+                            self.consumeByte('\n');
+                        }
+                        try self.prepareInlineText(
+                            "\n",
+                            self.text_start,
+                        );
                     },
                     .content_markup => {
                         if (self.cursor == self.input.len) {
@@ -738,12 +946,27 @@ pub fn Reader(comptime config: Config) type {
                         if (byte == '!' or byte == '?') {
                             return self.fail(.unsupported_stage, .unsupported_feature);
                         }
+                        if (byte >= 0x80 or isAsciiNameStart(byte)) {
+                            try self.beginStartElement();
+                            continue;
+                        }
+                        if (!isXml10Char(byte)) {
+                            return self.fail(.forbidden_character, .invalid_xml);
+                        }
                         if (!isAsciiNameStart(byte)) {
                             return self.fail(.malformed_start_tag, .invalid_xml);
                         }
-                        try self.beginStartElement();
                     },
                     .after_root => {
+                        if (self.utf8_len != 0) {
+                            const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
+                                return self.needInput();
+                            const start = self.utf8_start;
+                            if (!isXml10Char(scalar.codepoint)) {
+                                return self.failAt(.forbidden_character, .invalid_xml, start);
+                            }
+                            return self.failAt(.trailing_content, .invalid_xml, start);
+                        }
                         self.consumeWhitespaceRun();
                         if (self.cursor == self.input.len) {
                             if (self.final_input) {
@@ -753,6 +976,23 @@ pub fn Reader(comptime config: Config) type {
                             return self.needInput();
                         }
                         if (self.input[self.cursor] != '<') {
+                            const byte = self.input[self.cursor];
+                            if (byte >= 0x80) {
+                                const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
+                                    return self.needInput();
+                                const start = self.utf8_start;
+                                if (!isXml10Char(scalar.codepoint)) {
+                                    return self.failAt(
+                                        .forbidden_character,
+                                        .invalid_xml,
+                                        start,
+                                    );
+                                }
+                                return self.failAt(.trailing_content, .invalid_xml, start);
+                            }
+                            if (!isXml10Char(byte)) {
+                                return self.fail(.forbidden_character, .invalid_xml);
+                            }
                             return self.fail(.trailing_content, .invalid_xml);
                         }
                         self.token_start = self.currentLocation();
@@ -760,6 +1000,22 @@ pub fn Reader(comptime config: Config) type {
                         self.vertical_state = .after_root_markup;
                     },
                     .after_root_markup => {
+                        if (self.utf8_len != 0) {
+                            const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
+                                return self.needInput();
+                            const start = self.utf8_start;
+                            if (!isXml10Char(scalar.codepoint)) {
+                                return self.failAt(.forbidden_character, .invalid_xml, start);
+                            }
+                            if (isXml10NameStart(scalar.codepoint)) {
+                                return self.failAt(
+                                    .multiple_document_elements,
+                                    .invalid_xml,
+                                    self.token_start,
+                                );
+                            }
+                            return self.failAt(.trailing_content, .invalid_xml, start);
+                        }
                         if (self.cursor == self.input.len) {
                             if (self.final_input) {
                                 return self.fail(.incomplete_input, .invalid_xml);
@@ -773,6 +1029,22 @@ pub fn Reader(comptime config: Config) type {
                         if (byte == '!' or byte == '?') {
                             return self.fail(.unsupported_stage, .unsupported_feature);
                         }
+                        if (byte >= 0x80) {
+                            const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
+                                return self.needInput();
+                            const start = self.utf8_start;
+                            if (!isXml10Char(scalar.codepoint)) {
+                                return self.failAt(.forbidden_character, .invalid_xml, start);
+                            }
+                            if (isXml10NameStart(scalar.codepoint)) {
+                                return self.failAt(
+                                    .multiple_document_elements,
+                                    .invalid_xml,
+                                    self.token_start,
+                                );
+                            }
+                            return self.failAt(.trailing_content, .invalid_xml, start);
+                        }
                         if (isAsciiNameStart(byte)) {
                             return self.failAt(
                                 .multiple_document_elements,
@@ -780,15 +1052,50 @@ pub fn Reader(comptime config: Config) type {
                                 self.token_start,
                             );
                         }
+                        if (!isXml10Char(byte)) {
+                            return self.fail(.forbidden_character, .invalid_xml);
+                        }
                         return self.fail(.trailing_content, .invalid_xml);
                     },
                     .start_name => {
                         const run_start = self.cursor;
                         var run_end = run_start;
-                        while (run_end < self.input.len and isAsciiNameChar(self.input[run_end])) {
+                        while (self.utf8_len == 0 and run_end < self.input.len and
+                            isAsciiNameChar(self.input[run_end]))
+                        {
                             run_end += 1;
                         }
                         try self.appendStartNameRun(self.input[run_start..run_end]);
+
+                        if (self.utf8_len != 0 or
+                            (self.cursor < self.input.len and self.input[self.cursor] >= 0x80))
+                        {
+                            try self.ensureStartNameScalarCapacity();
+                            const scalar = (try self.readUtf8Scalar(.start_tag)) orelse
+                                return self.needInput();
+                            const scalar_start = self.utf8_start;
+                            if (!isXml10Char(scalar.codepoint)) {
+                                return self.failAt(
+                                    .forbidden_character,
+                                    .invalid_xml,
+                                    scalar_start,
+                                );
+                            }
+                            const valid = if (self.token_name_len == 0)
+                                isXml10NameStart(scalar.codepoint)
+                            else
+                                isXml10NameChar(scalar.codepoint);
+                            if (!valid) {
+                                return self.failAt(
+                                    .malformed_start_tag,
+                                    .invalid_xml,
+                                    scalar_start,
+                                );
+                            }
+                            try self.appendDecodedStartName(scalar.len);
+                            self.clearUtf8Scalar();
+                            continue;
+                        }
 
                         if (self.cursor < self.input.len) {
                             try self.requireStartTagByte();
@@ -806,6 +1113,9 @@ pub fn Reader(comptime config: Config) type {
                             if (isXmlWhitespace(byte)) {
                                 self.vertical_state = .start_after_space;
                                 continue;
+                            }
+                            if (!isXml10Char(byte)) {
+                                return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.malformed_start_tag, .invalid_xml);
                         }
@@ -834,22 +1144,57 @@ pub fn Reader(comptime config: Config) type {
                             self.vertical_state = .empty_slash;
                             continue;
                         }
-                        if (isAsciiNameStart(byte)) {
+                        if (byte >= 0x80 or isAsciiNameStart(byte)) {
                             try self.beginAttribute();
                             continue;
                         }
-                        if (byte >= 0x80) {
-                            return self.fail(.unsupported_stage, .unsupported_feature);
+                        if (!isXml10Char(byte)) {
+                            return self.fail(.forbidden_character, .invalid_xml);
                         }
                         return self.fail(.malformed_attribute, .invalid_xml);
                     },
                     .attribute_name => {
                         const run_start = self.cursor;
                         var run_end = run_start;
-                        while (run_end < self.input.len and isAsciiNameChar(self.input[run_end])) {
+                        while (self.utf8_len == 0 and run_end < self.input.len and
+                            isAsciiNameChar(self.input[run_end]))
+                        {
                             run_end += 1;
                         }
                         try self.appendAttributeNameRun(self.input[run_start..run_end]);
+
+                        if (self.utf8_len != 0 or
+                            (self.cursor < self.input.len and self.input[self.cursor] >= 0x80))
+                        {
+                            try self.ensureAttributeNameScalarCapacity();
+                            const scalar = (try self.readUtf8Scalar(.start_tag)) orelse
+                                return self.needInput();
+                            const scalar_start = self.utf8_start;
+                            if (!isXml10Char(scalar.codepoint)) {
+                                return self.failAt(
+                                    .forbidden_character,
+                                    .invalid_xml,
+                                    scalar_start,
+                                );
+                            }
+                            const record = self.attribute_records.items[
+                                self.attribute_records.items.len - 1
+                            ];
+                            const valid = if (record.name_len == 0)
+                                isXml10NameStart(scalar.codepoint)
+                            else
+                                isXml10NameChar(scalar.codepoint);
+                            if (!valid) {
+                                return self.failAt(
+                                    .malformed_attribute,
+                                    .invalid_xml,
+                                    scalar_start,
+                                );
+                            }
+                            try self.appendDecodedAttributeName(scalar.len);
+                            self.clearUtf8Scalar();
+                            continue;
+                        }
 
                         if (self.cursor < self.input.len) {
                             try self.requireStartTagByte();
@@ -863,8 +1208,8 @@ pub fn Reader(comptime config: Config) type {
                                 self.vertical_state = .attribute_after_name;
                                 continue;
                             }
-                            if (byte >= 0x80) {
-                                return self.fail(.unsupported_stage, .unsupported_feature);
+                            if (!isXml10Char(byte)) {
+                                return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.malformed_attribute, .invalid_xml);
                         }
@@ -875,6 +1220,13 @@ pub fn Reader(comptime config: Config) type {
                     },
                     .attribute_after_name => {
                         try self.consumeStartTagWhitespaceRun();
+                        if (self.utf8_len != 0 or
+                            (self.cursor < self.input.len and self.input[self.cursor] >= 0x80))
+                        {
+                            if (try self.rejectStartTagNonAsciiMarkup(.malformed_attribute)) {
+                                return self.needInput();
+                            }
+                        }
                         if (self.cursor == self.input.len) {
                             if (self.final_input) {
                                 return self.fail(.incomplete_input, .invalid_xml);
@@ -883,6 +1235,9 @@ pub fn Reader(comptime config: Config) type {
                         }
                         try self.requireStartTagByte();
                         if (self.input[self.cursor] != '=') {
+                            if (!isXml10Char(self.input[self.cursor])) {
+                                return self.fail(.forbidden_character, .invalid_xml);
+                            }
                             return self.fail(.malformed_attribute, .invalid_xml);
                         }
                         self.consumeStartTagByte('=');
@@ -890,6 +1245,13 @@ pub fn Reader(comptime config: Config) type {
                     },
                     .attribute_before_value => {
                         try self.consumeStartTagWhitespaceRun();
+                        if (self.utf8_len != 0 or
+                            (self.cursor < self.input.len and self.input[self.cursor] >= 0x80))
+                        {
+                            if (try self.rejectStartTagNonAsciiMarkup(.malformed_attribute)) {
+                                return self.needInput();
+                            }
+                        }
                         if (self.cursor == self.input.len) {
                             if (self.final_input) {
                                 return self.fail(.incomplete_input, .invalid_xml);
@@ -899,6 +1261,9 @@ pub fn Reader(comptime config: Config) type {
                         try self.requireStartTagByte();
                         const byte = self.input[self.cursor];
                         if (byte != '\'' and byte != '"') {
+                            if (!isXml10Char(byte)) {
+                                return self.fail(.forbidden_character, .invalid_xml);
+                            }
                             return self.fail(.malformed_attribute, .invalid_xml);
                         }
                         self.attribute_quote = byte;
@@ -906,10 +1271,21 @@ pub fn Reader(comptime config: Config) type {
                         self.vertical_state = .attribute_value;
                     },
                     .attribute_value => {
+                        if (self.utf8_len != 0) {
+                            const scalar = (try self.readUtf8Scalar(.start_tag)) orelse
+                                return self.needInput();
+                            const start = self.utf8_start;
+                            if (!isXml10Char(scalar.codepoint)) {
+                                return self.failAt(.forbidden_character, .invalid_xml, start);
+                            }
+                            try self.appendAttributeOutput(self.utf8_bytes[0..scalar.len]);
+                            self.clearUtf8Scalar();
+                            continue;
+                        }
                         const run_start = self.cursor;
                         var run_end = run_start;
                         while (run_end < self.input.len and
-                            isStage4AttributeValueByte(self.input[run_end], self.attribute_quote))
+                            isOrdinaryAttributeValueByte(self.input[run_end], self.attribute_quote))
                         {
                             run_end += 1;
                         }
@@ -927,14 +1303,67 @@ pub fn Reader(comptime config: Config) type {
                             if (byte == '<') {
                                 return self.fail(.attribute_less_than, .invalid_xml);
                             }
-                            return self.fail(.unsupported_stage, .unsupported_feature);
+                            if (byte == '&') {
+                                try self.beginReference(.attribute);
+                                continue;
+                            }
+                            if (byte == '\r') {
+                                self.consumeStartTagByte(byte);
+                                self.vertical_state = .attribute_after_carriage_return;
+                                continue;
+                            }
+                            if (byte == '\n' or byte == '\t') {
+                                self.consumeStartTagByte(byte);
+                                try self.appendAttributeOutput(" ");
+                                continue;
+                            }
+                            if (byte >= 0x80) {
+                                try self.ensureAttributeValueScalarCapacity();
+                                const scalar = (try self.readUtf8Scalar(.start_tag)) orelse
+                                    return self.needInput();
+                                const start = self.utf8_start;
+                                if (!isXml10Char(scalar.codepoint)) {
+                                    return self.failAt(
+                                        .forbidden_character,
+                                        .invalid_xml,
+                                        start,
+                                    );
+                                }
+                                try self.appendAttributeOutput(
+                                    self.utf8_bytes[0..scalar.len],
+                                );
+                                self.clearUtf8Scalar();
+                                continue;
+                            }
+                            if (!isXml10Char(byte)) {
+                                return self.fail(.forbidden_character, .invalid_xml);
+                            }
+                            return self.fail(.malformed_attribute, .invalid_xml);
                         }
                         if (self.final_input) {
                             return self.fail(.incomplete_input, .invalid_xml);
                         }
                         return self.needInput();
                     },
+                    .attribute_after_carriage_return => {
+                        if (self.cursor == self.input.len and !self.final_input) {
+                            return self.needInput();
+                        }
+                        if (self.cursor < self.input.len and self.input[self.cursor] == '\n') {
+                            try self.requireStartTagByte();
+                            self.consumeStartTagByte('\n');
+                        }
+                        try self.appendAttributeOutput(" ");
+                        self.vertical_state = .attribute_value;
+                    },
                     .start_after_attribute => {
+                        if (self.utf8_len != 0 or
+                            (self.cursor < self.input.len and self.input[self.cursor] >= 0x80))
+                        {
+                            if (try self.rejectStartTagNonAsciiMarkup(.malformed_attribute)) {
+                                return self.needInput();
+                            }
+                        }
                         if (self.cursor == self.input.len) {
                             if (self.final_input) {
                                 return self.fail(.incomplete_input, .invalid_xml);
@@ -957,9 +1386,19 @@ pub fn Reader(comptime config: Config) type {
                             self.vertical_state = .start_after_space;
                             continue;
                         }
+                        if (!isXml10Char(byte)) {
+                            return self.fail(.forbidden_character, .invalid_xml);
+                        }
                         return self.fail(.malformed_attribute, .invalid_xml);
                     },
                     .empty_slash => {
+                        if (self.utf8_len != 0 or
+                            (self.cursor < self.input.len and self.input[self.cursor] >= 0x80))
+                        {
+                            if (try self.rejectStartTagNonAsciiMarkup(.malformed_start_tag)) {
+                                return self.needInput();
+                            }
+                        }
                         if (self.cursor == self.input.len) {
                             if (self.final_input) {
                                 return self.fail(.incomplete_input, .invalid_xml);
@@ -968,6 +1407,9 @@ pub fn Reader(comptime config: Config) type {
                         }
                         try self.requireStartTagByte();
                         if (self.input[self.cursor] != '>') {
+                            if (!isXml10Char(self.input[self.cursor])) {
+                                return self.fail(.forbidden_character, .invalid_xml);
+                            }
                             return self.fail(.malformed_start_tag, .invalid_xml);
                         }
                         self.consumeStartTagByte('>');
@@ -1020,7 +1462,11 @@ pub fn Reader(comptime config: Config) type {
                             }
                             return self.needInput();
                         }
-                        if (!isAsciiNameStart(self.input[self.cursor])) {
+                        const byte = self.input[self.cursor];
+                        if (byte < 0x80 and !isAsciiNameStart(byte)) {
+                            if (!isXml10Char(byte)) {
+                                return self.fail(.forbidden_character, .invalid_xml);
+                            }
                             return self.fail(.malformed_end_tag, .invalid_xml);
                         }
                         self.token_name_len = 0;
@@ -1030,10 +1476,51 @@ pub fn Reader(comptime config: Config) type {
                     .end_name => {
                         const run_start = self.cursor;
                         var run_end = run_start;
-                        while (run_end < self.input.len and isAsciiNameChar(self.input[run_end])) {
+                        while (self.utf8_len == 0 and run_end < self.input.len and
+                            isAsciiNameChar(self.input[run_end]))
+                        {
                             run_end += 1;
                         }
                         try self.compareAndConsumeEndName(self.input[run_start..run_end]);
+
+                        if (self.utf8_len != 0 or
+                            (self.cursor < self.input.len and self.input[self.cursor] >= 0x80))
+                        {
+                            const scalar_start = if (self.utf8_len == 0)
+                                self.currentLocation()
+                            else
+                                self.utf8_start;
+                            const scalar_len = self.pendingUtf8ScalarLength() catch
+                                return self.fail(.malformed_utf8, .invalid_xml);
+                            if (scalar_len > self.options.limits.max_partial_token_bytes -
+                                self.token_name_len)
+                            {
+                                return self.failVoid(.partial_token_limit, .limit_exceeded);
+                            }
+                            const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
+                                return self.needInput();
+                            if (!isXml10Char(scalar.codepoint)) {
+                                return self.failAt(
+                                    .forbidden_character,
+                                    .invalid_xml,
+                                    scalar_start,
+                                );
+                            }
+                            const valid = if (self.token_name_len == 0)
+                                isXml10NameStart(scalar.codepoint)
+                            else
+                                isXml10NameChar(scalar.codepoint);
+                            if (!valid) {
+                                return self.failAt(
+                                    .malformed_end_tag,
+                                    .invalid_xml,
+                                    scalar_start,
+                                );
+                            }
+                            try self.compareDecodedEndName(scalar.len);
+                            self.clearUtf8Scalar();
+                            continue;
+                        }
 
                         if (self.cursor < self.input.len) {
                             const byte = self.input[self.cursor];
@@ -1048,6 +1535,9 @@ pub fn Reader(comptime config: Config) type {
                                 self.vertical_state = .end_after_space;
                                 continue;
                             }
+                            if (!isXml10Char(byte)) {
+                                return self.fail(.forbidden_character, .invalid_xml);
+                            }
                             return self.fail(.malformed_end_tag, .invalid_xml);
                         }
                         if (self.final_input) {
@@ -1057,6 +1547,13 @@ pub fn Reader(comptime config: Config) type {
                     },
                     .end_after_space => {
                         self.consumeWhitespaceRun();
+                        if (self.utf8_len != 0 or
+                            (self.cursor < self.input.len and self.input[self.cursor] >= 0x80))
+                        {
+                            if (try self.rejectNonAsciiMarkup(.malformed_end_tag)) {
+                                return self.needInput();
+                            }
+                        }
                         if (self.cursor == self.input.len) {
                             if (self.final_input) {
                                 return self.fail(.incomplete_input, .invalid_xml);
@@ -1064,6 +1561,9 @@ pub fn Reader(comptime config: Config) type {
                             return self.needInput();
                         }
                         if (self.input[self.cursor] != '>') {
+                            if (!isXml10Char(self.input[self.cursor])) {
+                                return self.fail(.forbidden_character, .invalid_xml);
+                            }
                             return self.fail(.malformed_end_tag, .invalid_xml);
                         }
                         self.consumeByte('>');
@@ -1075,6 +1575,30 @@ pub fn Reader(comptime config: Config) type {
                             .after_root
                         else
                             .content;
+                    },
+                    .reference_start => if (try self.readReferenceStart()) {
+                        return self.needInput();
+                    },
+                    .reference_numeric_prefix => if (try self.readReferenceNumericPrefix()) {
+                        return self.needInput();
+                    },
+                    .reference_numeric => if (try self.readReferenceNumeric()) {
+                        return self.needInput();
+                    },
+                    .reference_entity => if (try self.readReferenceEntity()) {
+                        return self.needInput();
+                    },
+                    .emit_text => {
+                        self.vertical_state = .release_text;
+                        return self.eventStep(
+                            .{ .text = .{ .bytes = self.text_fragment } },
+                            self.text_start,
+                            self.currentLocation(),
+                        );
+                    },
+                    .release_text => {
+                        self.text_fragment = &.{};
+                        self.vertical_state = .content;
                     },
                     .emit_document_end => {
                         self.vertical_state = .complete;
@@ -1145,6 +1669,418 @@ pub fn Reader(comptime config: Config) type {
             self.attribute_quote = 0;
         }
 
+        fn readUtf8Scalar(self: *Self, source: ScalarSource) ReadError!?DecodedScalar {
+            if (self.utf8_len == 0) {
+                std.debug.assert(self.cursor < self.input.len);
+                self.utf8_start = self.currentLocation();
+                const lead = self.input[self.cursor];
+                self.utf8_expected_len = utf8ExpectedLength(lead) orelse
+                    return self.fail(.malformed_utf8, .invalid_xml);
+            }
+
+            while (self.utf8_len < self.utf8_expected_len) {
+                if (self.cursor == self.input.len) {
+                    if (self.final_input) {
+                        return self.failAt(
+                            .malformed_utf8,
+                            .invalid_xml,
+                            self.utf8_start,
+                        );
+                    }
+                    return null;
+                }
+                const byte = self.input[self.cursor];
+                const index: usize = self.utf8_len;
+                if (index > 0 and (byte < 0x80 or byte > 0xbf or
+                    (index == 1 and !validUtf8SecondByte(self.utf8_bytes[0], byte))))
+                {
+                    return self.fail(.malformed_utf8, .invalid_xml);
+                }
+                switch (source) {
+                    .ordinary => self.consumeByte(byte),
+                    .start_tag => {
+                        try self.requireStartTagByte();
+                        self.consumeStartTagByte(byte);
+                    },
+                    .reference => try self.consumeReferenceByte(byte),
+                }
+                self.utf8_bytes[index] = byte;
+                self.utf8_len += 1;
+            }
+
+            const bytes = self.utf8_bytes[0..self.utf8_expected_len];
+            const codepoint = std.unicode.utf8Decode(bytes) catch unreachable;
+            return .{ .codepoint = codepoint, .len = self.utf8_expected_len };
+        }
+
+        fn clearUtf8Scalar(self: *Self) void {
+            self.utf8_len = 0;
+            self.utf8_expected_len = 0;
+        }
+
+        fn rejectNonAsciiMarkup(
+            self: *Self,
+            code: DiagnosticCode,
+        ) ReadError!bool {
+            const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
+            const start = self.utf8_start;
+            if (!isXml10Char(scalar.codepoint)) {
+                return self.failAt(.forbidden_character, .invalid_xml, start);
+            }
+            return self.failAt(code, .invalid_xml, start);
+        }
+
+        fn rejectStartTagNonAsciiMarkup(
+            self: *Self,
+            code: DiagnosticCode,
+        ) ReadError!bool {
+            const scalar = (try self.readUtf8Scalar(.start_tag)) orelse return true;
+            const start = self.utf8_start;
+            if (!isXml10Char(scalar.codepoint)) {
+                return self.failAt(.forbidden_character, .invalid_xml, start);
+            }
+            return self.failAt(code, .invalid_xml, start);
+        }
+
+        fn prepareContentRun(self: *Self) ReadError!bool {
+            std.debug.assert(self.utf8_len == 0);
+            const run_start = self.cursor;
+            const start = self.currentLocation();
+            var run_end = run_start;
+            var close_brackets = self.text_close_brackets;
+            const fragment_end = @min(
+                self.input.len,
+                run_start +| self.options.limits.max_fragment_bytes,
+            );
+            const delimiter_offset = std.mem.indexOfAny(
+                u8,
+                self.input[run_start..fragment_end],
+                "<&\r",
+            ) orelse fragment_end - run_start;
+            const scan_end = run_start + delimiter_offset;
+            while (run_end < scan_end) {
+                const byte = self.input[run_end];
+
+                var scalar_len: usize = 1;
+                if (byte < 0x80) {
+                    if (!isXml10Char(byte)) {
+                        if (run_end != run_start) break;
+                        return self.fail(.forbidden_character, .invalid_xml);
+                    }
+                    if (byte == '>' and close_brackets == 2) {
+                        if (run_end != run_start) break;
+                        return self.fail(.cdata_close_in_text, .invalid_xml);
+                    }
+                    close_brackets = if (byte == ']') @min(close_brackets + 1, 2) else 0;
+                } else {
+                    switch (probeUtf8(self.input[run_end..])) {
+                        .incomplete => {
+                            if (run_end != run_start) break;
+                            return false;
+                        },
+                        .invalid => |relative_offset| {
+                            if (run_end != run_start) break;
+                            return self.failAt(
+                                .malformed_utf8,
+                                .invalid_xml,
+                                locationWithByteDelta(config, start, relative_offset),
+                            );
+                        },
+                        .scalar => |scalar| {
+                            if (!isXml10Char(scalar.codepoint)) {
+                                if (run_end != run_start) break;
+                                return self.failAt(.forbidden_character, .invalid_xml, start);
+                            }
+                            scalar_len = scalar.len;
+                            close_brackets = 0;
+                        },
+                    }
+                }
+
+                const current_len = run_end - run_start;
+                if (scalar_len > self.options.limits.max_fragment_bytes -| current_len) {
+                    if (run_end == run_start) {
+                        return self.fail(.fragment_limit, .limit_exceeded);
+                    }
+                    break;
+                }
+                run_end += scalar_len;
+            }
+
+            if (run_end == run_start) return false;
+            const fragment = self.input[run_start..run_end];
+            self.consumeRun(fragment);
+            self.text_close_brackets = close_brackets;
+            self.text_fragment = fragment;
+            self.text_start = start;
+            self.vertical_state = .emit_text;
+            return true;
+        }
+
+        fn prepareInlineText(
+            self: *Self,
+            bytes: []const u8,
+            start: Location(config),
+        ) ReadError!void {
+            if (bytes.len > self.options.limits.max_fragment_bytes) {
+                return self.failAt(.fragment_limit, .limit_exceeded, start);
+            }
+            std.debug.assert(bytes.len <= self.text_inline.len);
+            @memcpy(self.text_inline[0..bytes.len], bytes);
+            self.text_fragment = self.text_inline[0..bytes.len];
+            self.text_start = start;
+            self.vertical_state = .emit_text;
+        }
+
+        fn beginReference(self: *Self, context: ReferenceContext) ReadError!void {
+            self.reference_context = context;
+            self.reference_start = self.currentLocation();
+            self.reference_value = 0;
+            self.reference_has_digits = false;
+            self.reference_token_bytes = 0;
+            self.reference_name = @splat(0);
+            self.reference_name_len = 0;
+            try self.consumeReferenceByte('&');
+            self.vertical_state = .reference_start;
+        }
+
+        fn consumeReferenceByte(self: *Self, byte: u8) ReadError!void {
+            if (self.reference_token_bytes == self.options.limits.max_partial_token_bytes) {
+                return self.failVoid(.partial_token_limit, .limit_exceeded);
+            }
+            if (self.reference_context == .attribute) {
+                try self.requireStartTagByte();
+                self.consumeStartTagByte(byte);
+            } else {
+                self.consumeByte(byte);
+            }
+            self.reference_token_bytes += 1;
+        }
+
+        fn readReferenceStart(self: *Self) ReadError!bool {
+            if (self.utf8_len != 0) {
+                const scalar = (try self.readUtf8Scalar(.reference)) orelse return true;
+                const start = self.utf8_start;
+                if (!isXml10Char(scalar.codepoint)) {
+                    return self.failAt(.forbidden_character, .invalid_xml, start);
+                }
+                if (!isXml10NameStart(scalar.codepoint)) {
+                    return self.failAt(.malformed_reference, .invalid_xml, start);
+                }
+                self.reference_name_len += scalar.len;
+                self.clearUtf8Scalar();
+                self.vertical_state = .reference_entity;
+                return false;
+            }
+            if (self.cursor == self.input.len) return self.referenceNeedsInput();
+            const byte = self.input[self.cursor];
+            if (byte == '#') {
+                try self.consumeReferenceByte(byte);
+                self.vertical_state = .reference_numeric_prefix;
+                return false;
+            }
+            if (byte < 0x80) {
+                if (!isXml10Char(byte)) {
+                    return self.failVoid(.forbidden_character, .invalid_xml);
+                }
+                if (!isXml10NameStart(byte)) {
+                    return self.failVoid(.malformed_reference, .invalid_xml);
+                }
+                try self.consumeReferenceNameAscii(byte);
+                self.vertical_state = .reference_entity;
+                return false;
+            }
+            const scalar = (try self.readUtf8Scalar(.reference)) orelse return true;
+            const start = self.utf8_start;
+            if (!isXml10Char(scalar.codepoint)) {
+                return self.failAt(.forbidden_character, .invalid_xml, start);
+            }
+            if (!isXml10NameStart(scalar.codepoint)) {
+                return self.failAt(.malformed_reference, .invalid_xml, start);
+            }
+            self.reference_name_len += scalar.len;
+            self.clearUtf8Scalar();
+            self.vertical_state = .reference_entity;
+            return false;
+        }
+
+        fn readReferenceNumericPrefix(self: *Self) ReadError!bool {
+            if (self.cursor == self.input.len) return self.referenceNeedsInput();
+            const byte = self.input[self.cursor];
+            if (byte == 'x') {
+                self.reference_kind = .hexadecimal;
+                try self.consumeReferenceByte(byte);
+                self.vertical_state = .reference_numeric;
+                return false;
+            }
+            self.reference_kind = .decimal;
+            self.vertical_state = .reference_numeric;
+            return false;
+        }
+
+        fn readReferenceNumeric(self: *Self) ReadError!bool {
+            if (self.utf8_len != 0) {
+                _ = (try self.readUtf8Scalar(.reference)) orelse return true;
+                return self.failAt(
+                    .malformed_reference,
+                    .invalid_xml,
+                    self.utf8_start,
+                );
+            }
+            if (self.cursor == self.input.len) return self.referenceNeedsInput();
+            const byte = self.input[self.cursor];
+            if (byte == ';') {
+                if (!self.reference_has_digits) {
+                    return self.failVoid(.malformed_reference, .invalid_xml);
+                }
+                try self.consumeReferenceByte(byte);
+                try self.finishNumericReference();
+                return false;
+            }
+            if (byte >= 0x80) {
+                _ = (try self.readUtf8Scalar(.reference)) orelse return true;
+                return self.failAt(
+                    .malformed_reference,
+                    .invalid_xml,
+                    self.utf8_start,
+                );
+            }
+            const digit = referenceDigit(byte, self.reference_kind) orelse {
+                if (byte < 0x20 and !isXml10Char(byte)) {
+                    return self.failVoid(.forbidden_character, .invalid_xml);
+                }
+                return self.failVoid(.malformed_reference, .invalid_xml);
+            };
+            try self.consumeReferenceByte(byte);
+            self.reference_has_digits = true;
+            const base: u32 = if (self.reference_kind == .hexadecimal) 16 else 10;
+            if (self.reference_value <= 0x10ffff and
+                self.reference_value <= (0x10ffff - digit) / base)
+            {
+                self.reference_value = self.reference_value * base + digit;
+            } else {
+                self.reference_value = 0x110000;
+            }
+            return false;
+        }
+
+        fn readReferenceEntity(self: *Self) ReadError!bool {
+            if (self.utf8_len != 0) {
+                const scalar = (try self.readUtf8Scalar(.reference)) orelse return true;
+                const start = self.utf8_start;
+                if (!isXml10Char(scalar.codepoint)) {
+                    return self.failAt(.forbidden_character, .invalid_xml, start);
+                }
+                if (!isXml10NameChar(scalar.codepoint)) {
+                    return self.failAt(.malformed_reference, .invalid_xml, start);
+                }
+                self.reference_name_len += scalar.len;
+                self.clearUtf8Scalar();
+                return false;
+            }
+            if (self.cursor == self.input.len) return self.referenceNeedsInput();
+            const byte = self.input[self.cursor];
+            if (byte == ';') {
+                try self.consumeReferenceByte(byte);
+                try self.finishEntityReference();
+                return false;
+            }
+            if (byte < 0x80) {
+                if (!isXml10Char(byte)) {
+                    return self.failVoid(.forbidden_character, .invalid_xml);
+                }
+                if (!isXml10NameChar(byte)) {
+                    return self.failVoid(.malformed_reference, .invalid_xml);
+                }
+                try self.consumeReferenceNameAscii(byte);
+                return false;
+            }
+            const scalar = (try self.readUtf8Scalar(.reference)) orelse return true;
+            const start = self.utf8_start;
+            if (!isXml10Char(scalar.codepoint)) {
+                return self.failAt(.forbidden_character, .invalid_xml, start);
+            }
+            if (!isXml10NameChar(scalar.codepoint)) {
+                return self.failAt(.malformed_reference, .invalid_xml, start);
+            }
+            self.reference_name_len += scalar.len;
+            self.clearUtf8Scalar();
+            return false;
+        }
+
+        fn consumeReferenceNameAscii(self: *Self, byte: u8) ReadError!void {
+            try self.consumeReferenceByte(byte);
+            if (self.reference_name_len < self.reference_name.len) {
+                self.reference_name[self.reference_name_len] = byte;
+            }
+            self.reference_name_len += 1;
+        }
+
+        fn referenceNeedsInput(self: *Self) ReadError!bool {
+            if (self.final_input) {
+                return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
+            }
+            return true;
+        }
+
+        fn finishNumericReference(self: *Self) ReadError!void {
+            if (self.reference_value > 0x10ffff or
+                !isXml10Char(@intCast(self.reference_value)))
+            {
+                return self.failAt(
+                    .invalid_character_reference,
+                    .invalid_xml,
+                    self.reference_start,
+                );
+            }
+            var bytes: [4]u8 = undefined;
+            const len = std.unicode.utf8Encode(@intCast(self.reference_value), &bytes) catch
+                unreachable;
+            try self.finishReferenceOutput(bytes[0..len]);
+        }
+
+        fn finishEntityReference(self: *Self) ReadError!void {
+            const bytes = predefinedEntity(
+                self.reference_name[0..@min(self.reference_name_len, self.reference_name.len)],
+                self.reference_name_len,
+            ) orelse return self.failAt(
+                .undeclared_entity,
+                .invalid_xml,
+                self.reference_start,
+            );
+            try self.finishReferenceOutput(bytes);
+        }
+
+        fn finishReferenceOutput(self: *Self, bytes: []const u8) ReadError!void {
+            if (self.reference_context == .attribute) {
+                try self.appendAttributeOutput(bytes);
+                self.vertical_state = .attribute_value;
+                return;
+            }
+            self.text_close_brackets = 0;
+            try self.prepareInlineText(
+                bytes,
+                self.reference_start,
+            );
+        }
+
+        fn appendAttributeOutput(self: *Self, bytes: []const u8) ReadError!void {
+            const record = &self.attribute_records.items[self.attribute_records.items.len - 1];
+            const value_offset = record.name_offset + record.name_len;
+            const value_len = self.attribute_bytes.items.len - value_offset;
+            const value_remaining = self.options.limits.max_attribute_value_bytes - value_len;
+            if (bytes.len > value_remaining) {
+                return self.failVoid(.attribute_value_limit, .limit_exceeded);
+            }
+            const aggregate_remaining = self.options.limits.max_attribute_bytes_per_element -
+                self.attribute_bytes.items.len;
+            if (bytes.len > aggregate_remaining) {
+                return self.failVoid(.attribute_bytes_limit, .limit_exceeded);
+            }
+            self.attribute_bytes.appendSlice(self.allocator, bytes) catch
+                return self.failOutOfMemory();
+        }
+
         fn beginStartElement(self: *Self) ReadError!void {
             if (self.open_elements.items.len == self.options.limits.max_depth) {
                 return self.failVoid(.depth_limit, .limit_exceeded);
@@ -1189,6 +2125,26 @@ pub fn Reader(comptime config: Config) type {
                 }
                 return self.failVoid(.start_tag_limit, .limit_exceeded);
             }
+        }
+
+        fn ensureStartNameScalarCapacity(self: *Self) ReadError!void {
+            const scalar_len = self.pendingUtf8ScalarLength() catch
+                return self.failVoid(.malformed_utf8, .invalid_xml);
+            if (scalar_len > self.options.limits.max_partial_token_bytes - self.token_name_len) {
+                return self.failVoid(.partial_token_limit, .limit_exceeded);
+            }
+            if (scalar_len > self.options.limits.max_open_name_bytes - self.open_names.items.len) {
+                return self.failVoid(.open_name_limit, .limit_exceeded);
+            }
+            if (scalar_len > self.startTagRemaining()) {
+                return self.failVoid(.start_tag_limit, .limit_exceeded);
+            }
+        }
+
+        fn appendDecodedStartName(self: *Self, len: usize) ReadError!void {
+            self.open_names.appendSlice(self.allocator, self.utf8_bytes[0..len]) catch
+                return self.failOutOfMemory();
+            self.token_name_len += len;
         }
 
         fn finishStartElement(self: *Self, empty_element: bool) ReadError!void {
@@ -1262,6 +2218,31 @@ pub fn Reader(comptime config: Config) type {
             }
         }
 
+        fn ensureAttributeNameScalarCapacity(self: *Self) ReadError!void {
+            const scalar_len = self.pendingUtf8ScalarLength() catch
+                return self.failVoid(.malformed_utf8, .invalid_xml);
+            const record = self.attribute_records.items[self.attribute_records.items.len - 1];
+            if (scalar_len > self.options.limits.max_attribute_name_bytes - record.name_len) {
+                return self.failVoid(.attribute_name_limit, .limit_exceeded);
+            }
+            if (scalar_len > self.options.limits.max_attribute_bytes_per_element -
+                self.attribute_bytes.items.len)
+            {
+                return self.failVoid(.attribute_bytes_limit, .limit_exceeded);
+            }
+            if (scalar_len > self.startTagRemaining()) {
+                return self.failVoid(.start_tag_limit, .limit_exceeded);
+            }
+        }
+
+        fn appendDecodedAttributeName(self: *Self, len: usize) ReadError!void {
+            self.attribute_bytes.appendSlice(
+                self.allocator,
+                self.utf8_bytes[0..len],
+            ) catch return self.failOutOfMemory();
+            self.attribute_records.items[self.attribute_records.items.len - 1].name_len += len;
+        }
+
         fn appendAttributeValueRun(self: *Self, run: []const u8) ReadError!void {
             const record = &self.attribute_records.items[self.attribute_records.items.len - 1];
             const value_offset = record.name_offset + record.name_len;
@@ -1298,6 +2279,25 @@ pub fn Reader(comptime config: Config) type {
                 {
                     return self.failVoid(.attribute_bytes_limit, .limit_exceeded);
                 }
+                return self.failVoid(.start_tag_limit, .limit_exceeded);
+            }
+        }
+
+        fn ensureAttributeValueScalarCapacity(self: *Self) ReadError!void {
+            const scalar_len = self.pendingUtf8ScalarLength() catch
+                return self.failVoid(.malformed_utf8, .invalid_xml);
+            const record = self.attribute_records.items[self.attribute_records.items.len - 1];
+            const value_offset = record.name_offset + record.name_len;
+            const value_len = self.attribute_bytes.items.len - value_offset;
+            if (scalar_len > self.options.limits.max_attribute_value_bytes - value_len) {
+                return self.failVoid(.attribute_value_limit, .limit_exceeded);
+            }
+            if (scalar_len > self.options.limits.max_attribute_bytes_per_element -
+                self.attribute_bytes.items.len)
+            {
+                return self.failVoid(.attribute_bytes_limit, .limit_exceeded);
+            }
+            if (scalar_len > self.startTagRemaining()) {
                 return self.failVoid(.start_tag_limit, .limit_exceeded);
             }
         }
@@ -1429,6 +2429,30 @@ pub fn Reader(comptime config: Config) type {
             if (accepted_len != run.len) {
                 return self.failVoid(.partial_token_limit, .limit_exceeded);
             }
+        }
+
+        fn compareDecodedEndName(self: *Self, len: usize) ReadError!void {
+            const remaining = self.options.limits.max_partial_token_bytes - self.token_name_len;
+            if (len > remaining) {
+                return self.failVoid(.partial_token_limit, .limit_exceeded);
+            }
+            const raw = self.topRawName();
+            if (self.end_mismatch_index == no_end_mismatch) {
+                for (self.utf8_bytes[0..len], 0..) |byte, index| {
+                    const name_index = self.token_name_len + index;
+                    if (name_index >= raw.len or raw[name_index] != byte) {
+                        self.end_mismatch_index = name_index;
+                        break;
+                    }
+                }
+            }
+            self.token_name_len += len;
+        }
+
+        fn pendingUtf8ScalarLength(self: *const Self) error{InvalidUtf8}!usize {
+            if (self.utf8_expected_len != 0) return self.utf8_expected_len;
+            if (self.cursor == self.input.len) return error.InvalidUtf8;
+            return utf8ExpectedLength(self.input[self.cursor]) orelse error.InvalidUtf8;
         }
 
         fn recordShortEndMismatch(self: *Self) void {
@@ -1705,8 +2729,124 @@ fn isAsciiNameChar(byte: u8) bool {
     return isAsciiNameStart(byte) or std.ascii.isDigit(byte) or byte == '-' or byte == '.';
 }
 
-fn isStage4AttributeValueByte(byte: u8, quote: u8) bool {
+fn isOrdinaryAttributeValueByte(byte: u8, quote: u8) bool {
     return byte >= ' ' and byte < 0x80 and byte != quote and byte != '&' and byte != '<';
+}
+
+fn isXml10Char(codepoint: u21) bool {
+    return codepoint == 0x9 or codepoint == 0xa or codepoint == 0xd or
+        (codepoint >= 0x20 and codepoint <= 0xd7ff) or
+        (codepoint >= 0xe000 and codepoint <= 0xfffd) or
+        (codepoint >= 0x10000 and codepoint <= 0x10ffff);
+}
+
+fn isXml10NameStart(codepoint: u21) bool {
+    return codepoint == ':' or
+        (codepoint >= 'A' and codepoint <= 'Z') or
+        codepoint == '_' or
+        (codepoint >= 'a' and codepoint <= 'z') or
+        (codepoint >= 0xc0 and codepoint <= 0xd6) or
+        (codepoint >= 0xd8 and codepoint <= 0xf6) or
+        (codepoint >= 0xf8 and codepoint <= 0x2ff) or
+        (codepoint >= 0x370 and codepoint <= 0x37d) or
+        (codepoint >= 0x37f and codepoint <= 0x1fff) or
+        (codepoint >= 0x200c and codepoint <= 0x200d) or
+        (codepoint >= 0x2070 and codepoint <= 0x218f) or
+        (codepoint >= 0x2c00 and codepoint <= 0x2fef) or
+        (codepoint >= 0x3001 and codepoint <= 0xd7ff) or
+        (codepoint >= 0xf900 and codepoint <= 0xfdcf) or
+        (codepoint >= 0xfdf0 and codepoint <= 0xfffd) or
+        (codepoint >= 0x10000 and codepoint <= 0xeffff);
+}
+
+fn isXml10NameChar(codepoint: u21) bool {
+    return isXml10NameStart(codepoint) or codepoint == '-' or codepoint == '.' or
+        (codepoint >= '0' and codepoint <= '9') or codepoint == 0xb7 or
+        (codepoint >= 0x300 and codepoint <= 0x36f) or
+        (codepoint >= 0x203f and codepoint <= 0x2040);
+}
+
+fn probeUtf8(bytes: []const u8) Utf8Probe {
+    std.debug.assert(bytes.len > 0);
+    const lead = bytes[0];
+    const expected: u3 = if (lead < 0x80)
+        1
+    else if (lead >= 0xc2 and lead <= 0xdf)
+        2
+    else if (lead >= 0xe0 and lead <= 0xef)
+        3
+    else if (lead >= 0xf0 and lead <= 0xf4)
+        4
+    else
+        return .{ .invalid = 0 };
+    if (bytes.len < expected) {
+        for (bytes[1..], 1..) |byte, index| {
+            if (byte < 0x80 or byte > 0xbf) return .{ .invalid = index };
+            if (index == 1 and !validUtf8SecondByte(lead, byte)) {
+                return .{ .invalid = index };
+            }
+        }
+        return .incomplete;
+    }
+    for (bytes[1..expected], 1..) |byte, index| {
+        if (byte < 0x80 or byte > 0xbf) return .{ .invalid = index };
+        if (index == 1 and !validUtf8SecondByte(lead, byte)) {
+            return .{ .invalid = index };
+        }
+    }
+    const codepoint = std.unicode.utf8Decode(bytes[0..expected]) catch unreachable;
+    return .{ .scalar = .{ .codepoint = codepoint, .len = expected } };
+}
+
+fn validUtf8SecondByte(lead: u8, byte: u8) bool {
+    if (lead == 0xe0) return byte >= 0xa0;
+    if (lead == 0xed) return byte <= 0x9f;
+    if (lead == 0xf0) return byte >= 0x90;
+    if (lead == 0xf4) return byte <= 0x8f;
+    return true;
+}
+
+fn utf8ExpectedLength(lead: u8) ?u3 {
+    if (lead < 0x80) return 1;
+    if (lead >= 0xc2 and lead <= 0xdf) return 2;
+    if (lead >= 0xe0 and lead <= 0xef) return 3;
+    if (lead >= 0xf0 and lead <= 0xf4) return 4;
+    return null;
+}
+
+fn referenceDigit(byte: u8, kind: ReferenceKind) ?u32 {
+    return switch (kind) {
+        .decimal => if (byte >= '0' and byte <= '9') byte - '0' else null,
+        .hexadecimal => if (byte >= '0' and byte <= '9')
+            byte - '0'
+        else if (byte >= 'a' and byte <= 'f')
+            byte - 'a' + 10
+        else if (byte >= 'A' and byte <= 'F')
+            byte - 'A' + 10
+        else
+            null,
+    };
+}
+
+fn predefinedEntity(name: []const u8, source_len: usize) ?[]const u8 {
+    if (source_len != name.len) return null;
+    if (std.mem.eql(u8, name, "amp")) return "&";
+    if (std.mem.eql(u8, name, "lt")) return "<";
+    if (std.mem.eql(u8, name, "gt")) return ">";
+    if (std.mem.eql(u8, name, "apos")) return "'";
+    if (std.mem.eql(u8, name, "quot")) return "\"";
+    return null;
+}
+
+fn locationWithByteDelta(
+    comptime config: Config,
+    location: Location(config),
+    delta: usize,
+) Location(config) {
+    var result = location;
+    result.byte_offset += delta;
+    if (config.diagnostic_location == .line_column) result.byte_column += delta;
+    return result;
 }
 
 fn nameFromRaw(comptime config: Config, raw: []const u8) Name(config) {
