@@ -12,11 +12,18 @@ const Summary = struct {
     const max_attribute_event_bytes = 512;
     const max_name_event_bytes = 512;
     const max_text_bytes = 4096;
+    const max_misc_bytes = 4096;
     const start_element_marker = 0xfe;
     const name_end_marker = 0;
     const attribute_end_marker = 0xff;
 
     sequence: u64 = 0,
+    declared_version: [32]u8 = @splat(0),
+    declared_version_len: usize = 0,
+    declared_encoding: [32]u8 = @splat(0),
+    declared_encoding_len: usize = 0,
+    standalone: bool = false,
+    standalone_declared: bool = false,
     starts: usize = 0,
     ends: usize = 0,
     empty_starts: usize = 0,
@@ -28,12 +35,39 @@ const Summary = struct {
     attribute_event_bytes_len: usize = 0,
     text_bytes: [max_text_bytes]u8 = @splat(0),
     text_bytes_len: usize = 0,
+    cdata_bytes: [max_misc_bytes]u8 = @splat(0),
+    cdata_bytes_len: usize = 0,
+    complete_comments: usize = 0,
+    comment_bytes: [max_misc_bytes]u8 = @splat(0),
+    comment_bytes_len: usize = 0,
+    complete_processing_instructions: usize = 0,
+    processing_instruction_active: bool = false,
+    processing_instruction_bytes: [max_misc_bytes]u8 = @splat(0),
+    processing_instruction_bytes_len: usize = 0,
     name_event_bytes: [max_name_event_bytes]u8 = @splat(0),
     name_event_bytes_len: usize = 0,
 
     fn observe(self: *Summary, event: anytype) !void {
         switch (event) {
-            .document_start => self.sequence = self.sequence * 10 + 1,
+            .document_start => |document| {
+                self.sequence = self.sequence * 10 + 1;
+                if (document.declared_version) |version| {
+                    if (version.len > self.declared_version.len) {
+                        return error.DeclaredVersionSummaryTooLarge;
+                    }
+                    @memcpy(self.declared_version[0..version.len], version);
+                    self.declared_version_len = version.len;
+                }
+                if (document.declared_encoding) |encoding| {
+                    if (encoding.len > self.declared_encoding.len) {
+                        return error.DeclaredEncodingSummaryTooLarge;
+                    }
+                    @memcpy(self.declared_encoding[0..encoding.len], encoding);
+                    self.declared_encoding_len = encoding.len;
+                }
+                self.standalone = document.standalone;
+                self.standalone_declared = document.standalone_declared;
+            },
             .start_element => |start| {
                 self.sequence = self.sequence * 10 + 2;
                 self.starts += 1;
@@ -61,9 +95,28 @@ const Summary = struct {
                 try self.appendNameEventBytes(end.name.raw);
                 try self.appendNameEventBytes("\x00");
             },
-            .text => |text| try self.appendText(text.bytes),
+            .text => |text| {
+                try self.appendText(text.bytes);
+                if (text.origin == .cdata) try self.appendCdataBytes(text.bytes);
+            },
+            .comment => |comment| {
+                self.complete_comments += @intFromBool(comment.complete);
+                try self.appendCommentBytes(comment.bytes);
+            },
+            .processing_instruction => |instruction| {
+                if (!self.processing_instruction_active) {
+                    try self.appendProcessingInstructionBytes(instruction.target);
+                    try self.appendProcessingInstructionBytes("\x00");
+                    self.processing_instruction_active = true;
+                }
+                self.complete_processing_instructions += @intFromBool(instruction.complete);
+                try self.appendProcessingInstructionBytes(instruction.data);
+                if (instruction.complete) {
+                    try self.appendProcessingInstructionBytes("\xff");
+                    self.processing_instruction_active = false;
+                }
+            },
             .document_end => self.sequence = self.sequence * 10 + 4,
-            else => return error.UnexpectedEvent,
         }
     }
 
@@ -89,6 +142,38 @@ const Summary = struct {
         if (end > self.name_event_bytes.len) return error.NameEventSummaryTooLarge;
         @memcpy(self.name_event_bytes[self.name_event_bytes_len..end], bytes);
         self.name_event_bytes_len = end;
+    }
+
+    fn appendCommentBytes(self: *Summary, bytes: []const u8) !void {
+        const end = std.math.add(usize, self.comment_bytes_len, bytes.len) catch
+            return error.CommentSummaryTooLarge;
+        if (end > self.comment_bytes.len) return error.CommentSummaryTooLarge;
+        @memcpy(self.comment_bytes[self.comment_bytes_len..end], bytes);
+        self.comment_bytes_len = end;
+    }
+
+    fn appendCdataBytes(self: *Summary, bytes: []const u8) !void {
+        const end = std.math.add(usize, self.cdata_bytes_len, bytes.len) catch
+            return error.CdataSummaryTooLarge;
+        if (end > self.cdata_bytes.len) return error.CdataSummaryTooLarge;
+        @memcpy(self.cdata_bytes[self.cdata_bytes_len..end], bytes);
+        self.cdata_bytes_len = end;
+    }
+
+    fn appendProcessingInstructionBytes(self: *Summary, bytes: []const u8) !void {
+        const end = std.math.add(
+            usize,
+            self.processing_instruction_bytes_len,
+            bytes.len,
+        ) catch return error.ProcessingInstructionSummaryTooLarge;
+        if (end > self.processing_instruction_bytes.len) {
+            return error.ProcessingInstructionSummaryTooLarge;
+        }
+        @memcpy(
+            self.processing_instruction_bytes[self.processing_instruction_bytes_len..end],
+            bytes,
+        );
+        self.processing_instruction_bytes_len = end;
     }
 };
 
@@ -273,6 +358,16 @@ fn expectSummarySchedulesWithOptions(
 
 fn expectSummaryMetrics(expected: Summary, actual: Summary) !void {
     try std.testing.expectEqual(expected.sequence, actual.sequence);
+    try std.testing.expectEqualStrings(
+        expected.declared_version[0..expected.declared_version_len],
+        actual.declared_version[0..actual.declared_version_len],
+    );
+    try std.testing.expectEqualStrings(
+        expected.declared_encoding[0..expected.declared_encoding_len],
+        actual.declared_encoding[0..actual.declared_encoding_len],
+    );
+    try std.testing.expectEqual(expected.standalone, actual.standalone);
+    try std.testing.expectEqual(expected.standalone_declared, actual.standalone_declared);
     try std.testing.expectEqual(expected.starts, actual.starts);
     try std.testing.expectEqual(expected.ends, actual.ends);
     try std.testing.expectEqual(expected.empty_starts, actual.empty_starts);
@@ -283,6 +378,23 @@ fn expectSummaryMetrics(expected: Summary, actual: Summary) !void {
     try std.testing.expectEqualStrings(
         expected.text_bytes[0..expected.text_bytes_len],
         actual.text_bytes[0..actual.text_bytes_len],
+    );
+    try std.testing.expectEqualStrings(
+        expected.cdata_bytes[0..expected.cdata_bytes_len],
+        actual.cdata_bytes[0..actual.cdata_bytes_len],
+    );
+    try std.testing.expectEqual(expected.complete_comments, actual.complete_comments);
+    try std.testing.expectEqualStrings(
+        expected.comment_bytes[0..expected.comment_bytes_len],
+        actual.comment_bytes[0..actual.comment_bytes_len],
+    );
+    try std.testing.expectEqual(
+        expected.complete_processing_instructions,
+        actual.complete_processing_instructions,
+    );
+    try std.testing.expectEqualStrings(
+        expected.processing_instruction_bytes[0..expected.processing_instruction_bytes_len],
+        actual.processing_instruction_bytes[0..actual.processing_instruction_bytes_len],
     );
 }
 
@@ -633,6 +745,24 @@ fn allocationStage5Parse(allocator: std.mem.Allocator) !void {
     );
 }
 
+fn allocationStage6Parse(allocator: std.mem.Allocator) !void {
+    const input =
+        "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>" ++
+        "<?setup data?><r><!--comment--><![CDATA[<text>&data]]></r><?done?>";
+    const parts = [_][]const u8{input};
+    const summary = try parseParts(CORE_CONFIG, allocator, .{}, &parts);
+    try std.testing.expectEqualStrings(
+        "1.0",
+        summary.declared_version[0..summary.declared_version_len],
+    );
+    try std.testing.expectEqual(@as(usize, 1), summary.complete_comments);
+    try std.testing.expectEqual(@as(usize, 2), summary.complete_processing_instructions);
+    try std.testing.expectEqualStrings(
+        "<text>&data",
+        summary.cdata_bytes[0..summary.cdata_bytes_len],
+    );
+}
+
 const TextRun = struct {
     bytes: usize = 0,
     fragments: usize = 0,
@@ -670,6 +800,85 @@ fn parseRepeatedText(reader: *CoreReader, total_bytes: usize) !TextRun {
 
     try reader.feed("</r>", true);
     try std.testing.expect(try drainTextBoundary(reader, &run));
+    return run;
+}
+
+const MarkupRun = struct {
+    bytes: usize = 0,
+    fragments: usize = 0,
+    complete: usize = 0,
+};
+
+fn drainCommentBoundary(reader: *CoreReader, run: *MarkupRun) !bool {
+    while (true) {
+        switch (try reader.next()) {
+            .event => |event| switch (event) {
+                .comment => |comment| {
+                    run.bytes += comment.bytes.len;
+                    run.fragments += 1;
+                    run.complete += @intFromBool(comment.complete);
+                },
+                else => {},
+            },
+            .need_input => return false,
+            .done => return true,
+        }
+    }
+}
+
+fn parseRepeatedComment(reader: *CoreReader, total_bytes: usize) !MarkupRun {
+    var run: MarkupRun = .{};
+    try reader.feed("<r><!--", false);
+    try std.testing.expect(!try drainCommentBoundary(reader, &run));
+
+    const data: [257]u8 = @splat('x');
+    var remaining = total_bytes;
+    while (remaining > 0) {
+        const len = @min(remaining, data.len);
+        try reader.feed(data[0..len], false);
+        try std.testing.expect(!try drainCommentBoundary(reader, &run));
+        remaining -= len;
+    }
+
+    try reader.feed("--></r>", true);
+    try std.testing.expect(try drainCommentBoundary(reader, &run));
+    return run;
+}
+
+fn drainProcessingInstructionBoundary(reader: *CoreReader, run: *MarkupRun) !bool {
+    while (true) {
+        switch (try reader.next()) {
+            .event => |event| switch (event) {
+                .processing_instruction => |instruction| {
+                    try std.testing.expectEqualStrings("target", instruction.target);
+                    run.bytes += instruction.data.len;
+                    run.fragments += 1;
+                    run.complete += @intFromBool(instruction.complete);
+                },
+                else => {},
+            },
+            .need_input => return false,
+            .done => return true,
+        }
+    }
+}
+
+fn parseRepeatedProcessingInstruction(reader: *CoreReader, total_bytes: usize) !MarkupRun {
+    var run: MarkupRun = .{};
+    try reader.feed("<r><?target ", false);
+    try std.testing.expect(!try drainProcessingInstructionBoundary(reader, &run));
+
+    const data: [257]u8 = @splat('x');
+    var remaining = total_bytes;
+    while (remaining > 0) {
+        const len = @min(remaining, data.len);
+        try reader.feed(data[0..len], false);
+        try std.testing.expect(!try drainProcessingInstructionBoundary(reader, &run));
+        remaining -= len;
+    }
+
+    try reader.feed("?></r>", true);
+    try std.testing.expect(try drainProcessingInstructionBoundary(reader, &run));
     return run;
 }
 
@@ -1094,6 +1303,17 @@ test "adapter - push drain: preserves event order and explicit cancellation" {
     );
     try std.testing.expectEqual(@as(usize, 6), complete.events);
     try std.testing.expectEqual(@as(usize, 0), complete.attributes);
+
+    var markup: PushContext = .{};
+    try xml.drainSlice(
+        CORE_CONFIG,
+        std.testing.allocator,
+        .{},
+        "<?pi?><r><!----><![CDATA[x]]></r>",
+        &markup,
+        pushObserve,
+    );
+    try std.testing.expectEqual(@as(usize, 7), markup.events);
 
     var attributed: PushContext = .{};
     try xml.drainSlice(
@@ -1697,6 +1917,38 @@ test "[integration] - [buffered UTF-8]: one-byte source reads preserve semantics
     );
 }
 
+test "[integration] - [buffered markup]: one-byte source reads preserve stage 6 semantics" {
+    var io_buffer: [7]u8 = undefined;
+    var source: std.testing.Reader = .init(
+        &io_buffer,
+        &.{.{ .buffer = fixtures.prolog_epilog_misc }},
+    );
+    source.artificial_limit = .limited(1);
+
+    var input = try xml.IoReader(CORE_CONFIG).init(
+        std.testing.allocator,
+        .{},
+        &source.interface,
+    );
+    defer input.deinit();
+    var summary: Summary = .{};
+    while (true) {
+        switch (try input.next()) {
+            .event => |event| try summary.observe(event),
+            .need_input => return error.UnexpectedNeedInput,
+            .done => break,
+        }
+    }
+    try std.testing.expectEqualStrings(
+        "beforeafter",
+        summary.comment_bytes[0..summary.comment_bytes_len],
+    );
+    try std.testing.expectEqualStrings(
+        "setup\x00ready\xffdone\x00\xff",
+        summary.processing_instruction_bytes[0..summary.processing_instruction_bytes_len],
+    );
+}
+
 test "[integration] - [XML names]: Fifth Edition names preserve UTF-8 bytes" {
     const unicode_attributes = [_]ExpectedAttribute{
         .{ .name = "属性", .value = "値" },
@@ -1963,6 +2215,60 @@ test "[integration] - [text locations]: source spans cover borrowed and transfor
     try std.testing.expectEqual(expected.len, index);
 }
 
+test "[integration] - [stage 6 locations]: declaration span and PI target lifetime are exact" {
+    const located_config = xml.Configs.XML10_UTF8_NO_DTD_LOCATED;
+    const Reader = xml.Reader(located_config);
+    var options: xml.Options(located_config) = .{};
+    options.limits.max_fragment_bytes = 4;
+    const input = "<?xml version='1.0'?><?target abcdef?><r/>";
+
+    var reader = try Reader.init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed(input, true);
+
+    const declaration_end = std.mem.indexOf(u8, input, "?>").? + 2;
+    const start = switch (try reader.next()) {
+        .event => |event| switch (event.payload) {
+            .document_start => |document| blk: {
+                try std.testing.expectEqualStrings("1.0", document.declared_version.?);
+                try std.testing.expectEqual(xml.XmlVersion.xml10, document.effective_version);
+                try std.testing.expectEqual(xml.SourceEncoding.utf8, document.source_encoding);
+                try std.testing.expectEqual(@as(u64, 0), event.span.start.byte_offset);
+                try std.testing.expectEqual(
+                    @as(u64, @intCast(declaration_end)),
+                    event.span.end.byte_offset,
+                );
+                break :blk document.declared_version.?;
+            },
+            else => return error.UnexpectedEvent,
+        },
+        else => return error.UnexpectedStep,
+    };
+    try std.testing.expectEqualStrings("1.0", start);
+
+    var instruction_bytes: [6]u8 = undefined;
+    var instruction_len: usize = 0;
+    var completed = false;
+    while (!completed) {
+        switch (try reader.next()) {
+            .event => |event| switch (event.payload) {
+                .processing_instruction => |instruction| {
+                    try std.testing.expectEqualStrings("target", instruction.target);
+                    @memcpy(
+                        instruction_bytes[instruction_len..][0..instruction.data.len],
+                        instruction.data,
+                    );
+                    instruction_len += instruction.data.len;
+                    completed = instruction.complete;
+                },
+                else => return error.UnexpectedEvent,
+            },
+            else => return error.UnexpectedStep,
+        }
+    }
+    try std.testing.expectEqualStrings("abcdef", instruction_bytes[0..instruction_len]);
+}
+
 test "[edge] - [text fragments]: limits preserve scalars and expose schedule counts" {
     var core_options: xml.Options(CORE_CONFIG) = .{};
     core_options.limits.max_fragment_bytes = 4;
@@ -2136,6 +2442,758 @@ test "[unit] - [text lifetime]: borrowed and transformed fragments survive one e
 
 test "[unit] - [stage 5 reset]: pending scalar, reference, and CR state is discarded" {
     const partials = [_][]const u8{ "<r>\xe2", "<r>&amp", "<r>\r" };
+    var reader = try CoreReader.init(std.testing.allocator, .{});
+    defer reader.deinit();
+    for (partials) |partial| {
+        try reader.feed(partial, false);
+        while (true) {
+            switch (try reader.next()) {
+                .event => {},
+                .need_input => break,
+                .done => return error.UnexpectedDone,
+            }
+        }
+        try reader.reset(.retain_capacity);
+        try reader.feed("<ok/>", true);
+        const summary = try drainCore(&reader);
+        try std.testing.expectEqual(@as(usize, 1), summary.starts);
+        try reader.reset(.retain_capacity);
+    }
+}
+
+test "[property] - [declaration]: metadata is final before document start across schedules" {
+    const parts = [_][]const u8{fixtures.declaration};
+    const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
+    try std.testing.expectEqualStrings(
+        "1.0",
+        expected.declared_version[0..expected.declared_version_len],
+    );
+    try std.testing.expectEqualStrings(
+        "UTF-8",
+        expected.declared_encoding[0..expected.declared_encoding_len],
+    );
+    try std.testing.expect(expected.standalone);
+    try std.testing.expect(expected.standalone_declared);
+    try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, fixtures.declaration, expected);
+
+    const version_input = "<?xml version='1.7'?><r/>";
+    const version_parts = [_][]const u8{version_input};
+    const version = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &version_parts);
+    try std.testing.expectEqualStrings(
+        "1.7",
+        version.declared_version[0..version.declared_version_len],
+    );
+
+    const default_input = "<r/>";
+    const default_parts = [_][]const u8{default_input};
+    const defaults = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &default_parts);
+    try std.testing.expectEqual(@as(usize, 0), defaults.declared_version_len);
+    try std.testing.expectEqual(@as(usize, 0), defaults.declared_encoding_len);
+    try std.testing.expect(!defaults.standalone);
+    try std.testing.expect(!defaults.standalone_declared);
+
+    const stylesheet_input = "<?xml-stylesheet href='style.css'?><r/>";
+    const stylesheet_parts = [_][]const u8{stylesheet_input};
+    const stylesheet = try parseParts(
+        CORE_CONFIG,
+        std.testing.allocator,
+        .{},
+        &stylesheet_parts,
+    );
+    try std.testing.expectEqualStrings(
+        "xml-stylesheet\x00href='style.css'\xff",
+        stylesheet.processing_instruction_bytes[0..stylesheet.processing_instruction_bytes_len],
+    );
+    try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, stylesheet_input, stylesheet);
+}
+
+test "[property] - [miscellaneous markup]: logical events agree across schedules" {
+    {
+        const parts = [_][]const u8{fixtures.prolog_epilog_misc};
+        const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
+        try std.testing.expectEqualStrings(
+            "content",
+            expected.text_bytes[0..expected.text_bytes_len],
+        );
+        try std.testing.expectEqualStrings(
+            "beforeafter",
+            expected.comment_bytes[0..expected.comment_bytes_len],
+        );
+        try std.testing.expectEqual(@as(usize, 2), expected.complete_comments);
+        try std.testing.expectEqualStrings(
+            "setup\x00ready\xffdone\x00\xff",
+            expected.processing_instruction_bytes[0..expected.processing_instruction_bytes_len],
+        );
+        try expectSummarySchedulesWithOptions(
+            CORE_CONFIG,
+            .{},
+            fixtures.prolog_epilog_misc,
+            expected,
+        );
+    }
+    {
+        const parts = [_][]const u8{fixtures.comment_edges};
+        const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
+        try std.testing.expectEqualStrings(
+            " hyphen-allowed empty",
+            expected.comment_bytes[0..expected.comment_bytes_len],
+        );
+        try std.testing.expectEqual(@as(usize, 2), expected.complete_comments);
+        try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, fixtures.comment_edges, expected);
+    }
+    {
+        const parts = [_][]const u8{fixtures.processing_instruction};
+        const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
+        try std.testing.expectEqualStrings(
+            "before\x00data\xffinside\x00more data\xffafter\x00\xff",
+            expected.processing_instruction_bytes[0..expected.processing_instruction_bytes_len],
+        );
+        try std.testing.expectEqual(@as(usize, 3), expected.complete_processing_instructions);
+        try expectSummarySchedulesWithOptions(
+            CORE_CONFIG,
+            .{},
+            fixtures.processing_instruction,
+            expected,
+        );
+    }
+    {
+        const parts = [_][]const u8{fixtures.cdata};
+        const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
+        const text = "<not-markup>&not-an-entity;";
+        try std.testing.expectEqualStrings(text, expected.text_bytes[0..expected.text_bytes_len]);
+        try std.testing.expectEqualStrings(text, expected.cdata_bytes[0..expected.cdata_bytes_len]);
+        try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, fixtures.cdata, expected);
+    }
+    {
+        const parts = [_][]const u8{fixtures.shape_records};
+        const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
+        try std.testing.expectEqual(@as(usize, 7), expected.starts);
+        try std.testing.expectEqual(@as(usize, 10), expected.attributes);
+        try std.testing.expectEqualStrings(
+            "tail <raw>",
+            expected.cdata_bytes[0..expected.cdata_bytes_len],
+        );
+        try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, fixtures.shape_records, expected);
+    }
+}
+
+test "[failure] - [declaration]: syntax placement version and encoding are distinct" {
+    const order_offset = std.mem.indexOf(u8, fixtures.declaration_attribute_order, "encoding").?;
+    try expectCoreFailureSchedules(
+        fixtures.declaration_attribute_order,
+        error.InvalidXml,
+        .malformed_declaration,
+        @intCast(order_offset),
+        null,
+    );
+    const misplaced_offset = std.mem.indexOf(u8, fixtures.declaration_not_first, "<?xml").?;
+    try expectCoreFailureSchedules(
+        fixtures.declaration_not_first,
+        error.InvalidXml,
+        .misplaced_xml_declaration,
+        @intCast(misplaced_offset),
+        null,
+    );
+    const duplicate_offset = std.mem.lastIndexOf(u8, fixtures.duplicate_declaration, "<?xml").?;
+    try expectCoreFailureSchedules(
+        fixtures.duplicate_declaration,
+        error.InvalidXml,
+        .misplaced_xml_declaration,
+        @intCast(duplicate_offset),
+        null,
+    );
+    const version_offset = std.mem.indexOf(u8, fixtures.unsupported_version, "2.0").?;
+    try expectCoreFailureSchedules(
+        fixtures.unsupported_version,
+        error.InvalidXml,
+        .unsupported_version,
+        @intCast(version_offset),
+        null,
+    );
+    const encodings = [_]struct {
+        input: []const u8,
+        value: []const u8,
+    }{
+        .{ .input = fixtures.declared_utf16, .value = "UTF-16" },
+        .{ .input = fixtures.ascii_declared, .value = "US-ASCII" },
+        .{ .input = fixtures.iso_8859_1, .value = "ISO-8859-1" },
+        .{ .input = fixtures.declared_ascii_high_byte, .value = "US-ASCII" },
+    };
+    for (encodings) |encoding| {
+        const encoding_offset = std.mem.indexOf(u8, encoding.input, encoding.value).?;
+        try expectCoreFailureSchedules(
+            encoding.input,
+            error.UnsupportedFeature,
+            .unsupported_encoding,
+            @intCast(encoding_offset),
+            null,
+        );
+    }
+}
+
+test "[failure] - [miscellaneous markup]: malformed forms retain exact categories" {
+    const comment_offset = std.mem.indexOf(u8, fixtures.comment_double_hyphen, "-- comment").? + 2;
+    try expectCoreFailureSchedules(
+        fixtures.comment_double_hyphen,
+        error.InvalidXml,
+        .malformed_comment,
+        @intCast(comment_offset),
+        null,
+    );
+    try expectCoreFailureSchedules(
+        fixtures.unclosed_comment,
+        error.InvalidXml,
+        .unclosed_comment,
+        @intCast(fixtures.unclosed_comment.len),
+        null,
+    );
+    const pi_offset = std.mem.indexOf(u8, fixtures.reserved_pi_target, "<?XmL").?;
+    try expectCoreFailureSchedules(
+        fixtures.reserved_pi_target,
+        error.InvalidXml,
+        .reserved_processing_instruction_target,
+        @intCast(pi_offset),
+        null,
+    );
+    try expectCoreFailureSchedules(
+        fixtures.unclosed_cdata,
+        error.InvalidXml,
+        .unclosed_cdata,
+        @intCast(fixtures.unclosed_cdata.len),
+        null,
+    );
+    const misplaced_doctype = std.mem.indexOf(u8, fixtures.doctype_after_root, "<!DOCTYPE").?;
+    try expectCoreFailureSchedules(
+        fixtures.doctype_after_root,
+        error.InvalidXml,
+        .misplaced_doctype,
+        @intCast(misplaced_doctype),
+        null,
+    );
+    try expectCoreFailureSchedules(
+        fixtures.multiple_doctypes,
+        error.UnsupportedFeature,
+        .unsupported_doctype,
+        0,
+        null,
+    );
+
+    const direct = [_]struct {
+        input: []const u8,
+        code: xml.DiagnosticCode,
+        offset: u64,
+    }{
+        .{ .input = "<r><??></r>", .code = .malformed_processing_instruction, .offset = 5 },
+        .{ .input = "<r><?1?></r>", .code = .malformed_processing_instruction, .offset = 5 },
+        .{ .input = "<![CDATA[x]]><r/>", .code = .malformed_cdata, .offset = 0 },
+        .{ .input = "<r/><![CDATA[x]]>", .code = .malformed_cdata, .offset = 4 },
+        .{ .input = "<r><!--x---></r>", .code = .malformed_comment, .offset = 10 },
+        .{ .input = "<r><!X></r>", .code = .malformed_markup_declaration, .offset = 5 },
+    };
+    for (direct) |case| {
+        try expectCoreFailureSchedules(
+            case.input,
+            error.InvalidXml,
+            case.code,
+            case.offset,
+            null,
+        );
+    }
+}
+
+test "[failure] - [stage 6 characters]: malformed UTF-8 and forbidden bytes win in data" {
+    const malformed = [_][]const u8{
+        "<?xml \xe2(?><r/>",
+        "<r><!--\xe2(--></r>",
+        "<r><?pi \xe2(?></r>",
+        "<r><![CDATA[\xe2(]]></r>",
+        "<r><![C\xe2(</r>",
+    };
+    for (malformed) |input| {
+        const offset = std.mem.indexOfScalar(u8, input, '(').?;
+        try expectCoreFailureSchedules(
+            input,
+            error.InvalidXml,
+            .malformed_utf8,
+            @intCast(offset),
+            null,
+        );
+    }
+
+    const forbidden = [_][]const u8{
+        "<?xml \x01?><r/>",
+        "<r><!--\x01--></r>",
+        "<r><?pi \x01?></r>",
+        "<r><![CDATA[\x01]]></r>",
+    };
+    for (forbidden) |input| {
+        const offset = std.mem.indexOfScalar(u8, input, 1).?;
+        try expectCoreFailureSchedules(
+            input,
+            error.InvalidXml,
+            .forbidden_character,
+            @intCast(offset),
+            null,
+        );
+    }
+
+    const late_bom = "<?xml version='1.0'?>\xef\xbb\xbf<r/>";
+    const bom_offset = std.mem.indexOf(u8, late_bom, "\xef\xbb\xbf").?;
+    try expectCoreFailureSchedules(
+        late_bom,
+        error.InvalidXml,
+        .unexpected_document_text,
+        @intCast(bom_offset),
+        null,
+    );
+}
+
+test "[edge] - [miscellaneous fragments]: semantic limits preserve complete values" {
+    var options: xml.Options(CORE_CONFIG) = .{};
+    options.limits.max_fragment_bytes = 4;
+    const input = "<?target abcdefgh?><r><!--abcdefgh--><![CDATA[abcdefgh]]></r>";
+    const parts = [_][]const u8{input};
+    const expected = try parseParts(CORE_CONFIG, std.testing.allocator, options, &parts);
+    try std.testing.expectEqualStrings(
+        "target\x00abcdefgh\xff",
+        expected.processing_instruction_bytes[0..expected.processing_instruction_bytes_len],
+    );
+    try std.testing.expectEqualStrings(
+        "abcdefgh",
+        expected.comment_bytes[0..expected.comment_bytes_len],
+    );
+    try std.testing.expectEqualStrings(
+        "abcdefgh",
+        expected.cdata_bytes[0..expected.cdata_bytes_len],
+    );
+    try expectSummarySchedulesWithOptions(CORE_CONFIG, options, input, expected);
+
+    var target_options: xml.Options(FAST_CONFIG) = .{};
+    target_options.limits.max_processing_instruction_target_bytes = 3;
+    try expectCoreFailureSchedulesWithOptions(
+        target_options,
+        "<?abcd?><r/>",
+        error.LimitExceeded,
+        .processing_instruction_target_limit,
+        5,
+        null,
+    );
+
+    var delimiter_options: xml.Options(FAST_CONFIG) = .{};
+    delimiter_options.limits.max_partial_token_bytes = 2;
+    try expectCoreFailureSchedulesWithOptions(
+        delimiter_options,
+        "<r><!--x--></r>",
+        error.LimitExceeded,
+        .partial_token_limit,
+        6,
+        null,
+    );
+}
+
+test "[failure] - [stage 6 storage]: every allocation failure cleans up" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        allocationStage6Parse,
+        .{},
+    );
+}
+
+test "[property] - [miscellaneous normalization]: UTF-8 CRLF and delimiter suffixes are semantic" {
+    const input = "<r><!--a\r\né--><?π a\r\né?><![CDATA[a\r\né]]]></r>";
+    const parts = [_][]const u8{input};
+    const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
+    try std.testing.expectEqualStrings(
+        "a\né",
+        expected.comment_bytes[0..expected.comment_bytes_len],
+    );
+    try std.testing.expectEqualStrings(
+        "π\x00a\né\xff",
+        expected.processing_instruction_bytes[0..expected.processing_instruction_bytes_len],
+    );
+    try std.testing.expectEqualStrings(
+        "a\né]",
+        expected.cdata_bytes[0..expected.cdata_bytes_len],
+    );
+    try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, input, expected);
+}
+
+test "[property] - [miscellaneous fragments]: contiguous UTF-8 stays in borrowed runs" {
+    const input = "<r><!--é🙂--><?pi é🙂?><![CDATA[é🙂]]></r>";
+    var reader = try CoreReader.init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(input, true);
+
+    var comment_fragments: usize = 0;
+    var instruction_fragments: usize = 0;
+    var cdata_fragments: usize = 0;
+    while (true) {
+        switch (try reader.next()) {
+            .event => |event| switch (event) {
+                .comment => |comment| {
+                    comment_fragments += 1;
+                    if (comment.complete) {
+                        try std.testing.expectEqual(@as(usize, 0), comment.bytes.len);
+                    } else {
+                        try std.testing.expectEqualStrings("é🙂", comment.bytes);
+                    }
+                },
+                .processing_instruction => |instruction| {
+                    instruction_fragments += 1;
+                    try std.testing.expectEqualStrings("pi", instruction.target);
+                    if (instruction.complete) {
+                        try std.testing.expectEqual(@as(usize, 0), instruction.data.len);
+                    } else {
+                        try std.testing.expectEqualStrings("é🙂", instruction.data);
+                    }
+                },
+                .text => |text| if (text.origin == .cdata) {
+                    cdata_fragments += 1;
+                    try std.testing.expectEqualStrings("é🙂", text.bytes);
+                },
+                else => {},
+            },
+            .need_input => return error.UnexpectedNeedInput,
+            .done => break,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), comment_fragments);
+    try std.testing.expectEqual(@as(usize, 2), instruction_fragments);
+    try std.testing.expectEqual(@as(usize, 1), cdata_fragments);
+}
+
+test "[edge] - [declaration grammar]: quoting whitespace ordering and values are exact" {
+    const valid =
+        "<?xml\r\nversion = '1.0'\r\nencoding='utf-8'\r\nstandalone = \"no\" ?>" ++
+        "<r/>";
+    const parts = [_][]const u8{valid};
+    const summary = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
+    try std.testing.expectEqualStrings(
+        "utf-8",
+        summary.declared_encoding[0..summary.declared_encoding_len],
+    );
+    try std.testing.expect(!summary.standalone);
+    try std.testing.expect(summary.standalone_declared);
+    try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, valid, summary);
+
+    const malformed = [_]struct {
+        input: []const u8,
+        diagnostic_offset: u64,
+    }{
+        .{ .input = "<?xml?><r/>", .diagnostic_offset = 0 },
+        .{
+            .input = "<?xml Version='1.0'?><r/>",
+            .diagnostic_offset = std.mem.indexOf(u8, "<?xml Version='1.0'?><r/>", "Version").?,
+        },
+        .{
+            .input = "<?xml version='1.a'?><r/>",
+            .diagnostic_offset = std.mem.indexOf(u8, "<?xml version='1.a'?><r/>", "1.a").?,
+        },
+        .{
+            .input = "<?xml version='1.0' version='1.0'?><r/>",
+            .diagnostic_offset = std.mem.lastIndexOf(u8, "<?xml version='1.0' version='1.0'?><r/>", "version").?,
+        },
+        .{
+            .input = "<?xml version='1.0' standalone='yes' encoding='UTF-8'?><r/>",
+            .diagnostic_offset = std.mem.indexOf(u8, "<?xml version='1.0' standalone='yes' encoding='UTF-8'?><r/>", "encoding").?,
+        },
+        .{
+            .input = "<?xml version='1.0' standalone='maybe'?><r/>",
+            .diagnostic_offset = std.mem.indexOf(u8, "<?xml version='1.0' standalone='maybe'?><r/>", "maybe").?,
+        },
+        .{
+            .input = "<?xml é?><r/>",
+            .diagnostic_offset = std.mem.indexOf(u8, "<?xml é?><r/>", "é").?,
+        },
+    };
+    for (malformed) |case| {
+        try expectCoreFailureSchedules(
+            case.input,
+            error.InvalidXml,
+            .malformed_declaration,
+            case.diagnostic_offset,
+            null,
+        );
+    }
+}
+
+test "[failure] - [markup delimiters]: every proper final prefix has a stable category" {
+    const cases = [_]struct {
+        input: []const u8,
+        code: xml.DiagnosticCode,
+    }{
+        .{ .input = "<r><!", .code = .incomplete_input },
+        .{ .input = "<r><!-", .code = .incomplete_input },
+        .{ .input = "<r><!--", .code = .unclosed_comment },
+        .{ .input = "<r><!--x-", .code = .unclosed_comment },
+        .{ .input = "<r><!--x--", .code = .unclosed_comment },
+        .{ .input = "<r><![", .code = .incomplete_input },
+        .{ .input = "<r><![C", .code = .incomplete_input },
+        .{ .input = "<r><![CD", .code = .incomplete_input },
+        .{ .input = "<r><![CDA", .code = .incomplete_input },
+        .{ .input = "<r><![CDAT", .code = .incomplete_input },
+        .{ .input = "<r><![CDATA", .code = .incomplete_input },
+        .{ .input = "<r><![CDATA[", .code = .unclosed_cdata },
+        .{ .input = "<r><![CDATA[x]", .code = .unclosed_cdata },
+        .{ .input = "<r><![CDATA[x]]", .code = .unclosed_cdata },
+        .{ .input = "<r><?", .code = .incomplete_processing_instruction },
+        .{ .input = "<r><?pi", .code = .incomplete_processing_instruction },
+        .{ .input = "<r><?pi?", .code = .incomplete_processing_instruction },
+        .{ .input = "<?", .code = .incomplete_processing_instruction },
+        .{ .input = "<?x", .code = .incomplete_processing_instruction },
+        .{ .input = "<?xm", .code = .incomplete_processing_instruction },
+        .{ .input = "<?xml", .code = .incomplete_declaration },
+        .{ .input = "<?xml ", .code = .incomplete_declaration },
+        .{ .input = "<?xml version='1.0'?", .code = .incomplete_declaration },
+        .{ .input = "<!D", .code = .incomplete_input },
+        .{ .input = "<!DO", .code = .incomplete_input },
+        .{ .input = "<!DOC", .code = .incomplete_input },
+        .{ .input = "<!DOCT", .code = .incomplete_input },
+        .{ .input = "<!DOCTY", .code = .incomplete_input },
+        .{ .input = "<!DOCTYP", .code = .incomplete_input },
+    };
+    for (cases) |case| {
+        try expectCoreFailureSchedules(
+            case.input,
+            error.InvalidXml,
+            case.code,
+            @intCast(case.input.len),
+            null,
+        );
+    }
+}
+
+test "[edge] - [markup limits]: at-limit values pass and multibyte excess fails" {
+    var short_target_options: xml.Options(FAST_CONFIG) = .{};
+    short_target_options.limits.max_processing_instruction_target_bytes = 1;
+    const declaration_with_short_target_limit = "<?xml version='1.0'?><r/>";
+    const declaration_with_short_target_parts = [_][]const u8{
+        declaration_with_short_target_limit,
+    };
+    const declaration_with_short_target_summary = try parseParts(
+        FAST_CONFIG,
+        std.testing.allocator,
+        short_target_options,
+        &declaration_with_short_target_parts,
+    );
+    try expectSummarySchedulesWithOptions(
+        FAST_CONFIG,
+        short_target_options,
+        declaration_with_short_target_limit,
+        declaration_with_short_target_summary,
+    );
+
+    const short_target_pi = "<?a?><r/>";
+    const short_target_pi_parts = [_][]const u8{short_target_pi};
+    const short_target_pi_summary = try parseParts(
+        FAST_CONFIG,
+        std.testing.allocator,
+        short_target_options,
+        &short_target_pi_parts,
+    );
+    try expectSummarySchedulesWithOptions(
+        FAST_CONFIG,
+        short_target_options,
+        short_target_pi,
+        short_target_pi_summary,
+    );
+    try expectCoreFailureSchedulesWithOptions(
+        short_target_options,
+        "<?ab?><r/>",
+        error.LimitExceeded,
+        .processing_instruction_target_limit,
+        3,
+        null,
+    );
+    try expectCoreFailureSchedulesWithOptions(
+        short_target_options,
+        "<?xml-stylesheet?><r/>",
+        error.LimitExceeded,
+        .processing_instruction_target_limit,
+        3,
+        null,
+    );
+
+    var options: xml.Options(CORE_CONFIG) = .{};
+    options.limits.max_processing_instruction_target_bytes = 4;
+    options.limits.max_fragment_bytes = 2;
+    const valid = "<?abcd é?><r><!--é--><![CDATA[é]]></r>";
+    const parts = [_][]const u8{valid};
+    const summary = try parseParts(CORE_CONFIG, std.testing.allocator, options, &parts);
+    try std.testing.expectEqualStrings(
+        "abcd\x00é\xff",
+        summary.processing_instruction_bytes[0..summary.processing_instruction_bytes_len],
+    );
+    try std.testing.expectEqualStrings("é", summary.comment_bytes[0..summary.comment_bytes_len]);
+    try std.testing.expectEqualStrings("é", summary.cdata_bytes[0..summary.cdata_bytes_len]);
+
+    var unicode_target_options: xml.Options(FAST_CONFIG) = .{};
+    unicode_target_options.limits.max_processing_instruction_target_bytes = 2;
+    const unicode_target_parts = [_][]const u8{"<?é?><r/>"};
+    _ = try parseParts(
+        FAST_CONFIG,
+        std.testing.allocator,
+        unicode_target_options,
+        &unicode_target_parts,
+    );
+    unicode_target_options.limits.max_processing_instruction_target_bytes = 1;
+    try expectCoreFailureSchedulesWithOptions(
+        unicode_target_options,
+        "<?é?><r/>",
+        error.LimitExceeded,
+        .processing_instruction_target_limit,
+        2,
+        null,
+    );
+
+    var delimiter_options: xml.Options(CORE_CONFIG) = .{};
+    delimiter_options.limits.max_partial_token_bytes = 3;
+    const comment_parts = [_][]const u8{"<r><!----></r>"};
+    _ = try parseParts(
+        CORE_CONFIG,
+        std.testing.allocator,
+        delimiter_options,
+        &comment_parts,
+    );
+
+    var cdata_delimiter_options: xml.Options(FAST_CONFIG) = .{};
+    cdata_delimiter_options.limits.max_partial_token_bytes = 8;
+    const cdata_delimiter_parts = [_][]const u8{"<r><![CDATA[x]]></r>"};
+    _ = try parseParts(
+        FAST_CONFIG,
+        std.testing.allocator,
+        cdata_delimiter_options,
+        &cdata_delimiter_parts,
+    );
+    cdata_delimiter_options.limits.max_partial_token_bytes = 7;
+    try expectCoreFailureSchedulesWithOptions(
+        cdata_delimiter_options,
+        "<r><![CDATA[x]]></r>",
+        error.LimitExceeded,
+        .partial_token_limit,
+        11,
+        null,
+    );
+
+    var declaration_options: xml.Options(FAST_CONFIG) = .{};
+    declaration_options.limits.max_partial_token_bytes = 21;
+    const declaration_parts = [_][]const u8{"<?xml version='1.0'?><r/>"};
+    _ = try parseParts(
+        FAST_CONFIG,
+        std.testing.allocator,
+        declaration_options,
+        &declaration_parts,
+    );
+    declaration_options.limits.max_partial_token_bytes = 20;
+    try expectCoreFailureSchedulesWithOptions(
+        declaration_options,
+        "<?xml version='1.0'?><r/>",
+        error.LimitExceeded,
+        .partial_token_limit,
+        20,
+        null,
+    );
+
+    declaration_options.limits.max_partial_token_bytes = 6;
+    try expectCoreFailureSchedulesWithOptions(
+        declaration_options,
+        "<?xml é?><r/>",
+        error.LimitExceeded,
+        .partial_token_limit,
+        6,
+        null,
+    );
+
+    for (1..6) |opener_limit| {
+        declaration_options.limits.max_partial_token_bytes = opener_limit;
+        try expectCoreFailureSchedulesWithOptions(
+            declaration_options,
+            "<?xml version='1.0'?><r/>",
+            error.LimitExceeded,
+            .partial_token_limit,
+            @intCast(opener_limit),
+            null,
+        );
+    }
+
+    var bracket_options: xml.Options(CORE_CONFIG) = .{};
+    bracket_options.limits.max_fragment_bytes = 1;
+    const bracket_input = "<r><![CDATA[]]x]]]></r>";
+    const bracket_parts = [_][]const u8{bracket_input};
+    const bracket_summary = try parseParts(
+        CORE_CONFIG,
+        std.testing.allocator,
+        bracket_options,
+        &bracket_parts,
+    );
+    try std.testing.expectEqualStrings(
+        "]]x]",
+        bracket_summary.cdata_bytes[0..bracket_summary.cdata_bytes_len],
+    );
+    try expectSummarySchedulesWithOptions(
+        CORE_CONFIG,
+        bracket_options,
+        bracket_input,
+        bracket_summary,
+    );
+
+    var fragment_options: xml.Options(FAST_CONFIG) = .{};
+    fragment_options.limits.max_fragment_bytes = 1;
+    inline for (.{
+        "<r><!--é--></r>",
+        "<r><?pi é?></r>",
+        "<r><![CDATA[é]]></r>",
+    }) |input| {
+        const scalar_offset = std.mem.indexOf(u8, input, "é").?;
+        try expectCoreFailureSchedulesWithOptions(
+            fragment_options,
+            input,
+            error.LimitExceeded,
+            .fragment_limit,
+            @intCast(scalar_offset),
+            null,
+        );
+    }
+}
+
+test "[property] - [markup memory]: increasing comments retain fixed parser capacity" {
+    var reader = try CoreReader.init(std.testing.allocator, .{});
+    defer reader.deinit();
+
+    const small = try parseRepeatedComment(&reader, 1024);
+    try std.testing.expectEqual(@as(usize, 1024), small.bytes);
+    try std.testing.expectEqual(@as(usize, 1), small.complete);
+    const retained = reader.memoryUsage().retained_capacity;
+
+    try reader.reset(.retain_capacity);
+    const large = try parseRepeatedComment(&reader, 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), large.bytes);
+    try std.testing.expectEqual(@as(usize, 1), large.complete);
+    try std.testing.expectEqual(retained, reader.memoryUsage().retained_capacity);
+
+    try reader.reset(.retain_capacity);
+    const small_instruction = try parseRepeatedProcessingInstruction(&reader, 1024);
+    try std.testing.expectEqual(@as(usize, 1024), small_instruction.bytes);
+    try std.testing.expectEqual(@as(usize, 1), small_instruction.complete);
+    const instruction_retained = reader.memoryUsage().retained_capacity;
+
+    try reader.reset(.retain_capacity);
+    const large_instruction = try parseRepeatedProcessingInstruction(&reader, 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), large_instruction.bytes);
+    try std.testing.expectEqual(@as(usize, 1), large_instruction.complete);
+    try std.testing.expectEqual(
+        instruction_retained,
+        reader.memoryUsage().retained_capacity,
+    );
+}
+
+test "[unit] - [stage 6 reset]: pending declaration and delimiter state is discarded" {
+    const partials = [_][]const u8{
+        "<?xml version='1.0'",
+        "<r><!--partial",
+        "<r><![CDATA[partial]",
+        "<r><?target partial?",
+    };
     var reader = try CoreReader.init(std.testing.allocator, .{});
     defer reader.deinit();
     for (partials) |partial| {

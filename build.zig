@@ -209,6 +209,106 @@ pub fn build(b: *std.Build) void {
         "literal_control",
         @embedFile("fixture/invalid/encoding/literal-control.xml"),
     );
+    reader_fixtures.addOption(
+        []const u8,
+        "declaration",
+        @embedFile("fixture/valid/core/declaration.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "prolog_epilog_misc",
+        @embedFile("fixture/valid/core/prolog_epilog_misc.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "comment_edges",
+        @embedFile("fixture/valid/core/comment_edges.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "processing_instruction",
+        @embedFile("fixture/valid/core/processing_instruction.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "cdata",
+        @embedFile("fixture/valid/core/cdata.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "declaration_attribute_order",
+        @embedFile("fixture/invalid/not_well_formed/declaration_attribute_order.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "declaration_not_first",
+        @embedFile("fixture/invalid/not_well_formed/declaration_not_first.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "duplicate_declaration",
+        @embedFile("fixture/invalid/not_well_formed/duplicate_declaration.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "unsupported_version",
+        @embedFile("fixture/invalid/not_well_formed/unsupported_version.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "comment_double_hyphen",
+        @embedFile("fixture/invalid/not_well_formed/comment_double_hyphen.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "unclosed_comment",
+        @embedFile("fixture/invalid/not_well_formed/unclosed_comment.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "reserved_pi_target",
+        @embedFile("fixture/invalid/not_well_formed/reserved_pi_target.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "unclosed_cdata",
+        @embedFile("fixture/invalid/not_well_formed/unclosed_cdata.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "doctype_after_root",
+        @embedFile("fixture/invalid/not_well_formed/doctype_after_root.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "multiple_doctypes",
+        @embedFile("fixture/invalid/not_well_formed/multiple_doctypes.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "declared_utf16",
+        @embedFile("fixture/invalid/encoding/declared-utf16-but-utf8.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "shape_records",
+        @embedFile("fixture/valid/core/shape_records.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "ascii_declared",
+        @embedFile("fixture/valid/encoding/ascii-declared.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "iso_8859_1",
+        @embedFile("fixture/valid/encoding/iso-8859-1.xml"),
+    );
+    reader_fixtures.addOption(
+        []const u8,
+        "declared_ascii_high_byte",
+        @embedFile("fixture/invalid/encoding/declared-ascii-with-high-byte.xml"),
+    );
     public_tests_module.addOptions("reader_fixtures", reader_fixtures);
 
     const public_tests = b.addTest(.{

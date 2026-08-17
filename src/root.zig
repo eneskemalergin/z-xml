@@ -27,6 +27,12 @@ pub const Limits = reader.Limits;
 pub const MemoryUsage = reader.MemoryUsage;
 /// Stable diagnostic category.
 pub const DiagnosticCode = reader.DiagnosticCode;
+/// Effective XML rules reported at document start.
+pub const XmlVersion = reader.XmlVersion;
+/// Detected source encoding reported at document start.
+pub const SourceEncoding = reader.SourceEncoding;
+/// Semantic origin reported by text fragments.
+pub const TextOrigin = reader.TextOrigin;
 /// Input-feed misuse errors.
 pub const FeedError = reader.FeedError;
 /// Event production errors.
