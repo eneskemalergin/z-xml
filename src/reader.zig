@@ -763,12 +763,21 @@ fn OpenElementFrame(comptime config: Config) type {
 }
 
 fn AttributeRecord(comptime config: Config) type {
-    return struct {
-        name_offset: usize,
-        name_len: usize,
-        value_len: usize,
-        start: Location(config),
-    };
+    return if (config.profile.hasNamespaces())
+        struct {
+            name_offset: usize,
+            name_len: usize,
+            value_len: usize,
+            start: Location(config),
+            namespace_shape: usize = 0,
+        }
+    else
+        struct {
+            name_offset: usize,
+            name_len: usize,
+            value_len: usize,
+            start: Location(config),
+        };
 }
 
 const Failure = enum {
@@ -1172,6 +1181,7 @@ pub fn Reader(comptime config: Config) type {
                         }
                         if (byte == '&') {
                             self.text_close_brackets = 0;
+                            if (try self.prepareCompleteContentReference()) continue;
                             try self.beginReference(.content);
                             continue;
                         }
@@ -3135,23 +3145,25 @@ pub fn Reader(comptime config: Config) type {
             std.debug.assert(self.utf8_len == 0);
             const run_start = self.cursor;
             const start = self.currentLocation();
-            var run_end = run_start;
-            var close_brackets = self.text_close_brackets;
             const fragment_end = @min(
                 self.input.len,
                 run_start +| self.options.limits.max_fragment_bytes,
             );
-            const delimiter_offset = std.mem.indexOfAny(
-                u8,
-                self.input[run_start..fragment_end],
-                "<&\r",
-            ) orelse fragment_end - run_start;
-            const scan_end = run_start + delimiter_offset;
-            while (run_end < scan_end) {
+            const candidate = self.input[run_start..fragment_end];
+            if (contentHasOrdinaryPrefix(candidate) and
+                self.prepareBulkContentRun(candidate, start))
+            {
+                return true;
+            }
+
+            var run_end = run_start;
+            var close_brackets = self.text_close_brackets;
+            while (run_end < fragment_end) {
                 const byte = self.input[run_end];
 
                 var scalar_len: usize = 1;
                 if (byte < 0x80) {
+                    if (byte == '<' or byte == '&' or byte == '\r') break;
                     if (!isXml10Char(byte)) {
                         if (run_end != run_start) break;
                         return self.fail(.forbidden_character, .invalid_xml);
@@ -3208,6 +3220,86 @@ pub fn Reader(comptime config: Config) type {
             return true;
         }
 
+        fn contentHasOrdinaryPrefix(run: []const u8) bool {
+            if (run.len < 64) return false;
+            for (run[0..8]) |byte| {
+                if (byte == '<' or byte == '&' or byte == '\r' or byte == ']') {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        noinline fn prepareBulkContentRun(
+            self: *Self,
+            candidate: []const u8,
+            start: Location(config),
+        ) bool {
+            const unicode_dense = contentStartsUnicodeDense(candidate);
+            const scan = if (unicode_dense) scanContentStructure(candidate) else null;
+            var fast_len = if (scan) |result| result.delimiter_index else candidate.len;
+            if (!unicode_dense) {
+                inline for ("<&\r") |delimiter| {
+                    if (std.mem.indexOfScalar(u8, candidate[0..fast_len], delimiter)) |index| {
+                        fast_len = index;
+                    }
+                }
+            }
+            if (contentCdataCloseIndex(
+                self.text_close_brackets,
+                candidate[0..fast_len],
+            )) |index| {
+                fast_len = index;
+            }
+            const fast_run = candidate[0..fast_len];
+            if (fast_run.len == 0 or
+                !contentRunCanUseBulkPath(
+                    fast_run,
+                    if (scan) |result| result.has_non_ascii else hasNonAscii(fast_run),
+                )) return false;
+            self.consumeRun(fast_run);
+            self.text_close_brackets = contentTrailingCloseBrackets(
+                self.text_close_brackets,
+                fast_run,
+            );
+            self.text_fragment = fast_run;
+            self.text_start = start;
+            self.text_origin = .character_data;
+            self.text_resume = .content;
+            self.vertical_state = .emit_text;
+            return true;
+        }
+
+        fn contentRunCanUseBulkPath(run: []const u8, has_non_ascii: bool) bool {
+            if (has_non_ascii) {
+                if (!utf8AndXmlControlsValid(run)) return false;
+            } else if (hasForbiddenAsciiControl(run)) return false;
+            return true;
+        }
+
+        fn contentCdataCloseIndex(close_brackets: u2, run: []const u8) ?usize {
+            var earliest: ?usize = null;
+            if (close_brackets == 2 and run.len > 0 and run[0] == '>') {
+                earliest = 0;
+            } else if (close_brackets == 1 and run.len > 1 and
+                run[0] == ']' and run[1] == '>')
+            {
+                earliest = 1;
+            }
+            if (std.mem.indexOf(u8, run, "]]>")) |start| {
+                const index = start + 2;
+                if (earliest == null or index < earliest.?) earliest = index;
+            }
+            return earliest;
+        }
+
+        fn contentTrailingCloseBrackets(previous: u2, run: []const u8) u2 {
+            std.debug.assert(run.len > 0);
+            if (run[run.len - 1] != ']') return 0;
+            if (run.len >= 2) return if (run[run.len - 2] == ']') 2 else 1;
+            return @min(previous + 1, 2);
+        }
+
         fn prepareInlineText(
             self: *Self,
             bytes: []const u8,
@@ -3238,6 +3330,59 @@ pub fn Reader(comptime config: Config) type {
             }
             try self.consumeReferenceByte('&');
             self.vertical_state = .reference_start;
+        }
+
+        fn prepareCompleteContentReference(self: *Self) ReadError!bool {
+            const input = self.input[self.cursor..];
+            const start = self.currentLocation();
+            const predefined = .{
+                .{ "&amp;", "&" },
+                .{ "&lt;", "<" },
+                .{ "&gt;", ">" },
+                .{ "&apos;", "'" },
+                .{ "&quot;", "\"" },
+            };
+            inline for (predefined) |entry| {
+                const token = entry[0];
+                const output = entry[1];
+                if (std.mem.startsWith(u8, input, token) and
+                    token.len <= self.options.limits.max_partial_token_bytes and
+                    output.len <= self.options.limits.max_fragment_bytes)
+                {
+                    self.consumeRun(input[0..token.len]);
+                    try self.prepareInlineText(output, start);
+                    return true;
+                }
+            }
+
+            if (!std.mem.startsWith(u8, input, "&#")) return false;
+            var index: usize = 2;
+            var kind: ReferenceKind = .decimal;
+            if (index < input.len and input[index] == 'x') {
+                kind = .hexadecimal;
+                index += 1;
+            }
+            const digits_start = index;
+            var value: u32 = 0;
+            const base: u32 = if (kind == .hexadecimal) 16 else 10;
+            while (index < input.len and input[index] != ';') : (index += 1) {
+                const digit = referenceDigit(input[index], kind) orelse return false;
+                if (value > (0x10ffff - digit) / base) return false;
+                value = value * base + digit;
+            }
+            if (index == digits_start or index == input.len or
+                index + 1 > self.options.limits.max_partial_token_bytes or
+                !isXml10Char(@intCast(value)))
+            {
+                return false;
+            }
+            var output: [4]u8 = undefined;
+            const output_len = std.unicode.utf8Encode(@intCast(value), &output) catch
+                unreachable;
+            if (output_len > self.options.limits.max_fragment_bytes) return false;
+            self.consumeRun(input[0 .. index + 1]);
+            try self.prepareInlineText(output[0..output_len], start);
+            return true;
         }
 
         fn consumeReferenceByte(self: *Self, byte: u8) ReadError!void {
@@ -3778,10 +3923,11 @@ pub fn Reader(comptime config: Config) type {
             }
 
             var declaration_count: usize = 0;
-            for (self.attribute_records.items) |record| {
-                const raw = self.attributeRawName(record);
+            for (self.attribute_records.items) |*record| {
+                const raw = self.attributeRawName(record.*);
                 const parts = try self.requireQName(raw, record.start);
                 if (namespaceDeclarationPrefix(raw, parts)) |declared_prefix| {
+                    record.namespace_shape = std.math.maxInt(usize);
                     declaration_count += 1;
                     if (declaration_count >
                         self.options.namespace_limits.max_declarations_per_element)
@@ -3792,7 +3938,9 @@ pub fn Reader(comptime config: Config) type {
                             record.start,
                         );
                     }
-                    try self.addNamespaceDeclaration(record, declared_prefix);
+                    try self.addNamespaceDeclaration(record.*, declared_prefix);
+                } else if (parts.prefix) |prefix| {
+                    record.namespace_shape = prefix.len + 1;
                 }
             }
 
@@ -3801,12 +3949,7 @@ pub fn Reader(comptime config: Config) type {
                 element_name_start,
             );
 
-            var ordinary_count: usize = 0;
-            for (self.attribute_records.items) |record| {
-                const raw = self.attributeRawName(record);
-                const parts = qnameParts(raw).?;
-                if (namespaceDeclarationPrefix(raw, parts) == null) ordinary_count += 1;
-            }
+            const ordinary_count = self.attribute_records.items.len - declaration_count;
             self.event_attributes.clearRetainingCapacity();
             self.event_attributes.ensureTotalCapacity(
                 self.allocator,
@@ -3823,8 +3966,16 @@ pub fn Reader(comptime config: Config) type {
 
             for (self.attribute_records.items) |record| {
                 const raw = self.attributeRawName(record);
-                const parts = qnameParts(raw).?;
-                if (namespaceDeclarationPrefix(raw, parts) != null) continue;
+                if (record.namespace_shape == std.math.maxInt(usize)) continue;
+                const parts: QNameParts = if (record.namespace_shape == 0)
+                    .{ .prefix = null, .local = raw }
+                else parts: {
+                    const colon = record.namespace_shape - 1;
+                    break :parts .{
+                        .prefix = raw[0..colon],
+                        .local = raw[colon + 1 ..],
+                    };
+                };
                 if (parts.prefix) |prefix| {
                     if (std.mem.eql(u8, prefix, "xmlns")) {
                         return self.failAt(
@@ -4820,6 +4971,276 @@ fn isXml10Char(codepoint: u21) bool {
         (codepoint >= 0x20 and codepoint <= 0xd7ff) or
         (codepoint >= 0xe000 and codepoint <= 0xfffd) or
         (codepoint >= 0x10000 and codepoint <= 0x10ffff);
+}
+
+fn hasForbiddenAsciiControl(bytes: []const u8) bool {
+    var index: usize = 0;
+    if (std.simd.suggestVectorLength(u8)) |vector_len| {
+        const Vector = @Vector(vector_len, u8);
+        const space: Vector = @splat(0x20);
+        const tab: Vector = @splat('\t');
+        const line_feed: Vector = @splat('\n');
+        while (index + vector_len <= bytes.len) : (index += vector_len) {
+            const block: Vector = bytes[index..][0..vector_len].*;
+            const forbidden = (block < space) & (block != tab) & (block != line_feed);
+            if (@reduce(.Or, forbidden)) return true;
+        }
+    }
+    for (bytes[index..]) |byte| {
+        if (byte < 0x20 and byte != '\t' and byte != '\n') return true;
+    }
+    return false;
+}
+
+const ContentStructureScan = struct {
+    delimiter_index: usize,
+    has_non_ascii: bool,
+};
+
+fn contentStartsUnicodeDense(bytes: []const u8) bool {
+    for (bytes[0..@min(bytes.len, 8)]) |byte| if (byte >= 0x80) return true;
+    return false;
+}
+
+noinline fn scanContentStructure(bytes: []const u8) ContentStructureScan {
+    var index: usize = 0;
+    var has_non_ascii = false;
+    if (std.simd.suggestVectorLength(u8)) |vector_len| {
+        const Vector = @Vector(vector_len, u8);
+        const mask: Vector = @splat(0x80);
+        const less_than: Vector = @splat('<');
+        const ampersand: Vector = @splat('&');
+        const carriage_return: Vector = @splat('\r');
+        while (index + vector_len <= bytes.len) : (index += vector_len) {
+            const block: Vector = bytes[index..][0..vector_len].*;
+            const delimiter = (block == less_than) | (block == ampersand) |
+                (block == carriage_return);
+            if (@reduce(.Or, delimiter)) {
+                for (bytes[index..][0..vector_len], 0..) |byte, relative| {
+                    if (byte == '<' or byte == '&' or byte == '\r') {
+                        return .{
+                            .delimiter_index = index + relative,
+                            .has_non_ascii = has_non_ascii,
+                        };
+                    }
+                    has_non_ascii = has_non_ascii or byte >= 0x80;
+                }
+                unreachable;
+            }
+            has_non_ascii = has_non_ascii or @reduce(.Or, block & mask == mask);
+        }
+    }
+    for (bytes[index..], index..) |byte, position| {
+        if (byte == '<' or byte == '&' or byte == '\r') {
+            return .{ .delimiter_index = position, .has_non_ascii = has_non_ascii };
+        }
+        has_non_ascii = has_non_ascii or byte >= 0x80;
+    }
+    return .{ .delimiter_index = bytes.len, .has_non_ascii = has_non_ascii };
+}
+
+fn hasNonAscii(bytes: []const u8) bool {
+    var index: usize = 0;
+    if (std.simd.suggestVectorLength(u8)) |vector_len| {
+        const Vector = @Vector(vector_len, u8);
+        const mask: Vector = @splat(0x80);
+        while (index + vector_len <= bytes.len) : (index += vector_len) {
+            const block: Vector = bytes[index..][0..vector_len].*;
+            if (@reduce(.Or, block & mask == mask)) return true;
+        }
+    }
+    for (bytes[index..]) |byte| if (byte >= 0x80) return true;
+    return false;
+}
+
+noinline fn utf8AndXmlControlsValid(bytes: []const u8) bool {
+    var index: usize = 0;
+    if (std.simd.suggestVectorLength(u8)) |vector_len| {
+        const Vector = @Vector(vector_len, u8);
+        const c2: Vector = @splat(0xc2);
+        const e0: Vector = @splat(0xe0);
+        const ed: Vector = @splat(0xed);
+        const f0: Vector = @splat(0xf0);
+        const f4: Vector = @splat(0xf4);
+        const ff: Vector = @splat(0xff);
+        const fe: Vector = @splat(0xfe);
+        const bf: Vector = @splat(0xbf);
+        const continuation_low: Vector = @splat(0x80);
+        const continuation_high: Vector = @splat(0xbf);
+        const a0: Vector = @splat(0xa0);
+        const nine_f: Vector = @splat(0x9f);
+        const nine_zero: Vector = @splat(0x90);
+        const eight_f: Vector = @splat(0x8f);
+        const space: Vector = @splat(0x20);
+        const tab: Vector = @splat('\t');
+        const line_feed: Vector = @splat('\n');
+
+        while (index < @min(bytes.len, 3)) : (index += 1) {
+            if (!utf8XmlByteValid(bytes, index)) return false;
+        }
+        while (index + vector_len <= bytes.len) : (index += vector_len) {
+            const current: Vector = bytes[index..][0..vector_len].*;
+            const previous1: Vector = bytes[index - 1 ..][0..vector_len].*;
+            const previous2: Vector = bytes[index - 2 ..][0..vector_len].*;
+            const previous3: Vector = bytes[index - 3 ..][0..vector_len].*;
+
+            const continuation = (current >= continuation_low) &
+                (current <= continuation_high);
+            const expected = ((previous1 >= c2) & (previous1 <= f4)) |
+                ((previous2 >= e0) & (previous2 <= f4)) |
+                ((previous3 >= f0) & (previous3 <= f4));
+            const invalid_leader = ((current >= @as(Vector, @splat(0xc0))) &
+                (current < c2)) | (current > f4);
+            const invalid_boundary = ((previous1 == e0) & (current < a0)) |
+                ((previous1 == ed) & (current > nine_f)) |
+                ((previous1 == f0) & (current < nine_zero)) |
+                ((previous1 == f4) & (current > eight_f));
+            const forbidden_noncharacter = (previous2 == @as(Vector, @splat(0xef))) &
+                (previous1 == bf) & ((current == fe) | (current == ff));
+            const forbidden_control = (current < space) &
+                (current != tab) &
+                (current != line_feed);
+            if (@reduce(.Or, (continuation != expected) | invalid_leader |
+                invalid_boundary | forbidden_noncharacter | forbidden_control))
+            {
+                return false;
+            }
+        }
+    }
+    while (index < bytes.len) : (index += 1) {
+        if (!utf8XmlByteValid(bytes, index)) return false;
+    }
+    if (bytes.len > 0 and isUtf8Leader(bytes[bytes.len - 1])) return false;
+    if (bytes.len > 1 and isUtf8ThreeOrFourByteLeader(bytes[bytes.len - 2])) return false;
+    if (bytes.len > 2 and isUtf8FourByteLeader(bytes[bytes.len - 3])) return false;
+    return true;
+}
+
+fn utf8XmlByteValid(bytes: []const u8, index: usize) bool {
+    const byte = bytes[index];
+    const continuation = byte >= 0x80 and byte <= 0xbf;
+    const expected = (index >= 1 and isUtf8Leader(bytes[index - 1])) or
+        (index >= 2 and isUtf8ThreeOrFourByteLeader(bytes[index - 2])) or
+        (index >= 3 and isUtf8FourByteLeader(bytes[index - 3]));
+    if (continuation != expected or byte == 0xc0 or byte == 0xc1 or byte > 0xf4) return false;
+    if (index >= 1) {
+        const previous = bytes[index - 1];
+        if ((previous == 0xe0 and byte < 0xa0) or
+            (previous == 0xed and byte > 0x9f) or
+            (previous == 0xf0 and byte < 0x90) or
+            (previous == 0xf4 and byte > 0x8f))
+        {
+            return false;
+        }
+    }
+    if (index >= 2 and bytes[index - 2] == 0xef and bytes[index - 1] == 0xbf and
+        (byte == 0xbe or byte == 0xbf)) return false;
+    return byte >= 0x20 or byte == '\t' or byte == '\n';
+}
+
+fn isUtf8Leader(byte: u8) bool {
+    return byte >= 0xc2 and byte <= 0xf4;
+}
+
+fn isUtf8ThreeOrFourByteLeader(byte: u8) bool {
+    return byte >= 0xe0 and byte <= 0xf4;
+}
+
+fn isUtf8FourByteLeader(byte: u8) bool {
+    return byte >= 0xf0 and byte <= 0xf4;
+}
+
+test "[unit] - [content SIMD]: forbidden-control scan matches scalar boundaries" {
+    const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
+    var storage: [2 * vector_len + 1]u8 = undefined;
+    const lengths = [_]usize{ vector_len - 1, vector_len, vector_len + 1, storage.len };
+    for (lengths) |length| {
+        const bytes = storage[0..length];
+        @memset(bytes, 'x');
+        try std.testing.expect(!hasForbiddenAsciiControl(bytes));
+        for (0..length) |position| {
+            for (0..256) |value| {
+                bytes[position] = @intCast(value);
+                const expected = value < 0x20 and value != '\t' and value != '\n';
+                try std.testing.expectEqual(expected, hasForbiddenAsciiControl(bytes));
+            }
+            bytes[position] = 'x';
+        }
+    }
+}
+
+test "[unit] - [content SIMD]: UTF-8 and XML-control scan matches reference" {
+    const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
+    var storage: [2 * vector_len + 7]u8 = undefined;
+    const pattern = "a\xc3\xa9\xce\xbb\xf0\x9f\x99\x82";
+    for (&storage, 0..) |*byte, index| byte.* = pattern[index % pattern.len];
+
+    const lengths = [_]usize{
+        0,
+        1,
+        vector_len - 1,
+        vector_len,
+        vector_len + 1,
+        2 * vector_len - 1,
+        2 * vector_len,
+        storage.len,
+    };
+    for (lengths) |length| {
+        for (0..length) |position| {
+            const original = storage[position];
+            for (0..256) |value| {
+                storage[position] = @intCast(value);
+                const bytes = storage[0..length];
+                const expected = std.unicode.utf8ValidateSlice(bytes) and
+                    !hasForbiddenAsciiControl(bytes) and
+                    std.mem.indexOf(u8, bytes, "\xef\xbf\xbe") == null and
+                    std.mem.indexOf(u8, bytes, "\xef\xbf\xbf") == null;
+                try std.testing.expectEqual(expected, utf8AndXmlControlsValid(bytes));
+            }
+            storage[position] = original;
+        }
+    }
+
+    var prng = std.Random.DefaultPrng.init(0x757466385f786d6c);
+    const random = prng.random();
+    for (0..10_000) |_| {
+        const length = random.intRangeAtMost(usize, 0, storage.len);
+        random.bytes(storage[0..length]);
+        const bytes = storage[0..length];
+        const expected = std.unicode.utf8ValidateSlice(bytes) and
+            !hasForbiddenAsciiControl(bytes) and
+            std.mem.indexOf(u8, bytes, "\xef\xbf\xbe") == null and
+            std.mem.indexOf(u8, bytes, "\xef\xbf\xbf") == null;
+        try std.testing.expectEqual(expected, utf8AndXmlControlsValid(bytes));
+    }
+}
+
+test "[unit] - [content SIMD]: structural scan matches scalar boundaries" {
+    const vector_len = std.simd.suggestVectorLength(u8) orelse 16;
+    var storage: [2 * vector_len + 1]u8 = undefined;
+    const lengths = [_]usize{ vector_len - 1, vector_len, vector_len + 1, storage.len };
+    for (lengths) |length| {
+        const bytes = storage[0..length];
+        @memset(bytes, 'x');
+        for (0..length) |position| {
+            for (0..256) |value| {
+                bytes[position] = @intCast(value);
+                var expected_index = length;
+                var expected_non_ascii = false;
+                for (bytes, 0..) |byte, index| {
+                    if (byte == '<' or byte == '&' or byte == '\r') {
+                        expected_index = index;
+                        break;
+                    }
+                    expected_non_ascii = expected_non_ascii or byte >= 0x80;
+                }
+                const observed = scanContentStructure(bytes);
+                try std.testing.expectEqual(expected_index, observed.delimiter_index);
+                try std.testing.expectEqual(expected_non_ascii, observed.has_non_ascii);
+            }
+            bytes[position] = 'x';
+        }
+    }
 }
 
 fn isXml10NameStart(codepoint: u21) bool {

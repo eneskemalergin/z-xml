@@ -404,6 +404,16 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run z-xml tests");
     test_step.dependOn(&run_public_tests.step);
 
+    const reader_internal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/reader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_reader_internal_tests = b.addRunArtifact(reader_internal_tests);
+    test_step.dependOn(&run_reader_internal_tests.step);
+
     const check_module = b.createModule(.{
         .root_source_file = b.path("tools/z_xml_check.zig"),
         .target = target,
@@ -445,6 +455,51 @@ pub fn build(b: *std.Build) void {
     });
     const run_namespace_check_tests = b.addRunArtifact(namespace_check_tests);
     test_step.dependOn(&run_namespace_check_tests.step);
+
+    const persistent_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_persistent.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    persistent_module.addImport("z_xml", z_xml);
+    const persistent_raw_options = b.addOptions();
+    persistent_raw_options.addOption(bool, "namespaces", false);
+    persistent_module.addOptions("persistent_options", persistent_raw_options);
+    const persistent = b.addExecutable(.{
+        .name = "z-xml-persistent",
+        .root_module = persistent_module,
+    });
+    b.installArtifact(persistent);
+    const persistent_tests = b.addTest(.{
+        .root_module = persistent_module,
+    });
+    const run_persistent_tests = b.addRunArtifact(persistent_tests);
+    test_step.dependOn(&run_persistent_tests.step);
+
+    const namespace_persistent_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_persistent.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    namespace_persistent_module.addImport("z_xml", z_xml);
+    const persistent_namespace_options = b.addOptions();
+    persistent_namespace_options.addOption(bool, "namespaces", true);
+    namespace_persistent_module.addOptions(
+        "persistent_options",
+        persistent_namespace_options,
+    );
+    const namespace_persistent = b.addExecutable(.{
+        .name = "z-xml-ns-persistent",
+        .root_module = namespace_persistent_module,
+    });
+    b.installArtifact(namespace_persistent);
+    const namespace_persistent_tests = b.addTest(.{
+        .root_module = namespace_persistent_module,
+    });
+    const run_namespace_persistent_tests = b.addRunArtifact(namespace_persistent_tests);
+    test_step.dependOn(&run_namespace_persistent_tests.step);
 
     const layout_module = b.createModule(.{
         .root_source_file = b.path("src/layout_probe.zig"),

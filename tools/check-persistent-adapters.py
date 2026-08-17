@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin-dir", type=Path, required=True)
+    parser.add_argument("--z-xml-bin-dir", type=Path)
     parser.add_argument(
         "--input",
         type=Path,
@@ -52,6 +53,8 @@ def main() -> int:
         "expat": args.bin_dir / "xml-ref-expat-persistent",
         "quick-xml": args.bin_dir / "xml-ref-quick-xml-persistent",
     }
+    if args.z_xml_bin_dir is not None:
+        targets["z-xml"] = args.z_xml_bin_dir / "z-xml-persistent"
     for engine, program in targets.items():
         if not program.is_file():
             print(f"missing {engine} persistent adapter: {program}", file=sys.stderr)
