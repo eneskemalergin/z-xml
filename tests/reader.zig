@@ -1097,6 +1097,7 @@ const DtdOutcome = struct {
     defaulted: usize = 0,
     namespace_declarations: usize = 0,
     text_hash: u64 = 14695981039346656037,
+    validation: ?xml.ValidationStatus = null,
 };
 
 const DtdSchedule = union(enum) {
@@ -1145,6 +1146,11 @@ fn dtdOutcome(comptime config: xml.Config, input: []const u8, schedule: DtdSched
                 .text => |text| for (text.bytes) |byte| {
                     outcome.text_hash ^= byte;
                     outcome.text_hash *%= 1099511628211;
+                },
+                .document_end => |document_end| {
+                    if (@hasField(@TypeOf(document_end), "validation")) {
+                        outcome.validation = document_end.validation;
+                    }
                 },
                 else => {},
             },
@@ -1358,8 +1364,6 @@ test "config - excluded capabilities: specialized types omit impossible fields" 
 
 test "[failure] - [unavailable profiles]: reject parsing explicitly" {
     inline for (.{
-        xml.Configs.XML10_VALIDATING,
-        xml.Configs.XML10_NAMESPACES_VALIDATING_DETAILED,
         xml.Configs.XML11_NAMESPACES_VALIDATING,
     }) |config| {
         const Reader = xml.Reader(config);
@@ -1373,6 +1377,241 @@ test "[failure] - [unavailable profiles]: reject parsing explicitly" {
         try std.testing.expectEqual(@as(u64, 0), diagnostic.primary.byte_offset);
         try std.testing.expectError(error.UnsupportedFeature, reader.next());
     }
+}
+
+test "[integration] - [DTD validation]: accepts declared sequence and attributes" {
+    const config = xml.Configs.XML10_VALIDATING;
+    const input = "<!DOCTYPE root [" ++
+        "<!ELEMENT root (item+)>" ++
+        "<!ELEMENT item (#PCDATA)>" ++
+        "<!ATTLIST item id ID #REQUIRED refs IDREFS #IMPLIED kind (a|b) #FIXED 'a'>" ++
+        "]><root><item id='one'/><item id='two' refs='one' kind='a'>text</item></root>";
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(input, true);
+    var status: ?xml.ValidationStatus = null;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .document_end => |document| status = document.validation,
+            else => {},
+        },
+        .done => break,
+        .need_input => unreachable,
+    };
+    try std.testing.expectEqual(xml.ValidationStatus.valid, status.?);
+    try std.testing.expect(reader.diagnostic() == null);
+}
+
+test "[failure] - [DTD validation]: stop-first reports content mismatch" {
+    const config = xml.Configs.XML10_VALIDATING;
+    const input = "<!DOCTYPE root [<!ELEMENT root (a,b)><!ELEMENT a EMPTY><!ELEMENT b EMPTY>]>" ++
+        "<root><b/></root>";
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(input, true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.NotValid, err);
+            break;
+        };
+    }
+    try std.testing.expectEqual(
+        xml.DiagnosticCode.validity_element_content,
+        reader.diagnostic().?.code,
+    );
+}
+
+test "[integration] - [DTD validation]: collection reaches explicit invalid result" {
+    const config = xml.Configs.XML10_VALIDATING;
+    const input = "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root needed CDATA #REQUIRED>]>" ++
+        "<root><child/></root>";
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{
+        .validation = .{ .collect_validity_errors = true },
+    });
+    defer reader.deinit();
+    try reader.feed(input, true);
+    var status: ?xml.ValidationStatus = null;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .document_end => |document| status = document.validation,
+            else => {},
+        },
+        .done => break,
+        .need_input => unreachable,
+    };
+    try std.testing.expectEqual(xml.ValidationStatus.invalid, status.?);
+    try std.testing.expectEqual(
+        xml.DiagnosticCode.validity_required_attribute,
+        reader.diagnostic().?.code,
+    );
+}
+
+const ValidityLog = struct {
+    codes: [8]xml.DiagnosticCode = @splat(.invalid_state),
+    len: usize = 0,
+    cancel_after: ?usize = null,
+
+    fn sink(self: *@This()) xml.ValiditySink(xml.Configs.XML10_VALIDATING) {
+        return .{ .context = self, .reportFn = report };
+    }
+
+    fn report(context: ?*anyopaque, diagnostic: xml.Diagnostic(xml.Configs.XML10_VALIDATING)) xml.ValidityAction {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.len < self.codes.len) self.codes[self.len] = diagnostic.code;
+        self.len += 1;
+        if (self.cancel_after != null and self.len == self.cancel_after.?) return .cancel;
+        return .continue_validation;
+    }
+};
+
+test "[integration] - [validity collection]: first error agrees and independent checks continue" {
+    const config = xml.Configs.XML10_VALIDATING;
+    const input = "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root needed CDATA #REQUIRED>]>" ++
+        "<root><child/></root>";
+    var log: ValidityLog = .{};
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{
+        .validation = .{
+            .collect_validity_errors = true,
+            .sink = log.sink(),
+        },
+    });
+    defer reader.deinit();
+    try reader.feed(input, true);
+    var status: ?xml.ValidationStatus = null;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .document_end => |document| status = document.validation,
+            else => {},
+        },
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+    try std.testing.expectEqual(xml.ValidationStatus.invalid, status.?);
+    try std.testing.expect(log.len >= 2);
+    try std.testing.expectEqual(xml.DiagnosticCode.validity_required_attribute, log.codes[0]);
+    try std.testing.expectEqual(log.codes[0], reader.diagnostic().?.code);
+
+    var stop = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer stop.deinit();
+    try stop.feed(input, true);
+    while (true) {
+        _ = stop.next() catch |err| {
+            try std.testing.expectEqual(error.NotValid, err);
+            break;
+        };
+    }
+    try std.testing.expectEqual(log.codes[0], stop.diagnostic().?.code);
+}
+
+test "[edge] - [validity collection]: diagnostic ceiling produces incomplete result" {
+    const config = xml.Configs.XML10_VALIDATING;
+    var log: ValidityLog = .{};
+    var options: xml.Options(config) = .{};
+    options.validation.collect_validity_errors = true;
+    options.validation.sink = log.sink();
+    options.validation.limits.max_errors = 1;
+    var reader = try xml.Reader(config).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed(
+        "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root first CDATA #REQUIRED second CDATA #REQUIRED>]><root/>",
+        true,
+    );
+    var status: ?xml.ValidationStatus = null;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .document_end => |document| status = document.validation,
+            else => {},
+        },
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+    try std.testing.expectEqual(@as(usize, 1), log.len);
+    try std.testing.expectEqual(xml.ValidationStatus.incomplete, status.?);
+}
+
+test "[failure] - [validity sink]: cancellation is sticky" {
+    const config = xml.Configs.XML10_VALIDATING;
+    var log: ValidityLog = .{ .cancel_after = 1 };
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{
+        .validation = .{
+            .collect_validity_errors = true,
+            .sink = log.sink(),
+        },
+    });
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root [<!ELEMENT root EMPTY>]><other/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.Cancelled, err);
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), log.len);
+    try std.testing.expectError(error.Cancelled, reader.next());
+}
+
+fn validationAllocationAttempt(allocator: std.mem.Allocator) !void {
+    const config = xml.Configs.XML10_VALIDATING;
+    var reader = try xml.Reader(config).init(allocator, .{});
+    defer reader.deinit();
+    try reader.feed(
+        "<!DOCTYPE root [" ++
+            "<!ELEMENT root (item+)><!ELEMENT item (#PCDATA)>" ++
+            "<!ATTLIST item id ID #REQUIRED refs IDREFS #IMPLIED>" ++
+            "]><root><item id='a'/><item id='b' refs='a'>text</item></root>",
+        true,
+    );
+    while (true) switch (try reader.next()) {
+        .event => {},
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+}
+
+test "[failure] - [validation storage]: every allocation failure cleans up" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        validationAllocationAttempt,
+        .{},
+    );
+}
+
+test "[unit] - [validation storage]: retained reset clears identity state and reuses capacity" {
+    const config = xml.Configs.XML10_VALIDATING;
+    const input = "<!DOCTYPE root [<!ELEMENT root (item+)><!ELEMENT item EMPTY>" ++
+        "<!ATTLIST item id ID #REQUIRED ref IDREF #IMPLIED>]>" ++
+        "<root><item id='one'/><item id='two' ref='one'/></root>";
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+
+    try reader.feed(input, true);
+    while (true) switch (try reader.next()) {
+        .event => {},
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+    const retained = reader.memoryUsage().retained_capacity;
+    try std.testing.expectEqual(@as(usize, 2), reader.memoryUsage().id_count);
+    try std.testing.expectEqual(@as(usize, 1), reader.memoryUsage().idref_count);
+    try std.testing.expect(reader.memoryUsage().id_index_capacity > 0);
+
+    try reader.reset(.retain_capacity);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().id_count);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().idref_count);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().identity_bytes);
+    try std.testing.expectEqual(retained, reader.memoryUsage().retained_capacity);
+    try reader.feed(input, true);
+    while (true) switch (try reader.next()) {
+        .event => {},
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+    try std.testing.expectEqual(@as(usize, 2), reader.memoryUsage().id_count);
+    try std.testing.expectEqual(@as(usize, 1), reader.memoryUsage().idref_count);
+    try std.testing.expect(reader.memoryUsage().retained_capacity >= retained);
+
+    try reader.reset(.release_memory);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().retained_capacity);
 }
 
 test "[integration] - [internal DTD]: applies defaults normalization and entity replacement" {
@@ -1547,6 +1786,26 @@ test "[property] - [internal DTD chunking]: schedules preserve raw and namespace
         }
         try std.testing.expectEqual(whole, try dtdOutcome(config, input, .{ .fixed = 7 }));
         for (0..16) |seed| {
+            try std.testing.expectEqual(whole, try dtdOutcome(config, input, .{ .random = seed + 1 }));
+        }
+    }
+}
+
+test "[property] - [validating chunking]: schedules preserve events and final validity" {
+    const input = "<!DOCTYPE root [<!ELEMENT root (item+)><!ELEMENT item (#PCDATA)>" ++
+        "<!ATTLIST item id ID #REQUIRED ref IDREF #IMPLIED>]>" ++
+        "<root><item id='one'/><item id='two' ref='one'>text</item></root>";
+    inline for (.{
+        xml.Configs.XML10_VALIDATING,
+        xml.Configs.XML10_NAMESPACES_VALIDATING,
+    }) |config| {
+        const whole = try dtdOutcome(config, input, .whole);
+        try std.testing.expectEqual(xml.ValidationStatus.valid, whole.validation.?);
+        for (1..input.len) |split| {
+            try std.testing.expectEqual(whole, try dtdOutcome(config, input, .{ .split = split }));
+        }
+        try std.testing.expectEqual(whole, try dtdOutcome(config, input, .{ .fixed = 7 }));
+        for (0..8) |seed| {
             try std.testing.expectEqual(whole, try dtdOutcome(config, input, .{ .random = seed + 1 }));
         }
     }
@@ -5302,6 +5561,33 @@ test "[failure] - [reader initialization]: zero required limits fail without all
             DtdReader.init(std.testing.allocator, dtd_options),
         );
     }
+
+    const ValidatingReader = xml.Reader(xml.Configs.XML10_VALIDATING);
+    var validating_options: xml.Options(xml.Configs.XML10_VALIDATING) = .{};
+    inline for (.{
+        "max_content_positions",
+        "max_content_states",
+        "max_content_transitions",
+        "max_compilation_work",
+        "max_ids",
+        "max_idrefs",
+        "max_id_bytes",
+        "max_comparison_work",
+        "max_errors",
+    }) |field_name| {
+        validating_options = .{};
+        @field(validating_options.validation.limits, field_name) = 0;
+        try std.testing.expectError(
+            error.InvalidOptions,
+            ValidatingReader.init(std.testing.allocator, validating_options),
+        );
+    }
+    validating_options = .{};
+    validating_options.validation.limits.max_content_positions = std.math.maxInt(usize);
+    try std.testing.expectError(
+        error.InvalidOptions,
+        ValidatingReader.init(std.testing.allocator, validating_options),
+    );
 }
 
 test "[unit] - [namespace expansion]: declarations and ordinary attributes are distinct" {
@@ -6002,6 +6288,320 @@ const TestResolver = struct {
         self.active = null;
     }
 };
+
+const TestSubsetProvider = struct {
+    resources: []const TestExternalResource,
+    resolves: usize = 0,
+
+    fn provider(self: *@This()) xml.ExternalSubsetProvider {
+        return .{ .context = self, .resolveFn = resolve };
+    }
+
+    fn resolve(context: ?*anyopaque, request: xml.ExternalSubsetRequest) xml.ExternalSubsetProviderError!xml.ExternalSubsetResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.resolves += 1;
+        for (self.resources) |resource| {
+            if (!std.mem.eql(u8, resource.system_id, request.system_id)) continue;
+            return .{ .content = .{
+                .bytes = resource.bytes,
+                .base_id = resource.system_id,
+                .source_id = resource.source_id,
+            } };
+        }
+        return .skipped;
+    }
+};
+
+test "[integration] - [compiled external subset]: fresh and reused validation agree" {
+    const config = xml.Configs.XML10_VALIDATING;
+    const declarations = "<!ELEMENT root (item+)><!ELEMENT item (#PCDATA)>" ++
+        "<!ATTLIST item id ID #REQUIRED>";
+    const document = "<!DOCTYPE root SYSTEM 'schema.dtd'><root><item id='one'>text</item></root>";
+    var subset = try xml.ExternalSubset.compileDecoded(
+        std.testing.allocator,
+        "schema.dtd",
+        declarations,
+        .{ .source_id = 71 },
+    );
+    defer subset.deinit();
+
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "schema.dtd", .bytes = declarations, .source_id = 71 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var fresh_options: xml.Options(config) = .{};
+    fresh_options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var fresh = try xml.Reader(config).init(std.testing.allocator, fresh_options);
+    defer fresh.deinit();
+    try fresh.feed(document, true);
+    var fresh_status: ?xml.ValidationStatus = null;
+    while (true) switch (try fresh.next()) {
+        .event => |event| switch (event) {
+            .document_end => |end| fresh_status = end.validation,
+            else => {},
+        },
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+
+    var reused_options: xml.Options(config) = .{};
+    reused_options.validation.external_subset = &subset;
+    var reused = try xml.Reader(config).init(std.testing.allocator, reused_options);
+    defer reused.deinit();
+    try reused.feed(document, true);
+    var reused_status: ?xml.ValidationStatus = null;
+    while (true) switch (try reused.next()) {
+        .event => |event| switch (event) {
+            .document_end => |end| reused_status = end.validation,
+            else => {},
+        },
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+
+    try std.testing.expectEqual(xml.ValidationStatus.valid, fresh_status.?);
+    try std.testing.expectEqual(fresh_status.?, reused_status.?);
+    try std.testing.expectEqual(@as(usize, 1), resolver.resolves);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+    try std.testing.expect(subset.memoryUsage().declaration_capacity > 0);
+    try std.testing.expect(subset.memoryUsage().validation_capacity > 0);
+}
+
+test "[integration] - [compiled external subset]: fresh and reused diagnostics agree" {
+    const config = xml.Configs.XML10_VALIDATING;
+    const declarations = "<!ELEMENT item EMPTY>\n<!ELEMENT root (item|item)>";
+    const document = "<!DOCTYPE root SYSTEM 'schema.dtd'><root><item/></root>";
+    var subset = try xml.ExternalSubset.compileDecoded(
+        std.testing.allocator,
+        "schema.dtd",
+        declarations,
+        .{ .source_id = 73 },
+    );
+    defer subset.deinit();
+
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "schema.dtd", .bytes = declarations, .source_id = 73 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var fresh_options: xml.Options(config) = .{};
+    fresh_options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    fresh_options.validation.collect_validity_errors = true;
+    var fresh = try xml.Reader(config).init(std.testing.allocator, fresh_options);
+    defer fresh.deinit();
+    try fresh.feed(document, true);
+    var fresh_status: ?xml.ValidationStatus = null;
+    while (true) switch (try fresh.next()) {
+        .event => |event| switch (event) {
+            .document_end => |document_end| fresh_status = document_end.validation,
+            else => {},
+        },
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+
+    var reused_options: xml.Options(config) = .{};
+    reused_options.validation.collect_validity_errors = true;
+    reused_options.validation.external_subset = &subset;
+    var reused = try xml.Reader(config).init(std.testing.allocator, reused_options);
+    defer reused.deinit();
+    try reused.feed(document, true);
+    var reused_status: ?xml.ValidationStatus = null;
+    while (true) switch (try reused.next()) {
+        .event => |event| switch (event) {
+            .document_end => |document_end| reused_status = document_end.validation,
+            else => {},
+        },
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+
+    try std.testing.expectEqual(xml.ValidationStatus.invalid, fresh_status.?);
+    try std.testing.expectEqual(fresh_status.?, reused_status.?);
+    const fresh_diagnostic = fresh.diagnostic().?;
+    const reused_diagnostic = reused.diagnostic().?;
+    try std.testing.expectEqual(fresh_diagnostic.code, reused_diagnostic.code);
+    try std.testing.expectEqualDeep(fresh_diagnostic.primary, reused_diagnostic.primary);
+    try std.testing.expectEqualDeep(fresh_diagnostic.related, reused_diagnostic.related);
+    try std.testing.expectEqualDeep(fresh_diagnostic.inclusion_trace, reused_diagnostic.inclusion_trace);
+    try std.testing.expectEqual(@as(u32, 73), reused_diagnostic.primary.source_id);
+    try std.testing.expectEqual(@as(usize, 1), reused_diagnostic.inclusion_trace.len);
+    try std.testing.expectEqual(@as(u32, 0), reused_diagnostic.inclusion_trace[0].source_id);
+    const second_line = subset.sourcePosition(73, "<!ELEMENT item EMPTY>\n".len).?;
+    try std.testing.expectEqual(@as(u64, 2), second_line.line);
+    try std.testing.expectEqual(@as(u64, 1), second_line.byte_column);
+}
+
+test "[integration] - [compiled external subset]: nested diagnostic ancestry is reusable" {
+    const config = xml.Configs.XML10_VALIDATING;
+    const declarations = "<!ENTITY % child SYSTEM 'child.dtd'>%child;";
+    const child = "<!ELEMENT item EMPTY>\n<!ELEMENT root (item|item)>";
+    const document = "<!DOCTYPE root SYSTEM 'schema.dtd'><root><item/></root>";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "schema.dtd", .bytes = declarations, .source_id = 80 },
+        .{ .system_id = "child.dtd", .bytes = child, .source_id = 81 },
+    };
+    var provider = TestSubsetProvider{ .resources = &resources };
+    var subset = try xml.ExternalSubset.compileDecoded(
+        std.testing.allocator,
+        "schema.dtd",
+        declarations,
+        .{ .source_id = 80, .provider = provider.provider() },
+    );
+    defer subset.deinit();
+    try std.testing.expectEqual(@as(usize, 1), provider.resolves);
+    const inclusion = subset.sourceInclusion(81).?;
+    try std.testing.expectEqual(@as(u32, 80), inclusion.source_id);
+    try std.testing.expectEqual(
+        std.mem.indexOf(u8, declarations, "%child;").?,
+        inclusion.offset,
+    );
+
+    var resolver = TestResolver{ .resources = &resources };
+    var fresh_options: xml.Options(config) = .{};
+    fresh_options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    fresh_options.validation.collect_validity_errors = true;
+    var fresh = try xml.Reader(config).init(std.testing.allocator, fresh_options);
+    defer fresh.deinit();
+    try fresh.feed(document, true);
+    while (true) switch (try fresh.next()) {
+        .event => {},
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+
+    var reused_options: xml.Options(config) = .{};
+    reused_options.validation.collect_validity_errors = true;
+    reused_options.validation.external_subset = &subset;
+    var reused = try xml.Reader(config).init(std.testing.allocator, reused_options);
+    defer reused.deinit();
+    try reused.feed(document, true);
+    while (true) switch (try reused.next()) {
+        .event => {},
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+
+    const fresh_diagnostic = fresh.diagnostic().?;
+    const reused_diagnostic = reused.diagnostic().?;
+    try std.testing.expectEqual(fresh_diagnostic.code, reused_diagnostic.code);
+    try std.testing.expectEqualDeep(fresh_diagnostic.primary, reused_diagnostic.primary);
+    try std.testing.expectEqualDeep(fresh_diagnostic.related, reused_diagnostic.related);
+    try std.testing.expectEqualDeep(fresh_diagnostic.inclusion_trace, reused_diagnostic.inclusion_trace);
+    try std.testing.expectEqual(@as(u32, 81), reused_diagnostic.primary.source_id);
+    try std.testing.expectEqual(@as(usize, 2), reused_diagnostic.inclusion_trace.len);
+    try std.testing.expectEqual(@as(u32, 80), reused_diagnostic.inclusion_trace[0].source_id);
+    try std.testing.expectEqual(@as(u32, 0), reused_diagnostic.inclusion_trace[1].source_id);
+}
+
+fn externalSubsetAllocationAttempt(allocator: std.mem.Allocator) !void {
+    const declarations = "<!ENTITY % child SYSTEM 'child.dtd'>%child;";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "child.dtd", .bytes = "<!ELEMENT root EMPTY>", .source_id = 91 },
+    };
+    var provider = TestSubsetProvider{ .resources = &resources };
+    var subset = try xml.ExternalSubset.compileDecoded(
+        allocator,
+        "schema.dtd",
+        declarations,
+        .{ .source_id = 90, .provider = provider.provider() },
+    );
+    defer subset.deinit();
+}
+
+test "[failure] - [compiled external subset]: every allocation failure cleans up" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        externalSubsetAllocationAttempt,
+        .{},
+    );
+}
+
+test "[failure] - [non-validating standalone]: externally declared entity is undeclared" {
+    const resources = [_]TestExternalResource{
+        .{
+            .system_id = "schema.dtd",
+            .bytes = "<!ELEMENT root (#PCDATA)><!ENTITY message 'external'>",
+            .source_id = 72,
+        },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed(
+        "<?xml version='1.0' standalone='yes'?><!DOCTYPE root SYSTEM 'schema.dtd'><root>&message;</root>",
+        true,
+    );
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.InvalidXml, err);
+            break;
+        };
+    }
+    try std.testing.expectEqual(xml.DiagnosticCode.undeclared_entity, reader.diagnostic().?.code);
+}
+
+test "[integration] - [compiled external subset]: internal declarations retain precedence" {
+    const config = xml.Configs.XML10_VALIDATING;
+    var subset = try xml.ExternalSubset.compileDecoded(
+        std.testing.allocator,
+        "schema.dtd",
+        "<!ELEMENT root EMPTY><!ATTLIST root mode (a|b) 'a'>",
+        .{},
+    );
+    defer subset.deinit();
+    var options: xml.Options(config) = .{};
+    options.validation.external_subset = &subset;
+    var reader = try xml.Reader(config).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed(
+        "<!DOCTYPE root SYSTEM 'schema.dtd' [<!ATTLIST root mode (a|b) 'b'>]><root/>",
+        true,
+    );
+    var default_value: ?u8 = null;
+    var status: ?xml.ValidationStatus = null;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .start_element => |start| {
+                try std.testing.expectEqual(@as(usize, 1), start.attributes[0].value.len);
+                default_value = start.attributes[0].value[0];
+            },
+            .document_end => |end| status = end.validation,
+            else => {},
+        },
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+    try std.testing.expectEqual(@as(u8, 'b'), default_value.?);
+    try std.testing.expectEqual(xml.ValidationStatus.valid, status.?);
+}
+
+test "[failure] - [compiled external subset]: identifier mismatch is explicit" {
+    const config = xml.Configs.XML10_VALIDATING;
+    var subset = try xml.ExternalSubset.compileDecoded(
+        std.testing.allocator,
+        "expected.dtd",
+        "<!ELEMENT root EMPTY>",
+        .{},
+    );
+    defer subset.deinit();
+    var options: xml.Options(config) = .{};
+    options.validation.external_subset = &subset;
+    var reader = try xml.Reader(config).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'other.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.InvalidDtd, err);
+            break;
+        };
+    }
+    try std.testing.expectEqual(
+        xml.DiagnosticCode.external_subset_mismatch,
+        reader.diagnostic().?.code,
+    );
+}
 
 fn testIdentityTranscoder(
     _: ?*anyopaque,

@@ -1,0 +1,7 @@
+<!DOCTYPE item [
+<!NOTATION first SYSTEM "one">
+<!NOTATION second SYSTEM "two">
+<!ELEMENT item ANY>
+<!ATTLIST item primary NOTATION (first) #IMPLIED secondary NOTATION (second) #IMPLIED>
+]>
+<item/>

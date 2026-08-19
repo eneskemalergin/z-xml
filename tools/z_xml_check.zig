@@ -4,7 +4,12 @@ const std = @import("std");
 const xml = @import("z_xml");
 const check_options = @import("check_options");
 
-const CONFIG = if (check_options.dtd)
+const CONFIG = if (check_options.validating)
+    if (check_options.namespaces)
+        xml.Configs.XML10_NAMESPACES_VALIDATING
+    else
+        xml.Configs.XML10_VALIDATING
+else if (check_options.dtd)
     if (check_options.namespaces)
         xml.Configs.XML10_NAMESPACES_NONVALIDATING
     else
@@ -109,6 +114,12 @@ fn run(init: std.process.Init) !u8 {
             .resolver = filesystem_resolver.resolver(),
             .document_base_id = std.fs.path.basename(args[1]),
         };
+    }
+    if (comptime check_options.validating) {
+        options.validation.limits.max_ids = 8 * 1024 * 1024;
+        options.validation.limits.max_idrefs = 8 * 1024 * 1024;
+        options.validation.limits.max_id_bytes = 256 * 1024 * 1024;
+        options.validation.limits.max_comparison_work = std.math.maxInt(usize);
     }
     var input_buffer: [INPUT_BUFFER_SIZE]u8 = undefined;
     var file_reader = file.reader(init.io, &input_buffer);

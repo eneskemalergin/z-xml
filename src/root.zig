@@ -1,13 +1,14 @@
 //! A bounded, incremental XML reader for Zig.
 //!
 //! The public API is specialized by a compile-time configuration. The library
-//! provides XML 1.0 no-DTD and non-validating readers with
-//! raw-name and namespace-aware profiles.
+//! provides XML 1.0 no-DTD, non-validating, and DTD-validating readers
+//! with raw-name and namespace-aware profiles.
 
 const reader = @import("reader.zig");
 const encoding = @import("encoding.zig");
 const io = @import("io.zig");
 const resolver = @import("resolver.zig");
+const external_subset = @import("external_subset.zig");
 
 /// Compile-time reader configuration.
 pub const Config = reader.Config;
@@ -23,6 +24,12 @@ pub const DiagnosticLocation = reader.DiagnosticLocation;
 pub const ResetMode = reader.ResetMode;
 /// Runtime policy for external declarations.
 pub const ExternalPolicy = reader.ExternalPolicy;
+/// Continuation selected by a validity diagnostic callback.
+pub const ValidityAction = reader.ValidityAction;
+/// Final validating-reader result.
+pub const ValidationStatus = reader.ValidationStatus;
+/// Declared DTD attribute type.
+pub const AttributeType = @import("dtd.zig").AttributeType;
 /// Observable reader lifecycle.
 pub const Lifecycle = reader.Lifecycle;
 /// Runtime resource limits.
@@ -59,6 +66,20 @@ pub const ExternalEntityKind = resolver.EntityKind;
 pub const SkippedEntityKind = reader.SkippedEntityKind;
 /// Optional handle-relative filesystem resolver with no network behavior.
 pub const RootedFilesystemResolver = resolver.RootedFilesystem;
+/// Immutable compiled declarations shared by validating readers.
+pub const ExternalSubset = external_subset.ExternalSubset;
+/// Construction options for a compiled external subset.
+pub const ExternalSubsetOptions = external_subset.Options;
+/// Synchronous provider used while compiling nested external declarations.
+pub const ExternalSubsetProvider = external_subset.Provider;
+/// Errors returned while compiling external declarations.
+pub const ExternalSubsetProviderError = external_subset.ProviderError;
+/// External declaration request made during subset compilation.
+pub const ExternalSubsetRequest = external_subset.Request;
+/// External declaration result returned during subset compilation.
+pub const ExternalSubsetResult = external_subset.Result;
+/// External declaration bytes returned during subset compilation.
+pub const ExternalSubsetContent = external_subset.Content;
 /// Semantic origin reported by text fragments.
 pub const TextOrigin = reader.TextOrigin;
 /// Input-feed misuse errors.
@@ -84,6 +105,8 @@ pub const Options = reader.Options;
 pub const Location = reader.Location;
 /// Returns the specialized diagnostic type.
 pub const Diagnostic = reader.Diagnostic;
+/// Returns the specialized validity diagnostic callback type.
+pub const ValiditySink = reader.ValiditySink;
 /// Returns the specialized element or attribute name type.
 pub const Name = reader.Name;
 /// Returns the specialized source attribute type.

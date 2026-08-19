@@ -222,6 +222,80 @@ def unicode_event(stats: Stats) -> None:
     stats.text("a\u00e9\u03bb\U0001f642".encode())
 
 
+VALIDATION_MODEL_PREFIX = (
+    b"<!DOCTYPE root [<!ELEMENT root (item*)><!ELEMENT item (left,right?)>"
+    b"<!ELEMENT left (#PCDATA)><!ELEMENT right (#PCDATA)>]><root>"
+)
+VALIDATION_MODEL_RECORD = b"<item><left>x</left><right>y</right></item>"
+VALIDATION_ID_PREFIX = (
+    b"<!DOCTYPE root [<!ELEMENT root (item*)><!ELEMENT item EMPTY>"
+    b"<!ATTLIST item id ID #REQUIRED ref IDREF #IMPLIED>]><root>"
+)
+
+
+def validation_model_event(stats: Stats) -> None:
+    stats.start(b"item")
+    stats.start(b"left")
+    stats.text(b"x")
+    stats.end(b"left")
+    stats.start(b"right")
+    stats.text(b"y")
+    stats.end(b"right")
+    stats.end(b"item")
+
+
+def generate_validation_models(
+    output: Output, stats: Stats | None, target_bytes: int
+) -> None:
+    suffix = b"</root>"
+    available = target_bytes - len(VALIDATION_MODEL_PREFIX) - len(suffix)
+    if available < 0:
+        raise ValueError("validation-model target is smaller than its declarations")
+    output.write(VALIDATION_MODEL_PREFIX)
+    if stats is not None:
+        stats.start(b"root")
+    count, filler = divmod(available, len(VALIDATION_MODEL_RECORD))
+    output.write_repeated(VALIDATION_MODEL_RECORD, count)
+    if stats is not None:
+        for _ in range(count):
+            validation_model_event(stats)
+    if filler:
+        output.write(b" " * filler)
+        if stats is not None:
+            stats.text(b" " * filler)
+    output.write(suffix)
+    if stats is not None:
+        stats.end(b"root")
+
+
+def generate_validation_identifiers(
+    output: Output, stats: Stats | None, target_bytes: int
+) -> None:
+    suffix = b"</root>"
+    sample = b'<item id="i0000000000" ref="i0000000000"/>'
+    available = target_bytes - len(VALIDATION_ID_PREFIX) - len(suffix)
+    if available < 0:
+        raise ValueError("validation-identifier target is smaller than its declarations")
+    count, filler = divmod(available, len(sample))
+    output.write(VALIDATION_ID_PREFIX)
+    if stats is not None:
+        stats.start(b"root")
+    for index in range(count):
+        value = f"i{index:010d}".encode()
+        record = b'<item id="' + value + b'" ref="' + value + b'"/>'
+        output.write(record)
+        if stats is not None:
+            stats.start(b"item", ((b"id", value), (b"ref", value)))
+            stats.end(b"item")
+    if filler:
+        output.write(b" " * filler)
+        if stats is not None:
+            stats.text(b" " * filler)
+    output.write(suffix)
+    if stats is not None:
+        stats.end(b"root")
+
+
 def record_short_event(stats: Stats) -> None:
     stats.start(b"entry", ((b"id", b"a"), (b"kind", b"short")))
     stats.text(b"alpha")
@@ -302,6 +376,8 @@ SHAPES: dict[str, tuple[bytes, Callable[[Stats], None]] | None] = {
     ),
     "escaped": (b"&amp;&#x3bb;&lt;&gt;&quot;&apos;", escaped_event),
     "unicode": ("a\u00e9\u03bb\U0001f642".encode(), unicode_event),
+    "validation-models": None,
+    "validation-identifiers": None,
 }
 
 SHAPE_FEATURES = {
@@ -314,6 +390,8 @@ SHAPE_FEATURES = {
     "mixed": "document,attributes,element_matching,cdata,comments,pi",
     "escaped": "document,predefined_entities,numeric_references",
     "unicode": "document,utf8",
+    "validation-models": "document,dtd",
+    "validation-identifiers": "document,dtd",
 }
 
 
@@ -325,6 +403,12 @@ def generate_shape(
         return
     if shape == "attributes-varied":
         generate_sequence(output, stats, target_bytes, VARIED_ATTRIBUTES)
+        return
+    if shape == "validation-models":
+        generate_validation_models(output, stats, target_bytes)
+        return
+    if shape == "validation-identifiers":
+        generate_validation_identifiers(output, stats, target_bytes)
         return
     definition = SHAPES[shape]
     if definition is None:

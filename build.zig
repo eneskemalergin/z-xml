@@ -460,6 +460,7 @@ pub fn build(b: *std.Build) void {
     raw_check_options.addOption(bool, "namespaces", false);
     raw_check_options.addOption(bool, "general_encodings", false);
     raw_check_options.addOption(bool, "dtd", false);
+    raw_check_options.addOption(bool, "validating", false);
     check_module.addOptions("check_options", raw_check_options);
     const check = b.addExecutable(.{
         .name = "z-xml-check",
@@ -483,6 +484,7 @@ pub fn build(b: *std.Build) void {
     namespace_check_options.addOption(bool, "namespaces", true);
     namespace_check_options.addOption(bool, "general_encodings", false);
     namespace_check_options.addOption(bool, "dtd", false);
+    namespace_check_options.addOption(bool, "validating", false);
     namespace_check_module.addOptions("check_options", namespace_check_options);
     const namespace_check = b.addExecutable(.{
         .name = "z-xml-ns-check",
@@ -506,6 +508,7 @@ pub fn build(b: *std.Build) void {
     general_check_options.addOption(bool, "namespaces", false);
     general_check_options.addOption(bool, "general_encodings", true);
     general_check_options.addOption(bool, "dtd", false);
+    general_check_options.addOption(bool, "validating", false);
     general_check_module.addOptions("check_options", general_check_options);
     const general_check = b.addExecutable(.{
         .name = "z-xml-general-check",
@@ -529,6 +532,7 @@ pub fn build(b: *std.Build) void {
     general_namespace_check_options.addOption(bool, "namespaces", true);
     general_namespace_check_options.addOption(bool, "general_encodings", true);
     general_namespace_check_options.addOption(bool, "dtd", false);
+    general_namespace_check_options.addOption(bool, "validating", false);
     general_namespace_check_module.addOptions(
         "check_options",
         general_namespace_check_options,
@@ -557,6 +561,7 @@ pub fn build(b: *std.Build) void {
     dtd_check_options.addOption(bool, "namespaces", false);
     dtd_check_options.addOption(bool, "general_encodings", true);
     dtd_check_options.addOption(bool, "dtd", true);
+    dtd_check_options.addOption(bool, "validating", false);
     dtd_check_module.addOptions("check_options", dtd_check_options);
     const dtd_check = b.addExecutable(.{
         .name = "z-xml-dtd-check",
@@ -577,6 +582,7 @@ pub fn build(b: *std.Build) void {
     dtd_namespace_check_options.addOption(bool, "namespaces", true);
     dtd_namespace_check_options.addOption(bool, "general_encodings", true);
     dtd_namespace_check_options.addOption(bool, "dtd", true);
+    dtd_namespace_check_options.addOption(bool, "validating", false);
     dtd_namespace_check_module.addOptions("check_options", dtd_namespace_check_options);
     const dtd_namespace_check = b.addExecutable(.{
         .name = "z-xml-dtd-ns-check",
@@ -585,6 +591,73 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(dtd_namespace_check);
     const dtd_namespace_check_tests = b.addTest(.{ .root_module = dtd_namespace_check_module });
     test_step.dependOn(&b.addRunArtifact(dtd_namespace_check_tests).step);
+
+    const validating_check_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    validating_check_module.addImport("z_xml", z_xml);
+    const validating_check_options = b.addOptions();
+    validating_check_options.addOption(bool, "namespaces", false);
+    validating_check_options.addOption(bool, "general_encodings", true);
+    validating_check_options.addOption(bool, "dtd", true);
+    validating_check_options.addOption(bool, "validating", true);
+    validating_check_module.addOptions("check_options", validating_check_options);
+    const validating_check = b.addExecutable(.{
+        .name = "z-xml-validating-check",
+        .root_module = validating_check_module,
+    });
+    b.installArtifact(validating_check);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = validating_check_module })).step);
+
+    const validating_namespace_check_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    validating_namespace_check_module.addImport("z_xml", z_xml);
+    const validating_namespace_check_options = b.addOptions();
+    validating_namespace_check_options.addOption(bool, "namespaces", true);
+    validating_namespace_check_options.addOption(bool, "general_encodings", true);
+    validating_namespace_check_options.addOption(bool, "dtd", true);
+    validating_namespace_check_options.addOption(bool, "validating", true);
+    validating_namespace_check_module.addOptions(
+        "check_options",
+        validating_namespace_check_options,
+    );
+    const validating_namespace_check = b.addExecutable(.{
+        .name = "z-xml-validating-ns-check",
+        .root_module = validating_namespace_check_module,
+    });
+    b.installArtifact(validating_namespace_check);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        .root_module = validating_namespace_check_module,
+    })).step);
+
+    inline for (.{
+        .{ "z-xml-validation-fresh", false },
+        .{ "z-xml-validation-reused", true },
+    }) |entry| {
+        const repeat_module = b.createModule(.{
+            .root_source_file = b.path("tools/z_xml_validation_repeat.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = optimize == .ReleaseFast,
+        });
+        repeat_module.addImport("z_xml", z_xml);
+        const repeat_options = b.addOptions();
+        repeat_options.addOption(bool, "reuse", entry[1]);
+        repeat_module.addOptions("repeat_options", repeat_options);
+        const repeat = b.addExecutable(.{
+            .name = entry[0],
+            .root_module = repeat_module,
+        });
+        b.installArtifact(repeat);
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = repeat_module })).step);
+    }
 
     const persistent_module = b.createModule(.{
         .root_source_file = b.path("tools/z_xml_persistent.zig"),

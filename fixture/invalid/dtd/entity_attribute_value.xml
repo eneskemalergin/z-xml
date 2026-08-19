@@ -1,0 +1,6 @@
+<!DOCTYPE item [
+<!ELEMENT item EMPTY>
+<!ENTITY parsed "text">
+<!ATTLIST item resource ENTITY #REQUIRED>
+]>
+<item resource="parsed"/>

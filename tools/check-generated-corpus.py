@@ -332,13 +332,15 @@ def main() -> int:
         for target in targets:
             counts: Counter[str] = Counter()
             for workload in workloads:
-                if target.processor_class in {"lexical", "index", "validating"}:
+                required = set(workload["feature_checks"].split(","))
+                if target.processor_class in {"lexical", "index"} or (
+                    target.processor_class == "validating" and "dtd" not in required
+                ):
                     expected = "out-of-profile"
                     observed = "not-run"
                     verdict = "out-of-profile"
                     reason = "processor-profile"
                 else:
-                    required = set(workload["feature_checks"].split(","))
                     missing = sorted(required.difference(target.features))
                     if missing:
                         expected = "unsupported-feature"

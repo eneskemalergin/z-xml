@@ -1,0 +1,6 @@
+<!DOCTYPE root [
+<!ELEMENT root EMPTY>
+<!NOTATION media SYSTEM "one">
+<!NOTATION media SYSTEM "two">
+]>
+<root/>

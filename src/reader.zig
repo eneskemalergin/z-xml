@@ -4,6 +4,8 @@ const std = @import("std");
 const encoding_module = @import("encoding.zig");
 const dtd_module = @import("dtd.zig");
 const resolver_module = @import("resolver.zig");
+const validation_module = @import("validation.zig");
+const external_subset_module = @import("external_subset.zig");
 
 /// XML capability profile selected at compile time.
 pub const Profile = enum {
@@ -84,6 +86,8 @@ pub const Profile = enum {
             .xml10_ns_no_dtd,
             .xml10_nonvalidating,
             .xml10_ns_nonvalidating,
+            .xml10_dtd_validating,
+            .xml10_ns_dtd_validating,
             => true,
             else => false,
         };
@@ -193,12 +197,19 @@ pub const Configs = struct {
     /// DTD-validating XML 1.0 profile without namespaces.
     pub const XML10_VALIDATING: Config = .{
         .profile = .xml10_dtd_validating,
+        .external_sources = true,
+    };
+    /// Namespace-aware DTD-validating XML 1.0 profile.
+    pub const XML10_NAMESPACES_VALIDATING: Config = .{
+        .profile = .xml10_ns_dtd_validating,
+        .external_sources = true,
     };
     /// Detailed namespace-aware DTD-validating XML 1.0 profile.
     pub const XML10_NAMESPACES_VALIDATING_DETAILED: Config = .{
         .profile = .xml10_ns_dtd_validating,
         .report = .detailed,
         .event_locations = true,
+        .external_sources = true,
     };
     /// Namespace-aware DTD-validating XML 1.1 profile.
     pub const XML11_NAMESPACES_VALIDATING: Config = .{
@@ -324,8 +335,26 @@ pub const MemoryUsage = struct {
     namespace_bytes: usize = 0,
     /// DTD storage capacity measured in bytes.
     dtd_capacity: usize = 0,
+    /// Retained notation-record storage measured in bytes.
+    notation_capacity: usize = 0,
     /// Validation storage capacity measured in bytes.
     validation_capacity: usize = 0,
+    /// Retained compiled content-model storage measured in bytes.
+    content_model_capacity: usize = 0,
+    /// Retained ID and IDREF storage measured in bytes.
+    identity_capacity: usize = 0,
+    /// IDs retained for uniqueness and reference checks.
+    id_count: usize = 0,
+    /// IDREF values retained for document-end resolution.
+    idref_count: usize = 0,
+    /// Active bytes retained for ID and IDREF values.
+    identity_bytes: usize = 0,
+    /// Retained ID-record storage measured in bytes.
+    id_capacity: usize = 0,
+    /// Retained IDREF-record storage measured in bytes.
+    idref_capacity: usize = 0,
+    /// Retained ID lookup-index storage measured in bytes.
+    id_index_capacity: usize = 0,
     /// Total reader-owned reusable capacity measured in bytes.
     retained_capacity: usize = 0,
 };
@@ -393,6 +422,7 @@ pub const DiagnosticCode = enum {
     misplaced_doctype,
     unsupported_doctype,
     malformed_doctype,
+    external_subset_mismatch,
     malformed_dtd,
     malformed_element_declaration,
     malformed_attribute_list_declaration,
@@ -425,6 +455,32 @@ pub const DiagnosticCode = enum {
     resolver_io_failure,
     resolver_cancelled,
     read_failed,
+    validity_missing_doctype,
+    validity_root_name_mismatch,
+    validity_undeclared_element,
+    validity_duplicate_element_declaration,
+    validity_nondeterministic_content_model,
+    validity_parameter_entity_nesting,
+    validity_duplicate_mixed_content_name,
+    validity_element_content,
+    validity_undeclared_attribute,
+    validity_undeclared_entity,
+    validity_required_attribute,
+    validity_fixed_attribute,
+    validity_attribute_value,
+    validity_duplicate_id,
+    validity_unresolved_idref,
+    validity_multiple_id_attributes,
+    validity_id_default,
+    validity_multiple_notation_attributes,
+    validity_notation_on_empty_element,
+    validity_duplicate_enumeration_token,
+    validity_undeclared_notation,
+    validity_duplicate_notation,
+    validity_xml_space_declaration,
+    validity_standalone_external_default,
+    validity_standalone_external_normalization,
+    validity_standalone_external_whitespace,
 };
 
 /// Location containing the precision selected by `config`.
@@ -487,10 +543,31 @@ pub const ExternalPolicy = enum {
     resolve,
 };
 
+/// Continuation selected by a validity diagnostic sink.
+pub const ValidityAction = enum { continue_validation, cancel };
+
+/// Final state reported by a validating reader.
+pub const ValidationStatus = enum { valid, invalid, incomplete };
+
+/// Synchronous validity diagnostic callback specialized to the reader.
+pub fn ValiditySink(comptime config: Config) type {
+    return struct {
+        context: ?*anyopaque,
+        reportFn: *const fn (?*anyopaque, Diagnostic(config)) ValidityAction,
+
+        pub fn report(self: @This(), value: Diagnostic(config)) ValidityAction {
+            return self.reportFn(self.context, value);
+        }
+    };
+}
+
 fn ValidationOptions(comptime config: Config) type {
     return if (config.profile.dtdMode() == .validating)
         struct {
             collect_validity_errors: bool = false,
+            limits: validation_module.Limits = .{},
+            sink: ?ValiditySink(config) = null,
+            external_subset: ?*const external_subset_module.ExternalSubset = null,
         }
     else
         struct {};
@@ -541,6 +618,7 @@ pub fn Attribute(comptime config: Config) type {
             name: Name(config),
             value: []const u8,
             specified: bool,
+            declared_type: ?dtd_module.AttributeType,
         };
 }
 
@@ -594,16 +672,30 @@ const DocumentStart = struct {
     standalone: bool = false,
     standalone_declared: bool = false,
 };
-const DocumentEnd = struct {};
+fn DocumentEnd(comptime config: Config) type {
+    return if (config.profile.dtdMode() == .validating)
+        struct { validation: ValidationStatus }
+    else
+        struct {};
+}
 const DocumentType = struct {
     root_name: []const u8,
     public_id: ?[]const u8 = null,
     system_id: ?[]const u8 = null,
 };
-const Text = struct {
-    bytes: []const u8,
-    origin: TextOrigin = .character_data,
-};
+fn Text(comptime config: Config) type {
+    return if (config.profile.dtdMode() == .validating)
+        struct {
+            bytes: []const u8,
+            origin: TextOrigin = .character_data,
+            ignorable_whitespace: bool = false,
+        }
+    else
+        struct {
+            bytes: []const u8,
+            origin: TextOrigin = .character_data,
+        };
+}
 const Comment = struct {
     bytes: []const u8,
     complete: bool,
@@ -648,10 +740,10 @@ fn NoDtdEventPayload(comptime config: Config) type {
         document_start: DocumentStart,
         start_element: StartElement(config),
         end_element: EndElement(config),
-        text: Text,
+        text: Text(config),
         comment: Comment,
         processing_instruction: ProcessingInstruction,
-        document_end: DocumentEnd,
+        document_end: DocumentEnd(config),
     };
 }
 
@@ -663,11 +755,11 @@ fn DtdEventPayload(comptime config: Config) type {
         unparsed_entity_declaration: UnparsedEntityDeclaration,
         start_element: StartElement(config),
         end_element: EndElement(config),
-        text: Text,
+        text: Text(config),
         comment: Comment,
         processing_instruction: ProcessingInstruction,
         skipped_entity: SkippedEntity(config),
-        document_end: DocumentEnd,
+        document_end: DocumentEnd(config),
     };
 }
 
@@ -684,11 +776,11 @@ fn DetailedDtdEventPayload(comptime config: Config) type {
         entity_end: EntityBoundary,
         start_element: StartElement(config),
         end_element: EndElement(config),
-        text: Text,
+        text: Text(config),
         comment: Comment,
         processing_instruction: ProcessingInstruction,
         skipped_entity: SkippedEntity(config),
-        document_end: DocumentEnd,
+        document_end: DocumentEnd(config),
     };
 }
 
@@ -830,6 +922,7 @@ const VerticalState = enum {
     release_processing_instruction,
     declaration,
     declaration_question,
+    finish_validation,
     emit_document_end,
     complete,
 };
@@ -994,12 +1087,20 @@ fn OpenElementFrame(comptime config: Config) type {
             namespace_binding_mark: usize,
             namespace_byte_mark: usize,
             namespace_reference: NamespaceReference,
+            validation: if (config.profile.dtdMode() == .validating)
+                validation_module.Frame
+            else
+                void = if (config.profile.dtdMode() == .validating) .{} else {},
         }
     else
         struct {
             name_offset: usize,
             name_len: usize,
             start: Location(config),
+            validation: if (config.profile.dtdMode() == .validating)
+                validation_module.Frame
+            else
+                void = if (config.profile.dtdMode() == .validating) .{} else {},
         };
 }
 
@@ -1011,6 +1112,9 @@ fn AttributeRecord(comptime config: Config) type {
             value_len: usize,
             start: Location(config),
             specified: bool = true,
+            declared_type: ?dtd_module.AttributeType = null,
+            declaration_index: ?usize = null,
+            normalization_changed: bool = false,
             namespace_shape: usize = 0,
         }
     else if (config.profile.hasNamespaces())
@@ -1028,6 +1132,9 @@ fn AttributeRecord(comptime config: Config) type {
             value_len: usize,
             start: Location(config),
             specified: bool = true,
+            declared_type: ?dtd_module.AttributeType = null,
+            declaration_index: ?usize = null,
+            normalization_changed: bool = false,
         }
     else
         struct {
@@ -1041,6 +1148,7 @@ fn AttributeRecord(comptime config: Config) type {
 const Failure = enum {
     invalid_xml,
     invalid_dtd,
+    not_valid,
     unsupported_feature,
     limit_exceeded,
     out_of_memory,
@@ -1140,6 +1248,16 @@ pub fn Reader(comptime config: Config) type {
         event_attributes: std.ArrayList(Attribute(config)) = .empty,
         namespace_state: NamespaceState(config) = .{},
         dtd_state: DtdState(config) = .{},
+        validation_state: if (config.profile.dtdMode() == .validating)
+            validation_module.State
+        else
+            void = if (config.profile.dtdMode() == .validating) .{} else {},
+        validity_errors: if (config.profile.dtdMode() == .validating) usize else void =
+            if (config.profile.dtdMode() == .validating) 0 else {},
+        validation_incomplete: if (config.profile.dtdMode() == .validating) bool else void =
+            if (config.profile.dtdMode() == .validating) false else {},
+        final_idref_cursor: if (config.profile.dtdMode() == .validating) usize else void =
+            if (config.profile.dtdMode() == .validating) 0 else {},
         token_start: Location(config) = .{},
         token_name_len: usize = 0,
         end_mismatch_index: usize = no_end_mismatch,
@@ -1150,6 +1268,7 @@ pub fn Reader(comptime config: Config) type {
         utf8_start: Location(config) = .{},
         text_inline: [4]u8 = @splat(0),
         text_fragment: []const u8 = &.{},
+        text_from_reference: bool = false,
         text_start: Location(config) = .{},
         text_close_brackets: u2 = 0,
         reference_context: ReferenceContext = .content,
@@ -1190,6 +1309,9 @@ pub fn Reader(comptime config: Config) type {
                     return error.InvalidOptions;
                 }
             }
+            if (comptime config.profile.dtdMode() == .validating) {
+                if (!options.validation.limits.validate()) return error.InvalidOptions;
+            }
             if (comptime config.external_sources) {
                 if (!options.resolver.validate()) return error.InvalidOptions;
             }
@@ -1222,6 +1344,9 @@ pub fn Reader(comptime config: Config) type {
                         self.clearAttributesRetainingCapacity();
                         self.clearNamespacesRetainingCapacity();
                         self.clearDtdRetainingCapacity();
+                        if (comptime config.profile.dtdMode() == .validating) {
+                            self.validation_state.clearRetainingCapacity();
+                        }
                     }
                 },
                 .release_memory => self.releaseStorage(),
@@ -1251,6 +1376,7 @@ pub fn Reader(comptime config: Config) type {
             self.utf8_start = .{};
             self.text_inline = @splat(0);
             self.text_fragment = &.{};
+            self.text_from_reference = false;
             self.text_start = .{};
             self.text_close_brackets = 0;
             self.reference_context = .content;
@@ -1283,6 +1409,11 @@ pub fn Reader(comptime config: Config) type {
             self.processing_instruction_initial = false;
             self.processing_instruction_target_len = 0;
             self.declaration_data_start = .{};
+            if (comptime config.profile.dtdMode() == .validating) {
+                self.validity_errors = 0;
+                self.validation_incomplete = false;
+                self.final_idref_cursor = 0;
+            }
             if (comptime config.profile.dtdMode() != .rejected) {
                 self.dtd_state.report_cursor = 0;
                 self.dtd_state.document_type_emitted = false;
@@ -1641,7 +1772,10 @@ pub fn Reader(comptime config: Config) type {
                         self.consumeWhitespaceRun();
                         if (self.cursor == self.input.len) {
                             if (self.final_input) {
-                                self.vertical_state = .emit_document_end;
+                                self.vertical_state = if (comptime config.profile.dtdMode() == .validating)
+                                    .finish_validation
+                                else
+                                    .emit_document_end;
                                 continue;
                             }
                             return self.needInput();
@@ -2262,12 +2396,12 @@ pub fn Reader(comptime config: Config) type {
                         return self.needInput();
                     },
                     .emit_text => {
+                        if (comptime config.profile.dtdMode() == .validating) {
+                            try self.validateTextFragment();
+                        }
                         self.vertical_state = .release_text;
                         return self.eventStep(
-                            .{ .text = .{
-                                .bytes = self.text_fragment,
-                                .origin = self.text_origin,
-                            } },
+                            .{ .text = self.textEvent() },
                             self.text_start,
                             self.currentLocation(),
                         );
@@ -2459,11 +2593,15 @@ pub fn Reader(comptime config: Config) type {
                     .declaration_question => if (try self.readDeclarationQuestion()) {
                         return self.needInput();
                     },
+                    .finish_validation => {
+                        try self.finishValidation();
+                        self.vertical_state = .emit_document_end;
+                    },
                     .emit_document_end => {
                         self.vertical_state = .complete;
                         const location = self.currentLocation();
                         return self.eventStep(
-                            .{ .document_end = .{} },
+                            .{ .document_end = self.documentEnd() },
                             location,
                             location,
                         );
@@ -2502,6 +2640,16 @@ pub fn Reader(comptime config: Config) type {
                 .namespace_binding_count = self.namespaceBindingCount(),
                 .namespace_bytes = self.namespaceBytes(),
                 .dtd_capacity = self.dtdCapacity(),
+                .notation_capacity = self.notationCapacity(),
+                .validation_capacity = self.validationCapacity(),
+                .content_model_capacity = self.contentModelCapacity(),
+                .identity_capacity = self.identityCapacity(),
+                .id_count = self.idCount(),
+                .idref_count = self.idrefCount(),
+                .identity_bytes = self.identityBytes(),
+                .id_capacity = self.idCapacity(),
+                .idref_capacity = self.idrefCapacity(),
+                .id_index_capacity = self.idIndexCapacity(),
                 .retained_capacity = self.retainedCapacity(),
             };
         }
@@ -2517,7 +2665,58 @@ pub fn Reader(comptime config: Config) type {
                 event_bytes +|
                 self.namespaceCapacity() +|
                 self.dtdCapacity() +|
+                self.validationCapacity() +|
                 self.decoderCapacity();
+        }
+
+        fn validationCapacity(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() != .validating) return 0;
+            return self.validation_state.capacity();
+        }
+
+        fn contentModelCapacity(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() != .validating) return 0;
+            return self.validation_state.contentModelCapacity();
+        }
+
+        fn identityCapacity(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() != .validating) return 0;
+            return self.validation_state.identityCapacity();
+        }
+
+        fn notationCapacity(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() == .rejected) return 0;
+            return self.dtd_state.declarations.notationCapacity();
+        }
+
+        fn idCount(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() != .validating) return 0;
+            return self.validation_state.idCount();
+        }
+
+        fn idrefCount(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() != .validating) return 0;
+            return self.validation_state.idrefCount();
+        }
+
+        fn identityBytes(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() != .validating) return 0;
+            return self.validation_state.identityBytes();
+        }
+
+        fn idCapacity(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() != .validating) return 0;
+            return self.validation_state.idCapacity();
+        }
+
+        fn idrefCapacity(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() != .validating) return 0;
+            return self.validation_state.idrefCapacity();
+        }
+
+        fn idIndexCapacity(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() != .validating) return 0;
+            return self.validation_state.idIndexCapacity();
         }
 
         fn decoderCapacity(self: *const Self) usize {
@@ -2609,6 +2808,9 @@ pub fn Reader(comptime config: Config) type {
                     self.dtd_state.external_buffers.deinit(self.allocator);
                 }
             }
+            if (comptime config.profile.dtdMode() == .validating) {
+                self.validation_state.deinit(self.allocator);
+            }
             if (comptime config.external_sources) {
                 self.diagnostic_inclusions.deinit(self.allocator);
             }
@@ -2620,6 +2822,9 @@ pub fn Reader(comptime config: Config) type {
             self.namespace_state = .{};
             self.source_state = .{};
             self.dtd_state = .{};
+            if (comptime config.profile.dtdMode() == .validating) {
+                self.validation_state = .{};
+            }
             self.diagnostic_inclusions = if (config.external_sources) .empty else {};
         }
 
@@ -2818,7 +3023,29 @@ pub fn Reader(comptime config: Config) type {
                 unreachable;
             } else {
                 self.dtd_state.declarations.discardDoctypeHeader();
-                if (comptime config.external_sources) {
+                const reusable = if (comptime config.profile.dtdMode() == .validating)
+                    self.options.validation.external_subset
+                else
+                    null;
+                var appended_external: ?dtd_module.State.AppendExternalResult = null;
+                if (reusable) |external| {
+                    self.dtd_state.declarations.parseDoctypeInternalOnly(
+                        self.allocator,
+                        self.options.dtd_limits,
+                    ) catch |err| return self.mapDoctypeError(err);
+                    if (!external.matches(&self.dtd_state.declarations)) {
+                        return self.failAt(
+                            .external_subset_mismatch,
+                            .invalid_dtd,
+                            self.dtdLocation(0),
+                        );
+                    }
+                    appended_external = self.dtd_state.declarations.appendExternalDeclarations(
+                        self.allocator,
+                        self.options.dtd_limits,
+                        external.declarationState(),
+                    ) catch |err| return self.mapDoctypeError(err);
+                } else if (comptime config.external_sources) {
                     self.dtd_state.declarations.parseDoctypeExternal(
                         self.allocator,
                         self.options.dtd_limits,
@@ -2833,9 +3060,78 @@ pub fn Reader(comptime config: Config) type {
                 if (comptime config.profile.hasNamespaces()) {
                     try self.validateDtdNamespaceNames();
                 }
+                if (comptime config.profile.dtdMode() == .validating) {
+                    try self.prepareValidation(reusable, appended_external);
+                }
                 self.dtd_state.report_cursor = 0;
                 self.vertical_state = .emit_dtd_report;
             }
+        }
+
+        fn prepareValidation(
+            self: *Self,
+            reusable: ?*const external_subset_module.ExternalSubset,
+            appended: ?dtd_module.State.AppendExternalResult,
+        ) ReadError!void {
+            if (comptime config.external_sources) {
+                self.diagnostic_inclusions.ensureTotalCapacity(
+                    self.allocator,
+                    self.options.dtd_limits.max_active_entity_depth,
+                ) catch return self.failOutOfMemory();
+            }
+            if (reusable != null and appended.?.grammar_unchanged) {
+                self.validation_state.copyCompiled(
+                    self.allocator,
+                    self.options.validation.limits,
+                    reusable.?.compiledState(),
+                    appended.?.byte_base,
+                ) catch |err| return self.mapValidationError(err);
+            } else {
+                self.validation_state.prepare(
+                    self.allocator,
+                    self.options.validation.limits,
+                    &self.dtd_state.declarations,
+                ) catch |err| return self.mapValidationError(err);
+            }
+            for (self.validation_state.issues.items) |issue| {
+                try self.reportValidity(issue, self.token_start);
+            }
+            if (self.validation_state.issues_truncated) self.validation_incomplete = true;
+        }
+
+        fn mapValidationError(self: *Self, err: validation_module.Error) ReadError {
+            return switch (err) {
+                error.OutOfMemory => self.failOutOfMemory(),
+                error.LimitExceeded => self.fail(.dtd_grammar_node_limit, .limit_exceeded),
+            };
+        }
+
+        fn finishValidation(self: *Self) ReadError!void {
+            if (comptime config.profile.dtdMode() == .validating) {
+                while (try self.validation_state.unresolvedIdref(
+                    self.options.validation.limits,
+                    self.final_idref_cursor,
+                )) |index| {
+                    self.final_idref_cursor = index + 1;
+                    const source = self.validation_state.idrefLocation(index);
+                    try self.reportValidity(.{
+                        .code = .unresolved_idref,
+                        .occurrence = source,
+                    }, validationLocation(config, source));
+                }
+            } else unreachable;
+        }
+
+        fn documentEnd(self: *const Self) DocumentEnd(config) {
+            if (comptime config.profile.dtdMode() == .validating) {
+                return .{ .validation = if (self.validation_incomplete)
+                    .incomplete
+                else if (self.validity_errors == 0)
+                    .valid
+                else
+                    .invalid };
+            }
+            return .{};
         }
 
         fn dtdExternalResolve(
@@ -2952,7 +3248,12 @@ pub fn Reader(comptime config: Config) type {
             requested_base_id: ?[]const u8,
             inclusion: Location(config),
         ) dtd_module.ParseError!?resolver_module.Source {
-            if (self.options.resolver.policy == .skip) return null;
+            if (self.options.resolver.policy == .skip) {
+                if (comptime config.profile.dtdMode() == .validating) {
+                    return self.externalProviderFailure(.resolver_forbidden, error.ResolverFailed);
+                }
+                return null;
+            }
             self.dtd_state.external_failure_code = null;
             self.dtd_state.external_failure_location = inclusion;
             self.diagnostic_inclusions.ensureTotalCapacity(
@@ -3165,6 +3466,18 @@ pub fn Reader(comptime config: Config) type {
                     }
                     return location;
                 }
+                if (comptime config.profile.dtdMode() == .validating) {
+                    if (self.options.validation.external_subset) |external| {
+                        if (external.sourcePosition(source_id, offset)) |position| {
+                            var location = locationFromSource(config, source_id, position.byte_offset);
+                            if (config.diagnostic_location == .line_column) {
+                                location.line = position.line;
+                                location.byte_column = position.byte_column;
+                            }
+                            return location;
+                        }
+                    }
+                }
             }
             return locationFromSource(config, source_id, offset);
         }
@@ -3314,8 +3627,22 @@ pub fn Reader(comptime config: Config) type {
                 return true;
             }
             switch (self.input[self.cursor]) {
-                '-' => self.vertical_state = .comment_open,
-                '[' => self.vertical_state = .cdata_open,
+                '-' => {
+                    if (comptime config.profile.dtdMode() == .validating) {
+                        if (self.markup_context == .content) {
+                            try self.noteValidationContentMarker(self.token_start);
+                        }
+                    }
+                    self.vertical_state = .comment_open;
+                },
+                '[' => {
+                    if (comptime config.profile.dtdMode() == .validating) {
+                        if (self.markup_context == .content) {
+                            try self.noteValidationContentMarker(self.token_start);
+                        }
+                    }
+                    self.vertical_state = .cdata_open;
+                },
                 'D' => self.vertical_state = .doctype_open,
                 else => {
                     if (self.input[self.cursor] >= 0x80) {
@@ -3403,6 +3730,9 @@ pub fn Reader(comptime config: Config) type {
             context: MarkupContext,
             initial: bool,
         ) ReadError!void {
+            if (comptime config.profile.dtdMode() == .validating) {
+                if (context == .content) try self.noteValidationContentMarker(self.token_start);
+            }
             self.clearAttributesRetainingCapacity();
             self.markup_context = context;
             self.processing_instruction_initial = initial;
@@ -3691,6 +4021,7 @@ pub fn Reader(comptime config: Config) type {
             self.text_fragment = bytes;
             self.text_start = start;
             self.text_origin = .cdata;
+            self.text_from_reference = false;
             self.text_resume = .cdata;
             self.vertical_state = .emit_text;
         }
@@ -4380,6 +4711,7 @@ pub fn Reader(comptime config: Config) type {
             self.text_fragment = fragment;
             self.text_start = start;
             self.text_origin = .character_data;
+            self.text_from_reference = false;
             self.text_resume = .content;
             self.vertical_state = .emit_text;
             return true;
@@ -4430,6 +4762,7 @@ pub fn Reader(comptime config: Config) type {
             self.text_fragment = fast_run;
             self.text_start = start;
             self.text_origin = .character_data;
+            self.text_from_reference = false;
             self.text_resume = .content;
             self.vertical_state = .emit_text;
             return true;
@@ -4478,6 +4811,7 @@ pub fn Reader(comptime config: Config) type {
             self.text_fragment = self.text_inline[0..bytes.len];
             self.text_start = start;
             self.text_origin = .character_data;
+            self.text_from_reference = false;
             self.text_resume = .content;
             self.vertical_state = .emit_text;
         }
@@ -4490,6 +4824,9 @@ pub fn Reader(comptime config: Config) type {
             self.reference_token_bytes = 0;
             self.reference_name = @splat(0);
             self.reference_name_len = 0;
+            if (comptime config.profile.dtdMode() == .validating) {
+                if (context == .content) try self.noteValidationContentMarker(self.reference_start);
+            }
             if (comptime config.profile.dtdMode() != .rejected) {
                 self.dtd_state.reference_name.clearRetainingCapacity();
             }
@@ -4517,8 +4854,12 @@ pub fn Reader(comptime config: Config) type {
                     token.len <= self.options.limits.max_partial_token_bytes and
                     output.len <= self.options.limits.max_fragment_bytes)
                 {
+                    if (comptime config.profile.dtdMode() == .validating) {
+                        try self.noteValidationContentMarker(start);
+                    }
                     self.consumeRun(input[0..token.len]);
                     try self.prepareInlineText(output, start);
+                    self.text_from_reference = true;
                     return true;
                 }
             }
@@ -4548,8 +4889,12 @@ pub fn Reader(comptime config: Config) type {
             const output_len = std.unicode.utf8Encode(@intCast(value), &output) catch
                 unreachable;
             if (output_len > self.options.limits.max_fragment_bytes) return false;
+            if (comptime config.profile.dtdMode() == .validating) {
+                try self.noteValidationContentMarker(start);
+            }
             self.consumeRun(input[0 .. index + 1]);
             try self.prepareInlineText(output[0..output_len], start);
+            self.text_from_reference = true;
             return true;
         }
 
@@ -4790,6 +5135,12 @@ pub fn Reader(comptime config: Config) type {
                     self.dtd_state.declarations.parameter_reference_seen and
                     !(self.standalone_declared and self.standalone))
                 {
+                    if (comptime config.profile.dtdMode() == .validating) {
+                        try self.reportValidity(.{
+                            .code = .undeclared_entity,
+                            .occurrence = toValidationLocation(config, self.reference_start),
+                        }, self.reference_start);
+                    }
                     self.vertical_state = .emit_skipped_entity;
                     self.dtd_state.pending_skipped_entity_index = null;
                     return;
@@ -5078,6 +5429,7 @@ pub fn Reader(comptime config: Config) type {
                 bytes,
                 self.reference_start,
             );
+            self.text_from_reference = true;
         }
 
         fn appendAttributeOutput(self: *Self, bytes: []const u8) ReadError!void {
@@ -5183,6 +5535,9 @@ pub fn Reader(comptime config: Config) type {
                 const binding_mark = self.namespace_state.bindings.items.len;
                 const byte_mark = self.namespace_state.bytes.items.len;
                 const namespace_reference = try self.prepareNamespaceStartElement();
+                const validation_frame = if (comptime config.profile.dtdMode() == .validating)
+                    try self.beginValidationElement(empty_element)
+                else {};
                 self.open_elements.append(self.allocator, .{
                     .name_offset = self.open_names.items.len - self.token_name_len,
                     .name_len = self.token_name_len,
@@ -5190,19 +5545,203 @@ pub fn Reader(comptime config: Config) type {
                     .namespace_binding_mark = binding_mark,
                     .namespace_byte_mark = byte_mark,
                     .namespace_reference = namespace_reference,
+                    .validation = validation_frame,
                 }) catch return self.failOutOfMemory();
             } else {
                 try self.prepareEventAttributes();
+                const validation_frame = if (comptime config.profile.dtdMode() == .validating)
+                    try self.beginValidationElement(empty_element)
+                else {};
                 self.open_elements.append(self.allocator, .{
                     .name_offset = self.open_names.items.len - self.token_name_len,
                     .name_len = self.token_name_len,
                     .start = self.token_start,
+                    .validation = validation_frame,
                 }) catch return self.failOutOfMemory();
             }
             self.vertical_state = if (empty_element)
                 .emit_empty_start_element
             else
                 .emit_start_element;
+        }
+
+        fn beginValidationElement(self: *Self, empty_element: bool) ReadError!validation_module.Frame {
+            const declarations = &self.dtd_state.declarations;
+            const name = self.open_names.items[self.open_names.items.len - self.token_name_len ..];
+            const location = toValidationLocation(config, self.token_start);
+            if (self.open_elements.items.len != 0) {
+                const parent = &self.open_elements.items[self.open_elements.items.len - 1].validation;
+                if (try self.validation_state.advance(
+                    self.options.validation.limits,
+                    declarations,
+                    parent,
+                    name,
+                    location,
+                )) |issue| try self.reportValidity(issue, self.token_start);
+            }
+            var beginning = self.validation_state.beginElement(
+                self.options.validation.limits,
+                declarations,
+                name,
+                location,
+            ) catch |err| return self.mapValidationError(err);
+            if (beginning.issue) |issue| try self.reportValidity(issue, self.token_start);
+            try self.validateStartAttributes(name);
+            if (empty_element) {
+                if (self.validation_state.finishElement(&beginning.frame, location)) |issue| {
+                    try self.reportValidity(issue, self.token_start);
+                }
+            }
+            return beginning.frame;
+        }
+
+        fn validateStartAttributes(self: *Self, element_name: []const u8) ReadError!void {
+            const declarations = &self.dtd_state.declarations;
+            for (self.attribute_records.items) |record| {
+                const declaration_index = record.declaration_index orelse {
+                    try self.reportValidity(.{
+                        .code = .undeclared_attribute,
+                        .occurrence = toValidationLocation(config, record.start),
+                    }, record.start);
+                    continue;
+                };
+                const declaration = declarations.attributes.items[declaration_index];
+                const value_offset = record.name_offset + record.name_len;
+                const value = self.attribute_bytes.items[value_offset..][0..record.value_len];
+                if (declaration.default_kind == .fixed and record.specified and
+                    !std.mem.eql(u8, value, declarations.string(declaration.default_value.?)))
+                {
+                    try self.reportValidity(.{
+                        .code = .fixed_attribute_mismatch,
+                        .related = declaration.location,
+                        .occurrence = toValidationLocation(config, record.start),
+                    }, record.start);
+                }
+                if (self.standalone_declared and self.standalone and declaration.declared_external) {
+                    if (!record.specified) {
+                        try self.reportValidity(.{
+                            .code = .standalone_external_default,
+                            .related = declaration.location,
+                            .occurrence = toValidationLocation(config, record.start),
+                        }, record.start);
+                    } else if (record.normalization_changed) {
+                        try self.reportValidity(.{
+                            .code = .standalone_external_normalization,
+                            .related = declaration.location,
+                            .occurrence = toValidationLocation(config, record.start),
+                        }, record.start);
+                    }
+                }
+                try self.validateAttributeValue(declaration, value, record.start);
+            }
+            for (declarations.attributes.items) |declaration| {
+                if (declaration.default_kind != .required or
+                    !std.mem.eql(u8, declarations.string(declaration.element_name), element_name))
+                {
+                    continue;
+                }
+                var present = false;
+                for (self.attribute_records.items) |record| {
+                    if (record.declaration_index != null and
+                        record.declaration_index.? == declaration.order)
+                    {
+                        present = true;
+                        break;
+                    }
+                }
+                if (!present) try self.reportValidity(.{
+                    .code = .required_attribute_missing,
+                    .related = declaration.location,
+                    .occurrence = toValidationLocation(config, self.token_start),
+                }, self.token_start);
+            }
+        }
+
+        fn validateAttributeValue(
+            self: *Self,
+            declaration: dtd_module.AttributeDeclaration,
+            value: []const u8,
+            location: Location(config),
+        ) ReadError!void {
+            const source = toValidationLocation(config, location);
+            var valid = true;
+            switch (declaration.attribute_type) {
+                .cdata => {},
+                .id => {
+                    valid = validValidationName(config, value);
+                    if (valid) {
+                        if (self.validation_state.addId(
+                            self.allocator,
+                            self.options.validation.limits,
+                            value,
+                            source,
+                        ) catch |err| return self.mapValidationError(err)) |issue| {
+                            try self.reportValidity(issue, location);
+                        }
+                    }
+                },
+                .idref, .idrefs => {
+                    var tokens = SpaceTokenIterator.init(value);
+                    var count: usize = 0;
+                    while (tokens.next()) |token| {
+                        count += 1;
+                        if (!validValidationName(config, token)) {
+                            valid = false;
+                            continue;
+                        }
+                        self.validation_state.addIdref(
+                            self.allocator,
+                            self.options.validation.limits,
+                            token,
+                            source,
+                        ) catch |err| return self.mapValidationError(err);
+                    }
+                    valid = valid and count != 0 and
+                        (declaration.attribute_type == .idrefs or count == 1);
+                },
+                .entity, .entities => {
+                    var tokens = SpaceTokenIterator.init(value);
+                    var count: usize = 0;
+                    while (tokens.next()) |token| {
+                        count += 1;
+                        if (!validValidationName(config, token) or !(try self.isUnparsedEntity(token))) {
+                            valid = false;
+                        }
+                    }
+                    valid = valid and count != 0 and
+                        (declaration.attribute_type == .entities or count == 1);
+                },
+                .nmtoken, .nmtokens => {
+                    var tokens = SpaceTokenIterator.init(value);
+                    var count: usize = 0;
+                    while (tokens.next()) |token| {
+                        count += 1;
+                        if (!dtd_module.validNmtoken(token)) valid = false;
+                    }
+                    valid = valid and count != 0 and
+                        (declaration.attribute_type == .nmtokens or count == 1);
+                },
+                .enumeration, .notation => {
+                    valid = dtd_module.validNmtoken(value) and
+                        validation_module.groupContains(
+                            self.dtd_state.declarations.string(declaration.allowed_values.?),
+                            value,
+                        );
+                },
+            }
+            if (!valid) try self.reportValidity(.{
+                .code = .invalid_attribute_value,
+                .related = declaration.location,
+                .occurrence = source,
+            }, location);
+        }
+
+        fn isUnparsedEntity(self: *Self, name: []const u8) ReadError!bool {
+            const index = self.dtd_state.declarations.findGeneralEntity(
+                self.options.dtd_limits,
+                name,
+            ) catch |err| return self.mapDtdError(err, .malformed_attribute);
+            return if (index) |value| self.dtd_state.declarations.entities.items[value].unparsed else false;
         }
 
         fn beginAttribute(self: *Self) ReadError!void {
@@ -5472,6 +6011,7 @@ pub fn Reader(comptime config: Config) type {
                         .name = self.expandedName(raw, parts, reference),
                         .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
                         .specified = record.specified,
+                        .declared_type = record.declared_type,
                     });
                 }
                 self.namespace_state.expanded_indices.appendAssumeCapacity(
@@ -5802,6 +6342,7 @@ pub fn Reader(comptime config: Config) type {
                         .name = nameFromRaw(config, raw_name),
                         .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
                         .specified = record.specified,
+                        .declared_type = record.declared_type,
                     });
                 }
             }
@@ -5814,20 +6355,22 @@ pub fn Reader(comptime config: Config) type {
 
             var source_index: usize = 0;
             while (source_index < self.attribute_records.items.len) : (source_index += 1) {
-                const record = self.attribute_records.items[source_index];
+                const record = &self.attribute_records.items[source_index];
                 const declaration_index = declarations.findAttribute(
                     self.options.dtd_limits,
                     element_name,
-                    self.attributeRawName(record),
+                    self.attributeRawName(record.*),
                 ) catch |err| return self.mapDtdError(err, .malformed_attribute);
                 if (declaration_index) |index| {
-                    if (declarations.attributes.items[index].attribute_type.isTokenized()) {
+                    record.declaration_index = index;
+                    record.declared_type = declarations.attributes.items[index].attribute_type;
+                    if (record.declared_type.?.isTokenized()) {
                         self.collapseAttributeValue(source_index);
                     }
                 }
             }
 
-            for (declarations.attributes.items) |declaration| {
+            for (declarations.attributes.items, 0..) |declaration, declaration_index| {
                 const applies = declarations.equalStored(
                     self.options.dtd_limits,
                     declaration.element_name,
@@ -5851,6 +6394,7 @@ pub fn Reader(comptime config: Config) type {
                 try self.appendDefaultAttribute(
                     name,
                     declarations.string(declaration.default_value.?),
+                    declaration_index,
                 );
             }
         }
@@ -5863,6 +6407,7 @@ pub fn Reader(comptime config: Config) type {
                 self.attribute_bytes.items[value_offset..][0..old_len],
             );
             if (new_len == old_len) return;
+            record.normalization_changed = true;
             const removed = old_len - new_len;
             std.mem.copyForwards(
                 u8,
@@ -5876,7 +6421,12 @@ pub fn Reader(comptime config: Config) type {
             }
         }
 
-        fn appendDefaultAttribute(self: *Self, name: []const u8, value: []const u8) ReadError!void {
+        fn appendDefaultAttribute(
+            self: *Self,
+            name: []const u8,
+            value: []const u8,
+            declaration_index: usize,
+        ) ReadError!void {
             if (self.attribute_records.items.len == self.options.limits.max_attributes_per_element) {
                 return self.failVoid(.attribute_count_limit, .limit_exceeded);
             }
@@ -5907,6 +6457,8 @@ pub fn Reader(comptime config: Config) type {
                 .value_len = value.len,
                 .start = self.token_start,
                 .specified = false,
+                .declared_type = self.dtd_state.declarations.attributes.items[declaration_index].attribute_type,
+                .declaration_index = declaration_index,
             }) catch return self.failOutOfMemory();
         }
 
@@ -6074,6 +6626,12 @@ pub fn Reader(comptime config: Config) type {
                     }
                 }
             }
+            if (comptime config.profile.dtdMode() == .validating) {
+                if (self.validation_state.finishElement(
+                    &self.open_elements.items[self.open_elements.items.len - 1].validation,
+                    toValidationLocation(config, self.token_start),
+                )) |issue| try self.reportValidity(issue, self.token_start);
+            }
             self.vertical_state = .emit_end_element;
         }
 
@@ -6234,6 +6792,54 @@ pub fn Reader(comptime config: Config) type {
             if (comptime config.profile.isUtf8Only()) return 1;
             if (self.source_state.input_is_direct_utf8) return 1;
             return self.source_state.source_advances.items[self.cursor + index];
+        }
+
+        fn validateTextFragment(self: *Self) ReadError!void {
+            if (self.open_elements.items.len == 0 or self.text_fragment.len == 0) return;
+            const frame = &self.open_elements.items[self.open_elements.items.len - 1].validation;
+            const source = toValidationLocation(config, self.text_start);
+            const whitespace = allXmlWhitespace(self.text_fragment);
+            if (self.standalone_declared and self.standalone and whitespace and
+                frame.declared_external and
+                self.validation_state.isIgnorableWhitespace(frame.*, self.text_fragment))
+            {
+                try self.reportValidity(.{
+                    .code = .standalone_external_whitespace,
+                    .occurrence = source,
+                }, self.text_start);
+            }
+            if (self.validation_state.text(
+                &self.dtd_state.declarations,
+                frame,
+                self.text_fragment,
+                self.text_origin == .character_data and !self.text_from_reference,
+                source,
+            )) |issue| try self.reportValidity(issue, self.text_start);
+        }
+
+        fn noteValidationContentMarker(self: *Self, location: Location(config)) ReadError!void {
+            if (self.open_elements.items.len == 0) return;
+            if (self.validation_state.contentMarker(
+                &self.open_elements.items[self.open_elements.items.len - 1].validation,
+                toValidationLocation(config, location),
+            )) |issue| try self.reportValidity(issue, location);
+        }
+
+        fn textEvent(self: *const Self) Text(config) {
+            if (comptime config.profile.dtdMode() == .validating) {
+                const ignorable = self.open_elements.items.len != 0 and
+                    self.text_origin == .character_data and !self.text_from_reference and
+                    self.validation_state.isIgnorableWhitespace(
+                        self.open_elements.items[self.open_elements.items.len - 1].validation,
+                        self.text_fragment,
+                    );
+                return .{
+                    .bytes = self.text_fragment,
+                    .origin = self.text_origin,
+                    .ignorable_whitespace = ignorable,
+                };
+            }
+            return .{ .bytes = self.text_fragment, .origin = self.text_origin };
         }
 
         fn topName(self: *const Self) Name(config) {
@@ -6798,6 +7404,58 @@ pub fn Reader(comptime config: Config) type {
             return self.failAt(code, failure, self.currentLocation());
         }
 
+        fn reportValidity(
+            self: *Self,
+            issue: validation_module.Issue,
+            fallback: Location(config),
+        ) ReadError!void {
+            if (self.validity_errors == self.options.validation.limits.max_errors) {
+                self.validation_incomplete = true;
+                return;
+            }
+            const primary = if (issue.occurrence) |location|
+                validationLocation(config, location)
+            else if (issue.declaration) |location|
+                if (location.source_id == 0)
+                    self.dtdLocation(location.offset)
+                else
+                    self.dtdSourceLocation(location.source_id, location.offset)
+            else
+                fallback;
+            const related = if (issue.related) |location|
+                if (location.source_id == 0)
+                    self.dtdLocation(location.offset)
+                else
+                    self.dtdSourceLocation(location.source_id, location.offset)
+            else
+                null;
+            const inclusion_trace = if (comptime config.external_sources)
+                self.captureInclusionTrace(primary.source_id)
+            else {};
+            const diagnostic_value: Diagnostic(config) = .{
+                .code = validityDiagnosticCode(issue.code),
+                .primary = primary,
+                .related = related,
+                .inclusion_trace = inclusion_trace,
+            };
+            if (self.first_diagnostic == null) self.first_diagnostic = diagnostic_value;
+            self.validity_errors += 1;
+            if (self.options.validation.sink) |sink| {
+                if (sink.report(diagnostic_value) == .cancel) {
+                    self.closeExternalSources();
+                    self.failure = .cancelled;
+                    self.lifecycle = .failed;
+                    return error.Cancelled;
+                }
+            }
+            if (!self.options.validation.collect_validity_errors) {
+                self.closeExternalSources();
+                self.failure = .not_valid;
+                self.lifecycle = .failed;
+                return error.NotValid;
+            }
+        }
+
         fn failAt(
             self: *Self,
             code: DiagnosticCode,
@@ -6906,6 +7564,25 @@ pub fn Reader(comptime config: Config) type {
                 }
                 self.diagnostic_inclusions.appendAssumeCapacity(location);
                 source_id = buffer.inclusion_source_id;
+            }
+            if (comptime config.profile.dtdMode() == .validating) {
+                if (self.diagnostic_inclusions.items.len == 0) {
+                    const external = self.options.validation.external_subset orelse
+                        return self.diagnostic_inclusions.items;
+                    source_id = primary_source_id;
+                    while (source_id != 0 and self.diagnostic_inclusions.items.len < max_depth) {
+                        const inclusion = external.sourceInclusion(source_id) orelse {
+                            if (external.hasSource(source_id)) {
+                                self.diagnostic_inclusions.appendAssumeCapacity(self.dtdLocation(0));
+                            }
+                            break;
+                        };
+                        self.diagnostic_inclusions.appendAssumeCapacity(
+                            self.dtdSourceLocation(inclusion.source_id, inclusion.offset),
+                        );
+                        source_id = inclusion.source_id;
+                    }
+                }
             }
             return self.diagnostic_inclusions.items;
         }
@@ -7197,12 +7874,95 @@ fn failureToError(failure: Failure) ReadError {
     return switch (failure) {
         .invalid_xml => error.InvalidXml,
         .invalid_dtd => error.InvalidDtd,
+        .not_valid => error.NotValid,
         .unsupported_feature => error.UnsupportedFeature,
         .limit_exceeded => error.LimitExceeded,
         .out_of_memory => error.OutOfMemory,
         .resolver_failed => error.ResolverFailed,
         .read_failed => error.ReadFailed,
         .cancelled => error.Cancelled,
+    };
+}
+
+fn validationLocation(
+    comptime config: Config,
+    source: validation_module.SourceLocation,
+) Location(config) {
+    var result = locationFromSource(config, source.source_id, source.byte_offset);
+    if (config.diagnostic_location == .line_column) {
+        result.line = source.line;
+        result.byte_column = source.byte_column;
+    }
+    return result;
+}
+
+fn toValidationLocation(
+    comptime config: Config,
+    location: Location(config),
+) validation_module.SourceLocation {
+    return .{
+        .source_id = location.source_id,
+        .byte_offset = location.byte_offset,
+        .line = if (config.diagnostic_location == .line_column) location.line else 1,
+        .byte_column = if (config.diagnostic_location == .line_column) location.byte_column else 1,
+    };
+}
+
+const SpaceTokenIterator = struct {
+    bytes: []const u8,
+    index: usize = 0,
+
+    fn init(bytes: []const u8) SpaceTokenIterator {
+        return .{ .bytes = bytes };
+    }
+
+    fn next(self: *SpaceTokenIterator) ?[]const u8 {
+        while (self.index < self.bytes.len and self.bytes[self.index] == ' ') self.index += 1;
+        if (self.index == self.bytes.len) return null;
+        const start = self.index;
+        while (self.index < self.bytes.len and self.bytes[self.index] != ' ') self.index += 1;
+        return self.bytes[start..self.index];
+    }
+};
+
+fn allXmlWhitespace(bytes: []const u8) bool {
+    for (bytes) |byte| if (!isXmlWhitespace(byte)) return false;
+    return true;
+}
+
+fn validValidationName(comptime config: Config, bytes: []const u8) bool {
+    return dtd_module.validName(bytes) and
+        (!config.profile.hasNamespaces() or std.mem.indexOfScalar(u8, bytes, ':') == null);
+}
+
+fn validityDiagnosticCode(code: validation_module.IssueCode) DiagnosticCode {
+    return switch (code) {
+        .missing_doctype => .validity_missing_doctype,
+        .root_name_mismatch => .validity_root_name_mismatch,
+        .undeclared_element => .validity_undeclared_element,
+        .duplicate_element_declaration => .validity_duplicate_element_declaration,
+        .nondeterministic_content_model => .validity_nondeterministic_content_model,
+        .improper_parameter_entity_nesting => .validity_parameter_entity_nesting,
+        .duplicate_mixed_content_name => .validity_duplicate_mixed_content_name,
+        .invalid_element_content => .validity_element_content,
+        .undeclared_attribute => .validity_undeclared_attribute,
+        .undeclared_entity => .validity_undeclared_entity,
+        .required_attribute_missing => .validity_required_attribute,
+        .fixed_attribute_mismatch => .validity_fixed_attribute,
+        .invalid_attribute_value => .validity_attribute_value,
+        .duplicate_id => .validity_duplicate_id,
+        .unresolved_idref => .validity_unresolved_idref,
+        .multiple_id_attributes => .validity_multiple_id_attributes,
+        .invalid_id_default => .validity_id_default,
+        .multiple_notation_attributes => .validity_multiple_notation_attributes,
+        .notation_on_empty_element => .validity_notation_on_empty_element,
+        .duplicate_enumeration_token => .validity_duplicate_enumeration_token,
+        .undeclared_notation => .validity_undeclared_notation,
+        .duplicate_notation_declaration => .validity_duplicate_notation,
+        .invalid_xml_space_declaration => .validity_xml_space_declaration,
+        .standalone_external_default => .validity_standalone_external_default,
+        .standalone_external_normalization => .validity_standalone_external_normalization,
+        .standalone_external_whitespace => .validity_standalone_external_whitespace,
     };
 }
 

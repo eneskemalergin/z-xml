@@ -44,9 +44,9 @@ ns-equivalent-uri	valid/namespaces/equivalent_uri_spelling.xml	namespace-valid	N
 shape-ns-churn	valid/namespaces/shape_namespace_churn.xml	namespace-valid	NS1.0-3e	document,namespaces,attributes,element_matching	no	Frequent prefix rebinding and default namespace changes
 dtd-empty	valid/dtd/empty.xml	dtd-valid	XML1.0-5e	dtd	no	EMPTY element declaration
 dtd-sequence	valid/dtd/sequence.xml	dtd-valid	XML1.0-5e	dtd	no	Sequence content model
-dtd-choice-repeat	valid/dtd/choice_and_repetition.xml	dtd-valid	XML1.0-5e	dtd	no	Choice and repetition content model
+dtd-choice-repeat	valid/dtd/choice_and_repetition.xml	dtd-valid	XML1.0-5e	dtd	yes	Choice and repetition content model
 dtd-attributes	valid/dtd/attributes.xml	dtd-valid	XML1.0-5e	dtd	no	Required implied fixed and default attributes
-dtd-id-idref	valid/dtd/id_idref.xml	dtd-valid	XML1.0-5e	dtd	no	ID and IDREF constraints
+dtd-id-idref	valid/dtd/id_idref.xml	dtd-valid	XML1.0-5e	dtd	yes	ID and IDREF constraints
 dtd-internal-entity	valid/dtd/internal_entity.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	no	Declared internal general entity
 dtd-mixed	valid/dtd/mixed.xml	dtd-valid	XML1.0-5e	dtd	no	Mixed element content declaration
 dtd-enumeration	valid/dtd/enumeration.xml	dtd-valid	XML1.0-5e	dtd	no	Enumerated attribute value
@@ -54,6 +54,9 @@ dtd-external	valid/dtd/external.xml	dtd-valid	XML1.0-5e	dtd,external_dtd	no	Loca
 dtd-external-entities	valid/dtd/external_entities.xml	dtd-valid	XML1.0-5e	dtd,external_dtd,external_general_entities,external_parameter_entities	no	External subset, parameter entity, general entity, text declarations, and default attribute
 dtd-bounded-expansion	valid/dtd/bounded_entity_expansion.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	no	Bounded three-level internal entity expansion with 1000 output bytes
 dtd-parameter-entity	valid/dtd/parameter_entity_declaration.xml	dtd-valid	XML1.0-5e	dtd,internal_parameter_entities	no	Internal parameter entity supplies an element declaration
+dtd-any	valid/dtd/any.xml	dtd-valid	XML1.0-5e	dtd	no	ANY content with text child comment and processing instruction
+dtd-tokenized-attributes	valid/dtd/tokenized_attributes.xml	dtd-valid	XML1.0-5e	dtd	no	Every tokenized and enumerated attribute type with an unparsed entity
+dtd-standalone	valid/dtd/standalone.xml	dtd-valid	XML1.0-5e	dtd,external_dtd	no	Standalone document with an external declaration that does not affect content
 shape-dtd-density	valid/dtd/shape_declaration_density.xml	dtd-valid	XML1.0-5e	dtd,attributes	no	Declaration-dense catalog with IDs defaults and repeated metadata
 shape-dtd-entities	valid/dtd/shape_entities.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	no	Repeated internal general entity expansion
 bad-empty	invalid/not_well_formed/empty.xml	not-well-formed	XML1.0-5e	check_document_element	no	Empty document
@@ -135,5 +138,27 @@ dtd-bad-element-text	invalid/dtd/element_content_text.xml	dtd-invalid	XML1.0-5e	
 dtd-bad-external	invalid/dtd/external_wrong_content.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	no	External DTD content model violation
 external-entity-unclosed	invalid/not_well_formed/external_entity_unclosed.xml	not-well-formed	XML1.0-5e	dtd,external_general_entities,check_element_matching	no	External parsed entity leaves an element open across its boundary
 dtd-bad-undeclared-root	invalid/dtd/undeclared_root.xml	dtd-invalid	XML1.0-5e	dtd	no	Document element has no declaration
+dtd-bad-nondeterministic	invalid/dtd/nondeterministic_content_model.xml	dtd-invalid	XML1.0-5e	dtd	no	Content model permits one child to match two particles
+dtd-bad-duplicate-element	invalid/dtd/duplicate_element_declaration.xml	dtd-invalid	XML1.0-5e	dtd	no	Element type is declared twice
+dtd-bad-multiple-id	invalid/dtd/multiple_id_declarations.xml	dtd-invalid	XML1.0-5e	dtd	no	Element type declares two ID attributes
+dtd-bad-id-default	invalid/dtd/id_default_value.xml	dtd-invalid	XML1.0-5e	dtd	no	ID attribute has a literal default
+dtd-bad-duplicate-mixed-name	invalid/dtd/duplicate_mixed_name.xml	dtd-invalid	XML1.0-5e	dtd	no	Mixed content names one child type twice
+dtd-bad-notation-empty	invalid/dtd/notation_on_empty_element.xml	dtd-invalid	XML1.0-5e	dtd	no	EMPTY element declares a NOTATION attribute
+dtd-bad-multiple-notation	invalid/dtd/multiple_notation_declarations.xml	dtd-invalid	XML1.0-5e	dtd	no	Element type declares two NOTATION attributes
+dtd-bad-undeclared-notation	invalid/dtd/undeclared_notation.xml	dtd-invalid	XML1.0-5e	dtd	no	NOTATION attribute names an undeclared notation
+dtd-bad-duplicate-enumeration	invalid/dtd/duplicate_enumeration_token.xml	dtd-invalid	XML1.0-5e	dtd	no	Enumeration repeats one token
+dtd-bad-entity-attribute	invalid/dtd/entity_attribute_value.xml	dtd-invalid	XML1.0-5e	dtd	no	ENTITY attribute names a parsed entity
+dtd-bad-nmtokens	invalid/dtd/nmtokens_value.xml	dtd-invalid	XML1.0-5e	dtd	no	NMTOKENS attribute contains non-name punctuation
+dtd-bad-empty-comment	invalid/dtd/empty_contains_comment.xml	dtd-invalid	XML1.0-5e	dtd	no	EMPTY element contains a comment
+dtd-bad-element-cdata-space	invalid/dtd/element_content_cdata_whitespace.xml	dtd-invalid	XML1.0-5e	dtd	no	Element-only content contains CDATA whitespace
+dtd-bad-element-reference-space	invalid/dtd/element_content_reference_whitespace.xml	dtd-invalid	XML1.0-5e	dtd	no	Element-only content contains referenced whitespace
+dtd-bad-missing-doctype	invalid/dtd/missing_doctype.xml	dtd-invalid	XML1.0-5e	dtd	no	Document has no document type declaration
+dtd-bad-xml-space	invalid/dtd/xml_space_declaration.xml	dtd-invalid	XML1.0-5e	dtd	no	xml:space declaration contains an unsupported token
+dtd-bad-undeclared-attribute	invalid/dtd/undeclared_attribute.xml	dtd-invalid	XML1.0-5e	dtd	no	Element specifies an undeclared attribute
+dtd-bad-duplicate-notation	invalid/dtd/duplicate_notation_declaration.xml	dtd-invalid	XML1.0-5e	dtd	no	Notation name is declared twice
+dtd-bad-standalone-default	invalid/dtd/standalone_default.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	no	Standalone document depends on an external default attribute
+dtd-bad-standalone-normalization	invalid/dtd/standalone_normalization.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	no	Standalone document depends on external tokenized normalization
+dtd-wf-standalone-entity	invalid/dtd/standalone_entity.xml	not-well-formed	XML1.0-5e	dtd,external_dtd,check_declared_entities	no	Standalone document references an externally declared entity
+dtd-bad-standalone-whitespace	invalid/dtd/standalone_whitespace.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	no	Standalone element-only content contains externally significant whitespace
 bench-common	benchmark/smoke/common.xml	benchmark-valid	XML1.0-5e	document,attributes,element_matching	yes	Shared basic adapter summary
 bench-normalized	benchmark/smoke/normalized.xml	benchmark-valid	XML1.0-5e	document,attributes,numeric_references,cdata,predefined_entities	yes	Shared normalized adapter summary

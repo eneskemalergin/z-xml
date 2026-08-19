@@ -1,0 +1,5 @@
+<!DOCTYPE root [
+<!ELEMENT root (child)>
+<!ELEMENT child EMPTY>
+]>
+<root><![CDATA[ ]]><child/></root>

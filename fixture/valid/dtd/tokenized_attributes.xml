@@ -1,0 +1,8 @@
+<!DOCTYPE catalog [
+<!NOTATION jpg SYSTEM "image/jpeg">
+<!ENTITY logo SYSTEM "logo.jpg" NDATA jpg>
+<!ELEMENT catalog (item*)>
+<!ELEMENT item ANY>
+<!ATTLIST item id ID #REQUIRED link IDREF #IMPLIED links IDREFS #IMPLIED image ENTITY #IMPLIED images ENTITIES #IMPLIED word NMTOKEN #IMPLIED words NMTOKENS #IMPLIED format NOTATION (jpg) #IMPLIED mode (a|b) #IMPLIED>
+]>
+<catalog><item id="one" word="a:b" words="x y"/><item id="two" link="one" links="one two" image="logo" images="logo logo" format="jpg" mode="a"/></catalog>

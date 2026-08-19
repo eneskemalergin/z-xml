@@ -165,6 +165,18 @@ pub const StoredString = struct {
     len: usize,
 };
 
+pub const DeclarationLocation = struct {
+    source_id: u32 = 0,
+    offset: usize = 0,
+};
+
+pub const ContentKind = enum {
+    empty,
+    any,
+    mixed,
+    children,
+};
+
 pub const ExternalId = struct {
     public_id: ?StoredString = null,
     system_id: ?StoredString = null,
@@ -172,6 +184,10 @@ pub const ExternalId = struct {
 
 pub const ElementDeclaration = struct {
     name: StoredString,
+    content_kind: ContentKind,
+    content_spec: ?StoredString = null,
+    location: DeclarationLocation,
+    declared_external: bool = false,
 };
 
 pub const AttributeDeclaration = struct {
@@ -180,7 +196,10 @@ pub const AttributeDeclaration = struct {
     attribute_type: AttributeType,
     default_kind: DefaultKind,
     default_value: ?StoredString,
+    allowed_values: ?StoredString = null,
     order: usize,
+    location: DeclarationLocation,
+    declared_external: bool = false,
 };
 
 pub const EntityDeclaration = struct {
@@ -193,11 +212,13 @@ pub const EntityDeclaration = struct {
     notation_name: ?StoredString = null,
     base_id: ?StoredString = null,
     declared_external: bool = false,
+    location: DeclarationLocation,
 };
 
 pub const NotationDeclaration = struct {
     name: StoredString,
     external_id: ExternalId,
+    location: DeclarationLocation,
 };
 
 pub const ReportKind = enum {
@@ -254,6 +275,7 @@ pub const State = struct {
     reports: std.ArrayList(Report) = .empty,
     misc: std.ArrayList(Misc) = .empty,
     skipped_external: std.ArrayList(SkippedExternal) = .empty,
+    nesting_violations: std.ArrayList(DeclarationLocation) = .empty,
     root_name: ?StoredString = null,
     external_id: ExternalId = .{},
     failure: ?Failure = null,
@@ -277,6 +299,7 @@ pub const State = struct {
         self.reports.deinit(allocator);
         self.misc.deinit(allocator);
         self.skipped_external.deinit(allocator);
+        self.nesting_violations.deinit(allocator);
         self.* = .{};
     }
 
@@ -290,6 +313,7 @@ pub const State = struct {
         self.reports.clearRetainingCapacity();
         self.misc.clearRetainingCapacity();
         self.skipped_external.clearRetainingCapacity();
+        self.nesting_violations.clearRetainingCapacity();
         self.root_name = null;
         self.external_id = .{};
         self.failure = null;
@@ -313,7 +337,12 @@ pub const State = struct {
             self.notations.capacity *| @sizeOf(NotationDeclaration) +|
             self.reports.capacity *| @sizeOf(Report) +|
             self.misc.capacity *| @sizeOf(Misc) +|
-            self.skipped_external.capacity *| @sizeOf(SkippedExternal);
+            self.skipped_external.capacity *| @sizeOf(SkippedExternal) +|
+            self.nesting_violations.capacity *| @sizeOf(DeclarationLocation);
+    }
+
+    pub fn notationCapacity(self: *const State) usize {
+        return self.notations.capacity *| @sizeOf(NotationDeclaration);
     }
 
     pub fn string(self: *const State, stored: StoredString) []const u8 {
@@ -535,6 +564,24 @@ pub const State = struct {
         try parser.parseDoctype();
     }
 
+    /// Parses the document type while leaving its external subset unattached.
+    pub fn parseDoctypeInternalOnly(
+        self: *State,
+        allocator: std.mem.Allocator,
+        limits: Limits,
+    ) ParseError!void {
+        self.failure = null;
+        var parser = Parser{
+            .allocator = allocator,
+            .limits = limits,
+            .state = self,
+            .subset = self.doctype_bytes.items,
+            .omit_external_subset = true,
+        };
+        defer parser.sources.deinit(allocator);
+        try parser.parseDoctype();
+    }
+
     /// Parses a document type and obtains external declaration sources through `provider`.
     pub fn parseDoctypeExternal(
         self: *State,
@@ -552,6 +599,253 @@ pub const State = struct {
         };
         defer parser.sources.deinit(allocator);
         try parser.parseDoctype();
+    }
+
+    /// Parses one decoded UTF-8 external subset without a document type wrapper.
+    pub fn parseExternalSubset(
+        self: *State,
+        allocator: std.mem.Allocator,
+        limits: Limits,
+        bytes: []const u8,
+        base_id: ?[]const u8,
+        source_id: u32,
+        provider: ?ExternalProvider,
+    ) ParseError!void {
+        self.failure = null;
+        var parser = Parser{
+            .allocator = allocator,
+            .limits = limits,
+            .state = self,
+            .subset = &.{},
+            .external_provider = provider,
+        };
+        defer parser.sources.deinit(allocator);
+        try parser.sources.append(allocator, .{
+            .storage = .borrowed,
+            .offset = 0,
+            .len = bytes.len,
+            .bytes = bytes,
+            .base_id = base_id,
+            .source_id = source_id,
+            .external = true,
+        });
+        try parser.parseSubset();
+    }
+
+    pub const AppendExternalResult = struct {
+        byte_base: usize,
+        grammar_unchanged: bool,
+    };
+
+    /// Appends pre-parsed external declarations after per-document declarations.
+    pub fn appendExternalDeclarations(
+        self: *State,
+        allocator: std.mem.Allocator,
+        limits: Limits,
+        external: *const State,
+    ) ParseError!AppendExternalResult {
+        const grammar_unchanged = self.elements.items.len == 0 and
+            self.attributes.items.len == 0 and self.entities.items.len == 0 and
+            self.notations.items.len == 0 and self.nesting_violations.items.len == 0;
+
+        if (external.declaration_count > limits.max_declarations -| self.declaration_count) {
+            return self.setLimit(.declaration_limit, 0);
+        }
+        if (external.declaration_bytes > limits.max_declaration_bytes -| self.declaration_bytes) {
+            return self.setLimit(.declaration_bytes_limit, 0);
+        }
+        if (external.grammar_nodes > limits.max_grammar_nodes -| self.grammar_nodes) {
+            return self.setLimit(.grammar_node_limit, 0);
+        }
+        if (external.replacement_bytes > limits.max_entity_replacement_bytes -| self.replacement_bytes) {
+            return self.setLimit(.replacement_bytes_limit, 0);
+        }
+        if (external.elements.items.len > limits.max_element_declarations -| self.elements.items.len) {
+            return self.setLimit(.element_declaration_limit, 0);
+        }
+        if (external.notations.items.len > limits.max_notation_declarations -| self.notations.items.len) {
+            return self.setLimit(.notation_declaration_limit, 0);
+        }
+
+        var attribute_additions: usize = 0;
+        for (external.attributes.items) |attribute| {
+            if (!try self.hasAttributeDeclaration(
+                limits,
+                external.string(attribute.element_name),
+                external.string(attribute.name),
+            )) attribute_additions += 1;
+        }
+        if (attribute_additions > limits.max_attribute_declarations -| self.attributes.items.len) {
+            return self.setLimit(.attribute_declaration_limit, 0);
+        }
+
+        var entity_additions: usize = 0;
+        for (external.entities.items) |entity| {
+            if (!try self.hasEntityDeclaration(
+                limits,
+                external.string(entity.name),
+                entity.parameter,
+            )) entity_additions += 1;
+        }
+        if (entity_additions > limits.max_entity_declarations -| self.entities.items.len) {
+            return self.setLimit(.entity_declaration_limit, 0);
+        }
+
+        const missing = std.math.maxInt(usize);
+        const element_map = try allocator.alloc(usize, external.elements.items.len);
+        defer allocator.free(element_map);
+        const entity_map = try allocator.alloc(usize, external.entities.items.len);
+        defer allocator.free(entity_map);
+        const notation_map = try allocator.alloc(usize, external.notations.items.len);
+        defer allocator.free(notation_map);
+        const misc_map = try allocator.alloc(usize, external.misc.items.len);
+        defer allocator.free(misc_map);
+        const skipped_map = try allocator.alloc(usize, external.skipped_external.items.len);
+        defer allocator.free(skipped_map);
+        @memset(entity_map, missing);
+
+        const byte_base = self.bytes.items.len;
+        try self.bytes.appendSlice(allocator, external.bytes.items);
+
+        for (external.elements.items, 0..) |element, index| {
+            element_map[index] = self.elements.items.len;
+            try self.elements.append(allocator, .{
+                .name = shifted(element.name, byte_base),
+                .content_kind = element.content_kind,
+                .content_spec = shiftedOptional(element.content_spec, byte_base),
+                .location = element.location,
+                .declared_external = true,
+            });
+        }
+        for (external.attributes.items) |attribute| {
+            if (try self.hasAttributeDeclaration(
+                limits,
+                external.string(attribute.element_name),
+                external.string(attribute.name),
+            )) continue;
+            try self.attributes.append(allocator, .{
+                .element_name = shifted(attribute.element_name, byte_base),
+                .name = shifted(attribute.name, byte_base),
+                .attribute_type = attribute.attribute_type,
+                .default_kind = attribute.default_kind,
+                .default_value = shiftedOptional(attribute.default_value, byte_base),
+                .allowed_values = shiftedOptional(attribute.allowed_values, byte_base),
+                .order = self.attributes.items.len,
+                .location = attribute.location,
+                .declared_external = true,
+            });
+        }
+        for (external.entities.items, 0..) |entity, index| {
+            if (try self.hasEntityDeclaration(
+                limits,
+                external.string(entity.name),
+                entity.parameter,
+            )) continue;
+            entity_map[index] = self.entities.items.len;
+            try self.entities.append(allocator, .{
+                .name = shifted(entity.name, byte_base),
+                .name_hash = entity.name_hash,
+                .value = shiftedOptional(entity.value, byte_base),
+                .external_id = shiftedExternalId(entity.external_id, byte_base),
+                .parameter = entity.parameter,
+                .unparsed = entity.unparsed,
+                .notation_name = shiftedOptional(entity.notation_name, byte_base),
+                .base_id = shiftedOptional(entity.base_id, byte_base),
+                .declared_external = true,
+                .location = entity.location,
+            });
+        }
+        for (external.notations.items, 0..) |notation, index| {
+            notation_map[index] = self.notations.items.len;
+            try self.notations.append(allocator, .{
+                .name = shifted(notation.name, byte_base),
+                .external_id = shiftedExternalId(notation.external_id, byte_base),
+                .location = notation.location,
+            });
+        }
+        for (external.misc.items, 0..) |misc, index| {
+            misc_map[index] = self.misc.items.len;
+            try self.misc.append(allocator, .{
+                .first = shifted(misc.first, byte_base),
+                .second = shiftedOptional(misc.second, byte_base),
+            });
+        }
+        for (external.skipped_external.items, 0..) |skipped, index| {
+            skipped_map[index] = self.skipped_external.items.len;
+            try self.skipped_external.append(allocator, .{
+                .kind = skipped.kind,
+                .name = shiftedOptional(skipped.name, byte_base),
+                .public_id = shiftedOptional(skipped.public_id, byte_base),
+                .system_id = shifted(skipped.system_id, byte_base),
+                .offset = skipped.offset,
+            });
+        }
+        for (external.nesting_violations.items) |location| {
+            try self.nesting_violations.append(allocator, location);
+        }
+        for (external.reports.items) |report| {
+            const mapped: ?Report = switch (report.kind) {
+                .element => .{ .kind = .element, .index = element_map[report.index] },
+                .attribute_list => .{
+                    .kind = .attribute_list,
+                    .index = 0,
+                    .name = shiftedOptional(report.name, byte_base),
+                },
+                .parsed_entity, .unparsed_entity => if (entity_map[report.index] == missing)
+                    null
+                else
+                    .{ .kind = report.kind, .index = entity_map[report.index] },
+                .notation => .{ .kind = .notation, .index = notation_map[report.index] },
+                .comment, .processing_instruction => .{
+                    .kind = report.kind,
+                    .index = misc_map[report.index],
+                },
+                .skipped_external => .{
+                    .kind = .skipped_external,
+                    .index = skipped_map[report.index],
+                },
+            };
+            if (mapped) |value| try self.reports.append(allocator, value);
+        }
+
+        self.declaration_count += external.declaration_count;
+        self.declaration_bytes += external.declaration_bytes;
+        self.grammar_nodes += external.grammar_nodes;
+        self.replacement_bytes += external.replacement_bytes;
+        self.parameter_reference_seen = self.parameter_reference_seen or external.parameter_reference_seen;
+        return .{ .byte_base = byte_base, .grammar_unchanged = grammar_unchanged };
+    }
+
+    fn hasAttributeDeclaration(
+        self: *State,
+        limits: Limits,
+        element_name: []const u8,
+        name: []const u8,
+    ) ParseError!bool {
+        for (self.attributes.items) |attribute| {
+            try self.chargeComparison(
+                limits,
+                element_name.len +| attribute.element_name.len +| name.len +| attribute.name.len +| 2,
+                0,
+            );
+            if (std.mem.eql(u8, element_name, self.string(attribute.element_name)) and
+                std.mem.eql(u8, name, self.string(attribute.name))) return true;
+        }
+        return false;
+    }
+
+    fn hasEntityDeclaration(
+        self: *State,
+        limits: Limits,
+        name: []const u8,
+        parameter: bool,
+    ) ParseError!bool {
+        for (self.entities.items) |entity| {
+            if (entity.parameter != parameter) continue;
+            try self.chargeComparison(limits, name.len +| entity.name.len +| 1, 0);
+            if (std.mem.eql(u8, name, self.string(entity.name))) return true;
+        }
+        return false;
     }
 
     fn store(self: *State, allocator: std.mem.Allocator, value: []const u8) ParseError!StoredString {
@@ -588,6 +882,21 @@ pub const State = struct {
     }
 };
 
+fn shifted(value: StoredString, base: usize) StoredString {
+    return .{ .offset = base + value.offset, .len = value.len };
+}
+
+fn shiftedOptional(value: ?StoredString, base: usize) ?StoredString {
+    return if (value) |stored| shifted(stored, base) else null;
+}
+
+fn shiftedExternalId(value: ExternalId, base: usize) ExternalId {
+    return .{
+        .public_id = shiftedOptional(value.public_id, base),
+        .system_id = shiftedOptional(value.system_id, base),
+    };
+}
+
 const Parser = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
@@ -595,7 +904,9 @@ const Parser = struct {
     subset: []const u8,
     sources: std.ArrayList(Source) = .empty,
     external_provider: ?ExternalProvider = null,
+    omit_external_subset: bool = false,
     diagnostic_source_id: u32 = 0,
+    conditional_header_byte_entity: ?usize = null,
 
     fn parseDoctype(self: *Parser) ParseError!void {
         var cursor: usize = 0;
@@ -646,6 +957,11 @@ const Parser = struct {
             if (cursor != self.subset.len) return self.invalid(.malformed_doctype, cursor);
         }
         if (self.state.external_id.system_id) |system_id| {
+            if (self.omit_external_subset) {
+                if (internal_source) |source| try self.sources.append(self.allocator, source);
+                if (self.sources.items.len != 0) try self.parseSubset();
+                return;
+            }
             const provider = self.external_provider orelse
                 return self.state.setUnsupported(.external_subset_unsupported, 0);
             const result = try provider.resolve(.{
@@ -757,6 +1073,9 @@ const Parser = struct {
         const declaration_requires_entity_nesting = declaration_source.boundary_space;
         var logical: std.ArrayList(u8) = .empty;
         defer logical.deinit(self.allocator);
+        var group_entities: std.ArrayList(?usize) = .empty;
+        defer group_entities.deinit(self.allocator);
+        var nesting_recorded = false;
         var quote: u8 = 0;
         var quote_entity_index: ?usize = null;
         var comment = false;
@@ -829,7 +1148,28 @@ const Parser = struct {
             } else if (byte == '\'' or byte == '"') {
                 quote = byte;
                 quote_entity_index = self.sources.items[index].entity_index;
+            } else if (byte == '(') {
+                try group_entities.append(self.allocator, self.sources.items[index].entity_index);
+            } else if (byte == ')') {
+                if (group_entities.pop()) |opening_entity| {
+                    if (opening_entity != self.sources.items[index].entity_index and !nesting_recorded) {
+                        try self.state.nesting_violations.append(self.allocator, .{
+                            .source_id = declaration_source.source_id,
+                            .offset = offset,
+                        });
+                        nesting_recorded = true;
+                    }
+                }
             } else if (byte == '>') {
+                if (self.sources.items[index].entity_index != declaration_entity_index and
+                    !nesting_recorded)
+                {
+                    try self.state.nesting_violations.append(self.allocator, .{
+                        .source_id = declaration_source.source_id,
+                        .offset = offset,
+                    });
+                    nesting_recorded = true;
+                }
                 if (declaration_requires_entity_nesting and
                     self.sources.items[index].entity_index != declaration_entity_index)
                 {
@@ -887,6 +1227,8 @@ const Parser = struct {
             return self.invalid(.malformed_declaration, self.sourceOffset(source_index, cursor.*));
         }
         const start = cursor.*;
+        const section_entity = self.sources.items[source_index].entity_index;
+        var improper_header_nesting = false;
         self.sources.items[source_index].cursor = cursor.* + 3;
         var keyword: [7]u8 = undefined;
         var keyword_len: usize = 0;
@@ -899,6 +1241,7 @@ const Parser = struct {
                 break;
             }
             if (byte == '[') {
+                improper_header_nesting = self.conditional_header_byte_entity != section_entity;
                 bracket_seen = true;
                 break;
             }
@@ -914,6 +1257,7 @@ const Parser = struct {
                 if (!isWhitespace(byte)) break;
             }
             if (byte != '[') return self.invalid(.malformed_declaration, self.logicalOffset());
+            improper_header_nesting = self.conditional_header_byte_entity != section_entity;
         }
         const include = if (std.mem.eql(u8, keyword[0..keyword_len], "INCLUDE"))
             true
@@ -921,6 +1265,12 @@ const Parser = struct {
             false
         else
             return self.invalid(.malformed_declaration, self.logicalOffset());
+        if (improper_header_nesting) {
+            try self.state.nesting_violations.append(self.allocator, .{
+                .source_id = self.sources.items[source_index].source_id,
+                .offset = self.sourceOffset(source_index, start),
+            });
+        }
         if (!try self.ensureSource()) return self.invalid(.malformed_declaration, start);
         const content_source_index = self.sources.items.len - 1;
         const source = self.sourceBytes(content_source_index);
@@ -966,6 +1316,7 @@ const Parser = struct {
                 try self.pushParameterReference();
                 continue;
             }
+            self.conditional_header_byte_entity = self.sources.items[index].entity_index;
             self.sources.items[index].cursor += 1;
             return source[cursor];
         }
@@ -1031,6 +1382,7 @@ const Parser = struct {
             return self.limit(.element_declaration_limit, self.sourceOffset(source_index, cursor.*));
         }
         const source = self.sourceBytes(source_index);
+        const declaration_offset = self.sourceOffset(source_index, cursor.*);
         cursor.* += "<!ELEMENT".len;
         if (!requireWhitespace(source, cursor)) {
             return self.invalid(.malformed_element_declaration, self.sourceOffset(source_index, cursor.*));
@@ -1040,21 +1392,40 @@ const Parser = struct {
         if (!requireWhitespace(source, cursor)) {
             return self.invalid(.malformed_element_declaration, self.sourceOffset(source_index, cursor.*));
         }
+        const content_start = cursor.*;
+        var content_kind: ContentKind = undefined;
         if (startsKeyword(source, cursor.*, "EMPTY")) {
             cursor.* += "EMPTY".len;
+            content_kind = .empty;
         } else if (startsKeyword(source, cursor.*, "ANY")) {
             cursor.* += "ANY".len;
+            content_kind = .any;
         } else {
             try self.parseContentSpec(source_index, source, cursor);
+            content_kind = if (std.mem.indexOf(u8, source[content_start..cursor.*], "#PCDATA") != null)
+                .mixed
+            else
+                .children;
         }
+        const content_end = cursor.*;
         skipWhitespace(source, cursor);
         if (cursor.* >= source.len or source[cursor.*] != '>') {
             return self.invalid(.malformed_element_declaration, self.sourceOffset(source_index, cursor.*));
         }
         cursor.* += 1;
         const stored_name = try self.state.store(self.allocator, name);
+        const stored_content = if (content_kind == .mixed or content_kind == .children)
+            try self.state.store(self.allocator, source[content_start..content_end])
+        else
+            null;
         const index = self.state.elements.items.len;
-        try self.state.elements.append(self.allocator, .{ .name = stored_name });
+        try self.state.elements.append(self.allocator, .{
+            .name = stored_name,
+            .content_kind = content_kind,
+            .content_spec = stored_content,
+            .location = self.declarationLocation(source_index, declaration_offset),
+            .declared_external = self.sources.items[source_index].external,
+        });
         try self.state.reports.append(self.allocator, .{ .kind = .element, .index = index });
     }
 
@@ -1194,11 +1565,16 @@ const Parser = struct {
             if (!requireWhitespace(source, cursor)) {
                 return self.invalid(.malformed_attribute_list, self.sourceOffset(source_index, cursor.*));
             }
-            const attribute_type = try self.parseAttributeType(source_index, source, cursor);
+            const parsed_type = try self.parseAttributeType(source_index, source, cursor);
             if (!requireWhitespace(source, cursor)) {
                 return self.invalid(.malformed_attribute_list, self.sourceOffset(source_index, cursor.*));
             }
-            const default = try self.parseDefaultDeclaration(source_index, source, cursor, attribute_type);
+            const default = try self.parseDefaultDeclaration(
+                source_index,
+                source,
+                cursor,
+                parsed_type.attribute_type,
+            );
             if (duplicate orelse try self.attributeExists(element_name, name, declaration_offset)) {
                 self.state.bytes.items.len = bytes_checkpoint;
                 self.state.replacement_bytes = replacement_checkpoint;
@@ -1208,20 +1584,28 @@ const Parser = struct {
             try self.state.attributes.append(self.allocator, .{
                 .element_name = stored_element_name,
                 .name = stored_name,
-                .attribute_type = attribute_type,
+                .attribute_type = parsed_type.attribute_type,
                 .default_kind = default.kind,
                 .default_value = default.value,
+                .allowed_values = parsed_type.allowed_values,
                 .order = self.state.attributes.items.len,
+                .location = self.declarationLocation(source_index, declaration_offset),
+                .declared_external = self.sources.items[source_index].external,
             });
         }
     }
+
+    const ParsedAttributeType = struct {
+        attribute_type: AttributeType,
+        allowed_values: ?StoredString = null,
+    };
 
     fn parseAttributeType(
         self: *Parser,
         source_index: usize,
         source: []const u8,
         cursor: *usize,
-    ) ParseError!AttributeType {
+    ) ParseError!ParsedAttributeType {
         inline for (.{
             .{ "CDATA", AttributeType.cdata },
             .{ "IDREFS", AttributeType.idrefs },
@@ -1234,7 +1618,7 @@ const Parser = struct {
         }) |entry| {
             if (startsKeyword(source, cursor.*, entry[0])) {
                 cursor.* += entry[0].len;
-                return entry[1];
+                return .{ .attribute_type = entry[1] };
             }
         }
         if (startsKeyword(source, cursor.*, "NOTATION")) {
@@ -1242,12 +1626,26 @@ const Parser = struct {
             if (!requireWhitespace(source, cursor)) {
                 return self.invalid(.malformed_attribute_list, self.sourceOffset(source_index, cursor.*));
             }
+            const values_start = cursor.*;
             try self.parseNameGroup(source_index, source, cursor, true);
-            return .notation;
+            return .{
+                .attribute_type = .notation,
+                .allowed_values = try self.state.store(
+                    self.allocator,
+                    source[values_start..cursor.*],
+                ),
+            };
         }
         if (cursor.* < source.len and source[cursor.*] == '(') {
+            const values_start = cursor.*;
             try self.parseNameGroup(source_index, source, cursor, false);
-            return .enumeration;
+            return .{
+                .attribute_type = .enumeration,
+                .allowed_values = try self.state.store(
+                    self.allocator,
+                    source[values_start..cursor.*],
+                ),
+            };
         }
         return self.invalid(.malformed_attribute_list, self.sourceOffset(source_index, cursor.*));
     }
@@ -1360,6 +1758,7 @@ const Parser = struct {
             .value = null,
             .parameter = parameter,
             .declared_external = self.sources.items[source_index].external,
+            .location = self.declarationLocation(source_index, declaration_offset),
         };
         if (self.sources.items[source_index].base_id) |base_id| {
             declaration.base_id = try self.state.store(self.allocator, base_id);
@@ -1534,6 +1933,7 @@ const Parser = struct {
             return self.limit(.notation_declaration_limit, self.sourceOffset(source_index, cursor.*));
         }
         const source = self.sourceBytes(source_index);
+        const declaration_offset = self.sourceOffset(source_index, cursor.*);
         cursor.* += "<!NOTATION".len;
         if (!requireWhitespace(source, cursor)) {
             return self.invalid(.malformed_notation_declaration, self.sourceOffset(source_index, cursor.*));
@@ -1560,8 +1960,20 @@ const Parser = struct {
         try self.state.notations.append(self.allocator, .{
             .name = stored_name,
             .external_id = external_id,
+            .location = self.declarationLocation(source_index, declaration_offset),
         });
         try self.state.reports.append(self.allocator, .{ .kind = .notation, .index = index });
+    }
+
+    fn declarationLocation(
+        self: *const Parser,
+        source_index: usize,
+        offset: usize,
+    ) DeclarationLocation {
+        return .{
+            .source_id = self.sources.items[source_index].source_id,
+            .offset = offset,
+        };
     }
 
     fn parseExternalId(
@@ -2308,6 +2720,18 @@ pub fn collapseSpaces(bytes: []u8) usize {
         }
     }
     return write;
+}
+
+pub fn validName(bytes: []const u8) bool {
+    var cursor: usize = 0;
+    const name = scanName(bytes, &cursor) orelse return false;
+    return name.len == bytes.len and cursor == bytes.len;
+}
+
+pub fn validNmtoken(bytes: []const u8) bool {
+    var cursor: usize = 0;
+    const token = scanNmtoken(bytes, &cursor) orelse return false;
+    return token.len == bytes.len and cursor == bytes.len;
 }
 
 fn expectLimitBoundaryForTest(

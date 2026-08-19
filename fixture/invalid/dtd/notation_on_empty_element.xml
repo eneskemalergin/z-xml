@@ -1,0 +1,6 @@
+<!DOCTYPE item [
+<!NOTATION text SYSTEM "text/plain">
+<!ELEMENT item EMPTY>
+<!ATTLIST item format NOTATION (text) #IMPLIED>
+]>
+<item/>
