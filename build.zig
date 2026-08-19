@@ -660,6 +660,33 @@ pub fn build(b: *std.Build) void {
     })).step);
 
     inline for (.{
+        .{ "z-xml11-validating-check", false },
+        .{ "z-xml11-validating-ns-check", true },
+    }) |entry| {
+        const xml11_check_module = b.createModule(.{
+            .root_source_file = b.path("tools/z_xml_check.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = optimize == .ReleaseFast,
+        });
+        xml11_check_module.addImport("z_xml", z_xml);
+        const xml11_check_options = b.addOptions();
+        xml11_check_options.addOption(bool, "namespaces", entry[1]);
+        xml11_check_options.addOption(bool, "general_encodings", true);
+        xml11_check_options.addOption(bool, "dtd", true);
+        xml11_check_options.addOption(bool, "validating", true);
+        xml11_check_options.addOption(bool, "xml11", true);
+        xml11_check_module.addOptions("check_options", xml11_check_options);
+        b.installArtifact(b.addExecutable(.{
+            .name = entry[0],
+            .root_module = xml11_check_module,
+        }));
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+            .root_module = xml11_check_module,
+        })).step);
+    }
+
+    inline for (.{
         .{ "z-xml-validation-fresh", false },
         .{ "z-xml-validation-reused", true },
     }) |entry| {

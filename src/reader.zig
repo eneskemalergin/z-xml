@@ -6,6 +6,7 @@ const dtd_module = @import("dtd.zig");
 const resolver_module = @import("resolver.zig");
 const validation_module = @import("validation.zig");
 const external_subset_module = @import("external_subset.zig");
+const unicode_normalization = @import("unicode_normalization.zig");
 
 /// XML capability profile selected at compile time.
 pub const Profile = enum {
@@ -79,18 +80,8 @@ pub const Profile = enum {
 
     /// Returns whether the reader implements the profile's complete grammar.
     pub fn isImplemented(comptime self: Profile) bool {
-        return switch (self) {
-            .xml10_utf8_no_dtd,
-            .xml10_utf8_ns_no_dtd,
-            .xml10_no_dtd,
-            .xml10_ns_no_dtd,
-            .xml10_nonvalidating,
-            .xml10_ns_nonvalidating,
-            .xml10_dtd_validating,
-            .xml10_ns_dtd_validating,
-            => true,
-            else => false,
-        };
+        _ = self;
+        return true;
     }
 };
 
@@ -214,6 +205,22 @@ pub const Configs = struct {
     /// Namespace-aware DTD-validating XML 1.1 profile.
     pub const XML11_NAMESPACES_VALIDATING: Config = .{
         .profile = .xml11_ns_dtd_validating,
+        .external_sources = true,
+    };
+    /// Full non-validating XML 1.1 profile without namespaces.
+    pub const XML11_NONVALIDATING: Config = .{
+        .profile = .xml11_nonvalidating,
+        .external_sources = true,
+    };
+    /// Full namespace-aware non-validating XML 1.1 profile.
+    pub const XML11_NAMESPACES_NONVALIDATING: Config = .{
+        .profile = .xml11_ns_nonvalidating,
+        .external_sources = true,
+    };
+    /// DTD-validating XML 1.1 profile without namespaces.
+    pub const XML11_VALIDATING: Config = .{
+        .profile = .xml11_dtd_validating,
+        .external_sources = true,
     };
 };
 
@@ -398,6 +405,8 @@ pub const DiagnosticCode = enum {
     incomplete_declaration,
     unsupported_version,
     unsupported_encoding,
+    not_fully_normalized,
+    normalization_properties_unknown,
     misplaced_xml_declaration,
     reserved_processing_instruction_target,
     malformed_processing_instruction,
@@ -557,6 +566,56 @@ pub const ValidityAction = enum { continue_validation, cancel };
 /// Final state reported by a validating reader.
 pub const ValidationStatus = enum { valid, invalid, incomplete };
 
+/// Runtime policy for XML 1.1 full-normalization verification.
+pub const NormalizationPolicy = enum {
+    /// Skip verification only when the caller certifies the input.
+    unchecked,
+    /// Continue parsing and expose the final verification result.
+    report,
+    /// Stop at the first definite or indeterminate finding.
+    require,
+};
+
+/// Progress or final result of XML 1.1 full-normalization verification.
+pub const NormalizationStatus = enum {
+    /// Verification was not requested or the document selected XML 1.0 rules.
+    unchecked,
+    /// Verification is active and the document is not complete.
+    checking,
+    /// Every read parsed entity and relevant construct passed verification.
+    normalized,
+    /// A definite full-normalization violation was found.
+    not_normalized,
+    /// The input used a character newer than the available property tables.
+    indeterminate,
+};
+
+/// Reason that XML 1.1 full-normalization verification did not succeed.
+pub const NormalizationIssueKind = enum {
+    not_nfc,
+    composing_start,
+    unknown_character,
+};
+
+/// First XML 1.1 full-normalization finding and its associated source location.
+pub fn NormalizationIssue(comptime config: Config) type {
+    return struct {
+        kind: NormalizationIssueKind,
+        location: Location(config),
+    };
+}
+
+/// XML 1.1 full-normalization result specialized out of XML 1.0 readers.
+pub fn NormalizationResult(comptime config: Config) type {
+    return if (config.profile.isXml11())
+        struct {
+            status: NormalizationStatus,
+            issue: ?NormalizationIssue(config),
+        }
+    else
+        struct {};
+}
+
 /// Synchronous validity diagnostic callback specialized to the reader.
 pub fn ValiditySink(comptime config: Config) type {
     return struct {
@@ -581,6 +640,10 @@ fn ValidationOptions(comptime config: Config) type {
         struct {};
 }
 
+fn NormalizationOptions(comptime config: Config) type {
+    return if (config.profile.isXml11()) NormalizationPolicy else void;
+}
+
 /// Runtime options containing only state permitted by `config`.
 pub fn Options(comptime config: Config) type {
     config.validate();
@@ -590,11 +653,15 @@ pub fn Options(comptime config: Config) type {
         dtd_limits: if (config.profile.dtdMode() == .rejected) struct {} else dtd_module.Limits = .{},
         resolver: ResolverOptions(config) = .{},
         validation: ValidationOptions(config) = .{},
+        /// XML 1.1 full-normalization verification policy.
+        normalization: NormalizationOptions(config) = if (config.profile.isXml11()) .report else {},
     } else struct {
         limits: Limits = .{},
         namespace_limits: NamespaceLimits(config) = .{},
         dtd_limits: if (config.profile.dtdMode() == .rejected) struct {} else dtd_module.Limits = .{},
         validation: ValidationOptions(config) = .{},
+        /// XML 1.1 full-normalization verification policy.
+        normalization: NormalizationOptions(config) = if (config.profile.isXml11()) .report else {},
     };
 }
 
@@ -659,9 +726,7 @@ fn EndElement(comptime config: Config) type {
 }
 
 /// XML rules selected for a document entity.
-pub const XmlVersion = enum {
-    xml10,
-};
+pub const XmlVersion = dtd_module.XmlVersion;
 
 /// Source encoding detected for the document entity.
 pub const SourceEncoding = encoding_module.SourceEncoding;
@@ -847,6 +912,7 @@ pub const ReadError = error{
     ResolverFailed,
     ReadFailed,
     Cancelled,
+    NotNormalized,
     OutOfMemory,
     InvalidState,
 };
@@ -957,6 +1023,12 @@ const ScalarSource = enum {
     reference,
 };
 
+const LineFollower = enum {
+    none,
+    nel,
+    need_input,
+};
+
 const DecodedScalar = struct {
     codepoint: u32,
     len: u3,
@@ -973,6 +1045,7 @@ fn EntitySourceFrame(comptime config: Config) type {
         entity_index: usize,
         open_depth: usize,
         resume_state: VerticalState,
+        parent_is_replacement: bool,
         external: if (config.external_sources) bool else void =
             if (config.external_sources) false else {},
         source_encoding: if (config.external_sources) SourceEncoding else void =
@@ -1033,6 +1106,7 @@ fn DtdState(comptime config: Config) type {
             document_type_emitted: bool = false,
             report_cursor: usize = 0,
             pending_entity_index: usize = 0,
+            current_is_replacement: bool = false,
             pending_skipped_entity_index: ?usize = null,
             doctype_data_start: Location(config) = .{},
             seen_doctype: bool = false,
@@ -1095,6 +1169,8 @@ fn OpenElementFrame(comptime config: Config) type {
             namespace_binding_mark: usize,
             namespace_byte_mark: usize,
             namespace_reference: NamespaceReference,
+            normalization_content_started: if (config.profile.isXml11()) bool else void =
+                if (config.profile.isXml11()) false else {},
             validation: if (config.profile.dtdMode() == .validating)
                 validation_module.Frame
             else
@@ -1105,6 +1181,8 @@ fn OpenElementFrame(comptime config: Config) type {
             name_offset: usize,
             name_len: usize,
             start: Location(config),
+            normalization_content_started: if (config.profile.isXml11()) bool else void =
+                if (config.profile.isXml11()) false else {},
             validation: if (config.profile.dtdMode() == .validating)
                 validation_module.Frame
             else
@@ -1163,6 +1241,7 @@ const Failure = enum {
     resolver_failed,
     read_failed,
     cancelled,
+    not_normalized,
 };
 
 const decoded_input_capacity = 16 * 1024;
@@ -1196,6 +1275,54 @@ fn ExternalDecoderState(comptime config: Config) type {
         };
 }
 
+const SourceNormalizationIssue = struct {
+    kind: NormalizationIssueKind,
+    byte_offset: u64,
+    line: u64,
+    byte_column: u64,
+};
+
+const SourceNormalization = struct {
+    checker: unicode_normalization.Checker = .{},
+    utf8_bytes: [4]u8 = @splat(0),
+    utf8_len: u3 = 0,
+    utf8_expected_len: u3 = 0,
+    utf8_start_offset: u64 = 0,
+    utf8_source_width: u64 = 0,
+    scanned_raw_offset: u64 = 0,
+    line: u64 = 1,
+    byte_column: u64 = 1,
+    previous_was_carriage_return: bool = false,
+    issue: ?SourceNormalizationIssue = null,
+    definite_issue: ?SourceNormalizationIssue = null,
+    issue_reported: bool = false,
+    definite_issue_reported: bool = false,
+
+    fn reset(self: *SourceNormalization) void {
+        self.* = .{};
+    }
+};
+
+fn advanceSourceNormalization(
+    normalization: *SourceNormalization,
+    codepoint: u21,
+    source_width: u64,
+) void {
+    if (normalization.previous_was_carriage_return and
+        (codepoint == '\n' or codepoint == 0x85))
+    {
+        normalization.previous_was_carriage_return = false;
+        return;
+    }
+    normalization.previous_was_carriage_return = codepoint == '\r';
+    if (codepoint == '\r' or codepoint == '\n' or codepoint == 0x85 or codepoint == 0x2028) {
+        normalization.line += 1;
+        normalization.byte_column = 1;
+    } else {
+        normalization.byte_column += source_width;
+    }
+}
+
 fn SourceState(comptime config: Config) type {
     return if (config.profile.isUtf8Only())
         struct {}
@@ -1211,12 +1338,18 @@ fn SourceState(comptime config: Config) type {
             decoded: std.ArrayList(u8) = .empty,
             source_advances: std.ArrayList(u8) = .empty,
             input_is_direct_utf8: bool = false,
+            line_pending: if (config.profile.isXml11()) [3]u8 else void =
+                if (config.profile.isXml11()) @splat(0) else {},
+            line_pending_len: if (config.profile.isXml11()) u2 else void =
+                if (config.profile.isXml11()) 0 else {},
             pending_byte: ?u8 = null,
             pending_byte_offset: u64 = 0,
             high_surrogate: ?u16 = null,
             high_surrogate_offset: u64 = 0,
             failure: ?EncodingFailure = null,
             external: ExternalDecoderState(config) = .{},
+            normalization: if (config.profile.isXml11()) SourceNormalization else void =
+                if (config.profile.isXml11()) .{} else {},
         };
 }
 
@@ -1291,6 +1424,18 @@ pub fn Reader(comptime config: Config) type {
         document_start_span: Location(config) = .{},
         declared_version_offset: usize = 0,
         declared_version_len: usize = 0,
+        effective_version: if (config.profile.isXml11()) XmlVersion else void =
+            if (config.profile.isXml11()) .xml10 else {},
+        normalization_status: if (config.profile.isXml11()) NormalizationStatus else void =
+            if (config.profile.isXml11()) .unchecked else {},
+        normalization_issue: if (config.profile.isXml11()) ?NormalizationIssue(config) else void =
+            if (config.profile.isXml11()) null else {},
+        construct_checker: if (config.profile.isXml11()) unicode_normalization.Checker else void =
+            if (config.profile.isXml11()) .{} else {},
+        construct_started: if (config.profile.isXml11()) bool else void =
+            if (config.profile.isXml11()) false else {},
+        cdata_started: if (config.profile.isXml11()) bool else void =
+            if (config.profile.isXml11()) false else {},
         declared_encoding_offset: usize = 0,
         declared_encoding_len: usize = 0,
         standalone: bool = false,
@@ -1397,11 +1542,20 @@ pub fn Reader(comptime config: Config) type {
             self.reference_name_len = 0;
             if (comptime config.profile.dtdMode() != .rejected) {
                 self.dtd_state.reference_name.clearRetainingCapacity();
+                self.dtd_state.current_is_replacement = false;
             }
             self.document_start_resume = .before_root;
             self.document_start_span = .{};
             self.declared_version_offset = 0;
             self.declared_version_len = 0;
+            if (comptime config.profile.isXml11()) self.effective_version = .xml10;
+            if (comptime config.profile.isXml11()) {
+                self.normalization_status = .unchecked;
+                self.normalization_issue = null;
+                self.construct_checker.reset();
+                self.construct_started = false;
+                self.cdata_started = false;
+            }
             self.declared_encoding_offset = 0;
             self.declared_encoding_len = 0;
             self.standalone = false;
@@ -1489,13 +1643,18 @@ pub fn Reader(comptime config: Config) type {
             }
 
             while (true) {
+                if (comptime config.profile.isXml11()) {
+                    if (self.normalization_status != .unchecked) {
+                        try self.mergeSourceNormalization();
+                    }
+                }
                 switch (self.vertical_state) {
                     .detect_bom => {
                         if (self.utf8_len != 0) {
                             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                                 return self.needInput();
                             const start = self.utf8_start;
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
                             self.clearUtf8Scalar();
@@ -1519,7 +1678,7 @@ pub fn Reader(comptime config: Config) type {
                         const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                             return self.needInput();
                         const start = self.utf8_start;
-                        if (!isXml10Char(scalar.codepoint)) {
+                        if (!self.isLiteralChar(scalar.codepoint)) {
                             return self.failAt(.forbidden_character, .invalid_xml, start);
                         }
                         self.clearUtf8Scalar();
@@ -1582,7 +1741,7 @@ pub fn Reader(comptime config: Config) type {
                             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                                 return self.needInput();
                             const start = self.utf8_start;
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
                             return self.failAt(
@@ -1604,7 +1763,7 @@ pub fn Reader(comptime config: Config) type {
                                 const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                                     return self.needInput();
                                 const start = self.utf8_start;
-                                if (!isXml10Char(scalar.codepoint)) {
+                                if (!self.isLiteralChar(scalar.codepoint)) {
                                     return self.failAt(
                                         .forbidden_character,
                                         .invalid_xml,
@@ -1617,7 +1776,7 @@ pub fn Reader(comptime config: Config) type {
                                     start,
                                 );
                             }
-                            if (!isXml10Char(byte)) {
+                            if (!self.isLiteralChar(byte)) {
                                 return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.unexpected_document_text, .invalid_xml);
@@ -1651,7 +1810,7 @@ pub fn Reader(comptime config: Config) type {
                             try self.beginStartElement();
                             continue;
                         }
-                        if (!isXml10Char(byte)) {
+                        if (!self.isLiteralChar(byte)) {
                             return self.fail(.forbidden_character, .invalid_xml);
                         }
                         if (!isAsciiNameStart(byte)) {
@@ -1663,7 +1822,14 @@ pub fn Reader(comptime config: Config) type {
                             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                                 return self.needInput();
                             const start = self.utf8_start;
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (self.isXml11LineEnd(scalar.codepoint)) {
+                                self.recordXml11LineEnd(false);
+                                self.text_close_brackets = 0;
+                                try self.prepareInlineText("\n", start);
+                                self.clearUtf8Scalar();
+                                continue;
+                            }
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
                             self.text_close_brackets = 0;
@@ -1689,6 +1855,7 @@ pub fn Reader(comptime config: Config) type {
                         const byte = self.input[self.cursor];
                         if (byte == '<') {
                             self.text_close_brackets = 0;
+                            self.markContentMarkup();
                             self.token_start = self.currentLocation();
                             self.consumeByte('<');
                             self.vertical_state = .content_markup;
@@ -1696,6 +1863,9 @@ pub fn Reader(comptime config: Config) type {
                         }
                         if (byte == '&') {
                             self.text_close_brackets = 0;
+                            if (comptime config.profile.isXml11()) {
+                                self.construct_started = false;
+                            }
                             if (try self.prepareCompleteContentReference()) continue;
                             try self.beginReference(.content);
                             continue;
@@ -1704,6 +1874,12 @@ pub fn Reader(comptime config: Config) type {
                             self.text_close_brackets = 0;
                             self.text_start = self.currentLocation();
                             self.consumeByte(byte);
+                            if (comptime config.profile.dtdMode() != .rejected) {
+                                if (self.dtd_state.current_is_replacement) {
+                                    try self.prepareInlineText("\r", self.text_start);
+                                    continue;
+                                }
+                            }
                             self.vertical_state = .content_after_carriage_return;
                             continue;
                         }
@@ -1711,7 +1887,14 @@ pub fn Reader(comptime config: Config) type {
                         const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                             return self.needInput();
                         const start = self.utf8_start;
-                        if (!isXml10Char(scalar.codepoint)) {
+                        if (self.isXml11LineEnd(scalar.codepoint)) {
+                            self.recordXml11LineEnd(false);
+                            self.text_close_brackets = 0;
+                            try self.prepareInlineText("\n", start);
+                            self.clearUtf8Scalar();
+                            continue;
+                        }
+                        if (!self.isLiteralChar(scalar.codepoint)) {
                             return self.failAt(.forbidden_character, .invalid_xml, start);
                         }
                         self.text_close_brackets = 0;
@@ -1727,6 +1910,9 @@ pub fn Reader(comptime config: Config) type {
                         }
                         if (self.cursor < self.input.len and self.input[self.cursor] == '\n') {
                             self.consumeByte('\n');
+                        } else switch (try self.consumeNelAfterCarriageReturn(.ordinary)) {
+                            .need_input => return self.needInput(),
+                            .none, .nel => {},
                         }
                         try self.prepareInlineText(
                             "\n",
@@ -1760,7 +1946,7 @@ pub fn Reader(comptime config: Config) type {
                             try self.beginStartElement();
                             continue;
                         }
-                        if (!isXml10Char(byte)) {
+                        if (!self.isLiteralChar(byte)) {
                             return self.fail(.forbidden_character, .invalid_xml);
                         }
                         if (!isAsciiNameStart(byte)) {
@@ -1772,7 +1958,7 @@ pub fn Reader(comptime config: Config) type {
                             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                                 return self.needInput();
                             const start = self.utf8_start;
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
                             return self.failAt(.trailing_content, .invalid_xml, start);
@@ -1794,7 +1980,7 @@ pub fn Reader(comptime config: Config) type {
                                 const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                                     return self.needInput();
                                 const start = self.utf8_start;
-                                if (!isXml10Char(scalar.codepoint)) {
+                                if (!self.isLiteralChar(scalar.codepoint)) {
                                     return self.failAt(
                                         .forbidden_character,
                                         .invalid_xml,
@@ -1803,7 +1989,7 @@ pub fn Reader(comptime config: Config) type {
                                 }
                                 return self.failAt(.trailing_content, .invalid_xml, start);
                             }
-                            if (!isXml10Char(byte)) {
+                            if (!self.isLiteralChar(byte)) {
                                 return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.trailing_content, .invalid_xml);
@@ -1817,7 +2003,7 @@ pub fn Reader(comptime config: Config) type {
                             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                                 return self.needInput();
                             const start = self.utf8_start;
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
                             if (isXml10NameStart(scalar.codepoint)) {
@@ -1853,7 +2039,7 @@ pub fn Reader(comptime config: Config) type {
                             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                                 return self.needInput();
                             const start = self.utf8_start;
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
                             if (isXml10NameStart(scalar.codepoint)) {
@@ -1872,7 +2058,7 @@ pub fn Reader(comptime config: Config) type {
                                 self.token_start,
                             );
                         }
-                        if (!isXml10Char(byte)) {
+                        if (!self.isLiteralChar(byte)) {
                             return self.fail(.forbidden_character, .invalid_xml);
                         }
                         return self.fail(.trailing_content, .invalid_xml);
@@ -1894,7 +2080,7 @@ pub fn Reader(comptime config: Config) type {
                             const scalar = (try self.readUtf8Scalar(.start_tag)) orelse
                                 return self.needInput();
                             const scalar_start = self.utf8_start;
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(
                                     .forbidden_character,
                                     .invalid_xml,
@@ -1934,7 +2120,7 @@ pub fn Reader(comptime config: Config) type {
                                 self.vertical_state = .start_after_space;
                                 continue;
                             }
-                            if (!isXml10Char(byte)) {
+                            if (!self.isLiteralChar(byte)) {
                                 return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.malformed_start_tag, .invalid_xml);
@@ -1968,7 +2154,7 @@ pub fn Reader(comptime config: Config) type {
                             try self.beginAttribute();
                             continue;
                         }
-                        if (!isXml10Char(byte)) {
+                        if (!self.isLiteralChar(byte)) {
                             return self.fail(.forbidden_character, .invalid_xml);
                         }
                         return self.fail(.malformed_attribute, .invalid_xml);
@@ -1990,7 +2176,7 @@ pub fn Reader(comptime config: Config) type {
                             const scalar = (try self.readUtf8Scalar(.start_tag)) orelse
                                 return self.needInput();
                             const scalar_start = self.utf8_start;
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(
                                     .forbidden_character,
                                     .invalid_xml,
@@ -2028,7 +2214,7 @@ pub fn Reader(comptime config: Config) type {
                                 self.vertical_state = .attribute_after_name;
                                 continue;
                             }
-                            if (!isXml10Char(byte)) {
+                            if (!self.isLiteralChar(byte)) {
                                 return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.malformed_attribute, .invalid_xml);
@@ -2055,7 +2241,7 @@ pub fn Reader(comptime config: Config) type {
                         }
                         try self.requireStartTagByte();
                         if (self.input[self.cursor] != '=') {
-                            if (!isXml10Char(self.input[self.cursor])) {
+                            if (!self.isLiteralChar(self.input[self.cursor])) {
                                 return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.malformed_attribute, .invalid_xml);
@@ -2081,7 +2267,7 @@ pub fn Reader(comptime config: Config) type {
                         try self.requireStartTagByte();
                         const byte = self.input[self.cursor];
                         if (byte != '\'' and byte != '"') {
-                            if (!isXml10Char(byte)) {
+                            if (!self.isLiteralChar(byte)) {
                                 return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.malformed_attribute, .invalid_xml);
@@ -2095,7 +2281,13 @@ pub fn Reader(comptime config: Config) type {
                             const scalar = (try self.readUtf8Scalar(.start_tag)) orelse
                                 return self.needInput();
                             const start = self.utf8_start;
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (self.isXml11LineEnd(scalar.codepoint)) {
+                                self.recordXml11LineEnd(false);
+                                try self.appendAttributeOutput(" ");
+                                self.clearUtf8Scalar();
+                                continue;
+                            }
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
                             try self.appendAttributeOutput(self.utf8_bytes[0..scalar.len]);
@@ -2142,7 +2334,13 @@ pub fn Reader(comptime config: Config) type {
                                 const scalar = (try self.readUtf8Scalar(.start_tag)) orelse
                                     return self.needInput();
                                 const start = self.utf8_start;
-                                if (!isXml10Char(scalar.codepoint)) {
+                                if (self.isXml11LineEnd(scalar.codepoint)) {
+                                    self.recordXml11LineEnd(false);
+                                    try self.appendAttributeOutput(" ");
+                                    self.clearUtf8Scalar();
+                                    continue;
+                                }
+                                if (!self.isLiteralChar(scalar.codepoint)) {
                                     return self.failAt(
                                         .forbidden_character,
                                         .invalid_xml,
@@ -2155,7 +2353,7 @@ pub fn Reader(comptime config: Config) type {
                                 self.clearUtf8Scalar();
                                 continue;
                             }
-                            if (!isXml10Char(byte)) {
+                            if (!self.isLiteralChar(byte)) {
                                 return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.malformed_attribute, .invalid_xml);
@@ -2172,6 +2370,9 @@ pub fn Reader(comptime config: Config) type {
                         if (self.cursor < self.input.len and self.input[self.cursor] == '\n') {
                             try self.requireStartTagByte();
                             self.consumeStartTagByte('\n');
+                        } else switch (try self.consumeNelAfterCarriageReturn(.start_tag)) {
+                            .need_input => return self.needInput(),
+                            .none, .nel => {},
                         }
                         try self.appendAttributeOutput(" ");
                         self.vertical_state = .attribute_value;
@@ -2206,7 +2407,7 @@ pub fn Reader(comptime config: Config) type {
                             self.vertical_state = .start_after_space;
                             continue;
                         }
-                        if (!isXml10Char(byte)) {
+                        if (!self.isLiteralChar(byte)) {
                             return self.fail(.forbidden_character, .invalid_xml);
                         }
                         return self.fail(.malformed_attribute, .invalid_xml);
@@ -2227,7 +2428,7 @@ pub fn Reader(comptime config: Config) type {
                         }
                         try self.requireStartTagByte();
                         if (self.input[self.cursor] != '>') {
-                            if (!isXml10Char(self.input[self.cursor])) {
+                            if (!self.isLiteralChar(self.input[self.cursor])) {
                                 return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.malformed_start_tag, .invalid_xml);
@@ -2276,7 +2477,7 @@ pub fn Reader(comptime config: Config) type {
                         }
                         const byte = self.input[self.cursor];
                         if (byte < 0x80 and !isAsciiNameStart(byte)) {
-                            if (!isXml10Char(byte)) {
+                            if (!self.isLiteralChar(byte)) {
                                 return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.malformed_end_tag, .invalid_xml);
@@ -2314,7 +2515,7 @@ pub fn Reader(comptime config: Config) type {
                             }
                             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse
                                 return self.needInput();
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(
                                     .forbidden_character,
                                     .invalid_xml,
@@ -2350,7 +2551,7 @@ pub fn Reader(comptime config: Config) type {
                                 self.vertical_state = .end_after_space;
                                 continue;
                             }
-                            if (!isXml10Char(byte)) {
+                            if (!self.isLiteralChar(byte)) {
                                 return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.malformed_end_tag, .invalid_xml);
@@ -2376,7 +2577,7 @@ pub fn Reader(comptime config: Config) type {
                             return self.needInput();
                         }
                         if (self.input[self.cursor] != '>') {
-                            if (!isXml10Char(self.input[self.cursor])) {
+                            if (!self.isLiteralChar(self.input[self.cursor])) {
                                 return self.fail(.forbidden_character, .invalid_xml);
                             }
                             return self.fail(.malformed_end_tag, .invalid_xml);
@@ -2404,6 +2605,7 @@ pub fn Reader(comptime config: Config) type {
                         return self.needInput();
                     },
                     .emit_text => {
+                        try self.checkTextNormalization();
                         if (comptime config.profile.dtdMode() == .validating) {
                             try self.validateTextFragment();
                         }
@@ -2453,6 +2655,7 @@ pub fn Reader(comptime config: Config) type {
                         if (self.markup_context != .content) {
                             return self.failAt(.malformed_cdata, .invalid_xml, self.token_start);
                         }
+                        self.resetConstructNormalization();
                         self.vertical_state = .cdata;
                     } else return self.needInput(),
                     .cdata => if (try self.readCdata()) return self.needInput(),
@@ -2606,6 +2809,7 @@ pub fn Reader(comptime config: Config) type {
                         self.vertical_state = .emit_document_end;
                     },
                     .emit_document_end => {
+                        try self.finishNormalization();
                         self.vertical_state = .complete;
                         const location = self.currentLocation();
                         return self.eventStep(
@@ -2625,6 +2829,17 @@ pub fn Reader(comptime config: Config) type {
         /// Returns the first sticky diagnostic, if one exists.
         pub fn diagnostic(self: *const Self) ?Diagnostic(config) {
             return self.first_diagnostic;
+        }
+
+        /// Returns XML 1.1 full-normalization progress or the final result.
+        pub fn normalizationResult(self: *const Self) NormalizationResult(config) {
+            if (comptime config.profile.isXml11()) {
+                return .{
+                    .status = self.normalization_status,
+                    .issue = self.normalization_issue,
+                };
+            }
+            return .{};
         }
 
         /// Reports memory currently owned by the reader.
@@ -2848,11 +3063,15 @@ pub fn Reader(comptime config: Config) type {
             self.source_state.decoded.clearRetainingCapacity();
             self.source_state.source_advances.clearRetainingCapacity();
             self.source_state.input_is_direct_utf8 = false;
+            if (comptime config.profile.isXml11()) self.source_state.line_pending_len = 0;
             self.source_state.pending_byte = null;
             self.source_state.pending_byte_offset = 0;
             self.source_state.high_surrogate = null;
             self.source_state.high_surrogate_offset = 0;
             self.source_state.failure = null;
+            if (comptime config.profile.isXml11()) {
+                self.source_state.normalization.reset();
+            }
             if (comptime config.external_sources) {
                 self.source_state.external.raw.clearRetainingCapacity();
                 self.source_state.external.transcoder = null;
@@ -2952,6 +3171,10 @@ pub fn Reader(comptime config: Config) type {
         fn documentStart(self: *const Self) DocumentStart {
             const bytes = self.attribute_bytes.items;
             return .{
+                .effective_version = if (comptime config.profile.isXml11())
+                    self.effective_version
+                else
+                    .xml10,
                 .source_encoding = self.source_encoding,
                 .declared_version = if (self.declared_version_len == 0)
                     null
@@ -2964,6 +3187,361 @@ pub fn Reader(comptime config: Config) type {
                 .standalone = self.standalone,
                 .standalone_declared = self.standalone_declared,
             };
+        }
+
+        inline fn xmlVersion(self: *const Self) XmlVersion {
+            return if (comptime config.profile.isXml11()) self.effective_version else .xml10;
+        }
+
+        fn activateNormalization(self: *Self) ReadError!void {
+            if (comptime !config.profile.isXml11()) unreachable;
+            if (self.options.normalization == .unchecked or self.xmlVersion() != .xml11) return;
+            self.normalization_status = .checking;
+            try self.mergeSourceNormalization();
+        }
+
+        fn finishNormalization(self: *Self) ReadError!void {
+            if (comptime !config.profile.isXml11()) return;
+            if (self.normalization_status == .unchecked) return;
+            try self.mergeSourceNormalization();
+            try self.enforceNormalization();
+            if (self.normalization_status == .checking) self.normalization_status = .normalized;
+        }
+
+        fn mergeSourceNormalization(self: *Self) ReadError!void {
+            if (comptime !config.profile.isXml11()) unreachable;
+            const normalization = &self.source_state.normalization;
+            while (true) {
+                const issue = if (!normalization.issue_reported)
+                    normalization.issue
+                else if (!normalization.definite_issue_reported)
+                    normalization.definite_issue
+                else
+                    null;
+                const finding = issue orelse return;
+                if (self.source_byte_offset <= finding.byte_offset) return;
+                if (!normalization.issue_reported) {
+                    normalization.issue_reported = true;
+                    if (finding.kind != .unknown_character) {
+                        normalization.definite_issue_reported = true;
+                    }
+                } else {
+                    normalization.definite_issue_reported = true;
+                }
+                var location = locationFromSource(config, self.dtdSourceId(), finding.byte_offset);
+                if (config.diagnostic_location == .line_column) {
+                    location.line = finding.line;
+                    location.byte_column = finding.byte_column;
+                }
+                try self.noteNormalization(finding.kind, location);
+            }
+        }
+
+        fn noteNormalization(
+            self: *Self,
+            kind: NormalizationIssueKind,
+            location: Location(config),
+        ) ReadError!void {
+            if (comptime !config.profile.isXml11()) unreachable;
+            self.recordNormalization(kind, location);
+            try self.enforceNormalization();
+        }
+
+        fn recordNormalization(
+            self: *Self,
+            kind: NormalizationIssueKind,
+            location: Location(config),
+        ) void {
+            if (comptime !config.profile.isXml11()) unreachable;
+            if (self.normalization_status == .unchecked) return;
+            const definite = kind != .unknown_character;
+            if (self.normalization_issue == null or
+                (definite and self.normalization_issue.?.kind == .unknown_character))
+            {
+                self.normalization_issue = .{
+                    .kind = kind,
+                    .location = location,
+                };
+            }
+            if (definite) {
+                self.normalization_status = .not_normalized;
+            } else if (self.normalization_status != .not_normalized) {
+                self.normalization_status = .indeterminate;
+            }
+        }
+
+        fn enforceNormalization(self: *Self) ReadError!void {
+            if (comptime !config.profile.isXml11()) return;
+            if (self.options.normalization != .require) return;
+            const issue = self.normalization_issue orelse return;
+            return self.failAt(
+                if (issue.kind == .unknown_character)
+                    .normalization_properties_unknown
+                else
+                    .not_fully_normalized,
+                .not_normalized,
+                issue.location,
+            );
+        }
+
+        fn scanSourceScalar(
+            self: *Self,
+            codepoint: u21,
+            byte_offset: u64,
+            source_width: u64,
+        ) ReadError!void {
+            if (comptime !config.profile.isXml11()) return;
+            const normalization = &self.source_state.normalization;
+            if (normalization.definite_issue != null) return;
+            const line = normalization.line;
+            const byte_column = normalization.byte_column;
+            const issue = normalization.checker.add(codepoint);
+            advanceSourceNormalization(normalization, codepoint, source_width);
+            const finding = issue orelse return;
+            const kind: NormalizationIssueKind = switch (finding) {
+                .not_nfc => .not_nfc,
+                .unknown_character => .unknown_character,
+            };
+            const source_issue: SourceNormalizationIssue = .{
+                .kind = kind,
+                .byte_offset = byte_offset,
+                .line = line,
+                .byte_column = byte_column,
+            };
+            if (normalization.issue == null) normalization.issue = source_issue;
+            if (kind != .unknown_character) normalization.definite_issue = source_issue;
+            if (kind == .unknown_character) normalization.checker.reset();
+        }
+
+        fn scanSourceUtf8Byte(
+            self: *Self,
+            byte: u8,
+            byte_offset: u64,
+            source_advance: u64,
+        ) ReadError!void {
+            if (comptime !config.profile.isXml11()) return;
+            const normalization = &self.source_state.normalization;
+            if (normalization.utf8_len == 0) {
+                if (byte < 0x80) {
+                    try self.scanSourceScalar(byte, byte_offset, source_advance);
+                    return;
+                }
+                normalization.utf8_expected_len = std.unicode.utf8ByteSequenceLength(byte) catch 0;
+                if (normalization.utf8_expected_len == 0) return;
+                normalization.utf8_bytes[0] = byte;
+                normalization.utf8_len = 1;
+                normalization.utf8_start_offset = byte_offset;
+                normalization.utf8_source_width = source_advance;
+                return;
+            }
+            if (byte & 0xc0 != 0x80) {
+                normalization.utf8_len = 0;
+                normalization.utf8_expected_len = 0;
+                normalization.utf8_source_width = 0;
+                try self.scanSourceUtf8Byte(byte, byte_offset, source_advance);
+                return;
+            }
+            normalization.utf8_bytes[normalization.utf8_len] = byte;
+            normalization.utf8_len += 1;
+            normalization.utf8_source_width += source_advance;
+            if (normalization.utf8_len != normalization.utf8_expected_len) return;
+            const bytes = normalization.utf8_bytes[0..normalization.utf8_len];
+            const codepoint = std.unicode.utf8Decode(bytes) catch {
+                normalization.utf8_len = 0;
+                normalization.utf8_expected_len = 0;
+                return;
+            };
+            const start = normalization.utf8_start_offset;
+            const source_width = normalization.utf8_source_width;
+            normalization.utf8_len = 0;
+            normalization.utf8_expected_len = 0;
+            normalization.utf8_source_width = 0;
+            try self.scanSourceScalar(codepoint, start, source_width);
+        }
+
+        fn scanSourceRawUtf8Byte(self: *Self, byte: u8, byte_offset: u64) ReadError!void {
+            if (comptime !config.profile.isXml11()) return;
+            const normalization = &self.source_state.normalization;
+            if (byte_offset < normalization.scanned_raw_offset) return;
+            normalization.scanned_raw_offset = byte_offset + 1;
+            try self.scanSourceUtf8Byte(byte, byte_offset, 1);
+        }
+
+        fn dtdSourceId(self: *const Self) u32 {
+            if (comptime config.profile.dtdMode() == .rejected) return 0;
+            return self.dtd_state.source_id;
+        }
+
+        fn resetConstructNormalization(self: *Self) void {
+            if (comptime !config.profile.isXml11()) return;
+            self.construct_checker.reset();
+            self.construct_started = false;
+            self.cdata_started = false;
+        }
+
+        fn markContentMarkup(self: *Self) void {
+            if (comptime !config.profile.isXml11()) return;
+            if (self.normalization_status == .unchecked) return;
+            if (self.open_elements.items.len != 0) {
+                self.open_elements.items[
+                    self.open_elements.items.len - 1
+                ].normalization_content_started = true;
+            }
+            self.resetConstructNormalization();
+        }
+
+        fn checkComposingStart(
+            self: *Self,
+            codepoint: u21,
+            location: Location(config),
+        ) ReadError!void {
+            if (comptime !config.profile.isXml11()) return;
+            if (unicode_normalization.isComposing(codepoint)) |composing| {
+                if (composing) {
+                    try self.noteNormalization(.composing_start, location);
+                }
+            } else {
+                try self.noteNormalization(.unknown_character, location);
+            }
+        }
+
+        fn checkConstructNormalization(
+            self: *Self,
+            bytes: []const u8,
+            location: Location(config),
+            check_start: bool,
+        ) ReadError!void {
+            if (comptime !config.profile.isXml11()) return;
+            if (self.normalization_status == .unchecked or bytes.len == 0) return;
+            var checker: unicode_normalization.Checker = .{};
+            var view = std.unicode.Utf8View.initUnchecked(bytes);
+            var iterator = view.iterator();
+            var first = true;
+            while (iterator.nextCodepoint()) |codepoint| {
+                if (first and check_start) {
+                    try self.checkComposingStart(codepoint, location);
+                }
+                first = false;
+                if (checker.add(codepoint)) |issue| {
+                    try self.noteNormalization(
+                        switch (issue) {
+                            .not_nfc => .not_nfc,
+                            .unknown_character => .unknown_character,
+                        },
+                        location,
+                    );
+                    if (issue == .not_nfc) return;
+                    checker.reset();
+                }
+            }
+        }
+
+        fn checkTextNormalization(self: *Self) ReadError!void {
+            if (comptime !config.profile.isXml11()) return;
+            if (self.normalization_status == .unchecked or self.text_fragment.len == 0) return;
+            var view = std.unicode.Utf8View.initUnchecked(self.text_fragment);
+            var iterator = view.iterator();
+            var first = true;
+            while (iterator.nextCodepoint()) |codepoint| {
+                if (first) {
+                    first = false;
+                    var check_start = false;
+                    if (self.open_elements.items.len != 0) {
+                        const frame = &self.open_elements.items[
+                            self.open_elements.items.len - 1
+                        ];
+                        if (!frame.normalization_content_started) {
+                            frame.normalization_content_started = true;
+                            check_start = true;
+                        }
+                    }
+                    if (self.text_origin == .cdata) {
+                        if (!self.cdata_started) {
+                            self.cdata_started = true;
+                            check_start = true;
+                        }
+                    } else if (!self.text_from_reference and !self.construct_started) {
+                        self.construct_started = true;
+                        check_start = true;
+                    }
+                    if (check_start) try self.checkComposingStart(codepoint, self.text_start);
+                }
+                if (self.construct_checker.add(codepoint)) |issue| {
+                    try self.noteNormalization(
+                        switch (issue) {
+                            .not_nfc => .not_nfc,
+                            .unknown_character => .unknown_character,
+                        },
+                        self.text_start,
+                    );
+                    if (issue == .not_nfc) return;
+                    self.construct_checker.reset();
+                }
+            }
+        }
+
+        fn checkNormalizationTokens(
+            self: *Self,
+            bytes: []const u8,
+            location: Location(config),
+        ) ReadError!void {
+            if (comptime !config.profile.isXml11()) return;
+            var tokens = SpaceTokenIterator.init(bytes);
+            while (tokens.next()) |token| {
+                try self.checkConstructNormalization(token, location, true);
+            }
+        }
+
+        inline fn isLiteralChar(self: *const Self, codepoint: u32) bool {
+            if (comptime !config.profile.isXml11()) return isXml10Char(codepoint);
+            return switch (self.xmlVersion()) {
+                .xml10 => isXml10Char(codepoint),
+                .xml11 => isXml11Char(codepoint) and
+                    (!isXml11RestrictedChar(codepoint) or
+                        (comptime config.profile.dtdMode() != .rejected) and
+                            self.dtd_state.current_is_replacement),
+            };
+        }
+
+        inline fn isReferenceChar(self: *const Self, codepoint: u32) bool {
+            if (comptime !config.profile.isXml11()) return isXml10Char(codepoint);
+            return switch (self.xmlVersion()) {
+                .xml10 => isXml10Char(codepoint),
+                .xml11 => isXml11Char(codepoint),
+            };
+        }
+
+        inline fn isXml11LineEnd(self: *const Self, codepoint: u32) bool {
+            if (comptime !config.profile.isXml11()) return false;
+            if (comptime config.profile.dtdMode() != .rejected) {
+                if (self.dtd_state.current_is_replacement) return false;
+            }
+            return self.xmlVersion() == .xml11 and (codepoint == 0x85 or codepoint == 0x2028);
+        }
+
+        fn recordXml11LineEnd(self: *Self, joined_carriage_return: bool) void {
+            if (config.diagnostic_location == .line_column) {
+                if (!joined_carriage_return) self.position.line += 1;
+                self.position.line_start_offset = self.source_byte_offset;
+                self.position.pending_carriage_return = false;
+            }
+        }
+
+        fn consumeNelAfterCarriageReturn(
+            self: *Self,
+            source: ScalarSource,
+        ) ReadError!LineFollower {
+            if (self.xmlVersion() != .xml11 or
+                (self.utf8_len == 0 and
+                    (self.cursor == self.input.len or self.input[self.cursor] < 0x80)))
+            {
+                return .none;
+            }
+            const scalar = (try self.readUtf8Scalar(source)) orelse return .need_input;
+            if (scalar.codepoint != 0x85) return .none;
+            self.recordXml11LineEnd(true);
+            self.clearUtf8Scalar();
+            return .nel;
         }
 
         fn contextResumeState(self: *const Self) VerticalState {
@@ -2987,7 +3565,7 @@ pub fn Reader(comptime config: Config) type {
                 (self.cursor < self.input.len and self.input[self.cursor] >= 0x80))
             {
                 const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
-                if (!isXml10Char(scalar.codepoint)) {
+                if (!self.isLiteralChar(scalar.codepoint)) {
                     return self.failAt(.forbidden_character, .invalid_xml, self.utf8_start);
                 }
                 for (self.utf8_bytes[0..scalar.len]) |byte| try self.appendDoctypeByte(byte);
@@ -2999,7 +3577,7 @@ pub fn Reader(comptime config: Config) type {
                 return true;
             }
             const byte = self.input[self.cursor];
-            if (!isXml10Char(byte)) return self.failVoid(.forbidden_character, .invalid_xml);
+            if (!self.isLiteralChar(byte)) return self.failVoid(.forbidden_character, .invalid_xml);
             self.consumeByte(byte);
             try self.appendDoctypeByte(byte);
             if (self.dtd_state.lexical_state == .normal and
@@ -3030,6 +3608,7 @@ pub fn Reader(comptime config: Config) type {
             if (comptime config.profile.dtdMode() == .rejected) {
                 unreachable;
             } else {
+                self.dtd_state.declarations.version = self.xmlVersion();
                 self.dtd_state.declarations.discardDoctypeHeader();
                 const reusable = if (comptime config.profile.dtdMode() == .validating)
                     self.options.validation.external_subset
@@ -3053,6 +3632,30 @@ pub fn Reader(comptime config: Config) type {
                         self.options.dtd_limits,
                         external.declarationState(),
                     ) catch |err| return self.mapDoctypeError(err);
+                    if (comptime config.profile.isXml11()) {
+                        if (external.normalizationFinding()) |finding| {
+                            const position = external.sourcePosition(
+                                finding.source_id,
+                                @intCast(finding.byte_offset),
+                            ).?;
+                            var location = locationFromSource(
+                                config,
+                                finding.source_id,
+                                finding.byte_offset,
+                            );
+                            if (config.diagnostic_location == .line_column) {
+                                location.line = position.line;
+                                location.byte_column = position.byte_column;
+                            }
+                            self.recordNormalization(
+                                switch (finding.kind) {
+                                    .not_nfc => .not_nfc,
+                                    .unknown_character => .unknown_character,
+                                },
+                                location,
+                            );
+                        }
+                    }
                 } else if (comptime config.external_sources) {
                     self.dtd_state.declarations.parseDoctypeExternal(
                         self.allocator,
@@ -3068,11 +3671,139 @@ pub fn Reader(comptime config: Config) type {
                 if (comptime config.profile.hasNamespaces()) {
                     try self.validateDtdNamespaceNames();
                 }
+                try self.checkDtdNormalization();
+                try self.enforceNormalization();
                 if (comptime config.profile.dtdMode() == .validating) {
                     try self.prepareValidation(reusable, appended_external);
                 }
                 self.dtd_state.report_cursor = 0;
                 self.vertical_state = .emit_dtd_report;
+            }
+        }
+
+        fn checkDtdNormalization(self: *Self) ReadError!void {
+            if (comptime !config.profile.isXml11() or
+                config.profile.dtdMode() == .rejected) return;
+            if (self.normalization_status == .unchecked) return;
+            const declarations = &self.dtd_state.declarations;
+            if (declarations.root_name) |root| {
+                try self.checkConstructNormalization(
+                    declarations.string(root),
+                    self.dtdLocation(0),
+                    true,
+                );
+            }
+            for (declarations.elements.items) |declaration| {
+                const location = self.dtdSourceLocation(
+                    declaration.location.source_id,
+                    declaration.location.offset,
+                );
+                try self.checkConstructNormalization(
+                    declarations.string(declaration.name),
+                    location,
+                    true,
+                );
+                if (declaration.content_spec) |content_spec| {
+                    try self.checkDtdNameTokens(declarations.string(content_spec), location);
+                }
+            }
+            for (declarations.attributes.items) |declaration| {
+                const location = self.dtdSourceLocation(
+                    declaration.location.source_id,
+                    declaration.location.offset,
+                );
+                try self.checkConstructNormalization(
+                    declarations.string(declaration.element_name),
+                    location,
+                    true,
+                );
+                try self.checkConstructNormalization(
+                    declarations.string(declaration.name),
+                    location,
+                    true,
+                );
+                if (declaration.allowed_values) |allowed| {
+                    try self.checkDtdNameTokens(declarations.string(allowed), location);
+                }
+                if (declaration.default_value) |default_value| {
+                    const value = declarations.string(default_value);
+                    try self.checkConstructNormalization(value, location, false);
+                    if (declaration.attribute_type != .cdata) {
+                        try self.checkNormalizationTokens(value, location);
+                    }
+                }
+            }
+            for (declarations.entities.items) |declaration| {
+                const location = self.dtdSourceLocation(
+                    declaration.location.source_id,
+                    declaration.location.offset,
+                );
+                try self.checkConstructNormalization(
+                    declarations.string(declaration.name),
+                    location,
+                    true,
+                );
+                if (declaration.value) |value| {
+                    try self.checkConstructNormalization(
+                        declarations.string(value),
+                        location,
+                        true,
+                    );
+                }
+                if (declaration.notation_name) |notation_name| {
+                    try self.checkConstructNormalization(
+                        declarations.string(notation_name),
+                        location,
+                        true,
+                    );
+                }
+            }
+            for (declarations.notations.items) |declaration| {
+                try self.checkConstructNormalization(
+                    declarations.string(declaration.name),
+                    self.dtdSourceLocation(
+                        declaration.location.source_id,
+                        declaration.location.offset,
+                    ),
+                    true,
+                );
+            }
+            for (declarations.reports.items) |report| {
+                if (report.kind != .processing_instruction) continue;
+                const location = declarations.reportLocation(report).?;
+                try self.checkConstructNormalization(
+                    declarations.reportName(report),
+                    if (location.source_id == 0)
+                        self.dtdLocation(location.offset)
+                    else
+                        self.dtdSourceLocation(location.source_id, location.offset),
+                    true,
+                );
+            }
+        }
+
+        fn checkDtdNameTokens(
+            self: *Self,
+            bytes: []const u8,
+            location: Location(config),
+        ) ReadError!void {
+            if (comptime !config.profile.isXml11()) return;
+            var view = std.unicode.Utf8View.initUnchecked(bytes);
+            var iterator = view.iterator();
+            var offset: usize = 0;
+            var token_start: ?usize = null;
+            while (iterator.nextCodepointSlice()) |scalar| {
+                const codepoint = std.unicode.utf8Decode(scalar) catch unreachable;
+                if (isXml10NameChar(codepoint)) {
+                    if (token_start == null) token_start = offset;
+                } else if (token_start) |start| {
+                    try self.checkConstructNormalization(bytes[start..offset], location, true);
+                    token_start = null;
+                }
+                offset += scalar.len;
+            }
+            if (token_start) |start| {
+                try self.checkConstructNormalization(bytes[start..], location, true);
             }
         }
 
@@ -3232,6 +3963,7 @@ pub fn Reader(comptime config: Config) type {
                 raw.items,
                 source.encoding_hint,
                 source.transcoder,
+                self.xmlVersion(),
                 self.options.resolver.max_source_bytes,
                 &decode_failure,
             ) catch |err| {
@@ -3247,6 +3979,7 @@ pub fn Reader(comptime config: Config) type {
                 return err;
             };
             errdefer decoded.deinit(self.allocator);
+            self.checkDecodedSourceNormalization(decoded, source.source_id);
             const owned_base = if (source.base_id) |value|
                 self.allocator.dupe(u8, value) catch return error.OutOfMemory
             else
@@ -3270,6 +4003,56 @@ pub fn Reader(comptime config: Config) type {
                 .base_id = owned_base,
                 .source_id = source.source_id,
             } };
+        }
+
+        fn checkDecodedSourceNormalization(
+            self: *Self,
+            decoded: DecodedExternalSource,
+            source_id: u32,
+        ) void {
+            if (comptime !config.profile.isXml11()) return;
+            if (self.normalization_status == .unchecked) return;
+            var normalization: SourceNormalization = .{
+                .line = decoded.source_start_line,
+                .byte_column = decoded.source_start_column,
+            };
+            var cursor: usize = 0;
+            var source_offset = decoded.source_start_offset;
+            while (cursor < decoded.bytes.len) {
+                const scalar = switch (probeUtf8(decoded.bytes[cursor..])) {
+                    .scalar => |value| value,
+                    .incomplete, .invalid => unreachable,
+                };
+                const scalar_offset = source_offset;
+                var source_width: u64 = 0;
+                for (decoded.source_advances[cursor..][0..scalar.len]) |advance| {
+                    source_offset += advance;
+                    source_width += advance;
+                }
+                cursor += scalar.len;
+                const line = normalization.line;
+                const byte_column = normalization.byte_column;
+                const issue = normalization.checker.add(@intCast(scalar.codepoint));
+                advanceSourceNormalization(
+                    &normalization,
+                    @intCast(scalar.codepoint),
+                    source_width,
+                );
+                if (issue) |finding| {
+                    const kind: NormalizationIssueKind = switch (finding) {
+                        .not_nfc => .not_nfc,
+                        .unknown_character => .unknown_character,
+                    };
+                    var location = locationFromSource(config, source_id, scalar_offset);
+                    if (config.diagnostic_location == .line_column) {
+                        location.line = line;
+                        location.byte_column = byte_column;
+                    }
+                    self.recordNormalization(kind, location);
+                    if (kind == .not_nfc) return;
+                    normalization.checker.reset();
+                }
+            }
         }
 
         fn openExternalSource(
@@ -3646,7 +4429,7 @@ pub fn Reader(comptime config: Config) type {
             if (self.utf8_len != 0) {
                 const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
                 const start = self.utf8_start;
-                if (!isXml10Char(scalar.codepoint)) {
+                if (!self.isLiteralChar(scalar.codepoint)) {
                     return self.failAt(.forbidden_character, .invalid_xml, start);
                 }
                 return self.failAt(
@@ -3681,7 +4464,7 @@ pub fn Reader(comptime config: Config) type {
                     if (self.input[self.cursor] >= 0x80) {
                         const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
                         const start = self.utf8_start;
-                        if (!isXml10Char(scalar.codepoint)) {
+                        if (!self.isLiteralChar(scalar.codepoint)) {
                             return self.failAt(.forbidden_character, .invalid_xml, start);
                         }
                         return self.failAt(
@@ -3690,7 +4473,7 @@ pub fn Reader(comptime config: Config) type {
                             start,
                         );
                     }
-                    if (!isXml10Char(self.input[self.cursor])) {
+                    if (!self.isLiteralChar(self.input[self.cursor])) {
                         return self.failVoid(.forbidden_character, .invalid_xml);
                     }
                     return self.failVoid(.malformed_markup_declaration, .invalid_xml);
@@ -3715,7 +4498,7 @@ pub fn Reader(comptime config: Config) type {
                     }
                     const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return false;
                     const start = self.utf8_start;
-                    if (!isXml10Char(scalar.codepoint)) {
+                    if (!self.isLiteralChar(scalar.codepoint)) {
                         return self.failAt(.forbidden_character, .invalid_xml, start);
                     }
                     return self.failAt(malformed_code, .invalid_xml, start);
@@ -3739,13 +4522,13 @@ pub fn Reader(comptime config: Config) type {
                     }
                     const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return false;
                     const start = self.utf8_start;
-                    if (!isXml10Char(scalar.codepoint)) {
+                    if (!self.isLiteralChar(scalar.codepoint)) {
                         return self.failAt(.forbidden_character, .invalid_xml, start);
                     }
                     return self.failAt(malformed_code, .invalid_xml, start);
                 }
                 if (byte != delimiter[self.delimiter_index]) {
-                    if (!isXml10Char(byte)) {
+                    if (!self.isLiteralChar(byte)) {
                         return self.failVoid(.forbidden_character, .invalid_xml);
                     }
                     return self.failVoid(malformed_code, .invalid_xml);
@@ -3903,7 +4686,7 @@ pub fn Reader(comptime config: Config) type {
                 }
                 const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
                 const start = self.utf8_start;
-                if (!isXml10Char(scalar.codepoint)) {
+                if (!self.isLiteralChar(scalar.codepoint)) {
                     return self.failAt(.forbidden_character, .invalid_xml, start);
                 }
                 const valid = if (self.processing_instruction_target_len == 0)
@@ -3927,7 +4710,7 @@ pub fn Reader(comptime config: Config) type {
             }
             const byte = self.input[self.cursor];
             if (!isXmlWhitespace(byte) and byte != '?') {
-                if (!isXml10Char(byte)) return self.failVoid(.forbidden_character, .invalid_xml);
+                if (!self.isLiteralChar(byte)) return self.failVoid(.forbidden_character, .invalid_xml);
                 return self.failVoid(.malformed_processing_instruction, .invalid_xml);
             }
 
@@ -3945,6 +4728,11 @@ pub fn Reader(comptime config: Config) type {
                     );
                 }
             }
+            try self.checkConstructNormalization(
+                target,
+                self.locationWithSemanticPrefix(self.token_start, 2, ""),
+                true,
+            );
             if (self.processing_instruction_initial and
                 std.mem.eql(u8, target, "xml") and isXmlWhitespace(byte))
             {
@@ -4063,7 +4851,13 @@ pub fn Reader(comptime config: Config) type {
             if (self.utf8_len != 0) {
                 const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
                 const scalar_start = self.utf8_start;
-                if (!isXml10Char(scalar.codepoint)) {
+                if (self.isXml11LineEnd(scalar.codepoint)) {
+                    self.recordXml11LineEnd(false);
+                    self.clearUtf8Scalar();
+                    try self.prepareCommentFragment("\n", scalar_start, false);
+                    return false;
+                }
+                if (!self.isLiteralChar(scalar.codepoint)) {
                     return self.failAt(.forbidden_character, .invalid_xml, scalar_start);
                 }
                 @memcpy(self.text_inline[0..scalar.len], self.utf8_bytes[0..scalar.len]);
@@ -4120,7 +4914,7 @@ pub fn Reader(comptime config: Config) type {
                 if (byte == '-' or byte == '\r') break;
                 var scalar_len: usize = 1;
                 if (byte < 0x80) {
-                    if (!isXml10Char(byte)) {
+                    if (!self.isLiteralChar(byte)) {
                         if (run_end != run_start) break;
                         return self.failVoid(.forbidden_character, .invalid_xml);
                     }
@@ -4136,7 +4930,8 @@ pub fn Reader(comptime config: Config) type {
                             );
                         },
                         .scalar => |scalar| {
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (self.isXml11LineEnd(scalar.codepoint)) break;
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 if (run_end != run_start) break;
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
@@ -4170,12 +4965,24 @@ pub fn Reader(comptime config: Config) type {
             if (byte == '\r') {
                 self.text_start = self.currentLocation();
                 self.consumeByte('\r');
+                if (comptime config.profile.dtdMode() != .rejected) {
+                    if (self.dtd_state.current_is_replacement) {
+                        try self.prepareCommentFragment("\r", self.text_start, false);
+                        return false;
+                    }
+                }
                 self.vertical_state = .comment_after_carriage_return;
                 return false;
             }
             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
             const scalar_start = self.utf8_start;
-            if (!isXml10Char(scalar.codepoint)) {
+            if (self.isXml11LineEnd(scalar.codepoint)) {
+                self.recordXml11LineEnd(false);
+                self.clearUtf8Scalar();
+                try self.prepareCommentFragment("\n", scalar_start, false);
+                return false;
+            }
+            if (!self.isLiteralChar(scalar.codepoint)) {
                 return self.failAt(.forbidden_character, .invalid_xml, scalar_start);
             }
             @memcpy(self.text_inline[0..scalar.len], self.utf8_bytes[0..scalar.len]);
@@ -4188,6 +4995,9 @@ pub fn Reader(comptime config: Config) type {
             if (self.cursor == self.input.len and !self.final_input) return true;
             if (self.cursor < self.input.len and self.input[self.cursor] == '\n') {
                 self.consumeByte('\n');
+            } else switch (try self.consumeNelAfterCarriageReturn(.ordinary)) {
+                .need_input => return true,
+                .none, .nel => {},
             }
             try self.prepareCommentFragment("\n", self.text_start, false);
             return false;
@@ -4197,7 +5007,13 @@ pub fn Reader(comptime config: Config) type {
             if (self.utf8_len != 0) {
                 const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
                 const scalar_start = self.utf8_start;
-                if (!isXml10Char(scalar.codepoint)) {
+                if (self.isXml11LineEnd(scalar.codepoint)) {
+                    self.recordXml11LineEnd(false);
+                    self.clearUtf8Scalar();
+                    try self.prepareProcessingInstructionFragment("\n", scalar_start, false);
+                    return false;
+                }
+                if (!self.isLiteralChar(scalar.codepoint)) {
                     return self.failAt(.forbidden_character, .invalid_xml, scalar_start);
                 }
                 @memcpy(self.text_inline[0..scalar.len], self.utf8_bytes[0..scalar.len]);
@@ -4253,7 +5069,7 @@ pub fn Reader(comptime config: Config) type {
                 if (byte == '?' or byte == '\r') break;
                 var scalar_len: usize = 1;
                 if (byte < 0x80) {
-                    if (!isXml10Char(byte)) {
+                    if (!self.isLiteralChar(byte)) {
                         if (run_end != run_start) break;
                         return self.failVoid(.forbidden_character, .invalid_xml);
                     }
@@ -4269,7 +5085,8 @@ pub fn Reader(comptime config: Config) type {
                             );
                         },
                         .scalar => |scalar| {
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (self.isXml11LineEnd(scalar.codepoint)) break;
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 if (run_end != run_start) break;
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
@@ -4303,12 +5120,24 @@ pub fn Reader(comptime config: Config) type {
             if (byte == '\r') {
                 self.text_start = self.currentLocation();
                 self.consumeByte('\r');
+                if (comptime config.profile.dtdMode() != .rejected) {
+                    if (self.dtd_state.current_is_replacement) {
+                        try self.prepareProcessingInstructionFragment("\r", self.text_start, false);
+                        return false;
+                    }
+                }
                 self.vertical_state = .processing_instruction_after_carriage_return;
                 return false;
             }
             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
             const scalar_start = self.utf8_start;
-            if (!isXml10Char(scalar.codepoint)) {
+            if (self.isXml11LineEnd(scalar.codepoint)) {
+                self.recordXml11LineEnd(false);
+                self.clearUtf8Scalar();
+                try self.prepareProcessingInstructionFragment("\n", scalar_start, false);
+                return false;
+            }
+            if (!self.isLiteralChar(scalar.codepoint)) {
                 return self.failAt(.forbidden_character, .invalid_xml, scalar_start);
             }
             @memcpy(self.text_inline[0..scalar.len], self.utf8_bytes[0..scalar.len]);
@@ -4325,6 +5154,9 @@ pub fn Reader(comptime config: Config) type {
             if (self.cursor == self.input.len and !self.final_input) return true;
             if (self.cursor < self.input.len and self.input[self.cursor] == '\n') {
                 self.consumeByte('\n');
+            } else switch (try self.consumeNelAfterCarriageReturn(.ordinary)) {
+                .need_input => return true,
+                .none, .nel => {},
             }
             try self.prepareProcessingInstructionFragment("\n", self.text_start, false);
             return false;
@@ -4334,7 +5166,13 @@ pub fn Reader(comptime config: Config) type {
             if (self.utf8_len != 0) {
                 const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
                 const scalar_start = self.utf8_start;
-                if (!isXml10Char(scalar.codepoint)) {
+                if (self.isXml11LineEnd(scalar.codepoint)) {
+                    self.recordXml11LineEnd(false);
+                    self.clearUtf8Scalar();
+                    try self.prepareCdataFragment("\n", scalar_start);
+                    return false;
+                }
+                if (!self.isLiteralChar(scalar.codepoint)) {
                     return self.failAt(.forbidden_character, .invalid_xml, scalar_start);
                 }
                 @memcpy(self.text_inline[0..scalar.len], self.utf8_bytes[0..scalar.len]);
@@ -4365,6 +5203,7 @@ pub fn Reader(comptime config: Config) type {
                 if (self.input[self.cursor] == '>') {
                     self.consumeByte('>');
                     self.delimiter_len = 0;
+                    self.resetConstructNormalization();
                     self.vertical_state = .content;
                     return false;
                 }
@@ -4391,7 +5230,7 @@ pub fn Reader(comptime config: Config) type {
                 if (byte == ']' or byte == '\r') break;
                 var scalar_len: usize = 1;
                 if (byte < 0x80) {
-                    if (!isXml10Char(byte)) {
+                    if (!self.isLiteralChar(byte)) {
                         if (run_end != run_start) break;
                         return self.failVoid(.forbidden_character, .invalid_xml);
                     }
@@ -4407,7 +5246,8 @@ pub fn Reader(comptime config: Config) type {
                             );
                         },
                         .scalar => |scalar| {
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (self.isXml11LineEnd(scalar.codepoint)) break;
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 if (run_end != run_start) break;
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
@@ -4441,12 +5281,24 @@ pub fn Reader(comptime config: Config) type {
             if (byte == '\r') {
                 self.text_start = self.currentLocation();
                 self.consumeByte('\r');
+                if (comptime config.profile.dtdMode() != .rejected) {
+                    if (self.dtd_state.current_is_replacement) {
+                        try self.prepareCdataFragment("\r", self.text_start);
+                        return false;
+                    }
+                }
                 self.vertical_state = .cdata_after_carriage_return;
                 return false;
             }
             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
             const scalar_start = self.utf8_start;
-            if (!isXml10Char(scalar.codepoint)) {
+            if (self.isXml11LineEnd(scalar.codepoint)) {
+                self.recordXml11LineEnd(false);
+                self.clearUtf8Scalar();
+                try self.prepareCdataFragment("\n", scalar_start);
+                return false;
+            }
+            if (!self.isLiteralChar(scalar.codepoint)) {
                 return self.failAt(.forbidden_character, .invalid_xml, scalar_start);
             }
             @memcpy(self.text_inline[0..scalar.len], self.utf8_bytes[0..scalar.len]);
@@ -4459,6 +5311,9 @@ pub fn Reader(comptime config: Config) type {
             if (self.cursor == self.input.len and !self.final_input) return true;
             if (self.cursor < self.input.len and self.input[self.cursor] == '\n') {
                 self.consumeByte('\n');
+            } else switch (try self.consumeNelAfterCarriageReturn(.ordinary)) {
+                .need_input => return true,
+                .none, .nel => {},
             }
             try self.prepareCdataFragment("\n", self.text_start);
             return false;
@@ -4503,12 +5358,12 @@ pub fn Reader(comptime config: Config) type {
                 }
                 const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
                 const start = self.utf8_start;
-                if (!isXml10Char(scalar.codepoint)) {
+                if (!self.isLiteralChar(scalar.codepoint)) {
                     return self.failAt(.forbidden_character, .invalid_xml, start);
                 }
                 return self.failAt(.malformed_declaration, .invalid_xml, start);
             }
-            if (!isXml10Char(byte)) return self.failVoid(.forbidden_character, .invalid_xml);
+            if (!self.isLiteralChar(byte)) return self.failVoid(.forbidden_character, .invalid_xml);
             try self.appendDeclarationByte(byte);
             return false;
         }
@@ -4537,6 +5392,7 @@ pub fn Reader(comptime config: Config) type {
                 self.attribute_bytes.items,
                 self.source_encoding,
                 !config.profile.isUtf8Only(),
+                config.profile.isXml11(),
             )) {
                 .parsed => |parsed| {
                     self.declared_version_offset = parsed.version_offset;
@@ -4545,6 +5401,13 @@ pub fn Reader(comptime config: Config) type {
                     self.declared_encoding_len = parsed.encoding_len;
                     self.standalone = parsed.standalone;
                     self.standalone_declared = parsed.standalone_declared;
+                    if (comptime config.profile.isXml11()) {
+                        self.effective_version = parsed.effective_version;
+                        if (parsed.effective_version == .xml11) {
+                            try self.activateXml11LineNormalization();
+                            try self.activateNormalization();
+                        }
+                    }
                 },
                 .malformed => |index| return self.failAt(
                     .malformed_declaration,
@@ -4652,7 +5515,7 @@ pub fn Reader(comptime config: Config) type {
         ) ReadError!bool {
             const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
             const start = self.utf8_start;
-            if (!isXml10Char(scalar.codepoint)) {
+            if (!self.isLiteralChar(scalar.codepoint)) {
                 return self.failAt(.forbidden_character, .invalid_xml, start);
             }
             return self.failAt(code, .invalid_xml, start);
@@ -4664,7 +5527,7 @@ pub fn Reader(comptime config: Config) type {
         ) ReadError!bool {
             const scalar = (try self.readUtf8Scalar(.start_tag)) orelse return true;
             const start = self.utf8_start;
-            if (!isXml10Char(scalar.codepoint)) {
+            if (!self.isLiteralChar(scalar.codepoint)) {
                 return self.failAt(.forbidden_character, .invalid_xml, start);
             }
             return self.failAt(code, .invalid_xml, start);
@@ -4693,7 +5556,7 @@ pub fn Reader(comptime config: Config) type {
                 var scalar_len: usize = 1;
                 if (byte < 0x80) {
                     if (byte == '<' or byte == '&' or byte == '\r') break;
-                    if (!isXml10Char(byte)) {
+                    if (!self.isLiteralChar(byte)) {
                         if (run_end != run_start) break;
                         return self.fail(.forbidden_character, .invalid_xml);
                     }
@@ -4717,7 +5580,7 @@ pub fn Reader(comptime config: Config) type {
                             );
                         },
                         .scalar => |scalar| {
-                            if (!isXml10Char(scalar.codepoint)) {
+                            if (!self.isLiteralChar(scalar.codepoint)) {
                                 if (run_end != run_start) break;
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
@@ -4766,6 +5629,9 @@ pub fn Reader(comptime config: Config) type {
             start: Location(config),
         ) bool {
             const unicode_dense = contentStartsUnicodeDense(candidate);
+            if (comptime config.profile.isXml11()) {
+                if (self.xmlVersion() == .xml11 and hasNonAscii(candidate)) return false;
+            }
             const scan = if (unicode_dense) scanContentStructure(candidate) else null;
             var fast_len = if (scan) |result| result.delimiter_index else candidate.len;
             if (!unicode_dense) {
@@ -4914,7 +5780,7 @@ pub fn Reader(comptime config: Config) type {
             }
             if (index == digits_start or index == input.len or
                 index + 1 > self.options.limits.max_partial_token_bytes or
-                !isXml10Char(@intCast(value)))
+                !self.isReferenceChar(@intCast(value)))
             {
                 return false;
             }
@@ -4948,7 +5814,7 @@ pub fn Reader(comptime config: Config) type {
             if (self.utf8_len != 0) {
                 const scalar = (try self.readUtf8Scalar(.reference)) orelse return true;
                 const start = self.utf8_start;
-                if (!isXml10Char(scalar.codepoint)) {
+                if (!self.isLiteralChar(scalar.codepoint)) {
                     return self.failAt(.forbidden_character, .invalid_xml, start);
                 }
                 if (!isXml10NameStart(scalar.codepoint)) {
@@ -4968,7 +5834,7 @@ pub fn Reader(comptime config: Config) type {
                 return false;
             }
             if (byte < 0x80) {
-                if (!isXml10Char(byte)) {
+                if (!self.isLiteralChar(byte)) {
                     return self.failVoid(.forbidden_character, .invalid_xml);
                 }
                 if (!isXml10NameStart(byte)) {
@@ -4980,7 +5846,7 @@ pub fn Reader(comptime config: Config) type {
             }
             const scalar = (try self.readUtf8Scalar(.reference)) orelse return true;
             const start = self.utf8_start;
-            if (!isXml10Char(scalar.codepoint)) {
+            if (!self.isLiteralChar(scalar.codepoint)) {
                 return self.failAt(.forbidden_character, .invalid_xml, start);
             }
             if (!isXml10NameStart(scalar.codepoint)) {
@@ -5034,7 +5900,7 @@ pub fn Reader(comptime config: Config) type {
                 );
             }
             const digit = referenceDigit(byte, self.reference_kind) orelse {
-                if (byte < 0x20 and !isXml10Char(byte)) {
+                if (byte < 0x20 and !self.isLiteralChar(byte)) {
                     return self.failVoid(.forbidden_character, .invalid_xml);
                 }
                 return self.failVoid(.malformed_reference, .invalid_xml);
@@ -5056,7 +5922,7 @@ pub fn Reader(comptime config: Config) type {
             if (self.utf8_len != 0) {
                 const scalar = (try self.readUtf8Scalar(.reference)) orelse return true;
                 const start = self.utf8_start;
-                if (!isXml10Char(scalar.codepoint)) {
+                if (!self.isLiteralChar(scalar.codepoint)) {
                     return self.failAt(.forbidden_character, .invalid_xml, start);
                 }
                 if (!isXml10NameChar(scalar.codepoint)) {
@@ -5075,7 +5941,7 @@ pub fn Reader(comptime config: Config) type {
                 return false;
             }
             if (byte < 0x80) {
-                if (!isXml10Char(byte)) {
+                if (!self.isLiteralChar(byte)) {
                     return self.failVoid(.forbidden_character, .invalid_xml);
                 }
                 if (!isXml10NameChar(byte)) {
@@ -5086,7 +5952,7 @@ pub fn Reader(comptime config: Config) type {
             }
             const scalar = (try self.readUtf8Scalar(.reference)) orelse return true;
             const start = self.utf8_start;
-            if (!isXml10Char(scalar.codepoint)) {
+            if (!self.isLiteralChar(scalar.codepoint)) {
                 return self.failAt(.forbidden_character, .invalid_xml, start);
             }
             if (!isXml10NameChar(scalar.codepoint)) {
@@ -5127,7 +5993,7 @@ pub fn Reader(comptime config: Config) type {
 
         fn finishNumericReference(self: *Self) ReadError!void {
             if (self.reference_value > 0x10ffff or
-                !isXml10Char(@intCast(self.reference_value)))
+                !self.isReferenceChar(@intCast(self.reference_value)))
             {
                 return self.failAt(
                     .invalid_character_reference,
@@ -5142,6 +6008,15 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn finishEntityReference(self: *Self) ReadError!void {
+            const normalization_name = if (comptime config.profile.dtdMode() == .rejected)
+                self.reference_name[0..@min(self.reference_name_len, self.reference_name.len)]
+            else
+                self.dtd_state.reference_name.items;
+            try self.checkConstructNormalization(
+                normalization_name,
+                self.locationWithSemanticPrefix(self.reference_start, 1, ""),
+                true,
+            );
             if (comptime config.profile.hasNamespaces()) {
                 if (self.namespace_state.reference_colon) |location| {
                     return self.failAt(.malformed_ncname, .invalid_xml, location);
@@ -5304,6 +6179,7 @@ pub fn Reader(comptime config: Config) type {
                 .entity_index = entity_index,
                 .open_depth = self.open_elements.items.len,
                 .resume_state = .content,
+                .parent_is_replacement = self.dtd_state.current_is_replacement,
                 .external = true,
                 .source_encoding = self.source_encoding,
                 .source_state = parent_source_state,
@@ -5328,6 +6204,7 @@ pub fn Reader(comptime config: Config) type {
             self.dtd_state.source_id = source.source_id;
             self.position = .{};
             self.dtd_state.pending_entity_index = entity_index;
+            self.dtd_state.current_is_replacement = false;
             self.vertical_state = if (comptime config.report == .detailed)
                 .emit_entity_start
             else
@@ -5362,6 +6239,7 @@ pub fn Reader(comptime config: Config) type {
                 .entity_index = entity_index,
                 .open_depth = self.open_elements.items.len,
                 .resume_state = .content,
+                .parent_is_replacement = self.dtd_state.current_is_replacement,
             }) catch return self.failOutOfMemory();
             self.input = value;
             self.cursor = 0;
@@ -5372,6 +6250,7 @@ pub fn Reader(comptime config: Config) type {
                 self.position = .{};
             }
             self.dtd_state.pending_entity_index = entity_index;
+            self.dtd_state.current_is_replacement = true;
             self.vertical_state = if (comptime config.report == .detailed)
                 .emit_entity_start
             else
@@ -5564,6 +6443,7 @@ pub fn Reader(comptime config: Config) type {
             if (comptime config.profile.dtdMode() != .rejected) {
                 try self.applyDtdAttributes();
             }
+            try self.checkStartElementNormalization();
             if (comptime config.profile.hasNamespaces()) {
                 const binding_mark = self.namespace_state.bindings.items.len;
                 const byte_mark = self.namespace_state.bytes.items.len;
@@ -5596,6 +6476,33 @@ pub fn Reader(comptime config: Config) type {
                 .emit_empty_start_element
             else
                 .emit_start_element;
+            self.resetConstructNormalization();
+        }
+
+        fn checkStartElementNormalization(self: *Self) ReadError!void {
+            if (comptime !config.profile.isXml11()) return;
+            if (self.normalization_status == .unchecked) return;
+            const element_name = self.open_names.items[self.open_names.items.len - self.token_name_len ..];
+            try self.checkConstructNormalization(
+                element_name,
+                self.locationWithSemanticPrefix(self.token_start, 1, ""),
+                true,
+            );
+            for (self.attribute_records.items) |record| {
+                try self.checkConstructNormalization(
+                    self.attributeRawName(record),
+                    record.start,
+                    true,
+                );
+                const value_offset = record.name_offset + record.name_len;
+                const value = self.attribute_bytes.items[value_offset..][0..record.value_len];
+                try self.checkConstructNormalization(value, record.start, false);
+                if (comptime config.profile.dtdMode() != .rejected) {
+                    if (record.declared_type != null and record.declared_type.? != .cdata) {
+                        try self.checkNormalizationTokens(value, record.start);
+                    }
+                }
+            }
         }
 
         fn beginValidationElement(self: *Self, empty_element: bool) ReadError!validation_module.Frame {
@@ -6107,7 +7014,7 @@ pub fn Reader(comptime config: Config) type {
             const uri = self.attribute_bytes.items[uri_offset..][0..record.value_len];
             const is_default = std.mem.eql(u8, raw, "xmlns");
 
-            if ((!is_default and uri.len == 0) or
+            if ((!is_default and uri.len == 0 and self.xmlVersion() == .xml10) or
                 std.mem.eql(u8, declared_prefix, "xmlns") or
                 std.mem.eql(u8, uri, xmlns_namespace_uri) or
                 (std.mem.eql(u8, declared_prefix, "xml") !=
@@ -6187,7 +7094,9 @@ pub fn Reader(comptime config: Config) type {
             if (active.found) {
                 const binding_index = self.namespace_state.active_prefixes.items[active.index];
                 const binding = self.namespace_state.bindings.items[binding_index];
-                return if (binding.uri_len == 0) .none else .{ .binding = binding_index };
+                if (binding.uri_len != 0) return .{ .binding = binding_index };
+                if (prefix.len == 0) return .none;
+                return self.failAt(.unbound_prefix, .invalid_xml, location);
             }
             if (prefix.len == 0) return .none;
             return self.failAt(.unbound_prefix, .invalid_xml, location);
@@ -6947,8 +7856,11 @@ pub fn Reader(comptime config: Config) type {
                     ];
                     if (comptime config.external_sources) {
                         if (current_frame.external and self.dtd_state.active_external != null) {
-                            try self.refillExternalSource();
-                            if (self.input.len != 0) return error.RefillDecodedInput;
+                            while (self.dtd_state.active_external != null) {
+                                try self.refillExternalSource();
+                                if (self.cursor < self.input.len) break;
+                            }
+                            if (self.cursor < self.input.len) return error.RefillDecodedInput;
                         }
                     }
                     if (self.vertical_state == .content_after_carriage_return) {
@@ -6968,7 +7880,14 @@ pub fn Reader(comptime config: Config) type {
                                 self.reference_start,
                         );
                     }
+                    if (comptime config.profile.isXml11() and config.external_sources) {
+                        if (current_frame.external) try self.mergeSourceNormalization();
+                    }
                     const frame = self.dtd_state.entity_sources.pop().?;
+                    if (comptime config.profile.isXml11()) {
+                        self.construct_started = false;
+                        self.cdata_started = false;
+                    }
                     if (comptime config.external_sources) {
                         if (frame.external) {
                             self.deinitSourceState(&self.source_state);
@@ -6985,6 +7904,7 @@ pub fn Reader(comptime config: Config) type {
                     self.dtd_state.source_id = frame.source_id;
                     self.position = frame.position;
                     self.dtd_state.pending_entity_index = frame.entity_index;
+                    self.dtd_state.current_is_replacement = frame.parent_is_replacement;
                     if (comptime config.report == .detailed) {
                         self.vertical_state = .emit_entity_end;
                     }
@@ -7066,12 +7986,20 @@ pub fn Reader(comptime config: Config) type {
             try self.refillDecodedInput();
             if (decoder.external.at_start and self.input.len != 0) {
                 if (externalTextDeclaration(self.input)) |declaration| {
+                    if (self.xmlVersion() == .xml10 and declaration.version == .xml11) {
+                        return self.failAt(.unsupported_version, .invalid_xml, self.currentLocation());
+                    }
                     if (!externalEncodingMatches(self.source_encoding, declaration.encoding)) {
                         return self.failAt(.encoding_mismatch, .invalid_xml, self.currentLocation());
                     }
                     self.consumeRun(self.input[0..declaration.end]);
+                } else if (malformedExternalTextDeclaration(self.input)) {
+                    return self.failAt(.malformed_declaration, .invalid_xml, self.currentLocation());
                 }
                 decoder.external.at_start = false;
+                if (comptime config.profile.isXml11()) {
+                    if (self.xmlVersion() == .xml11) try self.activateXml11LineNormalization();
+                }
             }
             try self.chargeExternalExpansion(self.input.len - self.cursor);
             if (self.final_input) self.final_input = false;
@@ -7100,10 +8028,10 @@ pub fn Reader(comptime config: Config) type {
                     continue;
                 }
                 switch (source.encoding.?) {
-                    .utf8 => self.decodeUtf8SourceRun(),
+                    .utf8 => try self.decodeUtf8SourceRun(),
                     .utf16_le, .utf16_be => {
                         try self.ensureDecoderCapacity();
-                        self.decodeUtf16SourceRun();
+                        try self.decodeUtf16SourceRun();
                     },
                     .other => try self.decodeExternalOtherRun(),
                 }
@@ -7271,23 +8199,147 @@ pub fn Reader(comptime config: Config) type {
             }
         }
 
-        fn decodeUtf8SourceRun(self: *Self) void {
+        fn activateXml11LineNormalization(self: *Self) ReadError!void {
+            if (comptime !config.profile.isXml11()) unreachable;
+            const source = &self.source_state;
+            if (self.cursor == self.input.len) return;
+            if (self.source_encoding == .utf8 and source.input_is_direct_utf8) {
+                const remaining = self.input[self.cursor..];
+                source.raw_input = remaining;
+                source.raw_cursor = 0;
+                source.raw_offset -= remaining.len;
+                source.decoded.clearRetainingCapacity();
+                source.source_advances.clearRetainingCapacity();
+                self.input = &.{};
+                self.cursor = 0;
+                source.input_is_direct_utf8 = false;
+                try self.decodeXml11Utf8Run();
+                self.input = source.decoded.items;
+                return;
+            }
+
+            var read = self.cursor;
+            var write: usize = 0;
+            while (read < self.input.len) {
+                const line_len: usize = if (std.mem.startsWith(u8, self.input[read..], "\xc2\x85"))
+                    2
+                else if (std.mem.startsWith(u8, self.input[read..], "\xe2\x80\xa8"))
+                    3
+                else
+                    0;
+                if (line_len == 0) {
+                    source.decoded.items[write] = self.input[read];
+                    source.source_advances.items[write] = source.source_advances.items[read];
+                    write += 1;
+                    read += 1;
+                    continue;
+                }
+                var advance: u8 = 0;
+                for (source.source_advances.items[read..][0..line_len]) |value| advance += value;
+                source.decoded.items[write] = '\n';
+                source.source_advances.items[write] = advance;
+                write += 1;
+                read += line_len;
+            }
+            source.decoded.items.len = write;
+            source.source_advances.items.len = write;
+            self.input = source.decoded.items;
+            self.cursor = 0;
+            source.input_is_direct_utf8 = false;
+        }
+
+        fn decodeUtf8SourceRun(self: *Self) ReadError!void {
             const source = &self.source_state;
             if (source.signature_len != 0) {
                 self.input = source.signature_bytes[0..source.signature_len];
+                if (comptime config.profile.isXml11()) {
+                    const base = source.raw_offset - source.signature_len;
+                    for (self.input, 0..) |byte, index| {
+                        try self.scanSourceRawUtf8Byte(byte, base + @as(u64, @intCast(index)));
+                    }
+                }
                 source.signature_len = 0;
                 source.input_is_direct_utf8 = true;
                 return;
             }
+            if (comptime config.profile.isXml11()) {
+                const external_declaration = if (comptime config.external_sources)
+                    self.dtd_state.active_external != null and source.external.at_start
+                else
+                    false;
+                if (self.xmlVersion() == .xml11 and !external_declaration) {
+                    try self.decodeXml11Utf8Run();
+                    return;
+                }
+            }
             if (source.raw_cursor < source.raw_input.len) {
+                const start = source.raw_offset;
                 self.input = source.raw_input[source.raw_cursor..];
+                if (comptime config.profile.isXml11()) {
+                    for (self.input, 0..) |byte, index| {
+                        try self.scanSourceRawUtf8Byte(byte, start + @as(u64, @intCast(index)));
+                    }
+                }
                 source.raw_offset += self.input.len;
                 source.raw_cursor = source.raw_input.len;
                 source.input_is_direct_utf8 = true;
             }
         }
 
-        fn decodeUtf16SourceRun(self: *Self) void {
+        fn decodeXml11Utf8Run(self: *Self) ReadError!void {
+            if (comptime !config.profile.isXml11()) unreachable;
+            const source = &self.source_state;
+            try self.ensureDecoderCapacity();
+            const target_capacity = self.decodedTargetCapacity();
+            while (source.decoded.items.len + 3 <= target_capacity) {
+                if (source.line_pending_len == 0) {
+                    if (source.raw_cursor == source.raw_input.len) break;
+                    const byte = source.raw_input[source.raw_cursor];
+                    try self.scanSourceRawUtf8Byte(byte, source.raw_offset);
+                    source.raw_cursor += 1;
+                    source.raw_offset += 1;
+                    if (byte == 0xc2 or byte == 0xe2) {
+                        source.line_pending[0] = byte;
+                        source.line_pending_len = 1;
+                    } else {
+                        self.appendDecodedByte(byte, 1);
+                    }
+                    continue;
+                }
+                if (source.raw_cursor == source.raw_input.len) {
+                    if (!source.raw_final) break;
+                    for (source.line_pending[0..source.line_pending_len]) |byte| {
+                        self.appendDecodedByte(byte, 1);
+                    }
+                    source.line_pending_len = 0;
+                    break;
+                }
+                const byte = source.raw_input[source.raw_cursor];
+                try self.scanSourceRawUtf8Byte(byte, source.raw_offset);
+                source.raw_cursor += 1;
+                source.raw_offset += 1;
+                source.line_pending[source.line_pending_len] = byte;
+                source.line_pending_len += 1;
+
+                const pending = source.line_pending[0..source.line_pending_len];
+                const complete_nel = pending.len == 2 and std.mem.eql(u8, pending, "\xc2\x85");
+                const complete_separator = pending.len == 3 and
+                    std.mem.eql(u8, pending, "\xe2\x80\xa8");
+                const possible_separator = pending[0] == 0xe2 and
+                    (pending.len == 1 or (pending.len == 2 and pending[1] == 0x80));
+                if (complete_nel or complete_separator) {
+                    self.appendDecodedByte('\n', @intCast(pending.len));
+                    source.line_pending_len = 0;
+                } else if ((pending[0] == 0xc2 and pending.len == 2) or
+                    (pending[0] == 0xe2 and !possible_separator))
+                {
+                    for (pending) |pending_byte| self.appendDecodedByte(pending_byte, 1);
+                    source.line_pending_len = 0;
+                }
+            }
+        }
+
+        fn decodeUtf16SourceRun(self: *Self) ReadError!void {
             const source = &self.source_state;
             const target_capacity = self.decodedTargetCapacity();
             while (source.decoded.items.len + 4 <= target_capacity and
@@ -7337,6 +8389,7 @@ pub fn Reader(comptime config: Config) type {
                     const low_value = @as(u32, unit) - 0xdc00;
                     const codepoint: u21 = @intCast(0x10000 + (high_value << 10) + low_value);
                     source.high_surrogate = null;
+                    try self.scanSourceScalar(codepoint, source.high_surrogate_offset, 4);
                     self.appendDecodedScalar(codepoint, 4);
                 } else if (unit >= 0xd800 and unit <= 0xdbff) {
                     source.high_surrogate = unit;
@@ -7345,6 +8398,7 @@ pub fn Reader(comptime config: Config) type {
                     source.failure = .{ .code = .malformed_encoding, .offset = unit_offset };
                     return;
                 } else {
+                    try self.scanSourceScalar(@intCast(unit), unit_offset, 2);
                     self.appendDecodedScalar(@intCast(unit), 2);
                 }
             }
@@ -7371,11 +8425,22 @@ pub fn Reader(comptime config: Config) type {
                 ) catch return self.failAt(.malformed_encoding, .invalid_xml, self.currentLocation());
                 switch (step) {
                     .progress => |progress| {
+                        const raw_start = source.raw_offset;
                         source.raw_cursor += progress.consumed;
                         source.raw_offset += progress.consumed;
                         const old_len = source.decoded.items.len;
                         source.decoded.items.len += progress.produced;
                         source.source_advances.items.len = old_len + progress.produced;
+                        if (comptime config.profile.isXml11()) {
+                            var mapped_offset = raw_start;
+                            for (
+                                source.decoded.items[old_len..][0..progress.produced],
+                                source.source_advances.items[old_len..][0..progress.produced],
+                            ) |byte, advance| {
+                                try self.scanSourceUtf8Byte(byte, mapped_offset, advance);
+                                mapped_offset += advance;
+                            }
+                        }
                     },
                     .need_input => break,
                     .need_output => break,
@@ -7414,6 +8479,18 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn appendDecodedScalar(self: *Self, codepoint: u21, source_len: u8) void {
+            if (comptime config.profile.isXml11()) {
+                const external_declaration = if (comptime config.external_sources)
+                    self.dtd_state.active_external != null and self.source_state.external.at_start
+                else
+                    false;
+                if (self.xmlVersion() == .xml11 and !external_declaration and
+                    (codepoint == 0x85 or codepoint == 0x2028))
+                {
+                    self.appendDecodedByte('\n', source_len);
+                    return;
+                }
+            }
             var bytes: [4]u8 = undefined;
             const len = std.unicode.utf8Encode(codepoint, &bytes) catch unreachable;
             for (bytes[0..len], 0..) |byte, index| {
@@ -7652,6 +8729,7 @@ pub fn Reader(comptime config: Config) type {
 const ParsedDeclaration = struct {
     version_offset: usize,
     version_len: usize,
+    effective_version: XmlVersion,
     encoding_offset: usize = 0,
     encoding_len: usize = 0,
     standalone: bool = false,
@@ -7675,6 +8753,7 @@ fn parseXmlDeclaration(
     bytes: []const u8,
     source_encoding: SourceEncoding,
     supports_utf16: bool,
+    supports_xml11: bool,
 ) DeclarationParse {
     var index: usize = 0;
     if (!skipRequiredXmlWhitespace(bytes, &index)) return .{ .malformed = index };
@@ -7692,6 +8771,10 @@ fn parseXmlDeclaration(
     var parsed: ParsedDeclaration = .{
         .version_offset = version.offset,
         .version_len = version.len,
+        .effective_version = if (supports_xml11 and std.mem.eql(u8, version_bytes, "1.1"))
+            .xml11
+        else
+            .xml10,
     };
     if (index == bytes.len) return .{ .parsed = parsed };
     if (!skipRequiredXmlWhitespace(bytes, &index)) return .{ .malformed = index };
@@ -7916,6 +8999,7 @@ fn failureToError(failure: Failure) ReadError {
         .resolver_failed => error.ResolverFailed,
         .read_failed => error.ReadFailed,
         .cancelled => error.Cancelled,
+        .not_normalized => error.NotNormalized,
     };
 }
 
@@ -8068,6 +9152,7 @@ fn decodeExternalSource(
     raw: []const u8,
     hint: ?SourceEncoding,
     transcoder: ?encoding_module.Transcoder,
+    version: XmlVersion,
     max_bytes: usize,
     failure: *?ExternalDecodeFailure,
 ) dtd_module.ParseError!DecodedExternalSource {
@@ -8278,6 +9363,18 @@ fn decodeExternalSource(
     var source_start_line: u64 = 1;
     var source_start_column: u64 = 1;
     if (externalTextDeclaration(content)) |declaration| {
+        if (version == .xml10 and declaration.version == .xml11) {
+            setExternalDecodeFailure(
+                failure,
+                .unsupported_version,
+                start,
+                content,
+                content_advances,
+                0,
+                start,
+            );
+            return error.InvalidDtd;
+        }
         if (!externalEncodingMatches(encoding, declaration.encoding)) {
             const encoding_offset = @intFromPtr(declaration.encoding.ptr) - @intFromPtr(content.ptr);
             var raw_offset = start;
@@ -8313,6 +9410,32 @@ fn decodeExternalSource(
         }
         content = content[declaration.end..];
         content_advances = content_advances[declaration.end..];
+    } else if (malformedExternalTextDeclaration(content)) {
+        setExternalDecodeFailure(failure, .malformed_declaration, start, content, content_advances, 0, start);
+        return error.InvalidDtd;
+    }
+
+    var validation_cursor: usize = 0;
+    while (validation_cursor < content.len) {
+        const scalar = switch (probeUtf8(content[validation_cursor..])) {
+            .scalar => |value| value,
+            .incomplete, .invalid => unreachable,
+        };
+        if (!isXmlLiteralChar(scalar.codepoint, version)) {
+            var raw_offset: usize = @intCast(source_start_offset);
+            for (content_advances[0..validation_cursor]) |advance| raw_offset += advance;
+            setExternalDecodeFailure(
+                failure,
+                .forbidden_character,
+                @intCast(source_start_offset),
+                content,
+                content_advances,
+                validation_cursor,
+                raw_offset,
+            );
+            return error.InvalidDtd;
+        }
+        validation_cursor += scalar.len;
     }
     var normalized: std.ArrayList(u8) = .empty;
     errdefer normalized.deinit(allocator);
@@ -8327,8 +9450,23 @@ fn decodeExternalSource(
             if (cursor < content.len and content[cursor] == '\n') {
                 source_advance += content_advances[cursor];
                 cursor += 1;
+            } else if (version == .xml11 and
+                std.mem.startsWith(u8, content[cursor..], "\xc2\x85"))
+            {
+                source_advance += content_advances[cursor] + content_advances[cursor + 1];
+                cursor += 2;
             }
             normalized_advances.append(allocator, source_advance) catch return error.OutOfMemory;
+        } else if (version == .xml11 and
+            (std.mem.startsWith(u8, content[cursor..], "\xc2\x85") or
+                std.mem.startsWith(u8, content[cursor..], "\xe2\x80\xa8")))
+        {
+            const line_len: usize = if (content[cursor] == 0xc2) 2 else 3;
+            normalized.append(allocator, '\n') catch return error.OutOfMemory;
+            var source_advance: u32 = 0;
+            for (content_advances[cursor..][0..line_len]) |advance| source_advance += advance;
+            normalized_advances.append(allocator, source_advance) catch return error.OutOfMemory;
+            cursor += line_len;
         } else {
             normalized.append(allocator, content[cursor]) catch return error.OutOfMemory;
             normalized_advances.append(allocator, content_advances[cursor]) catch
@@ -8359,6 +9497,7 @@ fn readUtf16Unit(bytes: *const [2]u8, little_endian: bool) u16 {
 const ExternalTextDeclaration = struct {
     end: usize,
     encoding: []const u8,
+    version: ?XmlVersion,
 };
 
 fn externalTextDeclaration(bytes: []const u8) ?ExternalTextDeclaration {
@@ -8366,33 +9505,33 @@ fn externalTextDeclaration(bytes: []const u8) ?ExternalTextDeclaration {
         !isXmlWhitespace(bytes[5])) return null;
     const close = std.mem.indexOfPos(u8, bytes, 6, "?>") orelse return null;
     const declaration = bytes[5..close];
-    if (std.mem.indexOf(u8, declaration, "standalone") != null) return null;
-    if (std.mem.indexOf(u8, declaration, "version")) |version_index| {
-        const version = declarationAttributeValue(declaration, version_index, "version") orelse return null;
-        if (!std.mem.eql(u8, version, "1.0")) return null;
-    }
-    const encoding_index = std.mem.indexOf(u8, declaration, "encoding") orelse return null;
-    const encoding = declarationAttributeValue(declaration, encoding_index, "encoding") orelse return null;
-    return .{ .end = close + 2, .encoding = encoding };
+    if (hasNonAscii(declaration)) return null;
+    var cursor: usize = 0;
+    if (!skipRequiredXmlWhitespace(declaration, &cursor)) return null;
+    const version = if (startsWithLiteral(declaration, cursor, "version")) blk: {
+        _ = consumeLiteral(declaration, &cursor, "version");
+        if (!consumeEquals(declaration, &cursor)) return null;
+        const range = consumeQuoted(declaration, &cursor) orelse return null;
+        const value = declaration[range.offset..][0..range.len];
+        if (std.mem.eql(u8, value, "1.0")) break :blk XmlVersion.xml10;
+        if (std.mem.eql(u8, value, "1.1")) break :blk XmlVersion.xml11;
+        return null;
+    } else null;
+    if (version != null and !skipRequiredXmlWhitespace(declaration, &cursor)) return null;
+    if (!consumeLiteral(declaration, &cursor, "encoding")) return null;
+    if (!consumeEquals(declaration, &cursor)) return null;
+    const encoding_range = consumeQuoted(declaration, &cursor) orelse return null;
+    const encoding = declaration[encoding_range.offset..][0..encoding_range.len];
+    if (!isEncodingName(encoding)) return null;
+    skipOptionalXmlWhitespace(declaration, &cursor);
+    if (cursor != declaration.len) return null;
+    return .{ .end = close + 2, .encoding = encoding, .version = version };
 }
 
-fn declarationAttributeValue(
-    declaration: []const u8,
-    attribute_index: usize,
-    comptime name: []const u8,
-) ?[]const u8 {
-    var cursor = attribute_index + name.len;
-    while (cursor < declaration.len and isXmlWhitespace(declaration[cursor])) cursor += 1;
-    if (cursor == declaration.len or declaration[cursor] != '=') return null;
-    cursor += 1;
-    while (cursor < declaration.len and isXmlWhitespace(declaration[cursor])) cursor += 1;
-    if (cursor == declaration.len or (declaration[cursor] != '\'' and declaration[cursor] != '"')) return null;
-    const quote = declaration[cursor];
-    cursor += 1;
-    const value_start = cursor;
-    while (cursor < declaration.len and declaration[cursor] != quote) cursor += 1;
-    if (cursor == value_start or cursor == declaration.len) return null;
-    return declaration[value_start..cursor];
+fn malformedExternalTextDeclaration(bytes: []const u8) bool {
+    return std.mem.startsWith(u8, bytes, "<?xml") and bytes.len > 5 and
+        isXmlWhitespace(bytes[5]) and std.mem.indexOfPos(u8, bytes, 6, "?>") != null and
+        externalTextDeclaration(bytes) == null;
 }
 
 fn externalEncodingMatches(encoding: SourceEncoding, declared: []const u8) bool {
@@ -8511,6 +9650,27 @@ fn isXml10Char(codepoint: u32) bool {
         (codepoint >= 0x20 and codepoint <= 0xd7ff) or
         (codepoint >= 0xe000 and codepoint <= 0xfffd) or
         (codepoint >= 0x10000 and codepoint <= 0x10ffff);
+}
+
+fn isXml11Char(codepoint: u32) bool {
+    return (codepoint >= 0x1 and codepoint <= 0xd7ff) or
+        (codepoint >= 0xe000 and codepoint <= 0xfffd) or
+        (codepoint >= 0x10000 and codepoint <= 0x10ffff);
+}
+
+fn isXml11RestrictedChar(codepoint: u32) bool {
+    return (codepoint >= 0x1 and codepoint <= 0x8) or
+        (codepoint >= 0xb and codepoint <= 0xc) or
+        (codepoint >= 0xe and codepoint <= 0x1f) or
+        (codepoint >= 0x7f and codepoint <= 0x84) or
+        (codepoint >= 0x86 and codepoint <= 0x9f);
+}
+
+fn isXmlLiteralChar(codepoint: u32, version: XmlVersion) bool {
+    return switch (version) {
+        .xml10 => isXml10Char(codepoint),
+        .xml11 => isXml11Char(codepoint) and !isXml11RestrictedChar(codepoint),
+    };
 }
 
 fn hasForbiddenAsciiControl(bytes: []const u8) bool {

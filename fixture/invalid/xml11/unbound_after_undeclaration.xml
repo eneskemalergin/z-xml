@@ -1,0 +1,7 @@
+<?xml version="1.1"?>
+<!DOCTYPE root [
+<!ELEMENT root (p:child)>
+<!ATTLIST root xmlns:p CDATA #IMPLIED>
+<!ELEMENT p:child EMPTY>
+]>
+<root xmlns:p="urn:example"><p:child xmlns:p=""/></root>

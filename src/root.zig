@@ -1,8 +1,8 @@
 //! A bounded, incremental XML reader for Zig.
 //!
 //! The public API is specialized by a compile-time configuration. The library
-//! provides XML 1.0 no-DTD, non-validating, and DTD-validating readers
-//! with raw-name and namespace-aware profiles.
+//! provides XML 1.0 and XML 1.1 non-validating and DTD-validating readers,
+//! plus specialized XML 1.0 no-DTD readers, with raw-name and namespace-aware profiles.
 
 const reader = @import("reader.zig");
 const encoding = @import("encoding.zig");
@@ -29,6 +29,12 @@ pub const ExternalPolicy = reader.ExternalPolicy;
 pub const ValidityAction = reader.ValidityAction;
 /// Final validating-reader result.
 pub const ValidationStatus = reader.ValidationStatus;
+/// Runtime XML 1.1 full-normalization policy.
+pub const NormalizationPolicy = reader.NormalizationPolicy;
+/// Progress or final XML 1.1 full-normalization result.
+pub const NormalizationStatus = reader.NormalizationStatus;
+/// Reason XML 1.1 full-normalization verification did not succeed.
+pub const NormalizationIssueKind = reader.NormalizationIssueKind;
 /// Declared DTD attribute type.
 pub const AttributeType = @import("dtd.zig").AttributeType;
 /// Observable reader lifecycle.
@@ -106,6 +112,10 @@ pub const Options = reader.Options;
 pub const Location = reader.Location;
 /// Returns the specialized diagnostic type.
 pub const Diagnostic = reader.Diagnostic;
+/// Returns the XML 1.1 full-normalization finding type.
+pub const NormalizationIssue = reader.NormalizationIssue;
+/// Returns the specialized XML 1.1 full-normalization result type.
+pub const NormalizationResult = reader.NormalizationResult;
 /// Returns the specialized validity diagnostic callback type.
 pub const ValiditySink = reader.ValiditySink;
 /// Returns the specialized element or attribute name type.

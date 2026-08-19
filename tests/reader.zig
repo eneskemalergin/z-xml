@@ -146,9 +146,11 @@ const Summary = struct {
                     self.processing_instruction_active = false;
                 }
             },
-            .document_end => {
-                self.sequence *%= 10;
-                self.sequence +%= 4;
+            else => {
+                if (std.mem.eql(u8, @tagName(std.meta.activeTag(event)), "document_end")) {
+                    self.sequence *%= 10;
+                    self.sequence +%= 4;
+                }
             },
         }
     }
@@ -1161,6 +1163,113 @@ fn dtdOutcome(comptime config: xml.Config, input: []const u8, schedule: DtdSched
     }
 }
 
+fn normalizationOutcome(
+    comptime config: xml.Config,
+    options: xml.Options(config),
+    input: []const u8,
+    schedule: DtdSchedule,
+) !xml.NormalizationResult(config) {
+    var reader = try xml.Reader(config).init(std.testing.allocator, options);
+    defer reader.deinit();
+    var offset: usize = 0;
+    var first = true;
+    var prng = std.Random.DefaultPrng.init(switch (schedule) {
+        .random => |seed| seed,
+        else => 0,
+    });
+    while (true) {
+        const remaining = input.len - offset;
+        const size = switch (schedule) {
+            .whole => remaining,
+            .split => |value| if (first) value else remaining,
+            .fixed => |value| @min(value, remaining),
+            .random => prng.random().intRangeAtMost(usize, 1, @min(@as(usize, 17), remaining)),
+        };
+        first = false;
+        const end = offset + size;
+        try reader.feed(input[offset..end], end == input.len);
+        offset = end;
+        while (true) switch (try reader.next()) {
+            .event => {},
+            .need_input => break,
+            .done => return reader.normalizationResult(),
+        };
+        if (offset == input.len) return error.MissingDone;
+    }
+}
+
+const NormalizationFailureOutcome = struct {
+    events: usize,
+    byte_offset: u64,
+    line: u64,
+    byte_column: u64,
+};
+
+fn strictNormalizationFailure(
+    input: []const u8,
+    chunk_size: usize,
+) !NormalizationFailureOutcome {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    var options: xml.Options(config) = .{};
+    options.normalization = .require;
+    var reader = try xml.Reader(config).init(std.testing.allocator, options);
+    defer reader.deinit();
+    var events: usize = 0;
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const end = @min(offset + chunk_size, input.len);
+        try reader.feed(input[offset..end], end == input.len);
+        offset = end;
+        while (true) {
+            const step = reader.next() catch |err| {
+                try std.testing.expectEqual(error.NotNormalized, err);
+                const diagnostic = reader.diagnostic().?;
+                return .{
+                    .events = events,
+                    .byte_offset = diagnostic.primary.byte_offset,
+                    .line = diagnostic.primary.line,
+                    .byte_column = diagnostic.primary.byte_column,
+                };
+            };
+            switch (step) {
+                .event => events += 1,
+                .need_input => break,
+                .done => return error.ExpectedFailure,
+            }
+        }
+    }
+    return error.ExpectedFailure;
+}
+
+fn expectNormalizationSchedules(
+    input: []const u8,
+    expected: xml.NormalizationResult(xml.Configs.XML11_NONVALIDATING),
+) !void {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    try std.testing.expectEqual(
+        expected,
+        try normalizationOutcome(config, .{}, input, .whole),
+    );
+    for (1..input.len) |split| {
+        try std.testing.expectEqual(
+            expected,
+            try normalizationOutcome(config, .{}, input, .{ .split = split }),
+        );
+    }
+    inline for (.{ 1, 2, 3, 5, 7 }) |size| {
+        try std.testing.expectEqual(
+            expected,
+            try normalizationOutcome(config, .{}, input, .{ .fixed = size }),
+        );
+    }
+    for (0..8) |seed| {
+        try std.testing.expectEqual(
+            expected,
+            try normalizationOutcome(config, .{}, input, .{ .random = seed }),
+        );
+    }
+}
+
 fn expectExpandedName(
     name: xml.Name(NS_CONFIG),
     raw: []const u8,
@@ -1336,6 +1445,9 @@ test "config - representative profiles: compile specialized public types" {
         xml.Configs.XML10_NAMESPACES_NONVALIDATING,
         xml.Configs.XML10_VALIDATING,
         xml.Configs.XML10_NAMESPACES_VALIDATING_DETAILED,
+        xml.Configs.XML11_NONVALIDATING,
+        xml.Configs.XML11_NAMESPACES_NONVALIDATING,
+        xml.Configs.XML11_VALIDATING,
         xml.Configs.XML11_NAMESPACES_VALIDATING,
     }) |config| {
         _ = xml.Reader(config);
@@ -1362,20 +1474,546 @@ test "config - excluded capabilities: specialized types omit impossible fields" 
     );
 }
 
-test "[failure] - [unavailable profiles]: reject parsing explicitly" {
-    inline for (.{
-        xml.Configs.XML11_NAMESPACES_VALIDATING,
-    }) |config| {
-        const Reader = xml.Reader(config);
-        var reader = try Reader.init(std.testing.allocator, .{});
+test "[unit] - [XML version]: XML 1.1 profiles select declared document rules" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const cases = .{
+        .{ "<root/>", xml.XmlVersion.xml10, "" },
+        .{ "<?xml version='1.0'?><root/>", xml.XmlVersion.xml10, "1.0" },
+        .{ "<?xml version='1.7'?><root/>", xml.XmlVersion.xml10, "1.7" },
+        .{ "<?xml version='1.1'?><root/>", xml.XmlVersion.xml11, "1.1" },
+    };
+    inline for (cases) |case| {
+        var reader = try xml.Reader(config).init(std.testing.allocator, .{});
         defer reader.deinit();
-        try reader.feed("<root/>", true);
+        try reader.feed(case[0], true);
+        const event = (try reader.next()).event;
+        switch (event) {
+            .document_start => |document| {
+                try std.testing.expectEqual(case[1], document.effective_version);
+                if (case[2].len != 0) {
+                    try std.testing.expectEqualStrings(case[2], document.declared_version.?);
+                } else {
+                    try std.testing.expect(document.declared_version == null);
+                }
+            },
+            else => return error.UnexpectedEvent,
+        }
+    }
+}
 
-        try std.testing.expectError(error.UnsupportedFeature, reader.next());
-        const diagnostic = reader.diagnostic().?;
-        try std.testing.expectEqual(xml.DiagnosticCode.unsupported_profile, diagnostic.code);
-        try std.testing.expectEqual(@as(u64, 0), diagnostic.primary.byte_offset);
-        try std.testing.expectError(error.UnsupportedFeature, reader.next());
+test "[unit] - [XML 1.1 normalization]: policy reports final verification state" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const normalized = "<?xml version='1.1'?><root>caf\xc3\xa9</root>";
+    try std.testing.expectEqual(
+        xml.NormalizationResult(config){ .status = .normalized, .issue = null },
+        try normalizationOutcome(config, .{}, normalized, .whole),
+    );
+
+    var unchecked: xml.Options(config) = .{};
+    unchecked.normalization = .unchecked;
+    try std.testing.expectEqual(
+        xml.NormalizationResult(config){ .status = .unchecked, .issue = null },
+        try normalizationOutcome(config, unchecked, normalized, .whole),
+    );
+    try std.testing.expectEqual(
+        xml.NormalizationResult(config){ .status = .unchecked, .issue = null },
+        try normalizationOutcome(config, .{}, "<root/>", .whole),
+    );
+
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed("<?xml version='1.1'?><root>e\xcc\x81</root>", true);
+    var text_bytes: [3]u8 = undefined;
+    var text_len: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .text => |value| {
+                @memcpy(text_bytes[text_len..][0..value.bytes.len], value.bytes);
+                text_len += value.bytes.len;
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqualStrings("e\xcc\x81", text_bytes[0..text_len]);
+    try std.testing.expectEqual(
+        xml.NormalizationStatus.not_normalized,
+        reader.normalizationResult().status,
+    );
+}
+
+test "[property] - [XML 1.1 normalization]: source NFC is stable across schedules" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const input = "<?xml version='1.1'?><root>e\xcc\x81</root>";
+    const offset = std.mem.indexOf(u8, input, "\xcc\x81").?;
+    try expectNormalizationSchedules(input, .{
+        .status = .not_normalized,
+        .issue = .{
+            .kind = .not_nfc,
+            .location = .{
+                .source_id = 0,
+                .byte_offset = offset,
+                .line = 1,
+                .byte_column = offset + 1,
+            },
+        },
+    });
+
+    var strict: xml.Options(config) = .{};
+    strict.normalization = .require;
+    try expectProfileFailureSchedules(
+        config,
+        strict,
+        input,
+        error.NotNormalized,
+        .not_fully_normalized,
+        offset,
+        null,
+    );
+
+    const multiline = "<?xml version='1.1'?>\n<!DOCTYPE r [<!--e\xcc\x81-->]><r/>";
+    const multiline_offset = std.mem.indexOf(u8, multiline, "\xcc\x81").?;
+    const expected_failure = NormalizationFailureOutcome{
+        .events = 2,
+        .byte_offset = multiline_offset,
+        .line = 2,
+        .byte_column = multiline_offset - std.mem.indexOf(u8, multiline, "<!DOCTYPE").? + 1,
+    };
+    try std.testing.expectEqual(
+        expected_failure,
+        try strictNormalizationFailure(multiline, multiline.len),
+    );
+    try std.testing.expectEqual(
+        expected_failure,
+        try strictNormalizationFailure(multiline, 1),
+    );
+}
+
+test "[unit] - [XML 1.1 normalization]: canonical forms cover composition and ordering" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const cases = .{
+        "<?xml version='1.1'?><root>\xe2\x84\xab</root>",
+        "<?xml version='1.1'?><root>\xe1\x84\x80\xe1\x85\xa1</root>",
+        "<?xml version='1.1'?><root>a\xcc\x95\xcc\x80</root>",
+    };
+    inline for (cases) |input| {
+        const result = try normalizationOutcome(config, .{}, input, .whole);
+        try std.testing.expectEqual(xml.NormalizationStatus.not_normalized, result.status);
+        try std.testing.expectEqual(xml.NormalizationIssueKind.not_nfc, result.issue.?.kind);
+    }
+
+    const normalized = "<?xml version='1.1'?><root>\xea\xb0\x80a\xcc\x95</root>";
+    try std.testing.expectEqual(
+        xml.NormalizationResult(config){ .status = .normalized, .issue = null },
+        try normalizationOutcome(config, .{}, normalized, .whole),
+    );
+    try expectNormalizationSchedules(
+        "<?xml version='1.1'?><root>x\xcc\x95</root>",
+        .{ .status = .normalized, .issue = null },
+    );
+}
+
+test "[unit] - [XML 1.1 normalization]: expanded references preserve construct rules" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const composing = "<?xml version='1.1'?><root>\xcc\x81x</root>";
+    const composing_offset = std.mem.indexOf(u8, composing, "\xcc\x81").?;
+    try std.testing.expectEqual(
+        xml.NormalizationResult(config){
+            .status = .not_normalized,
+            .issue = .{
+                .kind = .composing_start,
+                .location = .{
+                    .source_id = 0,
+                    .byte_offset = composing_offset,
+                    .line = 1,
+                    .byte_column = composing_offset + 1,
+                },
+            },
+        },
+        try normalizationOutcome(config, .{}, composing, .whole),
+    );
+
+    const reference = "<?xml version='1.1'?><root>A&#x30A;</root>";
+    const reference_offset = std.mem.indexOf(u8, reference, "&#x30A;").?;
+    try std.testing.expectEqual(
+        xml.NormalizationResult(config){
+            .status = .not_normalized,
+            .issue = .{
+                .kind = .not_nfc,
+                .location = .{
+                    .source_id = 0,
+                    .byte_offset = reference_offset,
+                    .line = 1,
+                    .byte_column = reference_offset + 1,
+                },
+            },
+        },
+        try normalizationOutcome(config, .{}, reference, .whole),
+    );
+
+    const attribute = "<?xml version='1.1'?><root a='A&#x30A;'/>";
+    const attribute_offset = std.mem.indexOf(u8, attribute, "a=").?;
+    try std.testing.expectEqual(
+        xml.NormalizationResult(config){
+            .status = .not_normalized,
+            .issue = .{
+                .kind = .not_nfc,
+                .location = .{
+                    .source_id = 0,
+                    .byte_offset = attribute_offset,
+                    .line = 1,
+                    .byte_column = attribute_offset + 1,
+                },
+            },
+        },
+        try normalizationOutcome(config, .{}, attribute, .whole),
+    );
+
+    const cdata = "<?xml version='1.1'?><root><![CDATA[\xcc\x81x]]></root>";
+    const cdata_offset = std.mem.indexOf(u8, cdata, "\xcc\x81").?;
+    try std.testing.expectEqual(
+        xml.NormalizationResult(config){
+            .status = .not_normalized,
+            .issue = .{
+                .kind = .composing_start,
+                .location = .{
+                    .source_id = 0,
+                    .byte_offset = cdata_offset,
+                    .line = 1,
+                    .byte_column = cdata_offset + 1,
+                },
+            },
+        },
+        try normalizationOutcome(config, .{}, cdata, .whole),
+    );
+
+    const name = "<?xml version='1.1'?><\xe1\x85\xa1/>";
+    const name_offset = std.mem.indexOf(u8, name, "\xe1\x85\xa1").?;
+    try std.testing.expectEqual(
+        xml.NormalizationResult(config){
+            .status = .not_normalized,
+            .issue = .{
+                .kind = .composing_start,
+                .location = .{
+                    .source_id = 0,
+                    .byte_offset = name_offset,
+                    .line = 1,
+                    .byte_column = name_offset + 1,
+                },
+            },
+        },
+        try normalizationOutcome(config, .{}, name, .whole),
+    );
+}
+
+test "[property] - [XML 1.1 normalization]: UTF-16 source findings retain byte offsets" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const utf8 = "<?xml version='1.1'?><root>e\xcc\x81</root>";
+    const encoded = try encodeUtf16(std.testing.allocator, utf8, .little, true);
+    defer std.testing.allocator.free(encoded);
+    const expected_offset = 2 + 2 * std.mem.indexOf(u8, utf8, "\xcc\x81").?;
+    const result = try normalizationOutcome(config, .{}, encoded, .{ .fixed = 1 });
+    try std.testing.expectEqual(xml.NormalizationStatus.not_normalized, result.status);
+    try std.testing.expectEqual(xml.NormalizationIssueKind.not_nfc, result.issue.?.kind);
+    try std.testing.expectEqual(@as(u64, expected_offset), result.issue.?.location.byte_offset);
+}
+
+test "[unit] - [XML 1.1 normalization]: reset clears verification state" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed("<?xml version='1.1'?><root>e\xcc\x81</root>", true);
+    while (true) switch (try reader.next()) {
+        .event => {},
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(xml.NormalizationStatus.not_normalized, reader.normalizationResult().status);
+
+    try reader.reset(.retain_capacity);
+    try reader.feed("<?xml version='1.1'?><root/>", true);
+    while (true) switch (try reader.next()) {
+        .event => {},
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(xml.NormalizationStatus.normalized, reader.normalizationResult().status);
+}
+
+test "[unit] - [XML 1.1 normalization]: unknown properties remain explicit" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const input = "<?xml version='1.1'?><root>\xcd\xb8</root>";
+    const offset = std.mem.indexOf(u8, input, "\xcd\xb8").?;
+    try std.testing.expectEqual(
+        xml.NormalizationResult(config){
+            .status = .indeterminate,
+            .issue = .{
+                .kind = .unknown_character,
+                .location = .{
+                    .source_id = 0,
+                    .byte_offset = offset,
+                    .line = 1,
+                    .byte_column = offset + 1,
+                },
+            },
+        },
+        try normalizationOutcome(config, .{}, input, .whole),
+    );
+
+    var strict: xml.Options(config) = .{};
+    strict.normalization = .require;
+    try expectProfileFailureSchedules(
+        config,
+        strict,
+        input,
+        error.NotNormalized,
+        .normalization_properties_unknown,
+        offset,
+        null,
+    );
+
+    try std.testing.expectEqual(
+        xml.NormalizationResult(config){ .status = .normalized, .issue = null },
+        try normalizationOutcome(
+            config,
+            .{},
+            "<?xml version='1.1'?><root>\xef\xb7\x90</root>",
+            .whole,
+        ),
+    );
+}
+
+test "[integration] - [XML 1.1 normalization]: DTD values and Nmtokens are verified" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const entity = "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e '&#x301;'>]><r/>";
+    const entity_result = try normalizationOutcome(config, .{}, entity, .whole);
+    try std.testing.expectEqual(xml.NormalizationStatus.not_normalized, entity_result.status);
+    try std.testing.expectEqual(xml.NormalizationIssueKind.composing_start, entity_result.issue.?.kind);
+
+    const token = "<?xml version='1.1'?><!DOCTYPE r [" ++
+        "<!ATTLIST r n NMTOKEN #IMPLIED>]><r n='\xcc\x81x'/>";
+    const token_result = try normalizationOutcome(config, .{}, token, .whole);
+    try std.testing.expectEqual(xml.NormalizationStatus.not_normalized, token_result.status);
+    try std.testing.expectEqual(xml.NormalizationIssueKind.composing_start, token_result.issue.?.kind);
+
+    const boundary = "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e 'x'>]>" ++
+        "<r>&e;\xcc\x81</r>";
+    const boundary_result = try normalizationOutcome(config, .{}, boundary, .{ .fixed = 1 });
+    try std.testing.expectEqual(xml.NormalizationStatus.not_normalized, boundary_result.status);
+    try std.testing.expectEqual(
+        xml.NormalizationIssueKind.composing_start,
+        boundary_result.issue.?.kind,
+    );
+
+    const processing_instruction =
+        "<?xml version='1.1'?><!DOCTYPE r [<?\xe1\x85\xa1?>]><r/>";
+    const processing_instruction_result = try normalizationOutcome(
+        config,
+        .{},
+        processing_instruction,
+        .whole,
+    );
+    try std.testing.expectEqual(
+        xml.NormalizationStatus.not_normalized,
+        processing_instruction_result.status,
+    );
+    try std.testing.expectEqual(
+        xml.NormalizationIssueKind.composing_start,
+        processing_instruction_result.issue.?.kind,
+    );
+    try std.testing.expectEqual(
+        @as(u64, std.mem.indexOf(u8, processing_instruction, "\xe1\x85\xa1").?),
+        processing_instruction_result.issue.?.location.byte_offset,
+    );
+}
+
+test "[integration] - [XML 1.1 characters]: references admit restricted controls" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed("<?xml version='1.1'?><root>&#x1;&#x7f;</root>", true);
+
+    var text: [2]u8 = undefined;
+    var text_len: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .text => |value| {
+                @memcpy(text[text_len..][0..value.bytes.len], value.bytes);
+                text_len += value.bytes.len;
+            },
+            else => {},
+        },
+        .done => break,
+        .need_input => unreachable,
+    };
+    try std.testing.expectEqualSlices(u8, &.{ 0x1, 0x7f }, text[0..text_len]);
+
+    var literal = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer literal.deinit();
+    try literal.feed("<?xml version='1.1'?><root>\x01</root>", true);
+    while (true) switch (literal.next() catch |err| {
+        try std.testing.expectEqual(error.InvalidXml, err);
+        try std.testing.expectEqual(
+            xml.DiagnosticCode.forbidden_character,
+            literal.diagnostic().?.code,
+        );
+        break;
+    }) {
+        .event => {},
+        .done => return error.ExpectedFailure,
+        .need_input => unreachable,
+    };
+}
+
+test "[property] - [XML 1.1 line endings]: semantic values agree across schedules" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const input =
+        "<?xml version='1.1'?><root a='A\xc2\x85B\xe2\x80\xa8C\r\xc2\x85D'>" ++
+        "T\xc2\x85U\xe2\x80\xa8V\r\xc2\x85W" ++
+        "<!--C\xc2\x85D--><?p I\xe2\x80\xa8J?><![CDATA[K\xc2\x85L]]>" ++
+        "</root>";
+    const parts = [_][]const u8{input};
+    const whole = try parseParts(config, std.testing.allocator, .{}, &parts);
+    try std.testing.expectEqualStrings(
+        "A B C D",
+        whole.attribute_event_bytes[3..][0..7],
+    );
+    try std.testing.expectEqualStrings("T\nU\nV\nWK\nL", whole.text_bytes[0..whole.text_bytes_len]);
+    try std.testing.expectEqualStrings("C\nD", whole.comment_bytes[0..whole.comment_bytes_len]);
+    try std.testing.expectEqualStrings(
+        "p\x00I\nJ\xff",
+        whole.processing_instruction_bytes[0..whole.processing_instruction_bytes_len],
+    );
+    try std.testing.expectEqualStrings("K\nL", whole.cdata_bytes[0..whole.cdata_bytes_len]);
+    try expectSummarySchedulesWithOptions(config, .{}, input, whole);
+}
+
+test "[property] - [XML 1.1 UTF-16]: line endings agree across byte schedules" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const encoded = try encodeUtf16(
+        std.testing.allocator,
+        "<?xml version='1.1'?><root>A\xc2\x85B\xe2\x80\xa8C\r\xc2\x85D</root>",
+        .little,
+        true,
+    );
+    defer std.testing.allocator.free(encoded);
+    const parts = [_][]const u8{encoded};
+    const whole = try parseParts(config, std.testing.allocator, .{}, &parts);
+    try std.testing.expectEqual(.utf16_le, whole.source_encoding);
+    try std.testing.expectEqualStrings("A\nB\nC\nD", whole.text_bytes[0..whole.text_bytes_len]);
+    try expectSummarySchedulesWithOptions(config, .{}, encoded, whole);
+}
+
+test "[unit] - [XML 1.1 reset]: pending line scalar does not cross documents" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed("<?xml version='1.1'?><root>\xc2", false);
+    while (true) switch (try reader.next()) {
+        .event => {},
+        .need_input => break,
+        .done => return error.UnexpectedDone,
+    };
+
+    try reader.reset(.retain_capacity);
+    try reader.feed("<?xml version='1.1'?><root>A\xc2\x85B</root>", true);
+    var text: [3]u8 = undefined;
+    var text_len: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .text => |value| {
+                @memcpy(text[text_len..][0..value.bytes.len], value.bytes);
+                text_len += value.bytes.len;
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqualStrings("A\nB", text[0..text_len]);
+}
+
+test "[integration] - [XML 1.1 DTD]: declaration references use document character rules" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const input =
+        "<?xml version='1.1'?><!DOCTYPE r [" ++
+        "<!ENTITY e '&#x1;&#xD;&#x85;&#x2028;'>]><r>&e;</r>";
+    const parts = [_][]const u8{input};
+    const summary = try parseParts(config, std.testing.allocator, .{}, &parts);
+    try std.testing.expectEqualSlices(
+        u8,
+        "\x01\r\xc2\x85\xe2\x80\xa8",
+        summary.text_bytes[0..summary.text_bytes_len],
+    );
+}
+
+test "[integration] - [XML 1.1 validation]: internal replacement whitespace remains ignorable" {
+    const config = xml.Configs.XML11_VALIDATING;
+    const declarations =
+        "<!ENTITY data '&#x9;&#xA;&#xD;'>" ++
+        "<!ELEMENT root (child)><!ELEMENT child EMPTY>";
+    const valid = "<?xml version='1.1'?><!DOCTYPE root [" ++ declarations ++
+        "]><root>&data;<child/></root>";
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(valid, true);
+    var saw_ignorable = false;
+    var status: ?xml.ValidationStatus = null;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .text => |text| saw_ignorable = saw_ignorable or text.ignorable_whitespace,
+            .document_end => |end| status = end.validation,
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expect(saw_ignorable);
+    try std.testing.expectEqual(xml.ValidationStatus.valid, status.?);
+
+    const invalid = "<?xml version='1.1'?><!DOCTYPE root [" ++ declarations ++
+        "]><root>&#x20;<child/></root>";
+    const parts = [_][]const u8{invalid};
+    try expectProfileFailureParts(
+        config,
+        .{},
+        &parts,
+        error.NotValid,
+        .validity_element_content,
+        std.mem.indexOf(u8, invalid, "&#x20;").?,
+        null,
+    );
+}
+
+test "[integration] - [XML 1.1 namespaces]: prefixed bindings can be undeclared" {
+    const config = xml.Configs.XML11_NAMESPACES_NONVALIDATING;
+    const valid = "<?xml version='1.1'?><r xmlns:p='urn:p'><a xmlns:p=''/></r>";
+    var valid_reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer valid_reader.deinit();
+    try valid_reader.feed(valid, true);
+    while (true) switch (try valid_reader.next()) {
+        .event => {},
+        .done => break,
+        .need_input => unreachable,
+    };
+
+    const cases = .{
+        "<?xml version='1.0'?><r xmlns:p='urn:p'><a xmlns:p=''/></r>",
+        "<?xml version='1.1'?><r xmlns:p='urn:p'><a xmlns:p=''><p:b/></a></r>",
+    };
+    inline for (cases) |input| {
+        var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+        defer reader.deinit();
+        try reader.feed(input, true);
+        while (true) switch (reader.next() catch |err| {
+            try std.testing.expectEqual(error.InvalidXml, err);
+            break;
+        }) {
+            .event => {},
+            .done => return error.ExpectedFailure,
+            .need_input => unreachable,
+        };
     }
 }
 
@@ -6433,6 +7071,180 @@ const TestSubsetProvider = struct {
     }
 };
 
+test "[integration] - [XML 1.1 external entity]: text declarations and lines are processed" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const external =
+        "<?xml version='1.1' encoding='UTF-8'?>A\xc2\x85B\xe2\x80\xa8C\r\xc2\x85D";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "text.xml", .bytes = external, .source_id = 81 },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var options: xml.Options(config) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    const document =
+        "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e SYSTEM 'text.xml'>]><r>&e;</r>";
+    const parts = [_][]const u8{document};
+    const summary = try parseParts(config, std.testing.allocator, options, &parts);
+    try std.testing.expectEqualStrings("A\nB\nC\nD", summary.text_bytes[0..summary.text_bytes_len]);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [XML 1.1 external subset]: document rules apply to declarations" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const external =
+        "<?xml version='1.1' encoding='UTF-8'?><!ENTITY e '&#x1;'>\xc2\x85";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "schema.dtd", .bytes = external, .source_id = 82 },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var options: xml.Options(config) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    const document =
+        "<?xml version='1.1'?><!DOCTYPE r SYSTEM 'schema.dtd'><r>&e;</r>";
+    const parts = [_][]const u8{document};
+    const summary = try parseParts(config, std.testing.allocator, options, &parts);
+    try std.testing.expectEqualSlices(u8, &.{0x1}, summary.text_bytes[0..summary.text_bytes_len]);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [XML 1.1 normalization]: external entities retain source findings" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const external = "e\xcc\x81";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "text.xml", .bytes = external, .source_id = 181 },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var options: xml.Options(config) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    const document =
+        "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e SYSTEM 'text.xml'>]><r>&e;</r>";
+    const result = try normalizationOutcome(config, options, document, .{ .fixed = 1 });
+    try std.testing.expectEqual(xml.NormalizationStatus.not_normalized, result.status);
+    try std.testing.expectEqual(xml.NormalizationIssueKind.not_nfc, result.issue.?.kind);
+    try std.testing.expectEqual(@as(u32, 181), result.issue.?.location.source_id);
+    try std.testing.expectEqual(@as(u64, 1), result.issue.?.location.byte_offset);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [XML 1.1 normalization]: external UTF-16 is checked incrementally" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const external = try encodeUtf16(std.testing.allocator, "e\xcc\x81", .little, true);
+    defer std.testing.allocator.free(external);
+    const resources = [_]TestExternalResource{
+        .{
+            .system_id = "text.xml",
+            .bytes = external,
+            .source_id = 184,
+            .encoding_hint = .utf16_le,
+        },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var options: xml.Options(config) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    const document =
+        "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e SYSTEM 'text.xml'>]><r>&e;</r>";
+    const result = try normalizationOutcome(config, options, document, .whole);
+    try std.testing.expectEqual(xml.NormalizationStatus.not_normalized, result.status);
+    try std.testing.expectEqual(xml.NormalizationIssueKind.not_nfc, result.issue.?.kind);
+    try std.testing.expectEqual(@as(u32, 184), result.issue.?.location.source_id);
+    try std.testing.expectEqual(@as(u64, 4), result.issue.?.location.byte_offset);
+}
+
+test "[integration] - [XML 1.1 normalization]: external DTD and compiled sources are verified" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const declarations = "<!--e\xcc\x81--><!ENTITY e 'ok'>";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "schema.dtd", .bytes = declarations, .source_id = 182 },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var options: xml.Options(config) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    const document =
+        "<?xml version='1.1'?><!DOCTYPE r SYSTEM 'schema.dtd'><r>&e;</r>";
+    const result = try normalizationOutcome(config, options, document, .whole);
+    try std.testing.expectEqual(xml.NormalizationStatus.not_normalized, result.status);
+    try std.testing.expectEqual(xml.NormalizationIssueKind.not_nfc, result.issue.?.kind);
+    try std.testing.expectEqual(@as(u32, 182), result.issue.?.location.source_id);
+    try std.testing.expectEqual(
+        @as(u64, std.mem.indexOf(u8, declarations, "\xcc\x81").?),
+        result.issue.?.location.byte_offset,
+    );
+
+    const validating_config = xml.Configs.XML11_VALIDATING;
+    const reusable_declarations = "<?\xe1\x85\xa1?><!ELEMENT r EMPTY>";
+    var subset = try xml.ExternalSubset.compileDecoded(
+        std.testing.allocator,
+        "schema.dtd",
+        reusable_declarations,
+        .{ .version = .xml11, .source_id = 183 },
+    );
+    defer subset.deinit();
+    var validating_options: xml.Options(validating_config) = .{};
+    validating_options.validation.external_subset = &subset;
+    const reused = try normalizationOutcome(
+        validating_config,
+        validating_options,
+        "<?xml version='1.1'?><!DOCTYPE r SYSTEM 'schema.dtd'><r/>",
+        .whole,
+    );
+    try std.testing.expectEqual(xml.NormalizationStatus.not_normalized, reused.status);
+    try std.testing.expectEqual(
+        xml.NormalizationIssueKind.composing_start,
+        reused.issue.?.kind,
+    );
+    try std.testing.expectEqual(@as(u32, 183), reused.issue.?.location.source_id);
+    try std.testing.expectEqual(@as(u64, 2), reused.issue.?.location.byte_offset);
+}
+
+test "[failure] - [XML 1.1 external sources]: restricted literals and malformed declarations fail" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    const cases = .{
+        .{
+            "schema.dtd",
+            "<!ELEMENT r (#PCDATA)><!ENTITY e 'bad\x7ftext'>",
+            "<?xml version='1.1'?><!DOCTYPE r SYSTEM 'schema.dtd'><r>&e;</r>",
+            xml.DiagnosticCode.forbidden_character,
+        },
+        .{
+            "text.xml",
+            "<?xml version='1.0' \xc2\x85 encoding='UTF-8'?>",
+            "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e SYSTEM 'text.xml'>]><r>&e;</r>",
+            xml.DiagnosticCode.malformed_declaration,
+        },
+        .{
+            "text.xml",
+            "<?xml encoding='UTF-8' version='1.1'?>",
+            "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e SYSTEM 'text.xml'>]><r>&e;</r>",
+            xml.DiagnosticCode.malformed_declaration,
+        },
+        .{
+            "text.xml",
+            "<?xml version='1.1' encoding='UTF-8' extra='value'?>",
+            "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e SYSTEM 'text.xml'>]><r>&e;</r>",
+            xml.DiagnosticCode.malformed_declaration,
+        },
+    };
+    inline for (cases, 0..) |case, index| {
+        const resources = [_]TestExternalResource{
+            .{ .system_id = case[0], .bytes = case[1], .source_id = 90 + index },
+        };
+        var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+        var options: xml.Options(config) = .{};
+        options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+        var reader = try xml.Reader(config).init(std.testing.allocator, options);
+        defer reader.deinit();
+        try reader.feed(case[2], true);
+        while (true) {
+            _ = reader.next() catch |err| {
+                try std.testing.expect(err == error.InvalidDtd or err == error.InvalidXml);
+                try std.testing.expectEqual(case[3], reader.diagnostic().?.code);
+                break;
+            };
+        }
+        try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+    }
+}
+
 test "[integration] - [compiled external subset]: fresh and reused validation agree" {
     const config = xml.Configs.XML10_VALIDATING;
     const declarations = "<!ELEMENT root (item+)><!ELEMENT item (#PCDATA)>" ++
@@ -6486,6 +7298,45 @@ test "[integration] - [compiled external subset]: fresh and reused validation ag
     try std.testing.expectEqual(@as(usize, 1), resolver.closes);
     try std.testing.expect(subset.memoryUsage().declaration_capacity > 0);
     try std.testing.expect(subset.memoryUsage().validation_capacity > 0);
+}
+
+test "[integration] - [XML 1.1 compiled subset]: edition must match the document" {
+    var subset = try xml.ExternalSubset.compileDecoded(
+        std.testing.allocator,
+        "schema.dtd",
+        "<!ELEMENT root (#PCDATA)><!ENTITY e '&#x1;'>",
+        .{ .version = .xml11, .source_id = 83 },
+    );
+    defer subset.deinit();
+
+    const xml11_config = xml.Configs.XML11_VALIDATING;
+    var xml11_options: xml.Options(xml11_config) = .{};
+    xml11_options.validation.external_subset = &subset;
+    const xml11_input =
+        "<?xml version='1.1'?><!DOCTYPE root SYSTEM 'schema.dtd'><root>&e;</root>";
+    const xml11_parts = [_][]const u8{xml11_input};
+    const summary = try parseParts(
+        xml11_config,
+        std.testing.allocator,
+        xml11_options,
+        &xml11_parts,
+    );
+    try std.testing.expectEqualSlices(u8, &.{0x1}, summary.text_bytes[0..summary.text_bytes_len]);
+
+    const xml10_config = xml.Configs.XML10_VALIDATING;
+    var xml10_options: xml.Options(xml10_config) = .{};
+    xml10_options.validation.external_subset = &subset;
+    const xml10_input = "<!DOCTYPE root SYSTEM 'schema.dtd'><root/>";
+    const xml10_parts = [_][]const u8{xml10_input};
+    try expectProfileFailureParts(
+        xml10_config,
+        xml10_options,
+        &xml10_parts,
+        error.InvalidDtd,
+        .external_subset_mismatch,
+        std.mem.indexOf(u8, xml10_input, " root").?,
+        null,
+    );
 }
 
 test "[integration] - [compiled external subset]: fresh and reused diagnostics agree" {

@@ -160,5 +160,8 @@ dtd-bad-standalone-default	invalid/dtd/standalone_default.xml	dtd-invalid	XML1.0
 dtd-bad-standalone-normalization	invalid/dtd/standalone_normalization.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	no	Standalone document depends on external tokenized normalization
 dtd-wf-standalone-entity	invalid/dtd/standalone_entity.xml	not-well-formed	XML1.0-5e	dtd,external_dtd,check_declared_entities	no	Standalone document references an externally declared entity
 dtd-bad-standalone-whitespace	invalid/dtd/standalone_whitespace.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	no	Standalone element-only content contains externally significant whitespace
+xml11-restricted-reference	valid/xml11/restricted_reference.xml	dtd-valid	XML1.1-2e	xml_version_1_1,dtd,numeric_references	no	Restricted XML 1.1 character produced by a numeric reference
+xml11-prefix-undeclaration	valid/xml11/prefix_undeclaration.xml	dtd-valid	NS1.1-2e	xml_version_1_1,dtd,namespaces	no	Prefixed namespace binding is undeclared for a child scope
+xml11-unbound-after-undeclaration	invalid/xml11/unbound_after_undeclaration.xml	namespace-invalid	NS1.1-2e	xml_version_1_1,dtd,namespaces,check_namespaces	no	Undeclared prefix is used after its binding is removed
 bench-common	benchmark/smoke/common.xml	benchmark-valid	XML1.0-5e	document,attributes,element_matching	yes	Shared basic adapter summary
 bench-normalized	benchmark/smoke/normalized.xml	benchmark-valid	XML1.0-5e	document,attributes,numeric_references,cdata,predefined_entities	yes	Shared normalized adapter summary

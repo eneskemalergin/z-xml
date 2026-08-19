@@ -67,6 +67,26 @@ test "[integration] - [owned tree]: preserves document order and semantic values
     try std.testing.expect(declaration.standalone);
 }
 
+test "[integration] - [owned tree]: preserves XML 1.1 declaration and normalized text" {
+    const config = xml.Configs.XML11_NONVALIDATING;
+    var document = try parse(
+        config,
+        std.testing.allocator,
+        "<?xml version='1.1'?><root>A\xc2\x85B</root>",
+        .{},
+    );
+    defer document.deinit();
+
+    try std.testing.expectEqual(
+        xml.XmlVersion.xml11,
+        document.xmlDeclaration().effective_version,
+    );
+    try std.testing.expectEqualStrings(
+        "A\nB",
+        document.nodeValue(document.firstChild(document.documentElement())).?,
+    );
+}
+
 test "[integration] - [owned tree]: joins fragmented comments and processing instructions" {
     const config = xml.Configs.XML10_UTF8_NO_DTD;
     var reader_options: xml.Options(config) = .{};

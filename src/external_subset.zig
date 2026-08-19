@@ -3,6 +3,7 @@
 const std = @import("std");
 const dtd = @import("dtd.zig");
 const validation = @import("validation.zig");
+const unicode_normalization = @import("unicode_normalization.zig");
 
 pub const Provider = dtd.ExternalProvider;
 pub const ProviderError = dtd.ParseError;
@@ -14,6 +15,8 @@ pub const CompileError = dtd.ParseError || error{InvalidOptions};
 
 /// Construction policy and limits for one compiled external subset.
 pub const Options = struct {
+    /// XML character rules used while compiling declaration values.
+    version: dtd.XmlVersion = .xml10,
     public_id: ?[]const u8 = null,
     base_id: ?[]const u8 = null,
     /// Nonzero diagnostic identity assigned to the top-level declaration source.
@@ -45,6 +48,16 @@ pub const Inclusion = struct {
     offset: usize,
 };
 
+/// Normalization outcome retained for a decoded XML 1.1 declaration source.
+pub const NormalizationFindingKind = enum { not_nfc, unknown_character };
+
+/// First normalization finding retained by a compiled subset.
+pub const NormalizationFinding = struct {
+    kind: NormalizationFindingKind,
+    source_id: u32,
+    byte_offset: u64,
+};
+
 const SourceRecord = struct {
     bytes: []u8,
     source_id: u32,
@@ -59,6 +72,7 @@ pub const ExternalSubset = struct {
     system_id: []u8,
     public_id: ?[]u8 = null,
     sources: std.ArrayList(SourceRecord) = .empty,
+    normalization_finding: ?NormalizationFinding = null,
 
     /// Compiles decoded UTF-8 declarations whose line endings are already normalized.
     /// Nested declaration bytes returned by `options.provider` follow the same contract.
@@ -78,6 +92,7 @@ pub const ExternalSubset = struct {
             .system_id = try allocator.dupe(u8, system_id),
         };
         errdefer result.deinit();
+        result.declarations.version = options.version;
         if (options.public_id) |public_id| {
             result.public_id = try allocator.dupe(u8, public_id);
         }
@@ -111,6 +126,7 @@ pub const ExternalSubset = struct {
             error.OutOfMemory => error.OutOfMemory,
             else => error.LimitExceeded,
         };
+        if (options.version == .xml11) result.scanNormalizationSources();
         return result;
     }
 
@@ -137,6 +153,7 @@ pub const ExternalSubset = struct {
     }
 
     pub fn matches(self: *const ExternalSubset, declarations: *const dtd.State) bool {
+        if (self.declarations.version != declarations.version) return false;
         const system = declarations.external_id.system_id orelse return false;
         if (!std.mem.eql(u8, self.system_id, declarations.string(system))) return false;
         const declared_public = declarations.external_id.public_id;
@@ -153,6 +170,11 @@ pub const ExternalSubset = struct {
 
     pub fn compiledState(self: *const ExternalSubset) *const validation.State {
         return &self.compiled;
+    }
+
+    /// Returns the first retained normalization finding, if any.
+    pub fn normalizationFinding(self: *const ExternalSubset) ?NormalizationFinding {
+        return self.normalization_finding;
     }
 
     pub fn sourcePosition(self: *const ExternalSubset, source_id: u32, offset: usize) ?SourcePosition {
@@ -184,6 +206,37 @@ pub const ExternalSubset = struct {
             if (source.source_id == source_id) return source;
         }
         return null;
+    }
+
+    fn scanNormalizationSources(self: *ExternalSubset) void {
+        for (self.sources.items) |source| {
+            var checker: unicode_normalization.Checker = .{};
+            var view = std.unicode.Utf8View.init(source.bytes) catch continue;
+            var iterator = view.iterator();
+            var offset: u64 = 0;
+            while (iterator.nextCodepointSlice()) |scalar| {
+                const codepoint = std.unicode.utf8Decode(scalar) catch unreachable;
+                if (checker.add(@intCast(codepoint))) |issue| {
+                    const finding: NormalizationFinding = .{
+                        .kind = switch (issue) {
+                            .not_nfc => .not_nfc,
+                            .unknown_character => .unknown_character,
+                        },
+                        .source_id = source.source_id,
+                        .byte_offset = offset,
+                    };
+                    if (self.normalization_finding == null or
+                        (finding.kind == .not_nfc and
+                            self.normalization_finding.?.kind == .unknown_character))
+                    {
+                        self.normalization_finding = finding;
+                    }
+                    if (finding.kind == .not_nfc) break;
+                    checker.reset();
+                }
+                offset += scalar.len;
+            }
+        }
     }
 };
 

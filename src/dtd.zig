@@ -1,8 +1,13 @@
-//! Parses and stores XML 1.0 internal and external DTD declarations.
+//! Parses and stores XML internal and external DTD declarations.
 //!
 //! Stored strings use offsets into one owned arena so growth cannot invalidate declarations.
 
 const std = @import("std");
+
+pub const XmlVersion = enum {
+    xml10,
+    xml11,
+};
 
 pub const AttributeType = enum {
     cdata,
@@ -241,6 +246,7 @@ pub const Report = struct {
 const Misc = struct {
     first: StoredString,
     second: ?StoredString = null,
+    location: DeclarationLocation,
 };
 
 pub const SkippedExternal = struct {
@@ -266,6 +272,7 @@ const Source = struct {
 };
 
 pub const State = struct {
+    version: XmlVersion = .xml10,
     doctype_bytes: std.ArrayList(u8) = .empty,
     bytes: std.ArrayList(u8) = .empty,
     elements: std.ArrayList(ElementDeclaration) = .empty,
@@ -326,6 +333,7 @@ pub const State = struct {
         self.expanded_bytes = 0;
         self.replacement_bytes = 0;
         self.parameter_reference_seen = false;
+        self.version = .xml10;
     }
 
     pub fn capacity(self: *const State) usize {
@@ -429,6 +437,14 @@ pub const State = struct {
             .comment => self.string(self.misc.items[report.index].first),
             .processing_instruction => self.string(self.misc.items[report.index].second.?),
             else => "",
+        };
+    }
+
+    /// Returns the source location retained for a miscellaneous report.
+    pub fn reportLocation(self: *const State, report: Report) ?DeclarationLocation {
+        return switch (report.kind) {
+            .comment, .processing_instruction => self.misc.items[report.index].location,
+            else => null,
         };
     }
 
@@ -768,6 +784,7 @@ pub const State = struct {
             try self.misc.append(allocator, .{
                 .first = shifted(misc.first, byte_base),
                 .second = shiftedOptional(misc.second, byte_base),
+                .location = misc.location,
             });
         }
         for (external.skipped_external.items, 0..) |skipped, index| {
@@ -1333,7 +1350,13 @@ const Parser = struct {
         }
         const value = try self.state.store(self.allocator, source[start + 4 .. close]);
         const index = self.state.misc.items.len;
-        try self.state.misc.append(self.allocator, .{ .first = value });
+        try self.state.misc.append(self.allocator, .{
+            .first = value,
+            .location = self.declarationLocation(
+                source_index,
+                self.sourceOffset(source_index, start + 4),
+            ),
+        });
         try self.state.reports.append(self.allocator, .{ .kind = .comment, .index = index });
         cursor.* = close + 3;
     }
@@ -1369,6 +1392,10 @@ const Parser = struct {
         try self.state.misc.append(self.allocator, .{
             .first = stored_target,
             .second = stored_data,
+            .location = self.declarationLocation(
+                source_index,
+                self.sourceOffset(source_index, start + 2),
+            ),
         });
         try self.state.reports.append(self.allocator, .{
             .kind = .processing_instruction,
@@ -2041,7 +2068,7 @@ const Parser = struct {
                 const token = raw[cursor + 1 .. end];
                 if (token.len > 0 and token[0] == '#') {
                     var encoded: [4]u8 = undefined;
-                    const len = decodeCharacterReference(token, &encoded) orelse
+                    const len = decodeCharacterReference(token, &encoded, self.state.version) orelse
                         return self.invalid(error_code, self.sourceOffset(source_index, raw_start + cursor));
                     try self.appendReplacement(
                         &output,
@@ -2104,10 +2131,10 @@ const Parser = struct {
     ) bool {
         const replacement = self.state.string(value);
         if (std.mem.eql(u8, name, "lt")) {
-            return characterReferenceEquals(replacement, '<');
+            return characterReferenceEquals(replacement, '<', self.state.version);
         }
         if (std.mem.eql(u8, name, "amp")) {
-            return characterReferenceEquals(replacement, '&');
+            return characterReferenceEquals(replacement, '&', self.state.version);
         }
         const expected: ?u21 = if (std.mem.eql(u8, name, "gt"))
             '>'
@@ -2119,7 +2146,7 @@ const Parser = struct {
             null;
         const scalar = expected orelse return true;
         return (replacement.len == 1 and replacement[0] == scalar) or
-            characterReferenceEquals(replacement, scalar);
+            characterReferenceEquals(replacement, scalar, self.state.version);
     }
 
     fn expandGeneralValue(
@@ -2673,22 +2700,26 @@ fn predefined(name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn decodeCharacterReference(token: []const u8, output: *[4]u8) ?usize {
+fn decodeCharacterReference(
+    token: []const u8,
+    output: *[4]u8,
+    version: XmlVersion,
+) ?usize {
     if (token.len < 2 or token[0] != '#') return null;
     const hexadecimal = token.len > 2 and token[1] == 'x';
     const digits = token[if (hexadecimal) 2 else 1..];
     if (digits.len == 0) return null;
     const value = std.fmt.parseInt(u21, digits, if (hexadecimal) 16 else 10) catch return null;
-    if (!isXml10Char(value)) return null;
+    if (!isXmlChar(value, version)) return null;
     return std.unicode.utf8Encode(value, output) catch null;
 }
 
-fn characterReferenceEquals(reference: []const u8, expected: u21) bool {
+fn characterReferenceEquals(reference: []const u8, expected: u21, version: XmlVersion) bool {
     if (reference.len < 4 or reference[0] != '&' or reference[reference.len - 1] != ';') {
         return false;
     }
     var output: [4]u8 = undefined;
-    const len = decodeCharacterReference(reference[1 .. reference.len - 1], &output) orelse
+    const len = decodeCharacterReference(reference[1 .. reference.len - 1], &output, version) orelse
         return false;
     var expected_output: [4]u8 = undefined;
     const expected_len = std.unicode.utf8Encode(expected, &expected_output) catch return false;
@@ -2700,6 +2731,15 @@ fn isXml10Char(value: u21) bool {
         (value >= 0x20 and value <= 0xd7ff) or
         (value >= 0xe000 and value <= 0xfffd) or
         (value >= 0x10000 and value <= 0x10ffff);
+}
+
+fn isXmlChar(value: u21, version: XmlVersion) bool {
+    return switch (version) {
+        .xml10 => isXml10Char(value),
+        .xml11 => value >= 0x1 and value <= 0xd7ff or
+            value >= 0xe000 and value <= 0xfffd or
+            value >= 0x10000 and value <= 0x10ffff,
+    };
 }
 
 pub fn collapseSpaces(bytes: []u8) usize {

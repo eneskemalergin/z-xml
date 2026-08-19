@@ -1,10 +1,16 @@
-//! Streaming corpus adapter for implemented XML 1.0 profiles.
+//! Streaming corpus adapter for implemented XML profiles.
 
 const std = @import("std");
 const xml = @import("z_xml");
 const check_options = @import("check_options");
 
-const CONFIG = if (check_options.validating)
+const XML11 = if (@hasDecl(check_options, "xml11")) check_options.xml11 else false;
+const CONFIG = if (XML11)
+    if (check_options.namespaces)
+        xml.Configs.XML11_NAMESPACES_VALIDATING
+    else
+        xml.Configs.XML11_VALIDATING
+else if (check_options.validating)
     if (check_options.namespaces)
         xml.Configs.XML10_NAMESPACES_VALIDATING
     else

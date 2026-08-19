@@ -172,7 +172,7 @@ def document_text(path: Path, encoding: str) -> str:
 
 def requirements(target: Target, case: Case) -> tuple[set[str], str | None]:
     versions = case.version.split()
-    if "1.0" not in versions:
+    if not any(f"xml_version_{version.replace('.', '_')}" in target.features for version in versions):
         return set(), "xml-version"
     if case.case_type == "error":
         return set(), "optional-error"
@@ -205,7 +205,13 @@ def expectation(target: Target, case: Case) -> tuple[str, str]:
         return "out-of-profile", "processor-profile"
     if case.edition != "unspecified":
         editions = case.edition.split()
-        if not any(f"xml1_0_{edition}e" in target.features for edition in editions):
+        versions = case.version.split()
+        if not any(
+            f"xml{version.replace('.', '_')}_{edition}e" in target.features
+            for version in versions
+            for edition in editions
+            if f"xml_version_{version.replace('.', '_')}" in target.features
+        ):
             return "out-of-profile", "xml-edition"
     needed, reason = requirements(target, case)
     if reason is not None:
