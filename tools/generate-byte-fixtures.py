@@ -18,6 +18,7 @@ def fixture_bytes() -> dict[str, bytes]:
     utf16be_document = (
         '<?xml version="1.0" encoding="UTF-16BE"?><root>\u03bb\U0001f642</root>'
     )
+    utf32_document = '<?xml version="1.0" encoding="UTF-32"?><root>\u03bb</root>'
     utf16_markup = "<\u6839 \u5c5e\u6027='\u503c'>one\r\ntwo\U0001f642</\u6839>"
     return {
         "valid/encoding/utf8-bom.xml": b"\xef\xbb\xbf<root>\xc3\xa9\xf0\x9f\x99\x82</root>",
@@ -38,6 +39,12 @@ def fixture_bytes() -> dict[str, bytes]:
         + utf16_markup.encode("utf-16-le"),
         "valid/encoding/utf16be-no-declaration.xml": (
             b"\xfe\xff" + "<root/>".encode("utf-16-be")
+        ),
+        "valid/encoding/utf32le-bom.xml": (
+            b"\xff\xfe\x00\x00" + utf32_document.encode("utf-32-le")
+        ),
+        "valid/encoding/utf32be-bom.xml": (
+            b"\x00\x00\xfe\xff" + utf32_document.encode("utf-32-be")
         ),
         "valid/encoding/iso-8859-1.xml": (
             b'<?xml version="1.0" encoding="ISO-8859-1"?><root>caf\xe9</root>'

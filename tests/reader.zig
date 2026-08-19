@@ -2256,6 +2256,11 @@ test "[property] - [general UTF-8]: direct source path agrees across schedules" 
     try std.testing.expectEqual(xml.SourceEncoding.utf8, summary.source_encoding);
     try std.testing.expectEqualStrings("x\ny🙂", summary.text_bytes[0..summary.text_bytes_len]);
     try expectSummarySchedulesWithOptions(GENERAL_CONFIG, .{}, input, summary);
+
+    var reader = try xml.Reader(GENERAL_FAST_CONFIG).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try drainGeneralChunks(&reader, input);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().decoder_capacity);
 }
 
 test "[failure] - [UTF-16]: odd bytes and unpaired surrogates have stable source offsets" {
@@ -2326,6 +2331,28 @@ test "[failure] - [encoding detection]: missing signatures and declaration confl
         .encoding_mismatch,
         std.mem.indexOf(u8, fixtures.declared_utf16, "UTF-16").?,
     );
+
+    const unsupported_four_byte_signatures = [_][4]u8{
+        "\x00\x00\xfe\xff".*,
+        "\xff\xfe\x00\x00".*,
+        "\x00\x00\xff\xfe".*,
+        "\xfe\xff\x00\x00".*,
+        "\x00\x00\x00\x3c".*,
+        "\x3c\x00\x00\x00".*,
+        "\x00\x00\x3c\x00".*,
+        "\x00\x3c\x00\x00".*,
+    };
+    for (unsupported_four_byte_signatures) |signature| {
+        try expectProfileFailureSchedules(
+            GENERAL_FAST_CONFIG,
+            .{},
+            &signature,
+            error.UnsupportedFeature,
+            .unsupported_encoding,
+            0,
+            null,
+        );
+    }
 }
 
 test "[integration] - [buffered UTF-16]: one-byte source reads preserve semantics" {

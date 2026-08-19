@@ -28,6 +28,8 @@ encoding-utf16le-explicit	valid/encoding/utf16le-explicit.xml	well-formed	XML1.0
 encoding-utf16be-explicit	valid/encoding/utf16be-explicit.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 big-endian document with explicit endian declaration
 encoding-utf16le-markup	valid/encoding/utf16le-markup.xml	well-formed	XML1.0-5e	document,utf16,unicode_names,attributes	no	UTF-16 names attributes supplementary text and CRLF normalization
 encoding-utf16be-no-declaration	valid/encoding/utf16be-no-declaration.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 big-endian document without an XML declaration
+encoding-utf32le	valid/encoding/utf32le-bom.xml	well-formed	XML1.0-5e	document,utf32	no	UTF-32 little-endian document with required byte order mark
+encoding-utf32be	valid/encoding/utf32be-bom.xml	well-formed	XML1.0-5e	document,utf32	no	UTF-32 big-endian document with required byte order mark
 encoding-latin1	valid/encoding/iso-8859-1.xml	well-formed	XML1.0-5e	document,latin1	no	Declared ISO-8859-1 document with a non-ASCII byte
 encoding-ascii	valid/encoding/ascii-declared.xml	well-formed	XML1.0-5e	document,ascii	no	Declared US-ASCII document
 encoding-cr	valid/encoding/cr-line-endings.xml	well-formed	XML1.0-5e	document	no	Literal carriage-return line endings accepted and normalized by event adapters

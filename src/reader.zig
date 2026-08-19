@@ -837,6 +837,17 @@ const EncodingFailure = struct {
     failure: Failure = .invalid_xml,
 };
 
+fn isUnsupportedFourByteSignature(bytes: [4]u8) bool {
+    return std.mem.eql(u8, &bytes, "\x00\x00\xfe\xff") or
+        std.mem.eql(u8, &bytes, "\xff\xfe\x00\x00") or
+        std.mem.eql(u8, &bytes, "\x00\x00\xff\xfe") or
+        std.mem.eql(u8, &bytes, "\xfe\xff\x00\x00") or
+        std.mem.eql(u8, &bytes, "\x00\x00\x00\x3c") or
+        std.mem.eql(u8, &bytes, "\x3c\x00\x00\x00") or
+        std.mem.eql(u8, &bytes, "\x00\x00\x3c\x00") or
+        std.mem.eql(u8, &bytes, "\x00\x3c\x00\x00");
+}
+
 fn SourceState(comptime config: Config) type {
     return if (config.profile.isUtf8Only())
         struct {}
@@ -4873,14 +4884,6 @@ pub fn Reader(comptime config: Config) type {
             source.decoded.clearRetainingCapacity();
             source.source_advances.clearRetainingCapacity();
             source.input_is_direct_utf8 = false;
-            source.decoded.ensureTotalCapacityPrecise(
-                self.allocator,
-                decoded_input_capacity,
-            ) catch return self.failOutOfMemory();
-            source.source_advances.ensureTotalCapacityPrecise(
-                self.allocator,
-                decoded_input_capacity,
-            ) catch return self.failOutOfMemory();
 
             if (source.failure) |failure| {
                 return self.failAt(
@@ -4898,7 +4901,10 @@ pub fn Reader(comptime config: Config) type {
                 }
                 switch (source.encoding.?) {
                     .utf8 => self.decodeUtf8SourceRun(),
-                    .utf16_le, .utf16_be => self.decodeUtf16SourceRun(),
+                    .utf16_le, .utf16_be => {
+                        try self.ensureDecoderCapacity();
+                        self.decodeUtf16SourceRun();
+                    },
                     .other => unreachable,
                 }
                 if (self.input.len != 0) return;
@@ -4963,60 +4969,58 @@ pub fn Reader(comptime config: Config) type {
                     if (byte != 0 and byte != '<' and byte != 0x4c and
                         byte != 0xef and byte != 0xfe and byte != 0xff)
                     {
-                        self.selectSourceEncoding(.utf8, false);
+                        self.selectSourceEncoding(.utf8, 0);
                     }
                 } else if (source.signature_len == 2) {
                     const signature = source.signature_bytes[0..2];
-                    if (std.mem.eql(u8, signature, "\xfe\xff")) {
-                        self.selectSourceEncoding(.utf16_be, true);
-                    } else if (std.mem.eql(u8, signature, "\xff\xfe")) {
-                        self.selectSourceEncoding(.utf16_le, true);
-                    } else if (!std.mem.eql(u8, signature, "\xef\xbb") and
-                        !std.mem.eql(u8, signature, "\x00\x3c") and
+                    if (!std.mem.eql(u8, signature, "\xfe\xff") and
+                        !std.mem.eql(u8, signature, "\xff\xfe") and
+                        !std.mem.eql(u8, signature, "\xef\xbb") and
+                        signature[0] != 0 and
                         !std.mem.eql(u8, signature, "\x3c\x00") and
                         !std.mem.eql(u8, signature, "\x4c\x6f"))
                     {
-                        self.selectSourceEncoding(.utf8, false);
+                        self.selectSourceEncoding(.utf8, 0);
                     }
                 } else if (source.signature_len == 3) {
                     const signature = source.signature_bytes[0..3];
                     if (std.mem.eql(u8, signature, "\xef\xbb\xbf")) {
-                        self.selectSourceEncoding(.utf8, true);
-                    } else if (!std.mem.eql(u8, signature, "\x00\x3c\x00") and
-                        !std.mem.eql(u8, signature, "\x3c\x00\x3f") and
+                        self.selectSourceEncoding(.utf8, 3);
+                    } else if (std.mem.startsWith(u8, signature, "\xfe\xff")) {
+                        if (signature[2] != 0) self.selectSourceEncoding(.utf16_be, 2);
+                    } else if (std.mem.startsWith(u8, signature, "\xff\xfe")) {
+                        if (signature[2] != 0) self.selectSourceEncoding(.utf16_le, 2);
+                    } else if (signature[0] != 0 and
+                        !std.mem.startsWith(u8, signature, "\x3c\x00") and
                         !std.mem.eql(u8, signature, "\x4c\x6f\xa7"))
                     {
-                        self.selectSourceEncoding(.utf8, false);
+                        self.selectSourceEncoding(.utf8, 0);
                     }
-                } else if (std.mem.eql(
-                    u8,
-                    source.signature_bytes[0..4],
-                    "\x00\x3c\x00\x3f",
-                ) or std.mem.eql(
-                    u8,
-                    source.signature_bytes[0..4],
-                    "\x3c\x00\x3f\x00",
-                )) {
-                    source.failure = .{
-                        .code = .missing_encoding_signature,
-                        .offset = 0,
-                    };
-                } else if (std.mem.eql(
-                    u8,
-                    source.signature_bytes[0..4],
-                    "\x4c\x6f\xa7\x94",
-                )) {
+                } else if (isUnsupportedFourByteSignature(source.signature_bytes)) {
                     source.failure = .{
                         .code = .unsupported_encoding,
                         .offset = 0,
                         .failure = .unsupported_feature,
                     };
+                } else if (std.mem.eql(u8, &source.signature_bytes, "\x00\x3c\x00\x3f") or
+                    std.mem.eql(u8, &source.signature_bytes, "\x3c\x00\x3f\x00"))
+                {
+                    source.failure = .{
+                        .code = .missing_encoding_signature,
+                        .offset = 0,
+                    };
+                } else if (std.mem.eql(u8, &source.signature_bytes, "\x4c\x6f\xa7\x94")) {
+                    source.failure = .{
+                        .code = .unsupported_encoding,
+                        .offset = 0,
+                        .failure = .unsupported_feature,
+                    };
+                } else if (std.mem.startsWith(u8, &source.signature_bytes, "\xfe\xff")) {
+                    self.selectSourceEncoding(.utf16_be, 2);
+                } else if (std.mem.startsWith(u8, &source.signature_bytes, "\xff\xfe")) {
+                    self.selectSourceEncoding(.utf16_le, 2);
                 } else {
-                    self.selectSourceEncoding(.utf8, std.mem.eql(
-                        u8,
-                        source.signature_bytes[0..4],
-                        "\xef\xbb\xbf",
-                    ));
+                    self.selectSourceEncoding(.utf8, 0);
                 }
             }
             if (source.encoding == null and source.raw_final and
@@ -5029,44 +5033,52 @@ pub fn Reader(comptime config: Config) type {
 
         fn finishEncodingDetection(self: *Self) bool {
             if (comptime config.profile.isUtf8Only()) unreachable;
-            if (self.source_state.encoding == null) self.selectSourceEncoding(.utf8, false);
+            if (self.source_state.encoding == null) {
+                const signature = self.source_state.signature_bytes[0..self.source_state.signature_len];
+                if (std.mem.startsWith(u8, signature, "\xfe\xff")) {
+                    self.selectSourceEncoding(.utf16_be, 2);
+                } else if (std.mem.startsWith(u8, signature, "\xff\xfe")) {
+                    self.selectSourceEncoding(.utf16_le, 2);
+                } else {
+                    self.selectSourceEncoding(.utf8, 0);
+                }
+            }
             return true;
         }
 
         fn selectSourceEncoding(
             self: *Self,
             encoding: SourceEncoding,
-            signature: bool,
+            signature_len: usize,
         ) void {
             const source = &self.source_state;
             source.encoding = encoding;
             self.source_encoding = encoding;
-            if (signature) {
-                self.source_byte_offset = source.signature_len;
+            if (signature_len != 0) {
+                self.source_byte_offset = signature_len;
                 if (config.diagnostic_location == .line_column) {
                     self.position.line_start_offset = self.source_byte_offset;
                 }
-                source.signature_len = 0;
+                const trailing_len = source.signature_len - signature_len;
+                if (trailing_len != 0) {
+                    std.mem.copyForwards(
+                        u8,
+                        source.signature_bytes[0..trailing_len],
+                        source.signature_bytes[signature_len..source.signature_len],
+                    );
+                }
+                source.signature_len = trailing_len;
             }
         }
 
         fn decodeUtf8SourceRun(self: *Self) void {
             const source = &self.source_state;
-            while (source.signature_len > 0 and
-                source.decoded.items.len < decoded_input_capacity)
-            {
-                const byte = source.signature_bytes[0];
-                if (source.signature_len > 1) {
-                    std.mem.copyForwards(
-                        u8,
-                        source.signature_bytes[0 .. source.signature_len - 1],
-                        source.signature_bytes[1..source.signature_len],
-                    );
-                }
-                source.signature_len -= 1;
-                self.appendDecodedByte(byte, 1);
+            if (source.signature_len != 0) {
+                self.input = source.signature_bytes[0..source.signature_len];
+                source.signature_len = 0;
+                source.input_is_direct_utf8 = true;
+                return;
             }
-            if (source.decoded.items.len != 0) return;
             if (source.raw_cursor < source.raw_input.len) {
                 self.input = source.raw_input[source.raw_cursor..];
                 source.raw_offset += self.input.len;
@@ -5078,12 +5090,27 @@ pub fn Reader(comptime config: Config) type {
         fn decodeUtf16SourceRun(self: *Self) void {
             const source = &self.source_state;
             while (source.decoded.items.len + 4 <= decoded_input_capacity and
-                source.raw_cursor < source.raw_input.len)
+                (source.signature_len != 0 or source.raw_cursor < source.raw_input.len))
             {
-                const byte = source.raw_input[source.raw_cursor];
-                const byte_offset = source.raw_offset;
-                source.raw_cursor += 1;
-                source.raw_offset += 1;
+                const byte, const byte_offset = if (source.signature_len != 0) replay: {
+                    const replay_offset = source.raw_offset - source.signature_len;
+                    const replay_byte = source.signature_bytes[0];
+                    if (source.signature_len > 1) {
+                        std.mem.copyForwards(
+                            u8,
+                            source.signature_bytes[0 .. source.signature_len - 1],
+                            source.signature_bytes[1..source.signature_len],
+                        );
+                    }
+                    source.signature_len -= 1;
+                    break :replay .{ replay_byte, replay_offset };
+                } else raw: {
+                    const raw_byte = source.raw_input[source.raw_cursor];
+                    const raw_offset = source.raw_offset;
+                    source.raw_cursor += 1;
+                    source.raw_offset += 1;
+                    break :raw .{ raw_byte, raw_offset };
+                };
                 if (source.pending_byte == null) {
                     source.pending_byte = byte;
                     source.pending_byte_offset = byte_offset;
@@ -5120,6 +5147,18 @@ pub fn Reader(comptime config: Config) type {
                     self.appendDecodedScalar(@intCast(unit), 2);
                 }
             }
+        }
+
+        fn ensureDecoderCapacity(self: *Self) ReadError!void {
+            const source = &self.source_state;
+            source.decoded.ensureTotalCapacityPrecise(
+                self.allocator,
+                decoded_input_capacity,
+            ) catch return self.failOutOfMemory();
+            source.source_advances.ensureTotalCapacityPrecise(
+                self.allocator,
+                decoded_input_capacity,
+            ) catch return self.failOutOfMemory();
         }
 
         fn appendDecodedScalar(self: *Self, codepoint: u21, source_len: u8) void {
