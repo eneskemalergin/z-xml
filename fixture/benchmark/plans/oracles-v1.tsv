@@ -1,7 +1,7 @@
 # z-xml-oracles-v1
 # Fields are the minimum semantic record required before a workload can enter a timing comparison.
 # id	lane	format	fields	status	notes
-common-summary-v1	event	compact-json	elements,attributes,text_bytes,checksum	ready	Shared UTF-8/no-DTD semantic fingerprint used by current adapters
+common-summary-v1	event	compact-json	elements,attributes,text_bytes,checksum	ready	Shared UTF-8/no-DTD semantic fingerprint used by qualified adapters
 rejection-offset-v1	event	manifest-columns	rejection_fraction,fatal_offset,fatal_fraction	ready	First fatal construct position for early middle and late rejection
 profile-summary-v1	event	compact-json	profile,elements,attributes,text_bytes,text_fragments,cdata_fragments,comments,processing_instructions,namespace_declarations,checksum	planned	Profile-aware event result for namespaces and encodings
 validation-summary-v1	validated	compact-json	profile,valid,declarations,defaulted_attributes,entity_references,ids,idrefs,content_model_transitions,checksum	planned	DTD processing and validation result with document-end state

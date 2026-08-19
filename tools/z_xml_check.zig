@@ -88,14 +88,42 @@ fn run(init: std.process.Init) !u8 {
 
     const file = try std.Io.Dir.cwd().openFile(init.io, args[1], .{});
     defer file.close(init.io);
+    var root_dir: ?std.Io.Dir = null;
+    defer if (root_dir) |dir| dir.close(init.io);
+    var filesystem_resolver: if (check_options.dtd) xml.RootedFilesystemResolver else void = undefined;
+    var options: xml.Options(CONFIG) = .{};
+    if (comptime check_options.dtd) {
+        options.dtd_limits.max_comparison_work = 512 * 1024 * 1024;
+        options.dtd_limits.max_entity_references = 8 * 1024 * 1024;
+        options.dtd_limits.max_expanded_bytes = 256 * 1024 * 1024;
+        options.dtd_limits.max_entity_replacement_bytes = 64 * 1024 * 1024;
+        options.dtd_limits.max_expansion_ratio = 1000;
+        const directory = std.fs.path.dirname(args[1]) orelse ".";
+        root_dir = if (std.fs.path.isAbsolute(directory))
+            try std.Io.Dir.openDirAbsolute(init.io, directory, .{})
+        else
+            try std.Io.Dir.cwd().openDir(init.io, directory, .{});
+        filesystem_resolver = .init(init.gpa, init.io, root_dir.?);
+        options.resolver = .{
+            .policy = .resolve,
+            .resolver = filesystem_resolver.resolver(),
+            .document_base_id = std.fs.path.basename(args[1]),
+        };
+    }
     var input_buffer: [INPUT_BUFFER_SIZE]u8 = undefined;
     var file_reader = file.reader(init.io, &input_buffer);
-    var reader = try xml.IoReader(CONFIG).init(init.gpa, .{}, &file_reader.interface);
+    var reader = try xml.IoReader(CONFIG).init(init.gpa, options, &file_reader.interface);
     defer reader.deinit();
 
     var stats: Stats = .{};
     while (true) {
         const step = reader.next() catch |err| {
+            if (reader.diagnostic()) |diagnostic| {
+                std.debug.print(
+                    "z-xml-check: {s} at source {d} byte {d}\n",
+                    .{ @tagName(diagnostic.code), diagnostic.primary.source_id, diagnostic.primary.byte_offset },
+                );
+            }
             if (statusForReadError(err)) |status| return status;
             return err;
         };

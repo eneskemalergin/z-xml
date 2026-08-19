@@ -1,0 +1,3 @@
+<!ENTITY % declarations SYSTEM "resolver-declarations.ent">
+%declarations;
+<!ENTITY message SYSTEM "resolver-message.ent">

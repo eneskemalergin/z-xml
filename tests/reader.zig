@@ -11,6 +11,7 @@ const GENERAL_CONFIG = xml.Configs.XML10_NO_DTD;
 const GENERAL_FAST_CONFIG = xml.Configs.XML10_NO_DTD_FAST;
 const DTD_CONFIG = xml.Configs.XML10_NONVALIDATING;
 const DTD_NS_CONFIG = xml.Configs.XML10_NAMESPACES_NONVALIDATING;
+const INTERNAL_DTD_CONFIG = xml.Configs.XML10_NONVALIDATING_INTERNAL;
 const CoreReader = xml.Reader(CORE_CONFIG);
 
 const Summary = struct {
@@ -1022,7 +1023,7 @@ fn allocationAttributeParse(allocator: std.mem.Allocator) !void {
     }
 }
 
-fn allocationStage5Parse(allocator: std.mem.Allocator) !void {
+fn allocationTextParse(allocator: std.mem.Allocator) !void {
     const input = "<文書 属性='one&#9;two'>before\r\n🙂&amp;<項目/></文書>";
     const parts = [_][]const u8{input};
     const summary = try parseParts(CORE_CONFIG, allocator, .{}, &parts);
@@ -1034,7 +1035,7 @@ fn allocationStage5Parse(allocator: std.mem.Allocator) !void {
     );
 }
 
-fn allocationStage6Parse(allocator: std.mem.Allocator) !void {
+fn allocationMiscMarkupParse(allocator: std.mem.Allocator) !void {
     const input =
         "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>" ++
         "<?setup data?><r><!--comment--><![CDATA[<text>&data]]></r><?done?>";
@@ -1355,7 +1356,7 @@ test "config - excluded capabilities: specialized types omit impossible fields" 
     );
 }
 
-test "[failure] - [unimplemented profiles]: reject parsing without placeholder semantics" {
+test "[failure] - [unavailable profiles]: reject parsing explicitly" {
     inline for (.{
         xml.Configs.XML10_VALIDATING,
         xml.Configs.XML10_NAMESPACES_VALIDATING_DETAILED,
@@ -1368,7 +1369,7 @@ test "[failure] - [unimplemented profiles]: reject parsing without placeholder s
 
         try std.testing.expectError(error.UnsupportedFeature, reader.next());
         const diagnostic = reader.diagnostic().?;
-        try std.testing.expectEqual(xml.DiagnosticCode.unsupported_stage, diagnostic.code);
+        try std.testing.expectEqual(xml.DiagnosticCode.unsupported_profile, diagnostic.code);
         try std.testing.expectEqual(@as(u64, 0), diagnostic.primary.byte_offset);
         try std.testing.expectError(error.UnsupportedFeature, reader.next());
     }
@@ -1449,14 +1450,14 @@ test "[integration] - [document type event]: header precedes internal subset inp
     };
 }
 
-test "[integration] - [document type event]: external header precedes unsupported processing" {
+test "[integration] - [document type event]: default policy reports and skips external subset" {
     const config = xml.Configs.XML10_NONVALIDATING;
     var reader = try xml.Reader(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
 
     var saw_doctype = false;
-    while (reader.next()) |step| switch (step) {
+    while (true) switch (try reader.next()) {
         .event => |event| switch (event) {
             .document_type => |doctype| {
                 saw_doctype = true;
@@ -1466,16 +1467,10 @@ test "[integration] - [document type event]: external header precedes unsupporte
             else => {},
         },
         .need_input => return error.UnexpectedNeedInput,
-        .done => return error.ExpectedUnsupportedFeature,
-    } else |err| {
-        try std.testing.expectEqual(error.UnsupportedFeature, err);
-    }
+        .done => break,
+    };
     try std.testing.expect(saw_doctype);
-    try std.testing.expectEqual(
-        xml.DiagnosticCode.unsupported_doctype,
-        reader.diagnostic().?.code,
-    );
-    try std.testing.expectError(error.UnsupportedFeature, reader.next());
+    try std.testing.expectEqual(@as(?xml.Diagnostic(config), null), reader.diagnostic());
 }
 
 test "[integration] - [internal DTD namespaces]: default declaration precedes expansion" {
@@ -2041,7 +2036,7 @@ test "streaming - explicit and empty fixture: all required chunk schedules agree
     }
 }
 
-test "fixture - stage 3 invalid corpus: registered structure cases have exact diagnostics" {
+test "[integration] - [document structure fixtures]: registered cases have exact diagnostics" {
     try expectCoreFailureSchedules(
         fixtures.mismatched,
         error.InvalidXml,
@@ -3096,7 +3091,7 @@ test "[integration] - [buffered UTF-8]: one-byte source reads preserve semantics
     );
 }
 
-test "[integration] - [buffered markup]: one-byte source reads preserve stage 6 semantics" {
+test "[integration] - [buffered markup]: one-byte source reads preserve markup semantics" {
     var io_buffer: [7]u8 = undefined;
     var source: std.testing.Reader = .init(
         &io_buffer,
@@ -3394,7 +3389,7 @@ test "[integration] - [text locations]: source spans cover borrowed and transfor
     try std.testing.expectEqual(expected.len, index);
 }
 
-test "[integration] - [stage 6 locations]: declaration span and PI target lifetime are exact" {
+test "[integration] - [event locations]: declaration span and PI target lifetime are exact" {
     const located_config = xml.Configs.XML10_UTF8_NO_DTD_LOCATED;
     const Reader = xml.Reader(located_config);
     var options: xml.Options(located_config) = .{};
@@ -3571,10 +3566,10 @@ test "[edge] - [reference limits]: partial and normalized value boundaries are e
     );
 }
 
-test "[failure] - [stage 5 storage]: every allocation failure cleans up" {
+test "[failure] - [text storage]: every allocation failure cleans up" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
-        allocationStage5Parse,
+        allocationTextParse,
         .{},
     );
 }
@@ -3619,7 +3614,7 @@ test "[unit] - [text lifetime]: borrowed and transformed fragments survive one e
     try std.testing.expectEqualStrings("&", transformed);
 }
 
-test "[unit] - [stage 5 reset]: pending scalar, reference, and CR state is discarded" {
+test "[unit] - [text reset]: pending scalar, reference, and CR state is discarded" {
     const partials = [_][]const u8{ "<r>\xe2", "<r>&amp", "<r>\r" };
     var reader = try CoreReader.init(std.testing.allocator, .{});
     defer reader.deinit();
@@ -3880,7 +3875,7 @@ test "[failure] - [miscellaneous markup]: malformed forms retain exact categorie
     }
 }
 
-test "[failure] - [stage 6 characters]: malformed UTF-8 and forbidden bytes win in data" {
+test "[failure] - [document characters]: malformed UTF-8 and forbidden bytes win in data" {
     const malformed = [_][]const u8{
         "<?xml \xe2(?><r/>",
         "<r><!--\xe2(--></r>",
@@ -3970,10 +3965,10 @@ test "[edge] - [miscellaneous fragments]: semantic limits preserve complete valu
     );
 }
 
-test "[failure] - [stage 6 storage]: every allocation failure cleans up" {
+test "[failure] - [markup storage]: every allocation failure cleans up" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
-        allocationStage6Parse,
+        allocationMiscMarkupParse,
         .{},
     );
 }
@@ -4366,7 +4361,7 @@ test "[property] - [markup memory]: increasing comments retain fixed parser capa
     );
 }
 
-test "[unit] - [stage 6 reset]: pending declaration and delimiter state is discarded" {
+test "[unit] - [markup reset]: pending declaration and delimiter state is discarded" {
     const partials = [_][]const u8{
         "<?xml version='1.0'",
         "<r><!--partial",
@@ -5030,7 +5025,7 @@ test "[property] - [persistent reader]: success failure limit and resets remain 
         defer reader.deinit();
 
         var plateau: usize = 0;
-        var phase: usize = 0;
+        var samples_since_release: usize = 0;
         for (0..1024) |iteration| {
             const input = switch (iteration % 3) {
                 0 => "<root a='1' b='2'><item/></root>",
@@ -5054,18 +5049,18 @@ test "[property] - [persistent reader]: success failure limit and resets remain 
             }
             try std.testing.expectEqual(wanted_error, observed_error);
             const retained = reader.memoryUsage().retained_capacity;
-            if (phase < 3) {
+            if (samples_since_release < 3) {
                 plateau = @max(plateau, retained);
             } else {
                 try std.testing.expect(retained <= plateau);
             }
-            phase += 1;
+            samples_since_release += 1;
 
             if (iteration % 127 == 126) {
                 try reader.reset(.release_memory);
                 try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().retained_capacity);
                 plateau = 0;
-                phase = 0;
+                samples_since_release = 0;
             } else {
                 try reader.reset(.retain_capacity);
                 try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().parser_stack_len);
@@ -5937,4 +5932,821 @@ test "[property] - [expanded attributes]: sorted duplicate path preserves source
         std.mem.indexOf(u8, invalid, "b:x0").?,
         std.mem.indexOf(u8, invalid, "a:x0").?,
     );
+}
+
+const TestExternalResource = struct {
+    system_id: []const u8,
+    bytes: []const u8,
+    source_id: u32,
+    encoding_hint: ?xml.SourceEncoding = null,
+    transcoder: ?xml.Transcoder = null,
+};
+
+const TestResolver = struct {
+    resources: []const TestExternalResource,
+    active: ?*const TestExternalResource = null,
+    cursor: usize = 0,
+    resolves: usize = 0,
+    reads: usize = 0,
+    closes: usize = 0,
+    fail_read_after: ?usize = null,
+    cancel_read_after: ?usize = null,
+    max_read_len: usize = 3,
+    parameter_inclusion_source_id: ?u32 = null,
+    parameter_inclusion_offset: ?u64 = null,
+
+    fn resolver(self: *@This()) xml.Resolver {
+        return .{ .context = self, .resolveFn = resolve };
+    }
+
+    fn resolve(context: ?*anyopaque, request: xml.ResolverRequest) xml.ResolverResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.resolves += 1;
+        if (request.kind == .parameter_entity) {
+            self.parameter_inclusion_source_id = request.inclusion.source_id;
+            self.parameter_inclusion_offset = request.inclusion.byte_offset;
+        }
+        for (self.resources) |*resource| {
+            if (!std.mem.eql(u8, resource.system_id, request.system_id)) continue;
+            self.active = resource;
+            self.cursor = 0;
+            return .{ .source = .{
+                .context = self,
+                .source_id = resource.source_id,
+                .base_id = resource.system_id,
+                .encoding_hint = resource.encoding_hint,
+                .transcoder = resource.transcoder,
+                .readFn = read,
+                .closeFn = close,
+            } };
+        }
+        return .not_found;
+    }
+
+    fn read(context: ?*anyopaque, output: []u8) xml.ResolverReadResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.fail_read_after != null and self.reads == self.fail_read_after.?) return .io_failure;
+        if (self.cancel_read_after != null and self.reads == self.cancel_read_after.?) return .cancelled;
+        self.reads += 1;
+        const resource = self.active.?;
+        if (self.cursor == resource.bytes.len) return .end;
+        const len = @min(self.max_read_len, @min(output.len, resource.bytes.len - self.cursor));
+        @memcpy(output[0..len], resource.bytes[self.cursor..][0..len]);
+        self.cursor += len;
+        return .{ .bytes = len };
+    }
+
+    fn close(context: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.closes += 1;
+        self.active = null;
+    }
+};
+
+fn testIdentityTranscoder(
+    _: ?*anyopaque,
+    input: []const u8,
+    _: bool,
+    output: []u8,
+    source_advances: []u8,
+) xml.TranscodeStep {
+    if (input.len == 0) return .need_input;
+    if (output.len == 0) return .need_output;
+    const len = @min(input.len, output.len);
+    @memcpy(output[0..len], input[0..len]);
+    @memset(source_advances[0..len], 1);
+    return .{ .progress = .{ .consumed = len, .produced = len } };
+}
+
+test "[integration] - [internal DTD profile]: has no resolver option or external acquisition path" {
+    try std.testing.expect(!@hasField(xml.Options(INTERNAL_DTD_CONFIG), "resolver"));
+    var reader = try xml.Reader(INTERNAL_DTD_CONFIG).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root [<!ENTITY local 'ok'>]><root>&local;</root>", true);
+    var text_bytes: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .text => |text| text_bytes += text.bytes.len,
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(@as(usize, 2), text_bytes);
+}
+
+test "[integration] - [external policy]: skipped general entity reports identifiers and reference" {
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    const input = "<!DOCTYPE root [<!ENTITY message PUBLIC 'public' 'message.ent'>]><root>&message;</root>";
+    try reader.feed(input, true);
+    var observed = false;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .skipped_entity => |skipped| {
+                observed = true;
+                try std.testing.expectEqual(xml.SkippedEntityKind.general_entity, skipped.kind);
+                try std.testing.expectEqualStrings("message", skipped.name.?);
+                try std.testing.expectEqualStrings("public", skipped.public_id.?);
+                try std.testing.expectEqualStrings("message.ent", skipped.system_id.?);
+                try std.testing.expectEqual(
+                    @as(u64, std.mem.indexOf(u8, input, "&message;").?),
+                    skipped.reference.byte_offset,
+                );
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expect(observed);
+}
+
+test "[integration] - [external policy]: skipped subset and parameter entity are explicit" {
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(
+        "<!DOCTYPE root SYSTEM 'external.dtd' [<!ENTITY % declarations SYSTEM 'declarations.ent'>%declarations;]><root/>",
+        true,
+    );
+    var subset_events: usize = 0;
+    var parameter_events: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .skipped_entity => |skipped| switch (skipped.kind) {
+                .external_subset => {
+                    subset_events += 1;
+                    try std.testing.expectEqualStrings("external.dtd", skipped.system_id.?);
+                },
+                .parameter_entity => {
+                    parameter_events += 1;
+                    try std.testing.expectEqualStrings("declarations", skipped.name.?);
+                    try std.testing.expectEqualStrings("declarations.ent", skipped.system_id.?);
+                },
+                .general_entity => return error.UnexpectedGeneralEntity,
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(@as(usize, 1), subset_events);
+    try std.testing.expectEqual(@as(usize, 1), parameter_events);
+}
+
+test "[integration] - [external entities]: resolves subset, parameter, and general sources" {
+    const resources = [_]TestExternalResource{
+        .{
+            .system_id = "external.dtd",
+            .bytes = "<!ENTITY % declarations SYSTEM 'declarations.ent'>%declarations;" ++
+                "<!ENTITY message SYSTEM 'message.ent'>" ++
+                "<![IGNORE[<!ELEMENT ignored EMPTY>]]>" ++
+                "<![INCLUDE[<!ATTLIST root source CDATA 'external'>]]>",
+            .source_id = 10,
+        },
+        .{
+            .system_id = "declarations.ent",
+            .bytes = "<?xml encoding='UTF-8'?><!ELEMENT root (#PCDATA)>",
+            .source_id = 11,
+        },
+        .{
+            .system_id = "message.ent",
+            .bytes = "<?xml encoding='UTF-8'?>hello",
+            .source_id = 12,
+        },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root>&message;</root>", true);
+    var text: [16]u8 = undefined;
+    var text_len: usize = 0;
+    var attributes: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .start_element => |start| attributes += start.attributes.len,
+            .text => |fragment| {
+                @memcpy(text[text_len..][0..fragment.bytes.len], fragment.bytes);
+                text_len += fragment.bytes.len;
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqualStrings("hello", text[0..text_len]);
+    try std.testing.expectEqual(@as(usize, 1), attributes);
+    try std.testing.expectEqual(@as(usize, 3), resolver.resolves);
+    try std.testing.expectEqual(@as(usize, 3), resolver.closes);
+    try std.testing.expectEqual(@as(?u32, 10), resolver.parameter_inclusion_source_id);
+    try std.testing.expectEqual(
+        @as(?u64, std.mem.indexOf(u8, resources[0].bytes, "%declarations;").?),
+        resolver.parameter_inclusion_offset,
+    );
+}
+
+test "[integration] - [external encoding]: decodes UTF-16 general entity and tracks source" {
+    const utf16 = "\xff\xfe<\x00?\x00x\x00m\x00l\x00 \x00e\x00n\x00c\x00o\x00d\x00i\x00n\x00g\x00=\x00'\x00U\x00T\x00F\x00-\x001\x006\x00'\x00?\x00>\x00h\x00i\x00";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "message.ent", .bytes = utf16, .source_id = 27 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>", true);
+    var external_text: [8]u8 = undefined;
+    var external_text_len: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .text => |text| {
+                @memcpy(external_text[external_text_len..][0..text.bytes.len], text.bytes);
+                external_text_len += text.bytes.len;
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqualStrings("hi", external_text[0..external_text_len]);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external cleanup]: read failure closes once and stays distinct" {
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "external.dtd", .bytes = "<!ELEMENT root EMPTY>", .source_id = 4 },
+    };
+    var resolver = TestResolver{ .resources = &resources, .fail_read_after = 1 };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.ReadFailed, err);
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+    try std.testing.expectError(error.ReadFailed, reader.next());
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external diagnostics]: malformed subset identifies its source" {
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "external.dtd", .bytes = "<!ELEMENT root", .source_id = 42 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.InvalidDtd, err);
+            try std.testing.expectEqual(@as(u32, 42), reader.diagnostic().?.primary.source_id);
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external diagnostics]: malformed source encoding identifies its source byte" {
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "external.dtd", .bytes = "\xff\xfe<", .source_id = 46 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.InvalidDtd, err);
+            const diagnostic = reader.diagnostic().?;
+            try std.testing.expectEqual(xml.DiagnosticCode.malformed_encoding, diagnostic.code);
+            try std.testing.expectEqual(@as(u32, 46), diagnostic.primary.source_id);
+            try std.testing.expectEqual(@as(u64, 2), diagnostic.primary.byte_offset);
+            try std.testing.expectEqual(@as(u64, 1), diagnostic.primary.line);
+            try std.testing.expectEqual(@as(u64, 1), diagnostic.primary.byte_column);
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external diagnostics]: unavailable caller encoding remains distinct" {
+    const resources = [_]TestExternalResource{
+        .{
+            .system_id = "external.dtd",
+            .bytes = "<!ELEMENT root EMPTY>",
+            .source_id = 47,
+            .encoding_hint = .other,
+        },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.UnsupportedFeature, err);
+            const diagnostic = reader.diagnostic().?;
+            try std.testing.expectEqual(xml.DiagnosticCode.unsupported_encoding, diagnostic.code);
+            try std.testing.expectEqual(@as(u32, 47), diagnostic.primary.source_id);
+            try std.testing.expectEqual(@as(u64, 0), diagnostic.primary.byte_offset);
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external diagnostics]: text declaration encoding conflict identifies its token" {
+    const external = "<?xml encoding='UTF-16'?><!ELEMENT root EMPTY>";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "external.dtd", .bytes = external, .source_id = 48 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.InvalidDtd, err);
+            const diagnostic = reader.diagnostic().?;
+            try std.testing.expectEqual(xml.DiagnosticCode.encoding_mismatch, diagnostic.code);
+            try std.testing.expectEqual(@as(u32, 48), diagnostic.primary.source_id);
+            try std.testing.expectEqual(
+                @as(u64, std.mem.indexOf(u8, external, "UTF-16").?),
+                diagnostic.primary.byte_offset,
+            );
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external diagnostics]: UTF-16 DTD offsets remain original after declaration and CRLF normalization" {
+    const ascii = "<?xml encoding='UTF-16'?>\r\n<!ELEMENT root EMPTY>\r\n?";
+    var utf16: [2 + ascii.len * 2]u8 = undefined;
+    utf16[0] = 0xff;
+    utf16[1] = 0xfe;
+    for (ascii, 0..) |byte, index| {
+        utf16[2 + index * 2] = byte;
+        utf16[2 + index * 2 + 1] = 0;
+    }
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "external.dtd", .bytes = &utf16, .source_id = 43 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.InvalidDtd, err);
+            const diagnostic = reader.diagnostic().?;
+            try std.testing.expectEqual(@as(u32, 43), diagnostic.primary.source_id);
+            const invalid_offset = 2 + std.mem.lastIndexOfScalar(u8, ascii, '?').? * 2;
+            try std.testing.expectEqual(@as(u64, invalid_offset), diagnostic.primary.byte_offset);
+            try std.testing.expectEqual(@as(u64, 3), diagnostic.primary.line);
+            try std.testing.expectEqual(@as(u64, 1), diagnostic.primary.byte_column);
+            break;
+        };
+    }
+}
+
+test "[integration] - [external diagnostics]: caller transcoder supplies exact per-output DTD offsets" {
+    const external = "<!ELEMENT root EMPTY>?";
+    const transcoder: xml.Transcoder = .{ .context = null, .runFn = testIdentityTranscoder };
+    const resources = [_]TestExternalResource{
+        .{
+            .system_id = "external.dtd",
+            .bytes = external,
+            .source_id = 44,
+            .encoding_hint = .other,
+            .transcoder = transcoder,
+        },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = external.len };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.InvalidDtd, err);
+            const diagnostic = reader.diagnostic().?;
+            try std.testing.expectEqual(@as(u32, 44), diagnostic.primary.source_id);
+            try std.testing.expectEqual(
+                @as(u64, std.mem.indexOfScalar(u8, external, '?').?),
+                diagnostic.primary.byte_offset,
+            );
+            break;
+        };
+    }
+}
+
+test "[integration] - [external diagnostics]: caller-transcoded general entity keeps source offsets" {
+    const transcoder: xml.Transcoder = .{ .context = null, .runFn = testIdentityTranscoder };
+    const resources = [_]TestExternalResource{
+        .{
+            .system_id = "message.ent",
+            .bytes = "ab<",
+            .source_id = 45,
+            .encoding_hint = .other,
+            .transcoder = transcoder,
+        },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed(
+        "<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>",
+        true,
+    );
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.InvalidXml, err);
+            const diagnostic = reader.diagnostic().?;
+            try std.testing.expectEqual(@as(u32, 45), diagnostic.primary.source_id);
+            try std.testing.expectEqual(@as(u64, 2), diagnostic.primary.byte_offset);
+            try std.testing.expectEqual(@as(usize, 1), diagnostic.inclusion_trace.len);
+            try std.testing.expectEqual(@as(u32, 0), diagnostic.inclusion_trace[0].source_id);
+            break;
+        };
+    }
+}
+
+test "[integration] - [external diagnostics]: nested DTD failures retain the immediate-to-root inclusion chain" {
+    const resources = [_]TestExternalResource{
+        .{
+            .system_id = "external.dtd",
+            .bytes = "\n<!ENTITY % nested SYSTEM 'nested.ent'>\n%nested;",
+            .source_id = 101,
+        },
+        .{ .system_id = "nested.ent", .bytes = "<!ELEMENT root", .source_id = 102 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.InvalidDtd, err);
+            const diagnostic = reader.diagnostic().?;
+            try std.testing.expectEqual(@as(u32, 102), diagnostic.primary.source_id);
+            try std.testing.expectEqual(@as(usize, 2), diagnostic.inclusion_trace.len);
+            try std.testing.expectEqual(@as(u32, 101), diagnostic.inclusion_trace[0].source_id);
+            try std.testing.expectEqual(@as(u64, 3), diagnostic.inclusion_trace[0].line);
+            try std.testing.expectEqual(@as(u64, 1), diagnostic.inclusion_trace[0].byte_column);
+            try std.testing.expectEqual(@as(u32, 0), diagnostic.inclusion_trace[1].source_id);
+            break;
+        };
+    }
+}
+
+test "[integration] - [external diagnostics]: nested resolver failure points to the requesting source" {
+    const external = "<!ENTITY % nested SYSTEM 'missing.ent'>%nested;";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "external.dtd", .bytes = external, .source_id = 103 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.ResolverFailed, err);
+            const diagnostic = reader.diagnostic().?;
+            try std.testing.expectEqual(xml.DiagnosticCode.resolver_not_found, diagnostic.code);
+            try std.testing.expectEqual(@as(u32, 103), diagnostic.primary.source_id);
+            try std.testing.expectEqual(
+                @as(u64, std.mem.indexOf(u8, external, "%nested;").?),
+                diagnostic.primary.byte_offset,
+            );
+            try std.testing.expectEqual(@as(usize, 1), diagnostic.inclusion_trace.len);
+            try std.testing.expectEqual(@as(u32, 0), diagnostic.inclusion_trace[0].source_id);
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external diagnostics]: nested general-entity failure retains both inclusions" {
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "outer.ent", .bytes = "&inner;", .source_id = 104 },
+        .{ .system_id = "inner.ent", .bytes = "<", .source_id = 105 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    const document = "<!DOCTYPE root [" ++
+        "<!ENTITY outer SYSTEM 'outer.ent'>" ++
+        "<!ENTITY inner SYSTEM 'inner.ent'>" ++
+        "]><root>&outer;</root>";
+    try reader.feed(document, true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.InvalidXml, err);
+            const diagnostic = reader.diagnostic().?;
+            try std.testing.expectEqual(@as(u32, 105), diagnostic.primary.source_id);
+            try std.testing.expectEqual(@as(usize, 2), diagnostic.inclusion_trace.len);
+            try std.testing.expectEqual(@as(u32, 104), diagnostic.inclusion_trace[0].source_id);
+            try std.testing.expectEqual(@as(u32, 0), diagnostic.inclusion_trace[1].source_id);
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 2), resolver.closes);
+}
+
+test "[integration] - [external limits]: streamed expansion stops at the semantic byte boundary" {
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "message.ent", .bytes = "hello", .source_id = 5 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.dtd_limits.max_expanded_bytes = 4;
+    options.dtd_limits.expansion_ratio_minimum_bytes = 1024;
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.LimitExceeded, err);
+            try std.testing.expectEqual(xml.DiagnosticCode.entity_expansion_limit, reader.diagnostic().?.code);
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external limits]: acquisition count and source bytes fail before excess use" {
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "message.ent", .bytes = "hello", .source_id = 8 },
+        .{ .system_id = "external.dtd", .bytes = "<!ENTITY message SYSTEM 'message.ent'>", .source_id = 9 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{
+        .policy = .resolve,
+        .resolver = resolver.resolver(),
+        .max_source_bytes = 4,
+    };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    const input = "<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>";
+    try reader.feed(input, true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.LimitExceeded, err);
+            try std.testing.expectEqual(xml.DiagnosticCode.external_resource_bytes_limit, reader.diagnostic().?.code);
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+
+    try reader.reset(.retain_capacity);
+    resolver.reads = 0;
+    resolver.resolves = 0;
+    resolver.closes = 0;
+    options.resolver.max_source_bytes = 64;
+    options.resolver.max_resources = 1;
+    reader.options = options;
+    try reader.feed(
+        "<!DOCTYPE root SYSTEM 'external.dtd'><root>&message;</root>",
+        true,
+    );
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.LimitExceeded, err);
+            try std.testing.expectEqual(xml.DiagnosticCode.external_resource_count_limit, reader.diagnostic().?.code);
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolver.resolves);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external cleanup]: cancellation and reset close active sources once" {
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "message.ent", .bytes = "long external text", .source_id = 6 },
+    };
+    var resolver = TestResolver{ .resources = &resources, .cancel_read_after = 0 };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.Cancelled, err);
+            try std.testing.expectEqual(xml.DiagnosticCode.resolver_cancelled, reader.diagnostic().?.code);
+            break;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+
+    try reader.reset(.retain_capacity);
+    resolver.cancel_read_after = null;
+    resolver.reads = 0;
+    try reader.feed("<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>", true);
+    parse: while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .text => break :parse,
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => return error.UnexpectedDone,
+    };
+    try reader.reset(.retain_capacity);
+    try std.testing.expectEqual(@as(usize, 2), resolver.closes);
+}
+
+test "[integration] - [external cleanup]: deinit closes an active source once" {
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "message.ent", .bytes = "long external text", .source_id = 7 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    try reader.feed("<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>", true);
+    parse: while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .text => break :parse,
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => return error.UnexpectedDone,
+    };
+    reader.deinit();
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external memory]: large generated entity keeps reader storage flat" {
+    const GeneratedResolver = struct {
+        remaining: usize,
+        closes: usize = 0,
+
+        fn resolver(self: *@This()) xml.Resolver {
+            return .{ .context = self, .resolveFn = resolve };
+        }
+
+        fn resolve(context: ?*anyopaque, _: xml.ResolverRequest) xml.ResolverResult {
+            return .{ .source = .{
+                .context = context,
+                .source_id = 31,
+                .encoding_hint = .utf8,
+                .readFn = read,
+                .closeFn = close,
+            } };
+        }
+
+        fn read(context: ?*anyopaque, output: []u8) xml.ResolverReadResult {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.remaining == 0) return .end;
+            const len = @min(output.len, self.remaining);
+            @memset(output[0..len], 'x');
+            self.remaining -= len;
+            return .{ .bytes = len };
+        }
+
+        fn close(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.closes += 1;
+        }
+    };
+    const generated_bytes = 2 * 1024 * 1024;
+    var resolver = GeneratedResolver{ .remaining = generated_bytes };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.dtd_limits.max_expanded_bytes = generated_bytes;
+    options.dtd_limits.max_expansion_ratio = generated_bytes;
+    options.dtd_limits.expansion_ratio_minimum_bytes = generated_bytes;
+    options.resolver = .{
+        .policy = .resolve,
+        .resolver = resolver.resolver(),
+        .max_source_bytes = generated_bytes,
+        .max_total_bytes = generated_bytes,
+    };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root [<!ENTITY data SYSTEM 'generated.ent'>]><root>&data;</root>", true);
+    var text_bytes: usize = 0;
+    var peak_capacity: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| {
+            peak_capacity = @max(peak_capacity, reader.memoryUsage().retained_capacity);
+            switch (event) {
+                .text => |text| text_bytes += text.bytes.len,
+                else => {},
+            }
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(@as(usize, generated_bytes), text_bytes);
+    try std.testing.expect(peak_capacity < 512 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+fn externalAllocationAttempt(allocator: std.mem.Allocator) !void {
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "external.dtd", .bytes = "<!ENTITY message SYSTEM 'message.ent'>", .source_id = 51 },
+        .{ .system_id = "message.ent", .bytes = "external", .source_id = 52 },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.Reader(DTD_CONFIG).init(allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root>&message;</root>", true);
+    while (true) switch (try reader.next()) {
+        .event => {},
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(@as(usize, 2), resolver.closes);
+}
+
+test "[integration] - [external allocation]: every parser allocation failure closes sources" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        externalAllocationAttempt,
+        .{},
+    );
+}
+
+test "[integration] - [rooted resolver]: reads beneath root and rejects escape and symlink paths" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    try temporary.dir.createDir(io, "schemas", .default_dir);
+    try temporary.dir.writeFile(io, .{
+        .sub_path = "schemas/document.dtd",
+        .data = "<!ELEMENT root EMPTY>",
+    });
+    try temporary.dir.writeFile(io, .{
+        .sub_path = "outside.dtd",
+        .data = "<!ELEMENT root ANY>",
+    });
+    try temporary.dir.symLink(io, "../outside.dtd", "schemas/link.dtd", .{});
+
+    var rooted = xml.RootedFilesystemResolver.init(std.testing.allocator, io, temporary.dir);
+    var options: xml.Options(DTD_CONFIG) = .{};
+    options.resolver = .{
+        .policy = .resolve,
+        .resolver = rooted.resolver(),
+        .document_base_id = "document.xml",
+    };
+    var reader = try xml.Reader(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'schemas/document.dtd'><root/>", true);
+    while (true) switch (try reader.next()) {
+        .event => {},
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+
+    try reader.reset(.retain_capacity);
+    try reader.feed("<!DOCTYPE root SYSTEM '../outside.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.ResolverFailed, err);
+            try std.testing.expectEqual(xml.DiagnosticCode.resolver_forbidden, reader.diagnostic().?.code);
+            break;
+        };
+    }
+
+    try reader.reset(.retain_capacity);
+    try reader.feed("<!DOCTYPE root SYSTEM 'schemas/link.dtd'><root/>", true);
+    while (true) {
+        _ = reader.next() catch |err| {
+            try std.testing.expectEqual(error.ResolverFailed, err);
+            try std.testing.expectEqual(xml.DiagnosticCode.resolver_forbidden, reader.diagnostic().?.code);
+            break;
+        };
+    }
 }

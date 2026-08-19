@@ -3,6 +3,7 @@
 const std = @import("std");
 const encoding_module = @import("encoding.zig");
 const dtd_module = @import("dtd.zig");
+const resolver_module = @import("resolver.zig");
 
 /// XML capability profile selected at compile time.
 pub const Profile = enum {
@@ -74,7 +75,7 @@ pub const Profile = enum {
         };
     }
 
-    /// Returns whether this stage implements the profile's complete grammar.
+    /// Returns whether the reader implements the profile's complete grammar.
     pub fn isImplemented(comptime self: Profile) bool {
         return switch (self) {
             .xml10_utf8_no_dtd,
@@ -114,16 +115,21 @@ pub const Config = struct {
     report: Report = .semantic,
     diagnostic_location: DiagnosticLocation = .line_column,
     event_locations: bool = false,
+    /// Includes caller-controlled external parsed-entity resolution.
+    external_sources: bool = false,
 
     /// Rejects combinations whose promised events cannot exist in a profile.
     pub fn validate(comptime self: Config) void {
         if (self.report == .detailed and self.profile.dtdMode() == .rejected) {
             @compileError("detailed reporting requires a DTD-capable profile");
         }
+        if (self.external_sources and self.profile.dtdMode() == .rejected) {
+            @compileError("external sources require a DTD-capable profile");
+        }
     }
 };
 
-/// Reviewed configurations for normal callers and benchmark lanes.
+/// Named configurations for normal callers and benchmark lanes.
 pub const Configs = struct {
     /// Line-aware XML 1.0 UTF-8 core profile.
     pub const XML10_UTF8_NO_DTD: Config = .{
@@ -169,9 +175,19 @@ pub const Configs = struct {
     /// Full non-validating XML 1.0 profile without namespaces.
     pub const XML10_NONVALIDATING: Config = .{
         .profile = .xml10_nonvalidating,
+        .external_sources = true,
     };
     /// Full namespace-aware non-validating XML 1.0 profile.
     pub const XML10_NAMESPACES_NONVALIDATING: Config = .{
+        .profile = .xml10_ns_nonvalidating,
+        .external_sources = true,
+    };
+    /// Non-validating XML 1.0 restricted to the document and internal subset.
+    pub const XML10_NONVALIDATING_INTERNAL: Config = .{
+        .profile = .xml10_nonvalidating,
+    };
+    /// Namespace-aware non-validating XML 1.0 restricted to internal sources.
+    pub const XML10_NAMESPACES_NONVALIDATING_INTERNAL: Config = .{
         .profile = .xml10_ns_nonvalidating,
     };
     /// DTD-validating XML 1.0 profile without namespaces.
@@ -206,7 +222,7 @@ pub const Lifecycle = enum {
     deinitialized,
 };
 
-/// Runtime limits implemented by the current reader stage.
+/// Runtime limits enforced by the reader.
 pub const Limits = struct {
     /// Maximum simultaneously open element count.
     max_depth: usize = 256,
@@ -314,10 +330,10 @@ pub const MemoryUsage = struct {
     retained_capacity: usize = 0,
 };
 
-/// Stable diagnostic category for the current reader API.
+/// Stable diagnostic category returned by the reader.
 pub const DiagnosticCode = enum {
     invalid_state,
-    unsupported_stage,
+    unsupported_profile,
     empty_document,
     unexpected_document_text,
     malformed_start_tag,
@@ -400,6 +416,14 @@ pub const DiagnosticCode = enum {
     dtd_comparison_work_limit,
     recursive_entity,
     entity_expansion_limit,
+    external_resource_count_limit,
+    external_resource_bytes_limit,
+    external_resource_depth_limit,
+    resolver_not_found,
+    resolver_forbidden,
+    resolver_unsupported_scheme,
+    resolver_io_failure,
+    resolver_cancelled,
     read_failed,
 };
 
@@ -426,17 +450,42 @@ pub fn Diagnostic(comptime config: Config) type {
         code: DiagnosticCode,
         primary: Location(config),
         related: ?Location(config) = null,
+        inclusion_trace: if (config.external_sources) []const Location(config) else void =
+            if (config.external_sources) &.{} else {},
     };
 }
 
 fn ResolverOptions(comptime config: Config) type {
-    return if (config.profile.dtdMode() == .rejected)
+    return if (!config.external_sources)
         struct {}
     else
         struct {
-            context: ?*anyopaque = null,
+            /// Whether external declarations are skipped or passed to `resolver`.
+            policy: ExternalPolicy = .skip,
+            /// Caller-owned resolver. Required when `policy` is `resolve`.
+            resolver: ?resolver_module.Resolver = null,
+            /// Base identifier of the document entity, when known.
+            document_base_id: ?[]const u8 = null,
+            /// Maximum external resources acquired for one document.
+            max_resources: usize = 256,
+            /// Maximum bytes read from one external resource.
+            max_source_bytes: usize = 8 * 1024 * 1024,
+            /// Maximum cumulative bytes read from external resources.
+            max_total_bytes: usize = 32 * 1024 * 1024,
+
+            fn validate(self: @This()) bool {
+                return self.max_resources > 0 and self.max_source_bytes > 0 and
+                    self.max_total_bytes > 0 and
+                    (self.policy == .skip or self.resolver != null);
+            }
         };
 }
+
+/// Runtime handling of external declarations in non-validating profiles.
+pub const ExternalPolicy = enum {
+    skip,
+    resolve,
+};
 
 fn ValidationOptions(comptime config: Config) type {
     return if (config.profile.dtdMode() == .validating)
@@ -450,11 +499,16 @@ fn ValidationOptions(comptime config: Config) type {
 /// Runtime options containing only state permitted by `config`.
 pub fn Options(comptime config: Config) type {
     config.validate();
-    return struct {
+    return if (config.external_sources) struct {
         limits: Limits = .{},
         namespace_limits: NamespaceLimits(config) = .{},
         dtd_limits: if (config.profile.dtdMode() == .rejected) struct {} else dtd_module.Limits = .{},
         resolver: ResolverOptions(config) = .{},
+        validation: ValidationOptions(config) = .{},
+    } else struct {
+        limits: Limits = .{},
+        namespace_limits: NamespaceLimits(config) = .{},
+        dtd_limits: if (config.profile.dtdMode() == .rejected) struct {} else dtd_module.Limits = .{},
         validation: ValidationOptions(config) = .{},
     };
 }
@@ -562,6 +616,18 @@ const ProcessingInstruction = struct {
 const Declaration = struct {
     name: []const u8,
 };
+/// Kind of external input intentionally not read by the selected policy.
+pub const SkippedEntityKind = enum { external_subset, parameter_entity, general_entity };
+
+fn SkippedEntity(comptime config: Config) type {
+    return struct {
+        name: ?[]const u8,
+        kind: SkippedEntityKind,
+        public_id: ?[]const u8,
+        system_id: ?[]const u8,
+        reference: Location(config),
+    };
+}
 const NotationDeclaration = struct {
     name: []const u8,
     public_id: ?[]const u8,
@@ -600,7 +666,7 @@ fn DtdEventPayload(comptime config: Config) type {
         text: Text,
         comment: Comment,
         processing_instruction: ProcessingInstruction,
-        skipped_entity: Declaration,
+        skipped_entity: SkippedEntity(config),
         document_end: DocumentEnd,
     };
 }
@@ -621,7 +687,7 @@ fn DetailedDtdEventPayload(comptime config: Config) type {
         text: Text,
         comment: Comment,
         processing_instruction: ProcessingInstruction,
-        skipped_entity: Declaration,
+        skipped_entity: SkippedEntity(config),
         document_end: DocumentEnd,
     };
 }
@@ -801,10 +867,21 @@ fn EntitySourceFrame(comptime config: Config) type {
         cursor: usize,
         final_input: bool,
         source_byte_offset: u64,
+        source_id: u32,
         position: PositionState(config),
         entity_index: usize,
         open_depth: usize,
         resume_state: VerticalState,
+        external: if (config.external_sources) bool else void =
+            if (config.external_sources) false else {},
+        source_encoding: if (config.external_sources) SourceEncoding else void =
+            if (config.external_sources) .utf8 else {},
+        source_state: if (config.external_sources) SourceState(config) else void =
+            if (config.external_sources) .{} else {},
+        active_external: if (config.external_sources) ?resolver_module.Source else void =
+            if (config.external_sources) null else {},
+        active_external_inclusion: if (config.external_sources) ?Location(config) else void =
+            if (config.external_sources) null else {},
     };
 }
 
@@ -812,6 +889,20 @@ const AttributeEntityFrame = struct {
     bytes: []const u8,
     cursor: usize = 0,
     entity_index: ?usize = null,
+};
+
+const ExternalBuffer = struct {
+    bytes: []u8,
+    source_advances: []u32,
+    source_start_offset: u64,
+    source_start_line: u64,
+    source_start_column: u64,
+    source_id: u32,
+    base_id: ?[]u8,
+    inclusion_source_id: u32,
+    inclusion_offset: u64,
+    inclusion_line: u64,
+    inclusion_column: u64,
 };
 
 fn DtdState(comptime config: Config) type {
@@ -823,9 +914,25 @@ fn DtdState(comptime config: Config) type {
             entity_sources: std.ArrayList(EntitySourceFrame(config)) = .empty,
             attribute_sources: std.ArrayList(AttributeEntityFrame) = .empty,
             reference_name: std.ArrayList(u8) = .empty,
+            external_buffers: if (config.external_sources) std.ArrayList(ExternalBuffer) else void =
+                if (config.external_sources) .empty else {},
+            external_resource_count: if (config.external_sources) usize else void =
+                if (config.external_sources) 0 else {},
+            external_resource_bytes: if (config.external_sources) usize else void =
+                if (config.external_sources) 0 else {},
+            source_id: u32 = 0,
+            external_failure_code: if (config.external_sources) ?DiagnosticCode else void =
+                if (config.external_sources) null else {},
+            external_failure_location: if (config.external_sources) ?Location(config) else void =
+                if (config.external_sources) null else {},
+            active_external: if (config.external_sources) ?resolver_module.Source else void =
+                if (config.external_sources) null else {},
+            active_external_inclusion: if (config.external_sources) ?Location(config) else void =
+                if (config.external_sources) null else {},
             document_type_emitted: bool = false,
             report_cursor: usize = 0,
             pending_entity_index: usize = 0,
+            pending_skipped_entity_index: ?usize = null,
             doctype_data_start: Location(config) = .{},
             seen_doctype: bool = false,
             bracket_depth: usize = 0,
@@ -937,7 +1044,9 @@ const Failure = enum {
     unsupported_feature,
     limit_exceeded,
     out_of_memory,
+    resolver_failed,
     read_failed,
+    cancelled,
 };
 
 const decoded_input_capacity = 16 * 1024;
@@ -957,6 +1066,18 @@ fn isUnsupportedFourByteSignature(bytes: [4]u8) bool {
         std.mem.eql(u8, &bytes, "\x3c\x00\x00\x00") or
         std.mem.eql(u8, &bytes, "\x00\x00\x3c\x00") or
         std.mem.eql(u8, &bytes, "\x00\x3c\x00\x00");
+}
+
+fn ExternalDecoderState(comptime config: Config) type {
+    return if (!config.external_sources)
+        struct {}
+    else
+        struct {
+            raw: std.ArrayList(u8) = .empty,
+            transcoder: ?encoding_module.Transcoder = null,
+            eof: bool = false,
+            at_start: bool = true,
+        };
 }
 
 fn SourceState(comptime config: Config) type {
@@ -979,6 +1100,7 @@ fn SourceState(comptime config: Config) type {
             high_surrogate: ?u16 = null,
             high_surrogate_offset: u64 = 0,
             failure: ?EncodingFailure = null,
+            external: ExternalDecoderState(config) = .{},
         };
 }
 
@@ -1005,6 +1127,10 @@ pub fn Reader(comptime config: Config) type {
         source_state: SourceState(config) = .{},
         position: PositionState(config) = .{},
         first_diagnostic: ?Diagnostic(config) = null,
+        diagnostic_inclusions: if (config.external_sources)
+            std.ArrayList(Location(config))
+        else
+            void = if (config.external_sources) .empty else {},
         vertical_state: VerticalState = .detect_bom,
         failure: ?Failure = null,
         open_elements: std.ArrayList(OpenElementFrame(config)) = .empty,
@@ -1060,7 +1186,12 @@ pub fn Reader(comptime config: Config) type {
                 return error.InvalidOptions;
             }
             if (comptime config.profile.dtdMode() != .rejected) {
-                if (!options.dtd_limits.validate()) return error.InvalidOptions;
+                if (!options.dtd_limits.validate()) {
+                    return error.InvalidOptions;
+                }
+            }
+            if (comptime config.external_sources) {
+                if (!options.resolver.validate()) return error.InvalidOptions;
             }
             return .{
                 .allocator = allocator,
@@ -1094,6 +1225,9 @@ pub fn Reader(comptime config: Config) type {
                     }
                 },
                 .release_memory => self.releaseStorage(),
+            }
+            if (comptime config.external_sources) {
+                self.diagnostic_inclusions.clearRetainingCapacity();
             }
             self.lifecycle = .ready;
             self.input = &.{};
@@ -1202,7 +1336,7 @@ pub fn Reader(comptime config: Config) type {
                 .producing => {},
             }
             if (comptime !config.profile.isImplemented()) {
-                return self.fail(.unsupported_stage, .unsupported_feature);
+                return self.fail(.unsupported_profile, .unsupported_feature);
             }
 
             if (comptime !config.profile.isUtf8Only()) {
@@ -2252,8 +2386,35 @@ pub fn Reader(comptime config: Config) type {
                     .emit_skipped_entity => {
                         if (comptime config.profile.dtdMode() == .rejected) unreachable;
                         self.vertical_state = .content;
+                        const entity_index = self.dtd_state.pending_skipped_entity_index;
+                        self.dtd_state.pending_skipped_entity_index = null;
+                        const declaration = if (entity_index) |index|
+                            self.dtd_state.declarations.entities.items[index]
+                        else
+                            null;
                         return self.eventStep(
-                            .{ .skipped_entity = .{ .name = self.dtd_state.reference_name.items } },
+                            .{ .skipped_entity = .{
+                                .name = if (declaration) |entity|
+                                    self.dtd_state.declarations.string(entity.name)
+                                else
+                                    self.dtd_state.reference_name.items,
+                                .kind = .general_entity,
+                                .public_id = if (declaration) |entity|
+                                    if (entity.external_id.public_id) |value|
+                                        self.dtd_state.declarations.string(value)
+                                    else
+                                        null
+                                else
+                                    null,
+                                .system_id = if (declaration) |entity|
+                                    if (entity.external_id.system_id) |value|
+                                        self.dtd_state.declarations.string(value)
+                                    else
+                                        null
+                                else
+                                    null,
+                                .reference = self.reference_start,
+                            } },
                             self.reference_start,
                             self.reference_start,
                         );
@@ -2361,8 +2522,18 @@ pub fn Reader(comptime config: Config) type {
 
         fn decoderCapacity(self: *const Self) usize {
             if (comptime config.profile.isUtf8Only()) return 0;
-            return self.source_state.decoded.capacity +|
+            var total = self.source_state.decoded.capacity +|
                 self.source_state.source_advances.capacity;
+            if (comptime config.external_sources) {
+                total +|= self.source_state.external.raw.capacity;
+                for (self.dtd_state.entity_sources.items) |frame| {
+                    if (!frame.external) continue;
+                    total +|= frame.source_state.decoded.capacity +|
+                        frame.source_state.source_advances.capacity +|
+                        frame.source_state.external.raw.capacity;
+                }
+            }
+            return total;
         }
 
         fn namespaceCapacity(self: *const Self) usize {
@@ -2385,7 +2556,24 @@ pub fn Reader(comptime config: Config) type {
             return self.dtd_state.declarations.capacity() +|
                 self.dtd_state.entity_sources.capacity *| @sizeOf(EntitySourceFrame(config)) +|
                 self.dtd_state.attribute_sources.capacity *| @sizeOf(AttributeEntityFrame) +|
-                self.dtd_state.reference_name.capacity;
+                self.dtd_state.reference_name.capacity +|
+                if (comptime config.external_sources)
+                    self.dtd_state.external_buffers.capacity *| @sizeOf(ExternalBuffer) +|
+                        self.externalBufferCapacity() +|
+                        self.diagnostic_inclusions.capacity *| @sizeOf(Location(config))
+                else
+                    0;
+        }
+
+        fn externalBufferCapacity(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() == .rejected or !config.external_sources) return 0;
+            var total: usize = 0;
+            for (self.dtd_state.external_buffers.items) |buffer| {
+                total +|= buffer.bytes.len +|
+                    buffer.source_advances.len *| @sizeOf(u32);
+                if (buffer.base_id) |base_id| total +|= base_id.len;
+            }
+            return total;
         }
 
         fn namespaceBytes(self: *const Self) usize {
@@ -2408,14 +2596,21 @@ pub fn Reader(comptime config: Config) type {
                 self.namespace_state.event_attribute_locations.deinit(self.allocator);
             }
             if (comptime !config.profile.isUtf8Only()) {
-                self.source_state.decoded.deinit(self.allocator);
-                self.source_state.source_advances.deinit(self.allocator);
+                self.deinitSourceState(&self.source_state);
             }
             if (comptime config.profile.dtdMode() != .rejected) {
+                self.releaseEntitySources();
+                if (comptime config.external_sources) self.freeExternalBuffers();
                 self.dtd_state.declarations.deinit(self.allocator);
                 self.dtd_state.entity_sources.deinit(self.allocator);
                 self.dtd_state.attribute_sources.deinit(self.allocator);
                 self.dtd_state.reference_name.deinit(self.allocator);
+                if (comptime config.external_sources) {
+                    self.dtd_state.external_buffers.deinit(self.allocator);
+                }
+            }
+            if (comptime config.external_sources) {
+                self.diagnostic_inclusions.deinit(self.allocator);
             }
             self.open_elements = .empty;
             self.open_names = .empty;
@@ -2425,6 +2620,7 @@ pub fn Reader(comptime config: Config) type {
             self.namespace_state = .{};
             self.source_state = .{};
             self.dtd_state = .{};
+            self.diagnostic_inclusions = if (config.external_sources) .empty else {};
         }
 
         fn resetSourceStateRetainingCapacity(self: *Self) void {
@@ -2444,6 +2640,12 @@ pub fn Reader(comptime config: Config) type {
             self.source_state.high_surrogate = null;
             self.source_state.high_surrogate_offset = 0;
             self.source_state.failure = null;
+            if (comptime config.external_sources) {
+                self.source_state.external.raw.clearRetainingCapacity();
+                self.source_state.external.transcoder = null;
+                self.source_state.external.eof = false;
+                self.source_state.external.at_start = true;
+            }
         }
 
         fn clearAttributesRetainingCapacity(self: *Self) void {
@@ -2475,16 +2677,63 @@ pub fn Reader(comptime config: Config) type {
 
         fn clearDtdRetainingCapacity(self: *Self) void {
             if (comptime config.profile.dtdMode() != .rejected) {
+                self.releaseEntitySources();
+                if (comptime config.external_sources) self.freeExternalBuffers();
                 self.dtd_state.declarations.clearRetainingCapacity();
                 self.dtd_state.entity_sources.clearRetainingCapacity();
                 self.dtd_state.attribute_sources.clearRetainingCapacity();
                 self.dtd_state.reference_name.clearRetainingCapacity();
+                self.dtd_state.source_id = 0;
+                if (comptime config.external_sources) {
+                    self.dtd_state.external_resource_count = 0;
+                    self.dtd_state.external_resource_bytes = 0;
+                    self.dtd_state.external_failure_code = null;
+                    self.dtd_state.external_failure_location = null;
+                    self.dtd_state.active_external_inclusion = null;
+                }
                 self.dtd_state.report_cursor = 0;
+                self.dtd_state.pending_skipped_entity_index = null;
                 self.dtd_state.document_type_emitted = false;
                 self.dtd_state.seen_doctype = false;
                 self.dtd_state.bracket_depth = 0;
                 self.dtd_state.lexical_state = .normal;
             }
+        }
+
+        fn freeExternalBuffers(self: *Self) void {
+            if (comptime config.profile.dtdMode() == .rejected or !config.external_sources) return;
+            for (self.dtd_state.external_buffers.items) |buffer| {
+                self.allocator.free(buffer.bytes);
+                self.allocator.free(buffer.source_advances);
+                if (buffer.base_id) |base_id| self.allocator.free(base_id);
+            }
+            self.dtd_state.external_buffers.clearRetainingCapacity();
+        }
+
+        fn deinitSourceState(self: *Self, source: *SourceState(config)) void {
+            if (comptime config.profile.isUtf8Only()) return;
+            source.decoded.deinit(self.allocator);
+            source.source_advances.deinit(self.allocator);
+            if (comptime config.external_sources) {
+                source.external.raw.deinit(self.allocator);
+            }
+            source.* = .{};
+        }
+
+        fn releaseEntitySources(self: *Self) void {
+            if (comptime config.profile.dtdMode() == .rejected) return;
+            if (comptime config.external_sources) {
+                if (self.dtd_state.active_external) |source| source.close();
+                self.dtd_state.active_external = null;
+                self.dtd_state.active_external_inclusion = null;
+            }
+            for (self.dtd_state.entity_sources.items) |*frame| {
+                if (comptime config.external_sources) {
+                    if (frame.active_external) |source| source.close();
+                    if (frame.external) self.deinitSourceState(&frame.source_state);
+                }
+            }
+            self.dtd_state.entity_sources.clearRetainingCapacity();
         }
 
         fn documentStart(self: *const Self) DocumentStart {
@@ -2569,16 +2818,186 @@ pub fn Reader(comptime config: Config) type {
                 unreachable;
             } else {
                 self.dtd_state.declarations.discardDoctypeHeader();
-                self.dtd_state.declarations.parseDoctype(
-                    self.allocator,
-                    self.options.dtd_limits,
-                ) catch |err| return self.mapDoctypeError(err);
+                if (comptime config.external_sources) {
+                    self.dtd_state.declarations.parseDoctypeExternal(
+                        self.allocator,
+                        self.options.dtd_limits,
+                        .{ .context = self, .resolveFn = dtdExternalResolve },
+                    ) catch |err| return self.mapDoctypeError(err);
+                } else {
+                    self.dtd_state.declarations.parseDoctype(
+                        self.allocator,
+                        self.options.dtd_limits,
+                    ) catch |err| return self.mapDoctypeError(err);
+                }
                 if (comptime config.profile.hasNamespaces()) {
                     try self.validateDtdNamespaceNames();
                 }
                 self.dtd_state.report_cursor = 0;
                 self.vertical_state = .emit_dtd_report;
             }
+        }
+
+        fn dtdExternalResolve(
+            context: ?*anyopaque,
+            request: dtd_module.ExternalRequest,
+        ) dtd_module.ParseError!dtd_module.ExternalResult {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            const kind: resolver_module.EntityKind = switch (request.kind) {
+                .subset => .external_subset,
+                .parameter_entity => .parameter_entity,
+            };
+            return self.acquireExternal(
+                kind,
+                request.name,
+                request.public_id,
+                request.system_id,
+                request.base_id,
+                if (request.inclusion_source_id == 0)
+                    self.dtdLocation(request.inclusion_offset)
+                else
+                    self.dtdSourceLocation(request.inclusion_source_id, request.inclusion_offset),
+            );
+        }
+
+        fn acquireExternal(
+            self: *Self,
+            kind: resolver_module.EntityKind,
+            name: ?[]const u8,
+            public_id: ?[]const u8,
+            system_id: []const u8,
+            requested_base_id: ?[]const u8,
+            inclusion: Location(config),
+        ) dtd_module.ParseError!dtd_module.ExternalResult {
+            const maybe_source = try self.openExternalSource(
+                kind,
+                name,
+                public_id,
+                system_id,
+                requested_base_id,
+                inclusion,
+            );
+            const source = maybe_source orelse return .skipped;
+            defer source.close();
+
+            var raw: std.ArrayList(u8) = .empty;
+            defer raw.deinit(self.allocator);
+            var chunk: [16 * 1024]u8 = undefined;
+            while (true) switch (source.read(&chunk)) {
+                .bytes => |len| {
+                    if (len > self.options.resolver.max_source_bytes -| raw.items.len or
+                        len > self.options.resolver.max_total_bytes -| self.dtd_state.external_resource_bytes)
+                    {
+                        return self.externalProviderFailure(.external_resource_bytes_limit, error.LimitExceeded);
+                    }
+                    raw.appendSlice(self.allocator, chunk[0..len]) catch return error.OutOfMemory;
+                    self.dtd_state.external_resource_bytes += len;
+                },
+                .end => break,
+                .io_failure => return self.externalProviderFailure(.resolver_io_failure, error.ReadFailed),
+                .cancelled => return self.externalProviderFailure(.resolver_cancelled, error.Cancelled),
+            };
+            var decode_failure: ?ExternalDecodeFailure = null;
+            const decoded = decodeExternalSource(
+                self.allocator,
+                raw.items,
+                source.encoding_hint,
+                source.transcoder,
+                self.options.resolver.max_source_bytes,
+                &decode_failure,
+            ) catch |err| {
+                if (decode_failure) |failure| {
+                    self.dtd_state.external_failure_code = failure.code;
+                    var location = locationFromSource(config, source.source_id, failure.byte_offset);
+                    if (config.diagnostic_location == .line_column) {
+                        location.line = failure.line;
+                        location.byte_column = failure.byte_column;
+                    }
+                    self.dtd_state.external_failure_location = location;
+                }
+                return err;
+            };
+            errdefer decoded.deinit(self.allocator);
+            const owned_base = if (source.base_id) |value|
+                self.allocator.dupe(u8, value) catch return error.OutOfMemory
+            else
+                null;
+            errdefer if (owned_base) |value| self.allocator.free(value);
+            self.dtd_state.external_buffers.append(self.allocator, .{
+                .bytes = decoded.bytes,
+                .source_advances = decoded.source_advances,
+                .source_start_offset = decoded.source_start_offset,
+                .source_start_line = decoded.source_start_line,
+                .source_start_column = decoded.source_start_column,
+                .source_id = source.source_id,
+                .base_id = owned_base,
+                .inclusion_source_id = inclusion.source_id,
+                .inclusion_offset = inclusion.byte_offset,
+                .inclusion_line = if (config.diagnostic_location == .line_column) inclusion.line else 1,
+                .inclusion_column = if (config.diagnostic_location == .line_column) inclusion.byte_column else 1,
+            }) catch return error.OutOfMemory;
+            return .{ .content = .{
+                .bytes = decoded.bytes,
+                .base_id = owned_base,
+                .source_id = source.source_id,
+            } };
+        }
+
+        fn openExternalSource(
+            self: *Self,
+            kind: resolver_module.EntityKind,
+            name: ?[]const u8,
+            public_id: ?[]const u8,
+            system_id: []const u8,
+            requested_base_id: ?[]const u8,
+            inclusion: Location(config),
+        ) dtd_module.ParseError!?resolver_module.Source {
+            if (self.options.resolver.policy == .skip) return null;
+            self.dtd_state.external_failure_code = null;
+            self.dtd_state.external_failure_location = inclusion;
+            self.diagnostic_inclusions.ensureTotalCapacity(
+                self.allocator,
+                @min(
+                    self.options.dtd_limits.max_active_entity_depth,
+                    self.dtd_state.external_resource_count +| 1,
+                ),
+            ) catch return error.OutOfMemory;
+            if (self.dtd_state.external_resource_count == self.options.resolver.max_resources) {
+                return self.externalProviderFailure(.external_resource_count_limit, error.LimitExceeded);
+            }
+            self.dtd_state.external_resource_count += 1;
+            const callback = self.options.resolver.resolver.?;
+            const base_id = requested_base_id orelse self.options.resolver.document_base_id;
+            const result = callback.resolve(.{
+                .kind = kind,
+                .name = name,
+                .public_id = public_id,
+                .system_id = system_id,
+                .base_id = base_id,
+                .inclusion = .{
+                    .source_id = inclusion.source_id,
+                    .byte_offset = inclusion.byte_offset,
+                },
+            });
+            const source = switch (result) {
+                .source => |source| source,
+                .not_found => return self.externalProviderFailure(.resolver_not_found, error.ResolverFailed),
+                .forbidden => return self.externalProviderFailure(.resolver_forbidden, error.ResolverFailed),
+                .unsupported_scheme => return self.externalProviderFailure(.resolver_unsupported_scheme, error.ResolverFailed),
+                .io_failure => return self.externalProviderFailure(.resolver_io_failure, error.ResolverFailed),
+                .resource_limit => return self.externalProviderFailure(.external_resource_bytes_limit, error.LimitExceeded),
+                .cancelled => return self.externalProviderFailure(.resolver_cancelled, error.Cancelled),
+            };
+            return source;
+        }
+
+        fn externalProviderFailure(
+            self: *Self,
+            code: DiagnosticCode,
+            err: dtd_module.ParseError,
+        ) dtd_module.ParseError {
+            self.dtd_state.external_failure_code = code;
+            return err;
         }
 
         fn appendDoctypeByte(self: *Self, byte: u8) ReadError!void {
@@ -2639,13 +3058,34 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn mapDoctypeError(self: *Self, err: dtd_module.ParseError) ReadError {
-            const location = self.dtdFailureLocation();
+            const external_code: ?DiagnosticCode = if (comptime config.external_sources)
+                self.dtd_state.external_failure_code
+            else
+                null;
+            const location = if (comptime config.external_sources)
+                if (external_code != null)
+                    self.dtd_state.external_failure_location orelse self.dtdFailureLocation()
+                else
+                    self.dtdFailureLocation()
+            else
+                self.dtdFailureLocation();
             const code = self.dtdDiagnosticCode();
             return switch (err) {
-                error.InvalidDtd => self.failAt(code, .invalid_dtd, location),
-                error.UnsupportedFeature => self.failAt(.unsupported_doctype, .unsupported_feature, location),
-                error.LimitExceeded => self.failAt(code, .limit_exceeded, location),
+                error.InvalidDtd => self.failAt(external_code orelse code, .invalid_dtd, location),
+                error.UnsupportedFeature => self.failAt(
+                    external_code orelse .unsupported_doctype,
+                    .unsupported_feature,
+                    location,
+                ),
+                error.LimitExceeded => self.failAt(
+                    external_code orelse code,
+                    .limit_exceeded,
+                    location,
+                ),
                 error.OutOfMemory => self.failOutOfMemory(),
+                error.ResolverFailed => self.failAt(external_code orelse .resolver_io_failure, .resolver_failed, location),
+                error.ReadFailed => self.failAt(external_code orelse .resolver_io_failure, .read_failed, location),
+                error.Cancelled => self.failAt(external_code orelse .resolver_cancelled, .cancelled, location),
             };
         }
 
@@ -2683,15 +3123,58 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn dtdFailureLocation(self: *const Self) Location(config) {
+            const failure = self.dtd_state.declarations.failure orelse return self.dtdLocation(0);
+            if (failure.source_id != 0) {
+                return self.dtdSourceLocation(failure.source_id, failure.offset);
+            }
+            const failure_offset = failure.offset;
+            return self.dtdLocation(failure_offset);
+        }
+
+        fn dtdSourceLocation(
+            self: *const Self,
+            source_id: u32,
+            offset: usize,
+        ) Location(config) {
+            if (comptime config.external_sources) {
+                for (self.dtd_state.external_buffers.items) |buffer| {
+                    if (buffer.source_id != source_id) continue;
+                    var location = locationFromSource(
+                        config,
+                        source_id,
+                        buffer.source_start_offset,
+                    );
+                    if (config.diagnostic_location == .line_column) {
+                        location.line = buffer.source_start_line;
+                        location.byte_column = buffer.source_start_column;
+                    }
+                    var cursor: usize = 0;
+                    while (cursor < @min(offset, buffer.bytes.len)) {
+                        const byte = buffer.bytes[cursor];
+                        const source_advance = buffer.source_advances[cursor];
+                        cursor += 1;
+                        location.byte_offset += source_advance;
+                        if (config.diagnostic_location == .line_column) {
+                            if (byte == '\n') {
+                                location.line += 1;
+                                location.byte_column = 1;
+                            } else {
+                                location.byte_column += source_advance;
+                            }
+                        }
+                    }
+                    return location;
+                }
+            }
+            return locationFromSource(config, source_id, offset);
+        }
+
+        fn dtdLocation(self: *const Self, offset: usize) Location(config) {
             var location = self.dtd_state.doctype_data_start;
-            const failure_offset = if (self.dtd_state.declarations.failure) |failure|
-                failure.offset
-            else
-                0;
             const bytes = self.dtd_state.declarations.doctype_bytes.items;
             var cursor: usize = 0;
             var pending_carriage_return = false;
-            while (cursor < @min(failure_offset, bytes.len)) {
+            while (cursor < @min(offset, bytes.len)) {
                 const len = std.unicode.utf8ByteSequenceLength(bytes[cursor]) catch 1;
                 if (len > bytes.len - cursor) break;
                 const codepoint = std.unicode.utf8Decode(bytes[cursor..][0..len]) catch break;
@@ -2794,6 +3277,19 @@ pub fn Reader(comptime config: Config) type {
                         .{ .parsed_entity_declaration = .{ .name = declarations.reportName(report) } }
                     else
                         continue,
+                    .skipped_external => skipped: {
+                        const external = declarations.skipped_external.items[report.index];
+                        break :skipped .{ .skipped_entity = .{
+                            .name = if (external.name) |value| declarations.string(value) else null,
+                            .kind = switch (external.kind) {
+                                .subset => .external_subset,
+                                .parameter_entity => .parameter_entity,
+                            },
+                            .public_id = if (external.public_id) |value| declarations.string(value) else null,
+                            .system_id = declarations.string(external.system_id),
+                            .reference = self.dtdLocation(external.offset),
+                        } };
+                    },
                 };
                 return self.eventStep(payload, self.token_start, self.currentLocation());
             }
@@ -4295,17 +4791,44 @@ pub fn Reader(comptime config: Config) type {
                     !(self.standalone_declared and self.standalone))
                 {
                     self.vertical_state = .emit_skipped_entity;
+                    self.dtd_state.pending_skipped_entity_index = null;
                     return;
                 }
                 return self.failAt(.undeclared_entity, .invalid_xml, self.reference_start);
             };
             const entity = self.dtd_state.declarations.entities.items[index];
             if (entity.unparsed) return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
+            if (self.standalone_declared and self.standalone and entity.declared_external) {
+                return self.failAt(.undeclared_entity, .invalid_xml, self.reference_start);
+            }
             if (entity.value == null) {
                 if (self.reference_context == .attribute) {
                     return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
                 }
-                return self.failAt(.unsupported_doctype, .unsupported_feature, self.reference_start);
+                const system_id = entity.external_id.system_id orelse
+                    return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
+                if (comptime !config.external_sources) {
+                    self.vertical_state = .emit_skipped_entity;
+                    self.dtd_state.pending_skipped_entity_index = index;
+                    return;
+                }
+                const external_source = (self.openExternalSource(
+                    .general_entity,
+                    name,
+                    if (entity.external_id.public_id) |value|
+                        self.dtd_state.declarations.string(value)
+                    else
+                        null,
+                    self.dtd_state.declarations.string(system_id),
+                    if (entity.base_id) |value| self.dtd_state.declarations.string(value) else null,
+                    self.reference_start,
+                ) catch |err| return self.mapDtdError(err, .malformed_reference)) orelse {
+                    self.vertical_state = .emit_skipped_entity;
+                    self.dtd_state.pending_skipped_entity_index = index;
+                    return;
+                };
+                try self.pushExternalContentEntity(index, external_source);
+                return;
             }
             if (self.reference_context == .attribute) {
                 try self.expandAttributeEntity(index);
@@ -4321,6 +4844,10 @@ pub fn Reader(comptime config: Config) type {
             invalid_code: DiagnosticCode,
         ) ReadError {
             const code = self.dtdDiagnosticCode();
+            const external_code: ?DiagnosticCode = if (comptime config.external_sources)
+                self.dtd_state.external_failure_code
+            else
+                null;
             return switch (err) {
                 error.InvalidDtd => self.failAt(
                     if (code == .malformed_dtd) invalid_code else code,
@@ -4328,8 +4855,11 @@ pub fn Reader(comptime config: Config) type {
                     self.reference_start,
                 ),
                 error.UnsupportedFeature => self.failAt(.unsupported_doctype, .unsupported_feature, self.reference_start),
-                error.LimitExceeded => self.failAt(code, .limit_exceeded, self.reference_start),
+                error.LimitExceeded => self.failAt(external_code orelse code, .limit_exceeded, self.reference_start),
                 error.OutOfMemory => self.failOutOfMemory(),
+                error.ResolverFailed => self.failAt(external_code orelse .resolver_io_failure, .resolver_failed, self.reference_start),
+                error.ReadFailed => self.failAt(external_code orelse .resolver_io_failure, .read_failed, self.reference_start),
+                error.Cancelled => self.failAt(external_code orelse .resolver_cancelled, .cancelled, self.reference_start),
             };
         }
 
@@ -4342,7 +4872,91 @@ pub fn Reader(comptime config: Config) type {
             ) catch |err| return self.mapDtdError(err, .malformed_reference);
         }
 
+        fn chargeExternalExpansion(self: *Self, expanded_bytes: usize) ReadError!void {
+            self.dtd_state.declarations.chargeExpanded(
+                self.options.dtd_limits,
+                expanded_bytes,
+                @intCast(self.reference_start.byte_offset),
+            ) catch |err| return self.mapDtdError(err, .malformed_reference);
+        }
+
         fn pushContentEntity(self: *Self, entity_index: usize) ReadError!void {
+            const value = self.dtd_state.declarations.string(
+                self.dtd_state.declarations.entities.items[entity_index].value.?,
+            );
+            return self.pushContentEntityBytes(entity_index, value, self.dtd_state.source_id, false);
+        }
+
+        fn pushExternalContentEntity(
+            self: *Self,
+            entity_index: usize,
+            source: resolver_module.Source,
+        ) ReadError!void {
+            for (self.dtd_state.entity_sources.items) |frame| {
+                if (frame.entity_index == entity_index) {
+                    source.close();
+                    return self.failAt(.recursive_entity, .invalid_xml, self.reference_start);
+                }
+            }
+            if (self.dtd_state.entity_sources.items.len ==
+                self.options.dtd_limits.max_active_entity_depth)
+            {
+                source.close();
+                return self.failAt(.entity_expansion_limit, .limit_exceeded, self.reference_start);
+            }
+            self.chargeEntity(self.dtd_state.reference_name.items.len +| 2, 0) catch |err| {
+                source.close();
+                return err;
+            };
+            const parent_source_state = self.source_state;
+            self.source_state = .{};
+            self.dtd_state.entity_sources.append(self.allocator, .{
+                .input = self.input,
+                .cursor = self.cursor,
+                .final_input = self.final_input,
+                .source_byte_offset = self.source_byte_offset,
+                .source_id = self.dtd_state.source_id,
+                .position = self.position,
+                .entity_index = entity_index,
+                .open_depth = self.open_elements.items.len,
+                .resume_state = .content,
+                .external = true,
+                .source_encoding = self.source_encoding,
+                .source_state = parent_source_state,
+                .active_external = self.dtd_state.active_external,
+                .active_external_inclusion = self.dtd_state.active_external_inclusion,
+            }) catch {
+                self.source_state = parent_source_state;
+                source.close();
+                return self.failOutOfMemory();
+            };
+            self.dtd_state.active_external = source;
+            self.dtd_state.active_external_inclusion = self.reference_start;
+            self.source_state.external.transcoder = source.transcoder;
+            if (source.encoding_hint == .other) {
+                self.source_state.encoding = .other;
+                self.source_encoding = .other;
+            }
+            self.input = &.{};
+            self.cursor = 0;
+            self.final_input = false;
+            self.source_byte_offset = 0;
+            self.dtd_state.source_id = source.source_id;
+            self.position = .{};
+            self.dtd_state.pending_entity_index = entity_index;
+            self.vertical_state = if (comptime config.report == .detailed)
+                .emit_entity_start
+            else
+                .content;
+        }
+
+        fn pushContentEntityBytes(
+            self: *Self,
+            entity_index: usize,
+            value: []const u8,
+            entity_source_id: u32,
+            external: bool,
+        ) ReadError!void {
             for (self.dtd_state.entity_sources.items) |source| {
                 if (source.entity_index == entity_index) {
                     return self.failAt(.recursive_entity, .invalid_xml, self.reference_start);
@@ -4353,15 +4967,13 @@ pub fn Reader(comptime config: Config) type {
             {
                 return self.failAt(.entity_expansion_limit, .limit_exceeded, self.reference_start);
             }
-            const value = self.dtd_state.declarations.string(
-                self.dtd_state.declarations.entities.items[entity_index].value.?,
-            );
             try self.chargeEntity(self.dtd_state.reference_name.items.len +| 2, value.len);
             self.dtd_state.entity_sources.append(self.allocator, .{
                 .input = self.input,
                 .cursor = self.cursor,
                 .final_input = self.final_input,
                 .source_byte_offset = self.source_byte_offset,
+                .source_id = self.dtd_state.source_id,
                 .position = self.position,
                 .entity_index = entity_index,
                 .open_depth = self.open_elements.items.len,
@@ -4370,6 +4982,11 @@ pub fn Reader(comptime config: Config) type {
             self.input = value;
             self.cursor = 0;
             self.final_input = false;
+            if (external) {
+                self.source_byte_offset = 0;
+                self.dtd_state.source_id = entity_source_id;
+                self.position = .{};
+            }
             self.dtd_state.pending_entity_index = entity_index;
             self.vertical_state = if (comptime config.report == .detailed)
                 .emit_entity_start
@@ -5684,21 +6301,47 @@ pub fn Reader(comptime config: Config) type {
             std.debug.assert(self.cursor == self.input.len);
             if (comptime config.profile.dtdMode() != .rejected) {
                 if (self.dtd_state.entity_sources.items.len != 0) {
+                    const current_frame = self.dtd_state.entity_sources.items[
+                        self.dtd_state.entity_sources.items.len - 1
+                    ];
+                    if (comptime config.external_sources) {
+                        if (current_frame.external and self.dtd_state.active_external != null) {
+                            try self.refillExternalSource();
+                            if (self.input.len != 0) return error.RefillDecodedInput;
+                        }
+                    }
                     if (self.vertical_state == .content_after_carriage_return) {
                         self.vertical_state = .content;
                         try self.prepareInlineText("\n", self.currentLocation());
                         return error.RefillDecodedInput;
                     }
-                    const frame = self.dtd_state.entity_sources.pop().?;
-                    if (self.open_elements.items.len != frame.open_depth or
-                        self.vertical_state != frame.resume_state)
+                    if (self.open_elements.items.len != current_frame.open_depth or
+                        self.vertical_state != current_frame.resume_state)
                     {
-                        return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
+                        return self.failAt(
+                            .malformed_reference,
+                            .invalid_xml,
+                            if (comptime config.external_sources)
+                                if (current_frame.external) self.token_start else self.reference_start
+                            else
+                                self.reference_start,
+                        );
+                    }
+                    const frame = self.dtd_state.entity_sources.pop().?;
+                    if (comptime config.external_sources) {
+                        if (frame.external) {
+                            self.deinitSourceState(&self.source_state);
+                            self.source_state = frame.source_state;
+                            self.dtd_state.active_external = frame.active_external;
+                            self.dtd_state.active_external_inclusion = frame.active_external_inclusion;
+                            self.source_encoding = frame.source_encoding;
+                        }
                     }
                     self.input = frame.input;
                     self.cursor = frame.cursor;
                     self.final_input = frame.final_input;
                     self.source_byte_offset = frame.source_byte_offset;
+                    self.dtd_state.source_id = frame.source_id;
                     self.position = frame.position;
                     self.dtd_state.pending_entity_index = frame.entity_index;
                     if (comptime config.report == .detailed) {
@@ -5719,6 +6362,80 @@ pub fn Reader(comptime config: Config) type {
             return .need_input;
         }
 
+        fn refillExternalSource(self: *Self) ReadError!void {
+            const source = self.dtd_state.active_external orelse return;
+            const decoder = &self.source_state;
+            self.input = &.{};
+            self.cursor = 0;
+            if (decoder.raw_cursor == decoder.raw_input.len and !decoder.raw_final) {
+                decoder.external.raw.clearRetainingCapacity();
+                while (true) {
+                    const old_len = decoder.external.raw.items.len;
+                    decoder.external.raw.ensureUnusedCapacity(self.allocator, 16 * 1024) catch
+                        return self.failOutOfMemory();
+                    decoder.external.raw.items.len = old_len + 16 * 1024;
+                    const result = source.read(decoder.external.raw.items[old_len..]);
+                    switch (result) {
+                        .bytes => |len| {
+                            decoder.external.raw.items.len = old_len + len;
+                            if (len > self.options.resolver.max_source_bytes -|
+                                (@as(usize, @intCast(decoder.raw_offset)) +| old_len) or
+                                len > self.options.resolver.max_total_bytes -| self.dtd_state.external_resource_bytes)
+                            {
+                                return self.failAt(.external_resource_bytes_limit, .limit_exceeded, self.currentLocation());
+                            }
+                            self.dtd_state.external_resource_bytes += len;
+                            if (!decoder.external.at_start or
+                                externalRawStartReady(
+                                    decoder.external.raw.items,
+                                    source.encoding_hint,
+                                    self.options.limits.max_partial_token_bytes,
+                                )) break;
+                        },
+                        .end => {
+                            decoder.external.raw.items.len = old_len;
+                            decoder.raw_final = true;
+                            decoder.external.eof = true;
+                            source.close();
+                            self.dtd_state.active_external = null;
+                            break;
+                        },
+                        .io_failure => return self.failAt(.resolver_io_failure, .read_failed, self.currentLocation()),
+                        .cancelled => return self.failAt(.resolver_cancelled, .cancelled, self.currentLocation()),
+                    }
+                    if (decoder.raw_final) break;
+                }
+                decoder.raw_input = decoder.external.raw.items;
+                decoder.raw_cursor = 0;
+                if (decoder.external.at_start and decoder.encoding == null) {
+                    const detected = detectExternalRawEncoding(
+                        decoder.raw_input,
+                        source.encoding_hint,
+                    ) orelse return self.failAt(.malformed_encoding, .invalid_xml, self.currentLocation());
+                    decoder.encoding = detected.encoding;
+                    self.source_encoding = detected.encoding;
+                    decoder.raw_cursor = detected.signature_len;
+                    decoder.raw_offset = detected.signature_len;
+                    self.source_byte_offset = detected.signature_len;
+                    if (config.diagnostic_location == .line_column) {
+                        self.position.line_start_offset = self.source_byte_offset;
+                    }
+                }
+            }
+            try self.refillDecodedInput();
+            if (decoder.external.at_start and self.input.len != 0) {
+                if (externalTextDeclaration(self.input)) |declaration| {
+                    if (!externalEncodingMatches(self.source_encoding, declaration.encoding)) {
+                        return self.failAt(.encoding_mismatch, .invalid_xml, self.currentLocation());
+                    }
+                    self.consumeRun(self.input[0..declaration.end]);
+                }
+                decoder.external.at_start = false;
+            }
+            try self.chargeExternalExpansion(self.input.len - self.cursor);
+            if (self.final_input) self.final_input = false;
+        }
+
         fn refillDecodedInput(self: *Self) ReadError!void {
             if (comptime config.profile.isUtf8Only()) unreachable;
             const source = &self.source_state;
@@ -5734,7 +6451,8 @@ pub fn Reader(comptime config: Config) type {
                 );
             }
 
-            while (source.decoded.items.len < decoded_input_capacity) {
+            const target_capacity = self.decodedTargetCapacity();
+            while (source.decoded.items.len < target_capacity) {
                 if (source.encoding == null) {
                     if (!self.detectSourceEncoding()) break;
                     if (source.failure != null) break;
@@ -5746,13 +6464,13 @@ pub fn Reader(comptime config: Config) type {
                         try self.ensureDecoderCapacity();
                         self.decodeUtf16SourceRun();
                     },
-                    .other => unreachable,
+                    .other => try self.decodeExternalOtherRun(),
                 }
                 if (self.input.len != 0) return;
                 if ((source.encoding == .utf8 and source.decoded.items.len != 0) or
                     source.failure != null or
                     source.raw_cursor == source.raw_input.len or
-                    source.decoded.items.len == decoded_input_capacity)
+                    target_capacity - source.decoded.items.len < 4)
                 {
                     break;
                 }
@@ -5930,7 +6648,8 @@ pub fn Reader(comptime config: Config) type {
 
         fn decodeUtf16SourceRun(self: *Self) void {
             const source = &self.source_state;
-            while (source.decoded.items.len + 4 <= decoded_input_capacity and
+            const target_capacity = self.decodedTargetCapacity();
+            while (source.decoded.items.len + 4 <= target_capacity and
                 (source.signature_len != 0 or source.raw_cursor < source.raw_input.len))
             {
                 const byte, const byte_offset = if (source.signature_len != 0) replay: {
@@ -5990,16 +6709,67 @@ pub fn Reader(comptime config: Config) type {
             }
         }
 
+        fn decodeExternalOtherRun(self: *Self) ReadError!void {
+            if (comptime !config.external_sources) {
+                return self.failAt(.unsupported_encoding, .unsupported_feature, self.currentLocation());
+            }
+            const source = &self.source_state;
+            const converter = source.external.transcoder orelse
+                return self.failAt(.unsupported_encoding, .unsupported_feature, self.currentLocation());
+            try self.ensureDecoderCapacity();
+            while (source.decoded.items.len < self.decodedTargetCapacity()) {
+                const output = source.decoded.allocatedSlice()[source.decoded.items.len..];
+                const source_advances = source.source_advances.allocatedSlice()[source.source_advances.items.len..];
+                const remaining = source.raw_input[source.raw_cursor..];
+                const bounded_input = remaining[0..@min(remaining.len, std.math.maxInt(u8))];
+                const step = converter.run(
+                    bounded_input,
+                    source.raw_final and bounded_input.len == remaining.len,
+                    output,
+                    source_advances,
+                ) catch return self.failAt(.malformed_encoding, .invalid_xml, self.currentLocation());
+                switch (step) {
+                    .progress => |progress| {
+                        source.raw_cursor += progress.consumed;
+                        source.raw_offset += progress.consumed;
+                        const old_len = source.decoded.items.len;
+                        source.decoded.items.len += progress.produced;
+                        source.source_advances.items.len = old_len + progress.produced;
+                    },
+                    .need_input => break,
+                    .need_output => break,
+                    .malformed => |offset| return self.failAt(
+                        .malformed_encoding,
+                        .invalid_xml,
+                        self.locationAtCurrentLine(source.raw_offset + offset),
+                    ),
+                    .unsupported => return self.failAt(.unsupported_encoding, .unsupported_feature, self.currentLocation()),
+                }
+                if (source.raw_cursor == source.raw_input.len and !source.raw_final) break;
+                if (source.raw_final and source.raw_cursor == source.raw_input.len and
+                    source.decoded.items.len == 0) break;
+            }
+        }
+
         fn ensureDecoderCapacity(self: *Self) ReadError!void {
             const source = &self.source_state;
+            const target_capacity = self.decodedTargetCapacity();
             source.decoded.ensureTotalCapacityPrecise(
                 self.allocator,
-                decoded_input_capacity,
+                target_capacity,
             ) catch return self.failOutOfMemory();
             source.source_advances.ensureTotalCapacityPrecise(
                 self.allocator,
-                decoded_input_capacity,
+                target_capacity,
             ) catch return self.failOutOfMemory();
+        }
+
+        fn decodedTargetCapacity(self: *const Self) usize {
+            if (comptime !config.external_sources) return decoded_input_capacity;
+            return if (self.dtd_state.active_external != null and self.source_state.external.at_start)
+                @max(decoded_input_capacity, self.options.limits.max_partial_token_bytes)
+            else
+                decoded_input_capacity;
         }
 
         fn appendDecodedScalar(self: *Self, codepoint: u21, source_len: u8) void {
@@ -6034,7 +6804,15 @@ pub fn Reader(comptime config: Config) type {
             failure: Failure,
             primary: Location(config),
         ) ReadError {
-            self.first_diagnostic = .{ .code = code, .primary = primary };
+            const inclusion_trace = if (comptime config.external_sources)
+                self.captureInclusionTrace(primary.source_id)
+            else {};
+            self.closeExternalSources();
+            self.first_diagnostic = .{
+                .code = code,
+                .primary = primary,
+                .inclusion_trace = inclusion_trace,
+            };
             self.failure = failure;
             self.lifecycle = .failed;
             return failureToError(failure);
@@ -6047,10 +6825,15 @@ pub fn Reader(comptime config: Config) type {
             primary: Location(config),
             related: Location(config),
         ) ReadError {
+            const inclusion_trace = if (comptime config.external_sources)
+                self.captureInclusionTrace(primary.source_id)
+            else {};
+            self.closeExternalSources();
             self.first_diagnostic = .{
                 .code = code,
                 .primary = primary,
                 .related = related,
+                .inclusion_trace = inclusion_trace,
             };
             self.failure = failure;
             self.lifecycle = .failed;
@@ -6062,9 +6845,69 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn failOutOfMemory(self: *Self) ReadError {
+            self.closeExternalSources();
             self.failure = .out_of_memory;
             self.lifecycle = .failed;
             return error.OutOfMemory;
+        }
+
+        fn closeExternalSources(self: *Self) void {
+            if (comptime config.profile.dtdMode() == .rejected or !config.external_sources) return;
+            if (self.dtd_state.active_external) |source| source.close();
+            self.dtd_state.active_external = null;
+            self.dtd_state.active_external_inclusion = null;
+            for (self.dtd_state.entity_sources.items) |*frame| {
+                if (frame.active_external) |source| source.close();
+                frame.active_external = null;
+            }
+        }
+
+        fn captureInclusionTrace(self: *Self, primary_source_id: u32) []const Location(config) {
+            if (comptime !config.external_sources) unreachable;
+            self.diagnostic_inclusions.clearRetainingCapacity();
+            const max_depth = self.options.dtd_limits.max_active_entity_depth;
+            if (primary_source_id == self.dtd_state.source_id and
+                self.dtd_state.active_external_inclusion != null)
+            {
+                self.diagnostic_inclusions.appendAssumeCapacity(
+                    self.dtd_state.active_external_inclusion.?,
+                );
+                var index = self.dtd_state.entity_sources.items.len;
+                while (index != 0 and self.diagnostic_inclusions.items.len < max_depth) {
+                    index -= 1;
+                    if (self.dtd_state.entity_sources.items[index].active_external_inclusion) |location| {
+                        self.diagnostic_inclusions.appendAssumeCapacity(location);
+                    }
+                }
+                return self.diagnostic_inclusions.items;
+            }
+
+            var source_id = primary_source_id;
+            while (source_id != 0 and self.diagnostic_inclusions.items.len < max_depth) {
+                var found: ?ExternalBuffer = null;
+                var index = self.dtd_state.external_buffers.items.len;
+                while (index != 0) {
+                    index -= 1;
+                    const buffer = self.dtd_state.external_buffers.items[index];
+                    if (buffer.source_id == source_id) {
+                        found = buffer;
+                        break;
+                    }
+                }
+                const buffer = found orelse break;
+                var location = locationFromSource(
+                    config,
+                    buffer.inclusion_source_id,
+                    buffer.inclusion_offset,
+                );
+                if (config.diagnostic_location == .line_column) {
+                    location.line = buffer.inclusion_line;
+                    location.byte_column = buffer.inclusion_column;
+                }
+                self.diagnostic_inclusions.appendAssumeCapacity(location);
+                source_id = buffer.inclusion_source_id;
+            }
+            return self.diagnostic_inclusions.items;
         }
 
         fn failureError(self: *const Self) ReadError {
@@ -6075,12 +6918,20 @@ pub fn Reader(comptime config: Config) type {
             if (config.diagnostic_location == .line_column) {
                 return .{
                     .byte_offset = self.source_byte_offset,
+                    .source_id = if (comptime config.profile.dtdMode() == .rejected)
+                        0
+                    else
+                        self.dtd_state.source_id,
                     .line = self.position.line,
                     .byte_column = self.source_byte_offset - self.position.line_start_offset + 1,
                 };
             }
             return .{
                 .byte_offset = self.source_byte_offset,
+                .source_id = if (comptime config.profile.dtdMode() == .rejected)
+                    0
+                else
+                    self.dtd_state.source_id,
             };
         }
     };
@@ -6349,7 +7200,486 @@ fn failureToError(failure: Failure) ReadError {
         .unsupported_feature => error.UnsupportedFeature,
         .limit_exceeded => error.LimitExceeded,
         .out_of_memory => error.OutOfMemory,
+        .resolver_failed => error.ResolverFailed,
         .read_failed => error.ReadFailed,
+        .cancelled => error.Cancelled,
+    };
+}
+
+const DecodedExternalSource = struct {
+    bytes: []u8,
+    source_advances: []u32,
+    source_start_offset: u64,
+    source_start_line: u64,
+    source_start_column: u64,
+
+    fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        allocator.free(self.source_advances);
+    }
+};
+
+const ExternalDecodeFailure = struct {
+    code: DiagnosticCode,
+    byte_offset: u64,
+    line: u64,
+    byte_column: u64,
+};
+
+fn setExternalDecodeFailure(
+    failure: *?ExternalDecodeFailure,
+    code: DiagnosticCode,
+    source_start_offset: usize,
+    decoded: []const u8,
+    source_advances: ?[]const u32,
+    decoded_limit: usize,
+    byte_offset: usize,
+) void {
+    var location: ExternalDecodeFailure = .{
+        .code = code,
+        .byte_offset = source_start_offset,
+        .line = 1,
+        .byte_column = 1,
+    };
+    var cursor: usize = 0;
+    while (cursor < @min(decoded_limit, decoded.len)) {
+        const byte = decoded[cursor];
+        const advance = if (source_advances) |values| values[cursor] else 1;
+        location.byte_offset += advance;
+        cursor += 1;
+        if (byte == '\r') {
+            if (cursor < decoded_limit and cursor < decoded.len and decoded[cursor] == '\n') {
+                location.byte_offset += if (source_advances) |values| values[cursor] else 1;
+                cursor += 1;
+            }
+            location.line += 1;
+            location.byte_column = 1;
+        } else if (byte == '\n') {
+            location.line += 1;
+            location.byte_column = 1;
+        } else {
+            location.byte_column += advance;
+        }
+    }
+    if (byte_offset > location.byte_offset) {
+        location.byte_column += byte_offset - location.byte_offset;
+    }
+    location.byte_offset = byte_offset;
+    failure.* = location;
+}
+
+fn decodeExternalSource(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    hint: ?SourceEncoding,
+    transcoder: ?encoding_module.Transcoder,
+    max_bytes: usize,
+    failure: *?ExternalDecodeFailure,
+) dtd_module.ParseError!DecodedExternalSource {
+    var encoding = hint orelse .utf8;
+    var start: usize = 0;
+    if (raw.len >= 3 and std.mem.eql(u8, raw[0..3], "\xef\xbb\xbf")) {
+        if (hint != null and hint.? != .utf8) {
+            setExternalDecodeFailure(failure, .encoding_mismatch, 0, &.{}, null, 0, 0);
+            return error.InvalidDtd;
+        }
+        encoding = .utf8;
+        start = 3;
+    } else if (raw.len >= 2 and std.mem.eql(u8, raw[0..2], "\xfe\xff")) {
+        if (hint != null and hint.? != .utf16_be) {
+            setExternalDecodeFailure(failure, .encoding_mismatch, 0, &.{}, null, 0, 0);
+            return error.InvalidDtd;
+        }
+        encoding = .utf16_be;
+        start = 2;
+    } else if (raw.len >= 2 and std.mem.eql(u8, raw[0..2], "\xff\xfe")) {
+        if (hint != null and hint.? != .utf16_le) {
+            setExternalDecodeFailure(failure, .encoding_mismatch, 0, &.{}, null, 0, 0);
+            return error.InvalidDtd;
+        }
+        encoding = .utf16_le;
+        start = 2;
+    } else if (hint == null and raw.len >= 4 and std.mem.eql(u8, raw[0..4], "\x00\x3c\x00\x3f")) {
+        encoding = .utf16_be;
+    } else if (hint == null and raw.len >= 4 and std.mem.eql(u8, raw[0..4], "\x3c\x00\x3f\x00")) {
+        encoding = .utf16_le;
+    }
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+    var advances: std.ArrayList(u32) = .empty;
+    defer advances.deinit(allocator);
+    switch (encoding) {
+        .utf8 => {
+            const bytes = raw[start..];
+            var cursor: usize = 0;
+            while (cursor < bytes.len) switch (probeUtf8(bytes[cursor..])) {
+                .scalar => |scalar| cursor += scalar.len,
+                .incomplete => {
+                    setExternalDecodeFailure(
+                        failure,
+                        .malformed_encoding,
+                        start,
+                        bytes,
+                        null,
+                        cursor,
+                        start + cursor,
+                    );
+                    return error.InvalidDtd;
+                },
+                .invalid => |index| {
+                    setExternalDecodeFailure(
+                        failure,
+                        .malformed_encoding,
+                        start,
+                        bytes,
+                        null,
+                        cursor,
+                        start + cursor + index,
+                    );
+                    return error.InvalidDtd;
+                },
+            };
+            decoded.appendSlice(allocator, bytes) catch return error.OutOfMemory;
+            advances.appendNTimes(allocator, 1, bytes.len) catch return error.OutOfMemory;
+        },
+        .utf16_le, .utf16_be => {
+            if ((raw.len - start) % 2 != 0) {
+                setExternalDecodeFailure(
+                    failure,
+                    .malformed_encoding,
+                    start,
+                    decoded.items,
+                    advances.items,
+                    decoded.items.len,
+                    raw.len - 1,
+                );
+                return error.InvalidDtd;
+            }
+            var cursor = start;
+            while (cursor < raw.len) {
+                const first_offset = cursor;
+                const first = readUtf16Unit(raw[cursor..][0..2], encoding == .utf16_le);
+                cursor += 2;
+                var scalar: u21 = undefined;
+                if (first >= 0xd800 and first <= 0xdbff) {
+                    if (cursor == raw.len) {
+                        setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, first_offset);
+                        return error.InvalidDtd;
+                    }
+                    const second = readUtf16Unit(raw[cursor..][0..2], encoding == .utf16_le);
+                    if (second < 0xdc00 or second > 0xdfff) {
+                        setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
+                        return error.InvalidDtd;
+                    }
+                    cursor += 2;
+                    scalar = @intCast(0x10000 +
+                        ((@as(u32, first) - 0xd800) << 10) +
+                        (@as(u32, second) - 0xdc00));
+                } else {
+                    if (first >= 0xdc00 and first <= 0xdfff) {
+                        setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, first_offset);
+                        return error.InvalidDtd;
+                    }
+                    scalar = @intCast(first);
+                }
+                var bytes: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(scalar, &bytes) catch unreachable;
+                if (len > max_bytes -| decoded.items.len) {
+                    setExternalDecodeFailure(failure, .external_resource_bytes_limit, start, decoded.items, advances.items, decoded.items.len, first_offset);
+                    return error.LimitExceeded;
+                }
+                decoded.appendSlice(allocator, bytes[0..len]) catch return error.OutOfMemory;
+                advances.appendNTimes(allocator, 0, len) catch return error.OutOfMemory;
+                advances.items[advances.items.len - 1] = if (scalar < 0x10000) 2 else 4;
+            }
+        },
+        .other => {
+            const converter = transcoder orelse {
+                setExternalDecodeFailure(failure, .unsupported_encoding, start, &.{}, null, 0, start);
+                return error.UnsupportedFeature;
+            };
+            var cursor = start;
+            var output: [4096]u8 = undefined;
+            var output_advances: [4096]u8 = undefined;
+            while (true) {
+                const final = cursor == raw.len;
+                const remaining = raw[cursor..];
+                const bounded = remaining[0..@min(remaining.len, std.math.maxInt(u8))];
+                const step = converter.run(
+                    bounded,
+                    final and bounded.len == remaining.len,
+                    &output,
+                    &output_advances,
+                ) catch {
+                    setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
+                    return error.InvalidDtd;
+                };
+                switch (step) {
+                    .progress => |progress| {
+                        if (progress.produced > max_bytes -| decoded.items.len) {
+                            setExternalDecodeFailure(failure, .external_resource_bytes_limit, start, decoded.items, advances.items, decoded.items.len, cursor);
+                            return error.LimitExceeded;
+                        }
+                        decoded.appendSlice(allocator, output[0..progress.produced]) catch
+                            return error.OutOfMemory;
+                        cursor += progress.consumed;
+                        for (output_advances[0..progress.produced]) |advance| {
+                            advances.append(allocator, advance) catch return error.OutOfMemory;
+                        }
+                    },
+                    .need_input, .need_output => {
+                        setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
+                        return error.InvalidDtd;
+                    },
+                    .malformed => |offset| {
+                        setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor + offset);
+                        return error.InvalidDtd;
+                    },
+                    .unsupported => {
+                        setExternalDecodeFailure(failure, .unsupported_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
+                        return error.UnsupportedFeature;
+                    },
+                }
+                if (cursor == raw.len) {
+                    const final_step = converter.run("", true, &output, &output_advances) catch {
+                        setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
+                        return error.InvalidDtd;
+                    };
+                    switch (final_step) {
+                        .progress => |progress| {
+                            if (progress.consumed != 0 or progress.produced > max_bytes -| decoded.items.len) {
+                                setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
+                                return error.InvalidDtd;
+                            }
+                            decoded.appendSlice(allocator, output[0..progress.produced]) catch
+                                return error.OutOfMemory;
+                            for (output_advances[0..progress.produced]) |advance| {
+                                advances.append(allocator, advance) catch return error.OutOfMemory;
+                            }
+                            continue;
+                        },
+                        .need_input => break,
+                        .need_output, .malformed => {
+                            setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
+                            return error.InvalidDtd;
+                        },
+                        .unsupported => {
+                            setExternalDecodeFailure(failure, .unsupported_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
+                            return error.UnsupportedFeature;
+                        },
+                    }
+                }
+            }
+            _ = std.unicode.Utf8View.init(decoded.items) catch {
+                setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
+                return error.InvalidDtd;
+            };
+        },
+    }
+
+    var content = decoded.items;
+    var content_advances = advances.items;
+    var source_start_offset: u64 = start;
+    var source_start_line: u64 = 1;
+    var source_start_column: u64 = 1;
+    if (externalTextDeclaration(content)) |declaration| {
+        if (!externalEncodingMatches(encoding, declaration.encoding)) {
+            const encoding_offset = @intFromPtr(declaration.encoding.ptr) - @intFromPtr(content.ptr);
+            var raw_offset = start;
+            for (content_advances[0..encoding_offset]) |advance| raw_offset += advance;
+            setExternalDecodeFailure(
+                failure,
+                .encoding_mismatch,
+                start,
+                content,
+                content_advances,
+                encoding_offset,
+                raw_offset,
+            );
+            return error.InvalidDtd;
+        }
+        var declaration_cursor: usize = 0;
+        while (declaration_cursor < declaration.end) {
+            const byte = content[declaration_cursor];
+            var source_advance = content_advances[declaration_cursor];
+            source_start_offset += source_advance;
+            declaration_cursor += 1;
+            if (byte == '\r') {
+                if (declaration_cursor < declaration.end and content[declaration_cursor] == '\n') {
+                    source_advance = content_advances[declaration_cursor];
+                    source_start_offset += source_advance;
+                    declaration_cursor += 1;
+                }
+                source_start_line += 1;
+                source_start_column = 1;
+            } else {
+                source_start_column += source_advance;
+            }
+        }
+        content = content[declaration.end..];
+        content_advances = content_advances[declaration.end..];
+    }
+    var normalized: std.ArrayList(u8) = .empty;
+    errdefer normalized.deinit(allocator);
+    var normalized_advances: std.ArrayList(u32) = .empty;
+    errdefer normalized_advances.deinit(allocator);
+    var cursor: usize = 0;
+    while (cursor < content.len) {
+        if (content[cursor] == '\r') {
+            normalized.append(allocator, '\n') catch return error.OutOfMemory;
+            var source_advance = content_advances[cursor];
+            cursor += 1;
+            if (cursor < content.len and content[cursor] == '\n') {
+                source_advance += content_advances[cursor];
+                cursor += 1;
+            }
+            normalized_advances.append(allocator, source_advance) catch return error.OutOfMemory;
+        } else {
+            normalized.append(allocator, content[cursor]) catch return error.OutOfMemory;
+            normalized_advances.append(allocator, content_advances[cursor]) catch
+                return error.OutOfMemory;
+            cursor += 1;
+        }
+    }
+    const owned_bytes = normalized.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    errdefer allocator.free(owned_bytes);
+    const owned_advances = normalized_advances.toOwnedSlice(allocator) catch
+        return error.OutOfMemory;
+    return .{
+        .bytes = owned_bytes,
+        .source_advances = owned_advances,
+        .source_start_offset = source_start_offset,
+        .source_start_line = source_start_line,
+        .source_start_column = source_start_column,
+    };
+}
+
+fn readUtf16Unit(bytes: *const [2]u8, little_endian: bool) u16 {
+    return if (little_endian)
+        @as(u16, bytes[0]) | (@as(u16, bytes[1]) << 8)
+    else
+        (@as(u16, bytes[0]) << 8) | @as(u16, bytes[1]);
+}
+
+const ExternalTextDeclaration = struct {
+    end: usize,
+    encoding: []const u8,
+};
+
+fn externalTextDeclaration(bytes: []const u8) ?ExternalTextDeclaration {
+    if (!std.mem.startsWith(u8, bytes, "<?xml") or bytes.len == 5 or
+        !isXmlWhitespace(bytes[5])) return null;
+    const close = std.mem.indexOfPos(u8, bytes, 6, "?>") orelse return null;
+    const declaration = bytes[5..close];
+    if (std.mem.indexOf(u8, declaration, "standalone") != null) return null;
+    if (std.mem.indexOf(u8, declaration, "version")) |version_index| {
+        const version = declarationAttributeValue(declaration, version_index, "version") orelse return null;
+        if (!std.mem.eql(u8, version, "1.0")) return null;
+    }
+    const encoding_index = std.mem.indexOf(u8, declaration, "encoding") orelse return null;
+    const encoding = declarationAttributeValue(declaration, encoding_index, "encoding") orelse return null;
+    return .{ .end = close + 2, .encoding = encoding };
+}
+
+fn declarationAttributeValue(
+    declaration: []const u8,
+    attribute_index: usize,
+    comptime name: []const u8,
+) ?[]const u8 {
+    var cursor = attribute_index + name.len;
+    while (cursor < declaration.len and isXmlWhitespace(declaration[cursor])) cursor += 1;
+    if (cursor == declaration.len or declaration[cursor] != '=') return null;
+    cursor += 1;
+    while (cursor < declaration.len and isXmlWhitespace(declaration[cursor])) cursor += 1;
+    if (cursor == declaration.len or (declaration[cursor] != '\'' and declaration[cursor] != '"')) return null;
+    const quote = declaration[cursor];
+    cursor += 1;
+    const value_start = cursor;
+    while (cursor < declaration.len and declaration[cursor] != quote) cursor += 1;
+    if (cursor == value_start or cursor == declaration.len) return null;
+    return declaration[value_start..cursor];
+}
+
+fn externalEncodingMatches(encoding: SourceEncoding, declared: []const u8) bool {
+    return switch (encoding) {
+        .utf8 => std.ascii.eqlIgnoreCase(declared, "UTF-8"),
+        .utf16_le, .utf16_be => std.ascii.eqlIgnoreCase(declared, "UTF-16") or
+            std.ascii.eqlIgnoreCase(declared, if (encoding == .utf16_le) "UTF-16LE" else "UTF-16BE"),
+        .other => true,
+    };
+}
+
+fn externalRawStartReady(
+    raw: []const u8,
+    hint: ?SourceEncoding,
+    max_declaration_bytes: usize,
+) bool {
+    var encoding = hint orelse .utf8;
+    var start: usize = 0;
+    if (raw.len >= 3 and std.mem.eql(u8, raw[0..3], "\xef\xbb\xbf")) {
+        encoding = .utf8;
+        start = 3;
+    } else if (raw.len >= 2 and std.mem.eql(u8, raw[0..2], "\xfe\xff")) {
+        encoding = .utf16_be;
+        start = 2;
+    } else if (raw.len >= 2 and std.mem.eql(u8, raw[0..2], "\xff\xfe")) {
+        encoding = .utf16_le;
+        start = 2;
+    } else if (hint == null and raw.len >= 4 and std.mem.eql(u8, raw[0..4], "\x00\x3c\x00\x3f")) {
+        encoding = .utf16_be;
+    } else if (hint == null and raw.len >= 4 and std.mem.eql(u8, raw[0..4], "\x3c\x00\x3f\x00")) {
+        encoding = .utf16_le;
+    } else if (raw.len < 4 and hint == null) {
+        return false;
+    }
+    if (encoding == .other) return true;
+    const width: usize = if (encoding == .utf8) 1 else 2;
+    if (raw.len < start + 6 * width) return false;
+    const prefix = "<?xml";
+    for (prefix, 0..) |expected, index| {
+        const actual = externalAsciiByte(raw, start + index * width, encoding) orelse return true;
+        if (actual != expected) return true;
+    }
+    const sixth = externalAsciiByte(raw, start + 5 * width, encoding) orelse return true;
+    if (!isXmlWhitespace(sixth)) return true;
+    var cursor = start + 6 * width;
+    while (cursor + 2 * width <= raw.len) : (cursor += width) {
+        if (externalAsciiByte(raw, cursor, encoding) == '?' and
+            externalAsciiByte(raw, cursor + width, encoding) == '>') return true;
+    }
+    return raw.len >= start + max_declaration_bytes * width;
+}
+
+const DetectedExternalEncoding = struct {
+    encoding: SourceEncoding,
+    signature_len: usize = 0,
+};
+
+fn detectExternalRawEncoding(raw: []const u8, hint: ?SourceEncoding) ?DetectedExternalEncoding {
+    var detected: DetectedExternalEncoding = .{ .encoding = hint orelse .utf8 };
+    if (raw.len >= 3 and std.mem.eql(u8, raw[0..3], "\xef\xbb\xbf")) {
+        detected = .{ .encoding = .utf8, .signature_len = 3 };
+    } else if (raw.len >= 2 and std.mem.eql(u8, raw[0..2], "\xfe\xff")) {
+        detected = .{ .encoding = .utf16_be, .signature_len = 2 };
+    } else if (raw.len >= 2 and std.mem.eql(u8, raw[0..2], "\xff\xfe")) {
+        detected = .{ .encoding = .utf16_le, .signature_len = 2 };
+    } else if (raw.len >= 4 and std.mem.eql(u8, raw[0..4], "\x00\x3c\x00\x3f")) {
+        detected.encoding = .utf16_be;
+    } else if (raw.len >= 4 and std.mem.eql(u8, raw[0..4], "\x3c\x00\x3f\x00")) {
+        detected.encoding = .utf16_le;
+    }
+    if (hint) |expected| {
+        if (expected != .other and expected != detected.encoding) return null;
+    }
+    return detected;
+}
+
+fn externalAsciiByte(raw: []const u8, offset: usize, encoding: SourceEncoding) ?u8 {
+    return switch (encoding) {
+        .utf8 => raw[offset],
+        .utf16_le => if (raw[offset + 1] == 0) raw[offset] else null,
+        .utf16_be => if (raw[offset] == 0) raw[offset + 1] else null,
+        .other => null,
     };
 }
 
@@ -6767,6 +8097,18 @@ fn locationWithByteDelta(
     result.byte_offset += delta;
     if (config.diagnostic_location == .line_column) result.byte_column += delta;
     return result;
+}
+
+fn locationFromSource(comptime config: Config, source_id: u32, byte_offset: usize) Location(config) {
+    if (config.diagnostic_location == .line_column) {
+        return .{
+            .source_id = source_id,
+            .byte_offset = byte_offset,
+            .line = 1,
+            .byte_column = byte_offset + 1,
+        };
+    }
+    return .{ .source_id = source_id, .byte_offset = byte_offset };
 }
 
 fn nameFromRaw(comptime config: Config, raw: []const u8) Name(config) {

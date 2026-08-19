@@ -21,8 +21,16 @@ pub fn main() void {
     );
     printLayout("xml10-nonvalidating", xml.Configs.XML10_NONVALIDATING);
     printLayout(
+        "xml10-nonvalidating-internal",
+        xml.Configs.XML10_NONVALIDATING_INTERNAL,
+    );
+    printLayout(
         "xml10-ns-nonvalidating",
         xml.Configs.XML10_NAMESPACES_NONVALIDATING,
+    );
+    printLayout(
+        "xml10-ns-nonvalidating-internal",
+        xml.Configs.XML10_NAMESPACES_NONVALIDATING_INTERNAL,
     );
     printLayout("xml10-validating", xml.Configs.XML10_VALIDATING);
     printLayout(

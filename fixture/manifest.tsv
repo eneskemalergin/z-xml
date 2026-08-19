@@ -51,6 +51,7 @@ dtd-internal-entity	valid/dtd/internal_entity.xml	dtd-valid	XML1.0-5e	dtd,intern
 dtd-mixed	valid/dtd/mixed.xml	dtd-valid	XML1.0-5e	dtd	no	Mixed element content declaration
 dtd-enumeration	valid/dtd/enumeration.xml	dtd-valid	XML1.0-5e	dtd	no	Enumerated attribute value
 dtd-external	valid/dtd/external.xml	dtd-valid	XML1.0-5e	dtd,external_dtd	no	Local external DTD
+dtd-external-entities	valid/dtd/external_entities.xml	dtd-valid	XML1.0-5e	dtd,external_dtd,external_general_entities,external_parameter_entities	no	External subset, parameter entity, general entity, text declarations, and default attribute
 dtd-bounded-expansion	valid/dtd/bounded_entity_expansion.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	no	Bounded three-level internal entity expansion with 1000 output bytes
 dtd-parameter-entity	valid/dtd/parameter_entity_declaration.xml	dtd-valid	XML1.0-5e	dtd,internal_parameter_entities	no	Internal parameter entity supplies an element declaration
 shape-dtd-density	valid/dtd/shape_declaration_density.xml	dtd-valid	XML1.0-5e	dtd,attributes	no	Declaration-dense catalog with IDs defaults and repeated metadata
@@ -132,6 +133,7 @@ dtd-bad-enumeration	invalid/dtd/enumeration_value.xml	dtd-invalid	XML1.0-5e	dtd	
 dtd-bad-empty	invalid/dtd/empty_contains_child.xml	dtd-invalid	XML1.0-5e	dtd	no	EMPTY element contains child
 dtd-bad-element-text	invalid/dtd/element_content_text.xml	dtd-invalid	XML1.0-5e	dtd	no	Element-only content contains text
 dtd-bad-external	invalid/dtd/external_wrong_content.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	no	External DTD content model violation
+external-entity-unclosed	invalid/not_well_formed/external_entity_unclosed.xml	not-well-formed	XML1.0-5e	dtd,external_general_entities,check_element_matching	no	External parsed entity leaves an element open across its boundary
 dtd-bad-undeclared-root	invalid/dtd/undeclared_root.xml	dtd-invalid	XML1.0-5e	dtd	no	Document element has no declaration
 bench-common	benchmark/smoke/common.xml	benchmark-valid	XML1.0-5e	document,attributes,element_matching	yes	Shared basic adapter summary
 bench-normalized	benchmark/smoke/normalized.xml	benchmark-valid	XML1.0-5e	document,attributes,numeric_references,cdata,predefined_entities	yes	Shared normalized adapter summary

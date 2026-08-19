@@ -1,16 +1,17 @@
 //! A bounded, incremental XML reader for Zig.
 //!
-//! The public API is specialized by a compile-time configuration. The current
-//! implementation provides XML 1.0 no-DTD readers and internal-DTD
-//! non-validating readers, with raw-name and namespace-aware profiles.
+//! The public API is specialized by a compile-time configuration. The library
+//! provides XML 1.0 no-DTD and non-validating readers with
+//! raw-name and namespace-aware profiles.
 
 const reader = @import("reader.zig");
 const encoding = @import("encoding.zig");
 const io = @import("io.zig");
+const resolver = @import("resolver.zig");
 
 /// Compile-time reader configuration.
 pub const Config = reader.Config;
-/// Reviewed XML capability profile.
+/// XML capability profile.
 pub const Profile = reader.Profile;
 /// DTD capability implied by a profile.
 pub const DtdMode = reader.DtdMode;
@@ -20,6 +21,8 @@ pub const Report = reader.Report;
 pub const DiagnosticLocation = reader.DiagnosticLocation;
 /// Reader reset capacity policy.
 pub const ResetMode = reader.ResetMode;
+/// Runtime policy for external declarations.
+pub const ExternalPolicy = reader.ExternalPolicy;
 /// Observable reader lifecycle.
 pub const Lifecycle = reader.Lifecycle;
 /// Runtime resource limits.
@@ -40,6 +43,22 @@ pub const Transcoder = encoding.Transcoder;
 pub const TranscodeStep = encoding.TranscodeStep;
 /// Invalid caller-transcoder result error.
 pub const TranscoderError = encoding.TranscoderError;
+/// Caller-controlled external entity resolver.
+pub const Resolver = resolver.Resolver;
+/// External entity resolver request.
+pub const ResolverRequest = resolver.Request;
+/// External entity resolver result.
+pub const ResolverResult = resolver.Result;
+/// Successfully acquired external byte stream.
+pub const ResolverSource = resolver.Source;
+/// External source stream read result.
+pub const ResolverReadResult = resolver.ReadResult;
+/// Kind of external entity requested.
+pub const ExternalEntityKind = resolver.EntityKind;
+/// Kind reported for external input intentionally skipped by policy.
+pub const SkippedEntityKind = reader.SkippedEntityKind;
+/// Optional handle-relative filesystem resolver with no network behavior.
+pub const RootedFilesystemResolver = resolver.RootedFilesystem;
 /// Semantic origin reported by text fragments.
 pub const TextOrigin = reader.TextOrigin;
 /// Input-feed misuse errors.
@@ -50,7 +69,7 @@ pub const ReadError = reader.ReadError;
 pub const ResetError = reader.ResetError;
 /// Reader construction errors.
 pub const InitError = reader.InitError;
-/// Reviewed named configurations.
+/// Named configurations for supported parser profiles.
 pub const Configs = reader.Configs;
 
 /// Returns the incremental reader type for a compile-time configuration.

@@ -2,11 +2,11 @@
 
 Status: **Active** (last updated: 2026-08-19)
 
-`z-xml` is a benchmark-led effort to build a complete, lightweight, high-performance XML library for Zig 0.16. The target includes compile-time-specialized streaming readers, XML namespaces, UTF-8 and UTF-16, complete non-validating DTD behavior, optional DTD validation, XML 1.1 compatibility, and a compact owned DOM. Conformance data, matched workloads, and reproducible peer builds keep correctness and performance decisions measurable.
+`z-xml` is a compile-time-specialized streaming XML library and parser benchmark laboratory for Zig 0.16. Conformance data, matched workloads, and reproducible peer builds keep correctness and performance claims measurable.
 
-The repository contains qualified raw-name and namespace-aware XML 1.0 readers for no-DTD input and for internal-DTD non-validating input. The latter parses the complete internal subset, applies internal parameter and general entities, declared attribute normalization and defaults, and exposes DTD events under explicit declaration, grammar, comparison, recursion, and expansion limits. UTF-8, UTF-16LE, and UTF-16BE sources are built in. External subsets and external entities remain an explicit unsupported boundary; DTD validation, XML 1.1, and the owned tree remain later work tracked in [`plan/ROADMAP.md`](plan/ROADMAP.md).
+The repository contains qualified raw-name and namespace-aware XML 1.0 readers for no-DTD and non-validating DTD input. The non-validating readers parse internal and external subsets, apply parameter and general parsed entities, normalize and default declared attributes, and expose DTD events under explicit declaration, grammar, comparison, recursion, expansion, and resolver limits. UTF-8, UTF-16LE, and UTF-16BE sources are built in. Other external-source encodings require a caller-supplied transcoder. External access requires a caller-owned resolver and grants no implicit filesystem or network authority. DTD validation, XML 1.1, and the owned tree are not implemented.
 
-Build the current library checks with the pinned compiler:
+Build the library checks with the pinned compiler:
 
 ```sh
 ./zig-0.16.0/zig build test
@@ -14,7 +14,7 @@ Build the current library checks with the pinned compiler:
 ./zig-0.16.0/zig build layout -Doptimize=ReleaseFast
 ```
 
-The reference laboratory in [`ref/`](ref/README.md), the checked-in valid and invalid corpus in [`fixture/`](fixture/README.md), and the measurement tooling qualify each expansion. The standards boundary, evidence, reader and validation contracts, compact tree, performance targets, and staged architecture live in [`plan/design/`](plan/design/README.md).
+The reference laboratory in [`ref/`](ref/README.md), the checked-in valid and invalid corpus in [`fixture/`](fixture/README.md), and the measurement tooling qualify parser behavior. The standards boundary, evidence, reader and validation contracts, compact tree, performance targets, and architecture live in [`plan/design/`](plan/design/README.md).
 
 Build every reference and run the focused correctness gate:
 
