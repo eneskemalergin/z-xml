@@ -103,11 +103,14 @@ pub const ExternalSubset = struct {
             options.source_id,
             if (options.provider != null) capture.provider() else null,
         );
-        try result.compiled.prepare(
+        result.compiled.prepare(
             allocator,
             options.validation_limits,
             &result.declarations,
-        );
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.LimitExceeded,
+        };
         return result;
     }
 
@@ -197,7 +200,7 @@ const ProviderCapture = struct {
         const self: *@This() = @ptrCast(@alignCast(context.?));
         const result = try self.upstream.?.resolve(request);
         return switch (result) {
-            .skipped => .skipped,
+            .skipped => error.UnsupportedFeature,
             .content => |content| blk: {
                 if (content.source_id == 0 or self.owner.findSource(content.source_id) != null) {
                     return error.InvalidDtd;

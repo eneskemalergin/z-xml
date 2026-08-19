@@ -20,6 +20,7 @@ pub const Limits = struct {
             self.max_content_states > 0 and
             self.max_content_states <= std.math.maxInt(u32) and
             self.max_content_transitions > 0 and
+            self.max_content_transitions <= std.math.maxInt(u32) and
             self.max_compilation_work > 0 and
             self.max_ids > 0 and
             self.max_idrefs > 0 and
@@ -29,7 +30,17 @@ pub const Limits = struct {
     }
 };
 
-pub const Error = error{ OutOfMemory, LimitExceeded };
+pub const Error = error{
+    OutOfMemory,
+    ContentPositionLimit,
+    ContentStateLimit,
+    ContentTransitionLimit,
+    CompilationWorkLimit,
+    IdLimit,
+    IdrefLimit,
+    IdentityBytesLimit,
+    ComparisonWorkLimit,
+};
 
 pub const IssueCode = enum {
     missing_doctype,
@@ -79,6 +90,7 @@ const ModelKind = enum { empty, any, mixed, children };
 const Model = struct {
     element_index: usize,
     kind: ModelKind,
+    position_count: usize = 0,
     start_state: u32 = 0,
     state_start: usize = 0,
     state_len: usize = 0,
@@ -89,11 +101,11 @@ const Model = struct {
 const DfaState = struct {
     item_start: usize,
     item_len: usize,
+    transition_start: u32 = 0,
     accepting: bool,
 };
 
 const Transition = struct {
-    state: u32,
     name: dtd.StoredString,
     target: u32,
 };
@@ -237,7 +249,7 @@ pub const State = struct {
         declarations: *const dtd.State,
     ) Error!void {
         if (declarations.elements.items.len > std.math.maxInt(u32)) {
-            return error.LimitExceeded;
+            return error.ContentStateLimit;
         }
         self.models.clearRetainingCapacity();
         self.dfa_states.clearRetainingCapacity();
@@ -314,12 +326,19 @@ pub const State = struct {
         source: *const State,
         byte_base: usize,
     ) Error!void {
-        if (source.dfa_states.items.len > limits.max_content_states or
-            source.transitions.items.len > limits.max_content_transitions or
-            source.mixed_names.items.len > limits.max_content_positions or
-            source.compilation_work > limits.max_compilation_work)
-        {
-            return error.LimitExceeded;
+        for (source.models.items) |model| {
+            if (model.position_count > limits.max_content_positions) {
+                return error.ContentPositionLimit;
+            }
+        }
+        if (source.dfa_states.items.len > limits.max_content_states) {
+            return error.ContentStateLimit;
+        }
+        if (source.transitions.items.len > limits.max_content_transitions) {
+            return error.ContentTransitionLimit;
+        }
+        if (source.compilation_work > limits.max_compilation_work) {
+            return error.CompilationWorkLimit;
         }
         self.clearRetainingCapacity();
         try self.models.appendSlice(allocator, source.models.items);
@@ -327,7 +346,6 @@ pub const State = struct {
         try self.dfa_items.appendSlice(allocator, source.dfa_items.items);
         for (source.transitions.items) |transition| {
             try self.transitions.append(allocator, .{
-                .state = transition.state,
                 .name = rebase(transition.name, byte_base),
                 .target = transition.target,
             });
@@ -399,8 +417,14 @@ pub const State = struct {
                 return .{ .code = .invalid_element_content, .occurrence = location };
             },
             .children => {
-                for (self.transitions.items) |transition| {
-                    if (transition.state != frame.state) continue;
+                const state_index: usize = frame.state;
+                const transition_start: usize = self.dfa_states.items[state_index].transition_start;
+                const transition_end = if (state_index + 1 < self.dfa_states.items.len)
+                    @as(usize, self.dfa_states.items[state_index + 1].transition_start)
+                else
+                    self.transitions.items.len;
+                const transitions = self.transitions.items[transition_start..transition_end];
+                for (transitions) |transition| {
                     try self.chargeComparison(limits, child_name.len +| transition.name.len +| 1);
                     if (std.mem.eql(u8, declarations.string(transition.name), child_name)) {
                         frame.state = transition.target;
@@ -474,7 +498,10 @@ pub const State = struct {
             self.ids.items.len >= std.math.maxInt(u32) or
             value.len > limits.max_id_bytes -| self.id_bytes.items.len)
         {
-            return error.LimitExceeded;
+            return if (value.len > limits.max_id_bytes -| self.id_bytes.items.len)
+                error.IdentityBytesLimit
+            else
+                error.IdLimit;
         }
         try self.ensureIdSlots(allocator);
         const hash = std.hash.Wyhash.hash(0, value);
@@ -505,7 +532,10 @@ pub const State = struct {
         if (self.idrefs.items.len == limits.max_idrefs or
             value.len > limits.max_id_bytes -| self.id_bytes.items.len)
         {
-            return error.LimitExceeded;
+            return if (value.len > limits.max_id_bytes -| self.id_bytes.items.len)
+                error.IdentityBytesLimit
+            else
+                error.IdrefLimit;
         }
         const offset = self.id_bytes.items.len;
         try self.id_bytes.appendSlice(allocator, value);
@@ -546,7 +576,8 @@ pub const State = struct {
         const new_len: usize = if (self.id_slots.items.len == 0)
             16
         else
-            std.math.mul(usize, self.id_slots.items.len, 2) catch return error.LimitExceeded;
+            std.math.mul(usize, self.id_slots.items.len, 2) catch
+                return error.IdLimit;
         var replacement: std.ArrayList(u32) = .empty;
         errdefer replacement.deinit(allocator);
         try replacement.resize(allocator, new_len);
@@ -733,7 +764,9 @@ pub const State = struct {
             try self.chargeCompilation(limits, 1);
             switch (token) {
                 .name => |name| {
-                    if (position_count == limits.max_content_positions) return error.LimitExceeded;
+                    if (position_count == limits.max_content_positions) {
+                        return error.ContentPositionLimit;
+                    }
                     position_count += 1;
                     const start = try appendNfaState(allocator, &nfa, limits);
                     const end = try appendNfaState(allocator, &nfa, limits);
@@ -790,6 +823,7 @@ pub const State = struct {
         }
         std.debug.assert(fragments.items.len == 1);
         const expression = fragments.items[0];
+        model.position_count = position_count;
         model.state_start = self.dfa_states.items.len;
 
         var closure: std.ArrayList(u32) = .empty;
@@ -807,10 +841,12 @@ pub const State = struct {
         var state_cursor = model.state_start;
         while (state_cursor < self.dfa_states.items.len) : (state_cursor += 1) {
             if (self.dfa_states.items.len - model.state_start > limits.max_content_states) {
-                return error.LimitExceeded;
+                return error.ContentStateLimit;
             }
             const state = self.dfa_states.items[state_cursor];
             const items = self.dfa_items.items[state.item_start..][0..state.item_len];
+            const transition_start = self.transitions.items.len;
+            self.dfa_states.items[state_cursor].transition_start = @intCast(transition_start);
             var candidates: std.ArrayList(struct { name: dtd.StoredString, target: u32 }) = .empty;
             defer candidates.deinit(allocator);
             for (items) |item| {
@@ -837,10 +873,9 @@ pub const State = struct {
                     expression.end,
                 );
                 if (self.transitions.items.len == limits.max_content_transitions) {
-                    return error.LimitExceeded;
+                    return error.ContentTransitionLimit;
                 }
                 try self.transitions.append(allocator, .{
-                    .state = @intCast(state_cursor),
                     .name = candidate.name,
                     .target = target,
                 });
@@ -875,11 +910,12 @@ pub const State = struct {
                 if (std.mem.eql(u8, value, declarations.string(prior))) duplicate = true;
             }
             if (self.mixed_names.items.len - model.mixed_start == limits.max_content_positions) {
-                return error.LimitExceeded;
+                return error.ContentPositionLimit;
             }
             try self.mixed_names.append(allocator, stored);
         }
         model.mixed_len = self.mixed_names.items.len - model.mixed_start;
+        model.position_count = model.mixed_len;
         return duplicate;
     }
 
@@ -890,7 +926,9 @@ pub const State = struct {
         items: []const u32,
         accept: u32,
     ) Error!u32 {
-        if (self.dfa_states.items.len == limits.max_content_states) return error.LimitExceeded;
+        if (self.dfa_states.items.len == limits.max_content_states) {
+            return error.ContentStateLimit;
+        }
         const start = self.dfa_items.items.len;
         try self.dfa_items.appendSlice(allocator, items);
         try self.dfa_states.append(allocator, .{
@@ -927,12 +965,16 @@ pub const State = struct {
     }
 
     fn chargeCompilation(self: *State, limits: Limits, amount: usize) Error!void {
-        if (amount > limits.max_compilation_work -| self.compilation_work) return error.LimitExceeded;
+        if (amount > limits.max_compilation_work -| self.compilation_work) {
+            return error.CompilationWorkLimit;
+        }
         self.compilation_work += amount;
     }
 
     fn chargeComparison(self: *State, limits: Limits, amount: usize) Error!void {
-        if (amount > limits.max_comparison_work -| self.comparison_work) return error.LimitExceeded;
+        if (amount > limits.max_comparison_work -| self.comparison_work) {
+            return error.ComparisonWorkLimit;
+        }
         self.comparison_work += amount;
     }
 };
@@ -946,7 +988,9 @@ fn appendNfaState(
     states: *std.ArrayList(NfaState),
     limits: Limits,
 ) Error!usize {
-    if (states.items.len >= limits.max_content_positions *| 4 +| 2) return error.LimitExceeded;
+    if (states.items.len >= limits.max_content_positions *| 4 +| 2) {
+        return error.ContentPositionLimit;
+    }
     try states.append(allocator, .{});
     return states.items.len - 1;
 }

@@ -5588,6 +5588,96 @@ test "[failure] - [reader initialization]: zero required limits fail without all
         error.InvalidOptions,
         ValidatingReader.init(std.testing.allocator, validating_options),
     );
+    validating_options = .{};
+    validating_options.validation.limits.max_content_transitions = std.math.maxInt(usize);
+    try std.testing.expectError(
+        error.InvalidOptions,
+        ValidatingReader.init(std.testing.allocator, validating_options),
+    );
+}
+
+test "[edge] - [validation limits]: report the exact exhausted resource" {
+    const config = xml.Configs.XML10_VALIDATING;
+    const LimitCase = enum {
+        content_positions,
+        content_states,
+        content_transitions,
+        compilation_work,
+        ids,
+        idrefs,
+        identity_bytes,
+        comparison_work,
+    };
+    const cases = [_]struct {
+        kind: LimitCase,
+        input: []const u8,
+        code: xml.DiagnosticCode,
+    }{
+        .{
+            .kind = .content_positions,
+            .input = "<!DOCTYPE root [<!ELEMENT root (a,b)><!ELEMENT a EMPTY><!ELEMENT b EMPTY>]><root><a/><b/></root>",
+            .code = .validation_content_position_limit,
+        },
+        .{
+            .kind = .content_states,
+            .input = "<!DOCTYPE root [<!ELEMENT root (a)><!ELEMENT a EMPTY>]><root><a/></root>",
+            .code = .validation_content_state_limit,
+        },
+        .{
+            .kind = .content_transitions,
+            .input = "<!DOCTYPE root [<!ELEMENT root (a,b)><!ELEMENT a EMPTY><!ELEMENT b EMPTY>]><root><a/><b/></root>",
+            .code = .validation_content_transition_limit,
+        },
+        .{
+            .kind = .compilation_work,
+            .input = "<!DOCTYPE root [<!ELEMENT root (a)><!ELEMENT a EMPTY>]><root><a/></root>",
+            .code = .validation_compilation_work_limit,
+        },
+        .{
+            .kind = .ids,
+            .input = "<!DOCTYPE root [<!ELEMENT root (item,item)><!ELEMENT item EMPTY><!ATTLIST item id ID #REQUIRED>]><root><item id='a'/><item id='b'/></root>",
+            .code = .validation_id_limit,
+        },
+        .{
+            .kind = .idrefs,
+            .input = "<!DOCTYPE root [<!ELEMENT root (item)><!ELEMENT item EMPTY><!ATTLIST item refs IDREFS #IMPLIED>]><root><item refs='a b'/></root>",
+            .code = .validation_idref_limit,
+        },
+        .{
+            .kind = .identity_bytes,
+            .input = "<!DOCTYPE root [<!ELEMENT root (item)><!ELEMENT item EMPTY><!ATTLIST item id ID #REQUIRED>]><root><item id='aa'/></root>",
+            .code = .validation_identity_bytes_limit,
+        },
+        .{
+            .kind = .comparison_work,
+            .input = "<!DOCTYPE root [<!ELEMENT root EMPTY>]><root/>",
+            .code = .validation_comparison_work_limit,
+        },
+    };
+
+    for (cases) |case| {
+        var options: xml.Options(config) = .{};
+        switch (case.kind) {
+            .content_positions => options.validation.limits.max_content_positions = 1,
+            .content_states => options.validation.limits.max_content_states = 1,
+            .content_transitions => options.validation.limits.max_content_transitions = 1,
+            .compilation_work => options.validation.limits.max_compilation_work = 1,
+            .ids => options.validation.limits.max_ids = 1,
+            .idrefs => options.validation.limits.max_idrefs = 1,
+            .identity_bytes => options.validation.limits.max_id_bytes = 1,
+            .comparison_work => options.validation.limits.max_comparison_work = 1,
+        }
+        var reader = try xml.Reader(config).init(std.testing.allocator, options);
+        defer reader.deinit();
+        try reader.feed(case.input, true);
+        while (true) {
+            _ = reader.next() catch |err| {
+                try std.testing.expectEqual(error.LimitExceeded, err);
+                try std.testing.expectEqual(case.code, reader.diagnostic().?.code);
+                break;
+            };
+        }
+    }
 }
 
 test "[unit] - [namespace expansion]: declarations and ordinary attributes are distinct" {
@@ -6516,6 +6606,24 @@ test "[failure] - [compiled external subset]: every allocation failure cleans up
     );
 }
 
+test "[failure] - [compiled external subset]: rejects a skipped parameter entity" {
+    var provider = TestSubsetProvider{ .resources = &.{} };
+    const result = xml.ExternalSubset.compileDecoded(
+        std.testing.allocator,
+        "schema.dtd",
+        "<!ELEMENT root EMPTY><!ENTITY % child SYSTEM 'child.dtd'>%child;",
+        .{ .provider = provider.provider() },
+    );
+    if (result) |value| {
+        var subset = value;
+        subset.deinit();
+        return error.ExpectedFailure;
+    } else |err| {
+        try std.testing.expectEqual(error.UnsupportedFeature, err);
+    }
+    try std.testing.expectEqual(@as(usize, 1), provider.resolves);
+}
+
 test "[failure] - [non-validating standalone]: externally declared entity is undeclared" {
     const resources = [_]TestExternalResource{
         .{
@@ -6575,6 +6683,53 @@ test "[integration] - [compiled external subset]: internal declarations retain p
     };
     try std.testing.expectEqual(@as(u8, 'b'), default_value.?);
     try std.testing.expectEqual(xml.ValidationStatus.valid, status.?);
+}
+
+test "[integration] - [compiled external subset]: content position limits remain per model" {
+    const config = xml.Configs.XML10_VALIDATING;
+    const declarations = "<!ELEMENT root (#PCDATA|a|b)*>" ++
+        "<!ELEMENT a (#PCDATA|c|d)*>" ++
+        "<!ELEMENT b EMPTY><!ELEMENT c EMPTY><!ELEMENT d EMPTY>";
+    const document = "<!DOCTYPE root SYSTEM 'schema.dtd'><root><a><c/></a><b/></root>";
+    var subset = try xml.ExternalSubset.compileDecoded(
+        std.testing.allocator,
+        "schema.dtd",
+        declarations,
+        .{},
+    );
+    defer subset.deinit();
+
+    var options: xml.Options(config) = .{};
+    options.validation.limits.max_content_positions = 2;
+    options.validation.external_subset = &subset;
+    var reader = try xml.Reader(config).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed(document, true);
+    var status: ?xml.ValidationStatus = null;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .document_end => |end| status = end.validation,
+            else => {},
+        },
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+    try std.testing.expectEqual(xml.ValidationStatus.valid, status.?);
+
+    options.validation.limits.max_content_positions = 1;
+    var strict_reader = try xml.Reader(config).init(std.testing.allocator, options);
+    defer strict_reader.deinit();
+    try strict_reader.feed(document, true);
+    while (true) {
+        _ = strict_reader.next() catch |err| {
+            try std.testing.expectEqual(error.LimitExceeded, err);
+            try std.testing.expectEqual(
+                xml.DiagnosticCode.validation_content_position_limit,
+                strict_reader.diagnostic().?.code,
+            );
+            break;
+        };
+    }
 }
 
 test "[failure] - [compiled external subset]: identifier mismatch is explicit" {

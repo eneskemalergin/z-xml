@@ -444,6 +444,14 @@ pub const DiagnosticCode = enum {
     entity_reference_limit,
     entity_expansion_ratio_limit,
     dtd_comparison_work_limit,
+    validation_content_position_limit,
+    validation_content_state_limit,
+    validation_content_transition_limit,
+    validation_compilation_work_limit,
+    validation_id_limit,
+    validation_idref_limit,
+    validation_identity_bytes_limit,
+    validation_comparison_work_limit,
     recursive_entity,
     entity_expansion_limit,
     external_resource_count_limit,
@@ -3102,16 +3110,41 @@ pub fn Reader(comptime config: Config) type {
         fn mapValidationError(self: *Self, err: validation_module.Error) ReadError {
             return switch (err) {
                 error.OutOfMemory => self.failOutOfMemory(),
-                error.LimitExceeded => self.fail(.dtd_grammar_node_limit, .limit_exceeded),
+                error.ContentPositionLimit => self.fail(
+                    .validation_content_position_limit,
+                    .limit_exceeded,
+                ),
+                error.ContentStateLimit => self.fail(
+                    .validation_content_state_limit,
+                    .limit_exceeded,
+                ),
+                error.ContentTransitionLimit => self.fail(
+                    .validation_content_transition_limit,
+                    .limit_exceeded,
+                ),
+                error.CompilationWorkLimit => self.fail(
+                    .validation_compilation_work_limit,
+                    .limit_exceeded,
+                ),
+                error.IdLimit => self.fail(.validation_id_limit, .limit_exceeded),
+                error.IdrefLimit => self.fail(.validation_idref_limit, .limit_exceeded),
+                error.IdentityBytesLimit => self.fail(
+                    .validation_identity_bytes_limit,
+                    .limit_exceeded,
+                ),
+                error.ComparisonWorkLimit => self.fail(
+                    .validation_comparison_work_limit,
+                    .limit_exceeded,
+                ),
             };
         }
 
         fn finishValidation(self: *Self) ReadError!void {
             if (comptime config.profile.dtdMode() == .validating) {
-                while (try self.validation_state.unresolvedIdref(
+                while (self.validation_state.unresolvedIdref(
                     self.options.validation.limits,
                     self.final_idref_cursor,
-                )) |index| {
+                ) catch |err| return self.mapValidationError(err)) |index| {
                     self.final_idref_cursor = index + 1;
                     const source = self.validation_state.idrefLocation(index);
                     try self.reportValidity(.{
@@ -5571,13 +5604,15 @@ pub fn Reader(comptime config: Config) type {
             const location = toValidationLocation(config, self.token_start);
             if (self.open_elements.items.len != 0) {
                 const parent = &self.open_elements.items[self.open_elements.items.len - 1].validation;
-                if (try self.validation_state.advance(
+                if (self.validation_state.advance(
                     self.options.validation.limits,
                     declarations,
                     parent,
                     name,
                     location,
-                )) |issue| try self.reportValidity(issue, self.token_start);
+                ) catch |err| return self.mapValidationError(err)) |issue| {
+                    try self.reportValidity(issue, self.token_start);
+                }
             }
             var beginning = self.validation_state.beginElement(
                 self.options.validation.limits,
