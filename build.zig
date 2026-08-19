@@ -439,6 +439,16 @@ pub fn build(b: *std.Build) void {
     const run_reader_internal_tests = b.addRunArtifact(reader_internal_tests);
     test_step.dependOn(&run_reader_internal_tests.step);
 
+    const dtd_internal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dtd.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_dtd_internal_tests = b.addRunArtifact(dtd_internal_tests);
+    test_step.dependOn(&run_dtd_internal_tests.step);
+
     const check_module = b.createModule(.{
         .root_source_file = b.path("tools/z_xml_check.zig"),
         .target = target,
@@ -449,6 +459,7 @@ pub fn build(b: *std.Build) void {
     const raw_check_options = b.addOptions();
     raw_check_options.addOption(bool, "namespaces", false);
     raw_check_options.addOption(bool, "general_encodings", false);
+    raw_check_options.addOption(bool, "dtd", false);
     check_module.addOptions("check_options", raw_check_options);
     const check = b.addExecutable(.{
         .name = "z-xml-check",
@@ -471,6 +482,7 @@ pub fn build(b: *std.Build) void {
     const namespace_check_options = b.addOptions();
     namespace_check_options.addOption(bool, "namespaces", true);
     namespace_check_options.addOption(bool, "general_encodings", false);
+    namespace_check_options.addOption(bool, "dtd", false);
     namespace_check_module.addOptions("check_options", namespace_check_options);
     const namespace_check = b.addExecutable(.{
         .name = "z-xml-ns-check",
@@ -493,6 +505,7 @@ pub fn build(b: *std.Build) void {
     const general_check_options = b.addOptions();
     general_check_options.addOption(bool, "namespaces", false);
     general_check_options.addOption(bool, "general_encodings", true);
+    general_check_options.addOption(bool, "dtd", false);
     general_check_module.addOptions("check_options", general_check_options);
     const general_check = b.addExecutable(.{
         .name = "z-xml-general-check",
@@ -515,6 +528,7 @@ pub fn build(b: *std.Build) void {
     const general_namespace_check_options = b.addOptions();
     general_namespace_check_options.addOption(bool, "namespaces", true);
     general_namespace_check_options.addOption(bool, "general_encodings", true);
+    general_namespace_check_options.addOption(bool, "dtd", false);
     general_namespace_check_module.addOptions(
         "check_options",
         general_namespace_check_options,
@@ -531,6 +545,46 @@ pub fn build(b: *std.Build) void {
         general_namespace_check_tests,
     );
     test_step.dependOn(&run_general_namespace_check_tests.step);
+
+    const dtd_check_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    dtd_check_module.addImport("z_xml", z_xml);
+    const dtd_check_options = b.addOptions();
+    dtd_check_options.addOption(bool, "namespaces", false);
+    dtd_check_options.addOption(bool, "general_encodings", true);
+    dtd_check_options.addOption(bool, "dtd", true);
+    dtd_check_module.addOptions("check_options", dtd_check_options);
+    const dtd_check = b.addExecutable(.{
+        .name = "z-xml-dtd-check",
+        .root_module = dtd_check_module,
+    });
+    b.installArtifact(dtd_check);
+    const dtd_check_tests = b.addTest(.{ .root_module = dtd_check_module });
+    test_step.dependOn(&b.addRunArtifact(dtd_check_tests).step);
+
+    const dtd_namespace_check_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    dtd_namespace_check_module.addImport("z_xml", z_xml);
+    const dtd_namespace_check_options = b.addOptions();
+    dtd_namespace_check_options.addOption(bool, "namespaces", true);
+    dtd_namespace_check_options.addOption(bool, "general_encodings", true);
+    dtd_namespace_check_options.addOption(bool, "dtd", true);
+    dtd_namespace_check_module.addOptions("check_options", dtd_namespace_check_options);
+    const dtd_namespace_check = b.addExecutable(.{
+        .name = "z-xml-dtd-ns-check",
+        .root_module = dtd_namespace_check_module,
+    });
+    b.installArtifact(dtd_namespace_check);
+    const dtd_namespace_check_tests = b.addTest(.{ .root_module = dtd_namespace_check_module });
+    test_step.dependOn(&b.addRunArtifact(dtd_namespace_check_tests).step);
 
     const persistent_module = b.createModule(.{
         .root_source_file = b.path("tools/z_xml_persistent.zig"),

@@ -20,6 +20,10 @@ pub fn main() void {
         xml.Configs.XML10_NAMESPACES_NO_DTD_FAST,
     );
     printLayout("xml10-nonvalidating", xml.Configs.XML10_NONVALIDATING);
+    printLayout(
+        "xml10-ns-nonvalidating",
+        xml.Configs.XML10_NAMESPACES_NONVALIDATING,
+    );
     printLayout("xml10-validating", xml.Configs.XML10_VALIDATING);
     printLayout(
         "xml10-ns-validating-detailed",

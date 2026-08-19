@@ -9,6 +9,8 @@ const FAST_CONFIG = xml.Configs.XML10_UTF8_NO_DTD_FAST;
 const NS_CONFIG = xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD;
 const GENERAL_CONFIG = xml.Configs.XML10_NO_DTD;
 const GENERAL_FAST_CONFIG = xml.Configs.XML10_NO_DTD_FAST;
+const DTD_CONFIG = xml.Configs.XML10_NONVALIDATING;
+const DTD_NS_CONFIG = xml.Configs.XML10_NAMESPACES_NONVALIDATING;
 const CoreReader = xml.Reader(CORE_CONFIG);
 
 const Summary = struct {
@@ -1058,6 +1060,100 @@ fn allocationNamespaceParse(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 9), summary.namespace_declarations);
 }
 
+fn allocationDtdParse(allocator: std.mem.Allocator) !void {
+    const config = xml.Configs.XML10_NAMESPACES_NONVALIDATING;
+    const input = "<!DOCTYPE p:root [" ++
+        "<!ENTITY % element '<!ELEMENT p:root (#PCDATA)>'>%element;" ++
+        "<!ENTITY text 'expanded'><!ATTLIST p:root xmlns:p CDATA 'urn:test' " ++
+        "tokens NMTOKENS ' one  two '>]><p:root>&text;</p:root>";
+    var reader = try xml.Reader(config).init(allocator, .{});
+    defer reader.deinit();
+    try reader.feed(input, true);
+    var starts: usize = 0;
+    var text_bytes: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .start_element => |start| {
+                starts += 1;
+                try std.testing.expectEqual(@as(usize, 1), start.attributes.len);
+                try std.testing.expectEqual(@as(usize, 1), start.namespace_declarations.len);
+            },
+            .text => |text| text_bytes += text.bytes.len,
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(@as(usize, 1), starts);
+    try std.testing.expectEqual(@as(usize, 8), text_bytes);
+}
+
+const DtdOutcome = struct {
+    doctypes: usize = 0,
+    starts: usize = 0,
+    ends: usize = 0,
+    attributes: usize = 0,
+    defaulted: usize = 0,
+    namespace_declarations: usize = 0,
+    text_hash: u64 = 14695981039346656037,
+};
+
+const DtdSchedule = union(enum) {
+    whole,
+    split: usize,
+    fixed: usize,
+    random: u64,
+};
+
+fn dtdOutcome(comptime config: xml.Config, input: []const u8, schedule: DtdSchedule) !DtdOutcome {
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    var outcome: DtdOutcome = .{};
+    var offset: usize = 0;
+    var first = true;
+    var prng = std.Random.DefaultPrng.init(switch (schedule) {
+        .random => |seed| seed,
+        else => 0,
+    });
+    while (true) {
+        const remaining = input.len - offset;
+        const size = switch (schedule) {
+            .whole => remaining,
+            .split => |value| if (first) value else remaining,
+            .fixed => |value| @min(value, remaining),
+            .random => prng.random().intRangeAtMost(usize, 1, @min(@as(usize, 17), remaining)),
+        };
+        first = false;
+        const end = offset + size;
+        try reader.feed(input[offset..end], end == input.len);
+        offset = end;
+        while (true) switch (try reader.next()) {
+            .event => |event| switch (event) {
+                .document_type => outcome.doctypes += 1,
+                .start_element => |start| {
+                    outcome.starts += 1;
+                    outcome.attributes += start.attributes.len;
+                    for (start.attributes) |attribute| {
+                        outcome.defaulted += @intFromBool(!attribute.specified);
+                    }
+                    if (@hasField(@TypeOf(start), "namespace_declarations")) {
+                        outcome.namespace_declarations += start.namespace_declarations.len;
+                    }
+                },
+                .end_element => outcome.ends += 1,
+                .text => |text| for (text.bytes) |byte| {
+                    outcome.text_hash ^= byte;
+                    outcome.text_hash *%= 1099511628211;
+                },
+                else => {},
+            },
+            .need_input => break,
+            .done => return outcome,
+        };
+        if (offset == input.len) return error.MissingDone;
+    }
+}
+
 fn expectExpandedName(
     name: xml.Name(NS_CONFIG),
     raw: []const u8,
@@ -1261,8 +1357,6 @@ test "config - excluded capabilities: specialized types omit impossible fields" 
 
 test "[failure] - [unimplemented profiles]: reject parsing without placeholder semantics" {
     inline for (.{
-        xml.Configs.XML10_NONVALIDATING,
-        xml.Configs.XML10_NAMESPACES_NONVALIDATING,
         xml.Configs.XML10_VALIDATING,
         xml.Configs.XML10_NAMESPACES_VALIDATING_DETAILED,
         xml.Configs.XML11_NAMESPACES_VALIDATING,
@@ -1277,6 +1371,522 @@ test "[failure] - [unimplemented profiles]: reject parsing without placeholder s
         try std.testing.expectEqual(xml.DiagnosticCode.unsupported_stage, diagnostic.code);
         try std.testing.expectEqual(@as(u64, 0), diagnostic.primary.byte_offset);
         try std.testing.expectError(error.UnsupportedFeature, reader.next());
+    }
+}
+
+test "[integration] - [internal DTD]: applies defaults normalization and entity replacement" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    const Reader = xml.Reader(config);
+    const input = "<!DOCTYPE root [<!ELEMENT root (#PCDATA)>" ++
+        "<!ATTLIST root mode NMTOKENS '  one   two  '>" ++
+        "<!ENTITY hello 'Hello'>]><root>&hello;</root>";
+    var reader = try Reader.init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(input, true);
+
+    var saw_doctype = false;
+    var saw_start = false;
+    var text: [16]u8 = undefined;
+    var text_len: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .document_type => |doctype| {
+                saw_doctype = true;
+                try std.testing.expectEqualStrings("root", doctype.root_name);
+            },
+            .start_element => |start| {
+                saw_start = true;
+                try std.testing.expectEqual(@as(usize, 1), start.attributes.len);
+                try std.testing.expectEqualStrings("mode", start.attributes[0].name.raw);
+                try std.testing.expectEqualStrings("one two", start.attributes[0].value);
+                try std.testing.expect(!start.attributes[0].specified);
+            },
+            .text => |fragment| {
+                @memcpy(text[text_len..][0..fragment.bytes.len], fragment.bytes);
+                text_len += fragment.bytes.len;
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expect(saw_doctype);
+    try std.testing.expect(saw_start);
+    try std.testing.expectEqualStrings("Hello", text[0..text_len]);
+    try std.testing.expect(reader.memoryUsage().dtd_capacity > 0);
+}
+
+test "[integration] - [document type event]: header precedes internal subset input" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root PUBLIC 'public-id' 'system-id' [", false);
+
+    var saw_doctype = false;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .document_type => |doctype| {
+                saw_doctype = true;
+                try std.testing.expectEqualStrings("root", doctype.root_name);
+                try std.testing.expectEqualStrings("public-id", doctype.public_id.?);
+                try std.testing.expectEqualStrings("system-id", doctype.system_id.?);
+            },
+            else => {},
+        },
+        .need_input => break,
+        .done => return error.UnexpectedDone,
+    };
+    try std.testing.expect(saw_doctype);
+
+    try reader.feed("<!ELEMENT root EMPTY>]><root/>", true);
+    while (true) switch (reader.next() catch |err| {
+        try std.testing.expectEqual(error.UnsupportedFeature, err);
+        break;
+    }) {
+        .event => {},
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+}
+
+test "[integration] - [document type event]: external header precedes unsupported processing" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+
+    var saw_doctype = false;
+    while (reader.next()) |step| switch (step) {
+        .event => |event| switch (event) {
+            .document_type => |doctype| {
+                saw_doctype = true;
+                try std.testing.expectEqualStrings("root", doctype.root_name);
+                try std.testing.expectEqualStrings("external.dtd", doctype.system_id.?);
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => return error.ExpectedUnsupportedFeature,
+    } else |err| {
+        try std.testing.expectEqual(error.UnsupportedFeature, err);
+    }
+    try std.testing.expect(saw_doctype);
+    try std.testing.expectEqual(
+        xml.DiagnosticCode.unsupported_doctype,
+        reader.diagnostic().?.code,
+    );
+    try std.testing.expectError(error.UnsupportedFeature, reader.next());
+}
+
+test "[integration] - [internal DTD namespaces]: default declaration precedes expansion" {
+    const config = xml.Configs.XML10_NAMESPACES_NONVALIDATING;
+    const Reader = xml.Reader(config);
+    const input = "<!DOCTYPE p:root [<!ELEMENT p:root EMPTY>" ++
+        "<!ATTLIST p:root xmlns:p CDATA 'urn:defaulted'>]><p:root/>";
+    var reader = try Reader.init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(input, true);
+    var saw_start = false;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .start_element => |start| {
+                saw_start = true;
+                try std.testing.expectEqualStrings("urn:defaulted", start.name.namespace_uri.?);
+                try std.testing.expectEqual(@as(usize, 1), start.namespace_declarations.len);
+                try std.testing.expectEqual(@as(usize, 0), start.attributes.len);
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expect(saw_start);
+}
+
+test "[integration] - [internal DTD chunking]: one-byte input preserves declaration effects" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    const Reader = xml.Reader(config);
+    const input = "<!DOCTYPE root [<!ELEMENT root (child)>" ++
+        "<!ELEMENT child (#PCDATA)><!ENTITY value '<child>text</child>'>]><root>&value;</root>";
+    var reader = try Reader.init(std.testing.allocator, .{});
+    defer reader.deinit();
+    var offset: usize = 0;
+    var starts: usize = 0;
+    var ends: usize = 0;
+    var text_bytes: usize = 0;
+    while (true) {
+        if (reader.lifecycle == .ready or reader.lifecycle == .needs_input) {
+            if (offset == input.len) return error.UnexpectedNeedInput;
+            try reader.feed(input[offset .. offset + 1], offset + 1 == input.len);
+            offset += 1;
+        }
+        switch (try reader.next()) {
+            .event => |event| switch (event) {
+                .start_element => starts += 1,
+                .end_element => ends += 1,
+                .text => |fragment| text_bytes += fragment.bytes.len,
+                else => {},
+            },
+            .need_input => {},
+            .done => break,
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), starts);
+    try std.testing.expectEqual(@as(usize, 2), ends);
+    try std.testing.expectEqual(@as(usize, 4), text_bytes);
+}
+
+test "[property] - [internal DTD chunking]: schedules preserve raw and namespace semantics" {
+    const input = "<?xml version='1.0'?><!DOCTYPE p:root [" ++
+        "<!ENTITY % declarations '<!ELEMENT p:root (#PCDATA)>'>%declarations;" ++
+        "<!ENTITY inner 'in'><!ENTITY outer '&inner;side'>" ++
+        "<!ATTLIST p:root xmlns:p CDATA 'urn:p' words NMTOKENS ' one   two '>]>" ++
+        "<p:root>&outer;</p:root>";
+    inline for (.{
+        xml.Configs.XML10_NONVALIDATING,
+        xml.Configs.XML10_NAMESPACES_NONVALIDATING,
+    }) |config| {
+        const whole = try dtdOutcome(config, input, .whole);
+        for (1..input.len) |split| {
+            try std.testing.expectEqual(whole, try dtdOutcome(config, input, .{ .split = split }));
+        }
+        try std.testing.expectEqual(whole, try dtdOutcome(config, input, .{ .fixed = 7 }));
+        for (0..16) |seed| {
+            try std.testing.expectEqual(whole, try dtdOutcome(config, input, .{ .random = seed + 1 }));
+        }
+    }
+}
+
+test "[failure] - [internal entities]: recursion and expansion limits fail" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    const Reader = xml.Reader(config);
+    {
+        var reader = try Reader.init(std.testing.allocator, .{});
+        defer reader.deinit();
+        try reader.feed(
+            "<!DOCTYPE root [<!ELEMENT root (#PCDATA)>" ++
+                "<!ENTITY a '&b;'><!ENTITY b '&a;'>]><root>&a;</root>",
+            true,
+        );
+        while (reader.next()) |step| {
+            if (step == .done) return error.ExpectedRecursiveEntity;
+        } else |err| try std.testing.expectEqual(error.InvalidXml, err);
+        try std.testing.expectEqual(xml.DiagnosticCode.recursive_entity, reader.diagnostic().?.code);
+    }
+    {
+        var reader = try Reader.init(std.testing.allocator, .{
+            .dtd_limits = .{ .max_expanded_bytes = 3 },
+        });
+        defer reader.deinit();
+        try reader.feed(
+            "<!DOCTYPE root [<!ELEMENT root (#PCDATA)><!ENTITY a 'four'>]>" ++
+                "<root>&a;</root>",
+            true,
+        );
+        while (reader.next()) |step| {
+            if (step == .done) return error.ExpectedExpansionLimit;
+        } else |err| try std.testing.expectEqual(error.LimitExceeded, err);
+        try std.testing.expectEqual(
+            xml.DiagnosticCode.entity_expansion_limit,
+            reader.diagnostic().?.code,
+        );
+    }
+}
+
+test "[edge] - [entity expansion ratio]: accepts the boundary and rejects one byte over" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    inline for (.{
+        .{ "123456789", false },
+        .{ "1234567890", true },
+    }) |case| {
+        var options: xml.Options(config) = .{};
+        options.dtd_limits.max_expanded_bytes = 100;
+        options.dtd_limits.max_expansion_ratio = 3;
+        options.dtd_limits.expansion_ratio_minimum_bytes = 0;
+        var reader = try xml.Reader(config).init(std.testing.allocator, options);
+        defer reader.deinit();
+        const input = try std.mem.concat(std.testing.allocator, u8, &.{
+            "<!DOCTYPE root [<!ENTITY a '",
+            case[0],
+            "'>]><root>&a;</root>",
+        });
+        defer std.testing.allocator.free(input);
+        try reader.feed(input, true);
+        var rejected = false;
+        while (reader.next()) |step| {
+            if (step == .done) break;
+        } else |err| {
+            try std.testing.expect(case[1]);
+            try std.testing.expectEqual(error.LimitExceeded, err);
+            try std.testing.expectEqual(
+                xml.DiagnosticCode.entity_expansion_ratio_limit,
+                reader.diagnostic().?.code,
+            );
+            rejected = true;
+        }
+        try std.testing.expectEqual(case[1], rejected);
+    }
+}
+
+test "[failure] - [DTD declaration limit]: rejects before declaration publication" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    const input = "<!DOCTYPE root [<!ELEMENT root EMPTY>]><root/>";
+    var options: xml.Options(config) = .{};
+    options.dtd_limits.max_declaration_bytes = "<!ELEMENT root EMPTY>".len - 1;
+
+    try expectProfileFailureSchedules(
+        config,
+        options,
+        input,
+        error.LimitExceeded,
+        .dtd_declaration_bytes_limit,
+        @intCast(std.mem.indexOf(u8, input, "<!ELEMENT").?),
+        null,
+    );
+}
+
+test "[failure] - [predefined entities]: invalid declarations are fatal" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    const input = "<!DOCTYPE root [<!ENTITY lt '&#60;'>]><root/>";
+
+    try expectProfileFailureSchedules(
+        config,
+        .{},
+        input,
+        error.InvalidDtd,
+        .malformed_entity_declaration,
+        @intCast(std.mem.indexOfScalar(u8, input, '>').?),
+        null,
+    );
+}
+
+test "[property] - [DTD diagnostics]: malformed grammar location is schedule invariant" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    const input = "<!DOCTYPE root [<!ELEMENT root (a|)>]><root/>";
+    try expectProfileFailureSchedules(
+        config,
+        .{},
+        input,
+        error.InvalidDtd,
+        .malformed_element_declaration,
+        @intCast(std.mem.indexOfScalar(u8, input, ')').?),
+        null,
+    );
+}
+
+test "[property] - [DTD diagnostics]: declaration value locations are schedule invariant" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    const attribute_input =
+        "<!DOCTYPE root [<!ATTLIST root mode CDATA '&#x110000;'>]><root/>";
+    try expectProfileFailureSchedules(
+        config,
+        .{},
+        attribute_input,
+        error.InvalidDtd,
+        .malformed_attribute_list_declaration,
+        @intCast(std.mem.indexOf(u8, attribute_input, "&#x110000;").?),
+        null,
+    );
+
+    const notation_input =
+        "<!DOCTYPE root [<!NOTATION image SYSTEM>]><root/>";
+    try expectProfileFailureSchedules(
+        config,
+        .{},
+        notation_input,
+        error.InvalidDtd,
+        .malformed_notation_declaration,
+        @intCast(std.mem.indexOf(u8, notation_input, ">]").?),
+        null,
+    );
+}
+
+test "[failure] - [DTD replacement bytes limit]: reports the rejected value byte" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    const input = "<!DOCTYPE root [<!ENTITY value 'ab'>]><root/>";
+    var options: xml.Options(config) = .{};
+    options.dtd_limits.max_entity_replacement_bytes = 1;
+    try expectProfileFailureSchedules(
+        config,
+        options,
+        input,
+        error.LimitExceeded,
+        .dtd_replacement_bytes_limit,
+        @intCast(std.mem.indexOf(u8, input, "ab").? + 1),
+        null,
+    );
+}
+
+test "[failure] - [DTD storage]: every allocation failure cleans up" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        allocationDtdParse,
+        .{},
+    );
+}
+
+test "[unit] - [DTD reset]: declarations and active entity state never cross documents" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(
+        "<!DOCTYPE root [<!ENTITY value 'text'>]><root>&value;</root>",
+        true,
+    );
+    while (true) switch (try reader.next()) {
+        .event => {},
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    const retained = reader.memoryUsage().dtd_capacity;
+    try std.testing.expect(retained > 0);
+
+    try reader.reset(.retain_capacity);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().attribute_count);
+    try reader.feed("<root>&value;</root>", true);
+    while (reader.next()) |step| {
+        if (step == .done) return error.ExpectedUndeclaredEntity;
+    } else |err| try std.testing.expectEqual(error.InvalidXml, err);
+    try std.testing.expectEqual(xml.DiagnosticCode.undeclared_entity, reader.diagnostic().?.code);
+
+    try reader.reset(.release_memory);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().dtd_capacity);
+}
+
+test "[integration] - [detailed DTD events]: declarations and entity boundaries retain order" {
+    const config: xml.Config = .{
+        .profile = .xml10_nonvalidating,
+        .report = .detailed,
+    };
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(
+        "<!DOCTYPE root [<!--dtd--><?inside data?>" ++
+            "<!ELEMENT root (#PCDATA)><!ATTLIST root a CDATA #IMPLIED>" ++
+            "<!ENTITY value 'text'><!NOTATION n PUBLIC 'public'>" ++
+            "<!ENTITY image SYSTEM 'image.bin' NDATA n>]><root>&value;</root>",
+        true,
+    );
+    var declarations: usize = 0;
+    var entity_starts: usize = 0;
+    var entity_ends: usize = 0;
+    var notation_seen = false;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .element_declaration, .attribute_list_declaration, .parsed_entity_declaration => {
+                declarations += 1;
+            },
+            .notation_declaration => |notation| {
+                notation_seen = true;
+                try std.testing.expectEqualStrings("public", notation.public_id.?);
+            },
+            .unparsed_entity_declaration => |entity| {
+                try std.testing.expectEqualStrings("n", entity.notation_name);
+                try std.testing.expectEqualStrings("image.bin", entity.system_id.?);
+            },
+            .entity_start => |entity| {
+                entity_starts += 1;
+                try std.testing.expectEqualStrings("value", entity.name);
+            },
+            .entity_end => |entity| {
+                entity_ends += 1;
+                try std.testing.expectEqualStrings("value", entity.name);
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(@as(usize, 3), declarations);
+    try std.testing.expectEqual(@as(usize, 1), entity_starts);
+    try std.testing.expectEqual(@as(usize, 1), entity_ends);
+    try std.testing.expect(notation_seen);
+}
+
+test "[integration] - [standalone DTD effects]: undeclared entity exception requires non-standalone input" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    const body = "<!DOCTYPE root [<!ENTITY % marker '<!ELEMENT root ANY>'>%marker;]>" ++
+        "<root>&undeclared;</root>";
+    inline for (.{
+        .{ "<?xml version='1.0'?>", false },
+        .{ "<?xml version='1.0' standalone='no'?>", false },
+        .{ "<?xml version='1.0' standalone='yes'?>", true },
+    }) |case| {
+        var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+        defer reader.deinit();
+        const input = try std.mem.concat(std.testing.allocator, u8, &.{ case[0], body });
+        defer std.testing.allocator.free(input);
+        try reader.feed(input, true);
+        var rejected = false;
+        while (reader.next()) |step| {
+            if (step == .done) break;
+        } else |err| {
+            try std.testing.expect(case[1]);
+            try std.testing.expectEqual(error.InvalidXml, err);
+            rejected = true;
+        }
+        try std.testing.expectEqual(case[1], rejected);
+    }
+}
+
+test "[integration] - [DTD attribute defaults]: nested entities normalize before publication" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    try reader.feed(
+        "<!DOCTYPE root [<!ENTITY % marker 'literal'><!ENTITY inner 'one  two'>" ++
+            "<!ENTITY outer '&inner; three'><!ATTLIST root words NMTOKENS '&outer;' " ++
+            "percent CDATA '%marker;'>]><root/>",
+        true,
+    );
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .start_element => |start| {
+                try std.testing.expectEqualStrings("one two three", start.attributes[0].value);
+                try std.testing.expect(!start.attributes[0].specified);
+                try std.testing.expectEqualStrings("%marker;", start.attributes[1].value);
+                try std.testing.expect(!start.attributes[1].specified);
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+}
+
+test "[property] - [entity memory]: repeated expansion retains a fixed active shape" {
+    const config = xml.Configs.XML10_NONVALIDATING;
+    var reader = try xml.Reader(config).init(std.testing.allocator, .{});
+    defer reader.deinit();
+    var baseline: xml.MemoryUsage = .{};
+    inline for (.{ @as(usize, 10), @as(usize, 10_000) }, 0..) |count, pass| {
+        if (pass != 0) try reader.reset(.retain_capacity);
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(std.testing.allocator);
+        try input.appendSlice(
+            std.testing.allocator,
+            "<!DOCTYPE root [<!ENTITY value 'payload'>]><root>",
+        );
+        for (0..count) |_| try input.appendSlice(std.testing.allocator, "&value;");
+        try input.appendSlice(std.testing.allocator, "</root>");
+        try reader.feed(input.items, true);
+        var text_bytes: usize = 0;
+        while (true) switch (try reader.next()) {
+            .event => |event| switch (event) {
+                .text => |text| text_bytes += text.bytes.len,
+                else => {},
+            },
+            .need_input => return error.UnexpectedNeedInput,
+            .done => break,
+        };
+        try std.testing.expectEqual(count * "payload".len, text_bytes);
+        if (pass == 0) {
+            baseline = reader.memoryUsage();
+        } else {
+            const usage = reader.memoryUsage();
+            try std.testing.expectEqual(baseline.dtd_capacity, usage.dtd_capacity);
+            try std.testing.expectEqual(baseline.retained_capacity, usage.retained_capacity);
+        }
     }
 }
 
@@ -4490,6 +5100,15 @@ fn arbitraryOutcome(comptime config: xml.Config, input: []const u8, seed: ?u64) 
     options.limits.max_fragment_bytes = 64;
     options.limits.max_processing_instruction_target_bytes = 64;
     options.limits.max_retained_bytes = 512;
+    if (comptime @hasField(@TypeOf(options.dtd_limits), "max_dtd_bytes")) {
+        options.dtd_limits.max_dtd_bytes = 512;
+        options.dtd_limits.max_declarations = 32;
+        options.dtd_limits.max_entity_replacement_bytes = 512;
+        options.dtd_limits.max_entity_references = 128;
+        options.dtd_limits.max_expanded_bytes = 4096;
+        options.dtd_limits.expansion_ratio_minimum_bytes = 256;
+        options.dtd_limits.max_comparison_work = 4096;
+    }
 
     const Reader = xml.Reader(config);
     var reader = try Reader.init(std.testing.allocator, options);
@@ -4556,7 +5175,7 @@ fn fuzzArbitraryBytes(_: void, smith: *std.testing.Smith) !void {
     @disableInstrumentation();
     var storage: [512]u8 = undefined;
     const input = storage[0..smith.slice(&storage)];
-    inline for (.{ FAST_CONFIG, GENERAL_FAST_CONFIG }) |config| {
+    inline for (.{ FAST_CONFIG, GENERAL_FAST_CONFIG, DTD_CONFIG, DTD_NS_CONFIG }) |config| {
         const whole = try arbitraryOutcome(config, input, null);
         try std.testing.expectEqual(
             whole,
@@ -4572,6 +5191,8 @@ test "[fuzz] - [arbitrary bytes]: parsing is bounded and schedule invariant" {
             "<root a='&amp;'>text</root>",
             "<root><item></root>",
             "<!DOCTYPE root><root/>",
+            "<!DOCTYPE root [<!ENTITY text 'value'>]><root>&text;</root>",
+            "<!DOCTYPE root [<!ENTITY loop '&loop;'>]><root>&loop;</root>",
             "\xef\xbb\xbf<root>\xf0\x9f\x99\x82</root>",
             "<root>\xc0\x80</root>",
             fixtures.utf16le_bom,
@@ -4589,7 +5210,7 @@ test "[property] - [arbitrary bytes]: deterministic campaign is bounded and sche
     for (0..10_000) |iteration| {
         const len = random.intRangeAtMost(usize, 0, storage.len);
         random.bytes(storage[0..len]);
-        inline for (.{ FAST_CONFIG, GENERAL_FAST_CONFIG }) |config| {
+        inline for (.{ FAST_CONFIG, GENERAL_FAST_CONFIG, DTD_CONFIG, DTD_NS_CONFIG }) |config| {
             const whole = try arbitraryOutcome(config, storage[0..len], null);
             try std.testing.expectEqual(
                 whole,
@@ -4657,6 +5278,33 @@ test "[failure] - [reader initialization]: zero required limits fail without all
         try std.testing.expectError(
             error.InvalidOptions,
             NamespaceReader.init(std.testing.allocator, namespace_options),
+        );
+    }
+
+    const DtdReader = xml.Reader(xml.Configs.XML10_NONVALIDATING);
+    var dtd_options: xml.Options(xml.Configs.XML10_NONVALIDATING) = .{};
+    inline for (.{
+        "max_dtd_bytes",
+        "max_declarations",
+        "max_declaration_bytes",
+        "max_element_declarations",
+        "max_attribute_declarations",
+        "max_entity_declarations",
+        "max_notation_declarations",
+        "max_group_depth",
+        "max_grammar_nodes",
+        "max_entity_replacement_bytes",
+        "max_active_entity_depth",
+        "max_entity_references",
+        "max_expanded_bytes",
+        "max_expansion_ratio",
+        "max_comparison_work",
+    }) |field_name| {
+        dtd_options = .{};
+        @field(dtd_options.dtd_limits, field_name) = 0;
+        try std.testing.expectError(
+            error.InvalidOptions,
+            DtdReader.init(std.testing.allocator, dtd_options),
         );
     }
 }

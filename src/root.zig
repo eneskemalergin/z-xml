@@ -1,8 +1,8 @@
 //! A bounded, incremental XML reader for Zig.
 //!
 //! The public API is specialized by a compile-time configuration. The current
-//! implementation provides XML 1.0 no-DTD raw-name and namespace readers with
-//! UTF-8-only and general UTF-8 or UTF-16 source profiles.
+//! implementation provides XML 1.0 no-DTD readers and internal-DTD
+//! non-validating readers, with raw-name and namespace-aware profiles.
 
 const reader = @import("reader.zig");
 const encoding = @import("encoding.zig");

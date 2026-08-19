@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const encoding_module = @import("encoding.zig");
+const dtd_module = @import("dtd.zig");
 
 /// XML capability profile selected at compile time.
 pub const Profile = enum {
@@ -80,6 +81,8 @@ pub const Profile = enum {
             .xml10_utf8_ns_no_dtd,
             .xml10_no_dtd,
             .xml10_ns_no_dtd,
+            .xml10_nonvalidating,
+            .xml10_ns_nonvalidating,
             => true,
             else => false,
         };
@@ -373,6 +376,30 @@ pub const DiagnosticCode = enum {
     malformed_markup_declaration,
     misplaced_doctype,
     unsupported_doctype,
+    malformed_doctype,
+    malformed_dtd,
+    malformed_element_declaration,
+    malformed_attribute_list_declaration,
+    malformed_entity_declaration,
+    malformed_notation_declaration,
+    undeclared_parameter_entity,
+    recursive_parameter_entity,
+    dtd_bytes_limit,
+    dtd_declaration_limit,
+    dtd_declaration_bytes_limit,
+    dtd_element_declaration_limit,
+    dtd_attribute_declaration_limit,
+    dtd_entity_declaration_limit,
+    dtd_notation_declaration_limit,
+    dtd_grammar_depth_limit,
+    dtd_grammar_node_limit,
+    dtd_replacement_bytes_limit,
+    entity_depth_limit,
+    entity_reference_limit,
+    entity_expansion_ratio_limit,
+    dtd_comparison_work_limit,
+    recursive_entity,
+    entity_expansion_limit,
     read_failed,
 };
 
@@ -426,6 +453,7 @@ pub fn Options(comptime config: Config) type {
     return struct {
         limits: Limits = .{},
         namespace_limits: NamespaceLimits(config) = .{},
+        dtd_limits: if (config.profile.dtdMode() == .rejected) struct {} else dtd_module.Limits = .{},
         resolver: ResolverOptions(config) = .{},
         validation: ValidationOptions(config) = .{},
     };
@@ -449,10 +477,17 @@ pub fn Name(comptime config: Config) type {
 
 /// Source attribute whose slices follow the enclosing event lifetime.
 pub fn Attribute(comptime config: Config) type {
-    return struct {
-        name: Name(config),
-        value: []const u8,
-    };
+    return if (config.profile.dtdMode() == .rejected)
+        struct {
+            name: Name(config),
+            value: []const u8,
+        }
+    else
+        struct {
+            name: Name(config),
+            value: []const u8,
+            specified: bool,
+        };
 }
 
 /// One source-ordered namespace declaration whose slices follow the event lifetime.
@@ -508,6 +543,8 @@ const DocumentStart = struct {
 const DocumentEnd = struct {};
 const DocumentType = struct {
     root_name: []const u8,
+    public_id: ?[]const u8 = null,
+    system_id: ?[]const u8 = null,
 };
 const Text = struct {
     bytes: []const u8,
@@ -524,6 +561,17 @@ const ProcessingInstruction = struct {
 };
 const Declaration = struct {
     name: []const u8,
+};
+const NotationDeclaration = struct {
+    name: []const u8,
+    public_id: ?[]const u8,
+    system_id: ?[]const u8,
+};
+const UnparsedEntityDeclaration = struct {
+    name: []const u8,
+    public_id: ?[]const u8,
+    system_id: ?[]const u8,
+    notation_name: []const u8,
 };
 const EntityBoundary = struct {
     name: []const u8,
@@ -545,8 +593,8 @@ fn DtdEventPayload(comptime config: Config) type {
     return union(enum) {
         document_start: DocumentStart,
         document_type: DocumentType,
-        notation_declaration: Declaration,
-        unparsed_entity_declaration: Declaration,
+        notation_declaration: NotationDeclaration,
+        unparsed_entity_declaration: UnparsedEntityDeclaration,
         start_element: StartElement(config),
         end_element: EndElement(config),
         text: Text,
@@ -561,8 +609,8 @@ fn DetailedDtdEventPayload(comptime config: Config) type {
     return union(enum) {
         document_start: DocumentStart,
         document_type: DocumentType,
-        notation_declaration: Declaration,
-        unparsed_entity_declaration: Declaration,
+        notation_declaration: NotationDeclaration,
+        unparsed_entity_declaration: UnparsedEntityDeclaration,
         element_declaration: Declaration,
         attribute_list_declaration: Declaration,
         parsed_entity_declaration: Declaration,
@@ -700,6 +748,13 @@ const VerticalState = enum {
     cdata,
     cdata_after_carriage_return,
     doctype_open,
+    doctype,
+    emit_document_type,
+    finish_doctype,
+    emit_dtd_report,
+    emit_entity_start,
+    emit_entity_end,
+    emit_skipped_entity,
     processing_instruction_target,
     processing_instruction_after_target,
     processing_instruction_before_data,
@@ -739,6 +794,44 @@ const DecodedScalar = struct {
     codepoint: u32,
     len: u3,
 };
+
+fn EntitySourceFrame(comptime config: Config) type {
+    return struct {
+        input: []const u8,
+        cursor: usize,
+        final_input: bool,
+        source_byte_offset: u64,
+        position: PositionState(config),
+        entity_index: usize,
+        open_depth: usize,
+        resume_state: VerticalState,
+    };
+}
+
+const AttributeEntityFrame = struct {
+    bytes: []const u8,
+    cursor: usize = 0,
+    entity_index: ?usize = null,
+};
+
+fn DtdState(comptime config: Config) type {
+    return if (config.profile.dtdMode() == .rejected)
+        struct {}
+    else
+        struct {
+            declarations: dtd_module.State = .{},
+            entity_sources: std.ArrayList(EntitySourceFrame(config)) = .empty,
+            attribute_sources: std.ArrayList(AttributeEntityFrame) = .empty,
+            reference_name: std.ArrayList(u8) = .empty,
+            document_type_emitted: bool = false,
+            report_cursor: usize = 0,
+            pending_entity_index: usize = 0,
+            doctype_data_start: Location(config) = .{},
+            seen_doctype: bool = false,
+            bracket_depth: usize = 0,
+            lexical_state: enum { normal, single_quote, double_quote, comment, pi } = .normal,
+        };
+}
 
 const Utf8Probe = union(enum) {
     scalar: DecodedScalar,
@@ -804,13 +897,30 @@ fn OpenElementFrame(comptime config: Config) type {
 }
 
 fn AttributeRecord(comptime config: Config) type {
-    return if (config.profile.hasNamespaces())
+    return if (config.profile.hasNamespaces() and config.profile.dtdMode() != .rejected)
+        struct {
+            name_offset: usize,
+            name_len: usize,
+            value_len: usize,
+            start: Location(config),
+            specified: bool = true,
+            namespace_shape: usize = 0,
+        }
+    else if (config.profile.hasNamespaces())
         struct {
             name_offset: usize,
             name_len: usize,
             value_len: usize,
             start: Location(config),
             namespace_shape: usize = 0,
+        }
+    else if (config.profile.dtdMode() != .rejected)
+        struct {
+            name_offset: usize,
+            name_len: usize,
+            value_len: usize,
+            start: Location(config),
+            specified: bool = true,
         }
     else
         struct {
@@ -823,6 +933,7 @@ fn AttributeRecord(comptime config: Config) type {
 
 const Failure = enum {
     invalid_xml,
+    invalid_dtd,
     unsupported_feature,
     limit_exceeded,
     out_of_memory,
@@ -902,6 +1013,7 @@ pub fn Reader(comptime config: Config) type {
         attribute_bytes: std.ArrayList(u8) = .empty,
         event_attributes: std.ArrayList(Attribute(config)) = .empty,
         namespace_state: NamespaceState(config) = .{},
+        dtd_state: DtdState(config) = .{},
         token_start: Location(config) = .{},
         token_name_len: usize = 0,
         end_mismatch_index: usize = no_end_mismatch,
@@ -947,6 +1059,9 @@ pub fn Reader(comptime config: Config) type {
             if (!options.limits.validate() or !options.namespace_limits.validate()) {
                 return error.InvalidOptions;
             }
+            if (comptime config.profile.dtdMode() != .rejected) {
+                if (!options.dtd_limits.validate()) return error.InvalidOptions;
+            }
             return .{
                 .allocator = allocator,
                 .options = options,
@@ -975,6 +1090,7 @@ pub fn Reader(comptime config: Config) type {
                         self.open_names.clearRetainingCapacity();
                         self.clearAttributesRetainingCapacity();
                         self.clearNamespacesRetainingCapacity();
+                        self.clearDtdRetainingCapacity();
                     }
                 },
                 .release_memory => self.releaseStorage(),
@@ -1011,6 +1127,9 @@ pub fn Reader(comptime config: Config) type {
             self.reference_token_bytes = 0;
             self.reference_name = @splat(0);
             self.reference_name_len = 0;
+            if (comptime config.profile.dtdMode() != .rejected) {
+                self.dtd_state.reference_name.clearRetainingCapacity();
+            }
             self.document_start_resume = .before_root;
             self.document_start_span = .{};
             self.declared_version_offset = 0;
@@ -1030,6 +1149,14 @@ pub fn Reader(comptime config: Config) type {
             self.processing_instruction_initial = false;
             self.processing_instruction_target_len = 0;
             self.declaration_data_start = .{};
+            if (comptime config.profile.dtdMode() != .rejected) {
+                self.dtd_state.report_cursor = 0;
+                self.dtd_state.document_type_emitted = false;
+                self.dtd_state.seen_doctype = false;
+                self.dtd_state.bracket_depth = 0;
+                self.dtd_state.lexical_state = .normal;
+                self.dtd_state.doctype_data_start = .{};
+            }
         }
 
         /// Installs one caller-owned input chunk.
@@ -1057,7 +1184,7 @@ pub fn Reader(comptime config: Config) type {
             self.lifecycle = .producing;
         }
 
-        /// Produces the next event from the current implementation stage.
+        /// Produces the next semantic event.
         pub fn next(self: *Self) ReadError!Step(config) {
             while (true) {
                 return self.nextParser() catch |err| switch (err) {
@@ -1079,7 +1206,11 @@ pub fn Reader(comptime config: Config) type {
             }
 
             if (comptime !config.profile.isUtf8Only()) {
-                if (self.cursor == self.input.len and !self.final_input) {
+                const internal_entity_active = if (comptime config.profile.dtdMode() == .rejected)
+                    false
+                else
+                    self.dtd_state.entity_sources.items.len != 0;
+                if (self.cursor == self.input.len and !self.final_input and !internal_entity_active) {
                     return self.needInput();
                 }
             }
@@ -2057,14 +2188,76 @@ pub fn Reader(comptime config: Config) type {
                         .malformed_markup_declaration,
                     )) {
                         if (self.markup_context == .prolog) {
-                            return self.failAt(
-                                .unsupported_doctype,
-                                .unsupported_feature,
-                                self.token_start,
-                            );
+                            if (comptime config.profile.dtdMode() == .rejected) {
+                                return self.failAt(
+                                    .unsupported_doctype,
+                                    .unsupported_feature,
+                                    self.token_start,
+                                );
+                            } else {
+                                if (self.dtd_state.seen_doctype) {
+                                    return self.failAt(.malformed_doctype, .invalid_dtd, self.token_start);
+                                }
+                                self.dtd_state.declarations.clearRetainingCapacity();
+                                self.dtd_state.document_type_emitted = false;
+                                self.dtd_state.bracket_depth = 0;
+                                self.dtd_state.lexical_state = .normal;
+                                self.dtd_state.doctype_data_start = self.currentLocation();
+                                self.vertical_state = .doctype;
+                                continue;
+                            }
                         }
                         return self.failAt(.misplaced_doctype, .invalid_xml, self.token_start);
                     } else return self.needInput(),
+                    .doctype => if (try self.readDoctype()) return self.needInput(),
+                    .emit_document_type => {
+                        if (comptime config.profile.dtdMode() == .rejected) unreachable;
+                        self.vertical_state = if (self.dtd_state.seen_doctype)
+                            .finish_doctype
+                        else
+                            .doctype;
+                        return self.eventStep(
+                            .{ .document_type = self.documentType() },
+                            self.token_start,
+                            self.currentLocation(),
+                        );
+                    },
+                    .finish_doctype => try self.finishDoctype(),
+                    .emit_dtd_report => {
+                        if (comptime config.profile.dtdMode() == .rejected) unreachable;
+                        if (self.nextDtdReport()) |step| {
+                            return step;
+                        } else {
+                            self.vertical_state = .before_root;
+                        }
+                    },
+                    .emit_entity_start => {
+                        if (comptime config.report != .detailed) unreachable;
+                        self.vertical_state = .content;
+                        return self.eventStep(
+                            .{ .entity_start = .{ .name = self.pendingEntityName() } },
+                            self.reference_start,
+                            self.reference_start,
+                        );
+                    },
+                    .emit_entity_end => {
+                        if (comptime config.report != .detailed) unreachable;
+                        self.vertical_state = .content;
+                        return self.eventStep(
+                            .{ .entity_end = .{ .name = self.pendingEntityName() } },
+                            self.reference_start,
+                            self.reference_start,
+                        );
+                    },
+                    .emit_skipped_entity => {
+                        if (comptime config.profile.dtdMode() == .rejected) unreachable;
+                        self.vertical_state = .content;
+                        return self.eventStep(
+                            .{ .skipped_entity = .{ .name = self.dtd_state.reference_name.items } },
+                            self.reference_start,
+                            self.reference_start,
+                        );
+                    },
                     .processing_instruction_target => if (try self.readProcessingInstructionTarget()) {
                         return self.needInput();
                     },
@@ -2147,6 +2340,7 @@ pub fn Reader(comptime config: Config) type {
                 .namespace_capacity = self.namespaceCapacity(),
                 .namespace_binding_count = self.namespaceBindingCount(),
                 .namespace_bytes = self.namespaceBytes(),
+                .dtd_capacity = self.dtdCapacity(),
                 .retained_capacity = self.retainedCapacity(),
             };
         }
@@ -2161,6 +2355,7 @@ pub fn Reader(comptime config: Config) type {
                 self.attribute_bytes.capacity +|
                 event_bytes +|
                 self.namespaceCapacity() +|
+                self.dtdCapacity() +|
                 self.decoderCapacity();
         }
 
@@ -2183,6 +2378,14 @@ pub fn Reader(comptime config: Config) type {
         fn namespaceBindingCount(self: *const Self) usize {
             if (comptime !config.profile.hasNamespaces()) return 0;
             return self.namespace_state.bindings.items.len;
+        }
+
+        fn dtdCapacity(self: *const Self) usize {
+            if (comptime config.profile.dtdMode() == .rejected) return 0;
+            return self.dtd_state.declarations.capacity() +|
+                self.dtd_state.entity_sources.capacity *| @sizeOf(EntitySourceFrame(config)) +|
+                self.dtd_state.attribute_sources.capacity *| @sizeOf(AttributeEntityFrame) +|
+                self.dtd_state.reference_name.capacity;
         }
 
         fn namespaceBytes(self: *const Self) usize {
@@ -2208,6 +2411,12 @@ pub fn Reader(comptime config: Config) type {
                 self.source_state.decoded.deinit(self.allocator);
                 self.source_state.source_advances.deinit(self.allocator);
             }
+            if (comptime config.profile.dtdMode() != .rejected) {
+                self.dtd_state.declarations.deinit(self.allocator);
+                self.dtd_state.entity_sources.deinit(self.allocator);
+                self.dtd_state.attribute_sources.deinit(self.allocator);
+                self.dtd_state.reference_name.deinit(self.allocator);
+            }
             self.open_elements = .empty;
             self.open_names = .empty;
             self.attribute_records = .empty;
@@ -2215,6 +2424,7 @@ pub fn Reader(comptime config: Config) type {
             self.event_attributes = .empty;
             self.namespace_state = .{};
             self.source_state = .{};
+            self.dtd_state = .{};
         }
 
         fn resetSourceStateRetainingCapacity(self: *Self) void {
@@ -2263,6 +2473,20 @@ pub fn Reader(comptime config: Config) type {
             }
         }
 
+        fn clearDtdRetainingCapacity(self: *Self) void {
+            if (comptime config.profile.dtdMode() != .rejected) {
+                self.dtd_state.declarations.clearRetainingCapacity();
+                self.dtd_state.entity_sources.clearRetainingCapacity();
+                self.dtd_state.attribute_sources.clearRetainingCapacity();
+                self.dtd_state.reference_name.clearRetainingCapacity();
+                self.dtd_state.report_cursor = 0;
+                self.dtd_state.document_type_emitted = false;
+                self.dtd_state.seen_doctype = false;
+                self.dtd_state.bracket_depth = 0;
+                self.dtd_state.lexical_state = .normal;
+            }
+        }
+
         fn documentStart(self: *const Self) DocumentStart {
             const bytes = self.attribute_bytes.items;
             return .{
@@ -2293,6 +2517,287 @@ pub fn Reader(comptime config: Config) type {
             self.delimiter_index = 0;
             self.delimiter_len = 0;
             self.vertical_state = .markup_declaration_start;
+        }
+
+        fn readDoctype(self: *Self) ReadError!bool {
+            if (comptime config.profile.dtdMode() == .rejected) unreachable;
+            if (self.utf8_len != 0 or
+                (self.cursor < self.input.len and self.input[self.cursor] >= 0x80))
+            {
+                const scalar = (try self.readUtf8Scalar(.ordinary)) orelse return true;
+                if (!isXml10Char(scalar.codepoint)) {
+                    return self.failAt(.forbidden_character, .invalid_xml, self.utf8_start);
+                }
+                for (self.utf8_bytes[0..scalar.len]) |byte| try self.appendDoctypeByte(byte);
+                self.clearUtf8Scalar();
+                return false;
+            }
+            if (self.cursor == self.input.len) {
+                if (self.final_input) return self.failAt(.malformed_doctype, .invalid_dtd, self.token_start);
+                return true;
+            }
+            const byte = self.input[self.cursor];
+            if (!isXml10Char(byte)) return self.failVoid(.forbidden_character, .invalid_xml);
+            self.consumeByte(byte);
+            try self.appendDoctypeByte(byte);
+            if (self.dtd_state.lexical_state == .normal and
+                byte == '>' and self.dtd_state.bracket_depth == 0)
+            {
+                self.dtd_state.seen_doctype = true;
+                if (self.dtd_state.document_type_emitted) {
+                    try self.finishDoctype();
+                } else {
+                    self.dtd_state.declarations.parseDoctypeHeader(self.allocator) catch |err|
+                        return self.mapDoctypeError(err);
+                    self.dtd_state.document_type_emitted = true;
+                    self.vertical_state = .emit_document_type;
+                }
+            } else if (!self.dtd_state.document_type_emitted and
+                self.dtd_state.lexical_state == .normal and
+                byte == '[' and self.dtd_state.bracket_depth == 1)
+            {
+                self.dtd_state.declarations.parseDoctypeHeader(self.allocator) catch |err|
+                    return self.mapDoctypeError(err);
+                self.dtd_state.document_type_emitted = true;
+                self.vertical_state = .emit_document_type;
+            }
+            return false;
+        }
+
+        fn finishDoctype(self: *Self) ReadError!void {
+            if (comptime config.profile.dtdMode() == .rejected) {
+                unreachable;
+            } else {
+                self.dtd_state.declarations.discardDoctypeHeader();
+                self.dtd_state.declarations.parseDoctype(
+                    self.allocator,
+                    self.options.dtd_limits,
+                ) catch |err| return self.mapDoctypeError(err);
+                if (comptime config.profile.hasNamespaces()) {
+                    try self.validateDtdNamespaceNames();
+                }
+                self.dtd_state.report_cursor = 0;
+                self.vertical_state = .emit_dtd_report;
+            }
+        }
+
+        fn appendDoctypeByte(self: *Self, byte: u8) ReadError!void {
+            self.dtd_state.declarations.appendDoctypeByte(
+                self.allocator,
+                self.options.dtd_limits,
+                byte,
+            ) catch |err| return switch (err) {
+                error.LimitExceeded => self.failAt(.dtd_bytes_limit, .limit_exceeded, self.token_start),
+                error.OutOfMemory => self.failOutOfMemory(),
+                else => unreachable,
+            };
+            const bytes = self.dtd_state.declarations.doctype_bytes.items;
+            switch (self.dtd_state.lexical_state) {
+                .single_quote => if (byte == '\'') {
+                    self.dtd_state.lexical_state = .normal;
+                },
+                .double_quote => if (byte == '"') {
+                    self.dtd_state.lexical_state = .normal;
+                },
+                .comment => if (std.mem.endsWith(u8, bytes, "-->")) {
+                    self.dtd_state.lexical_state = .normal;
+                },
+                .pi => if (std.mem.endsWith(u8, bytes, "?>")) {
+                    self.dtd_state.lexical_state = .normal;
+                },
+                .normal => {
+                    if (std.mem.endsWith(u8, bytes, "<!--")) {
+                        self.dtd_state.lexical_state = .comment;
+                    } else if (std.mem.endsWith(u8, bytes, "<?")) {
+                        self.dtd_state.lexical_state = .pi;
+                    } else switch (byte) {
+                        '\'' => self.dtd_state.lexical_state = .single_quote,
+                        '"' => self.dtd_state.lexical_state = .double_quote,
+                        '[' => self.dtd_state.bracket_depth += 1,
+                        ']' => if (self.dtd_state.bracket_depth != 0) {
+                            self.dtd_state.bracket_depth -= 1;
+                        },
+                        else => {},
+                    }
+                },
+            }
+        }
+
+        fn documentType(self: *const Self) DocumentType {
+            const declarations = &self.dtd_state.declarations;
+            return .{
+                .root_name = declarations.rootName(),
+                .public_id = if (declarations.external_id.public_id) |value|
+                    declarations.string(value)
+                else
+                    null,
+                .system_id = if (declarations.external_id.system_id) |value|
+                    declarations.string(value)
+                else
+                    null,
+            };
+        }
+
+        fn mapDoctypeError(self: *Self, err: dtd_module.ParseError) ReadError {
+            const location = self.dtdFailureLocation();
+            const code = self.dtdDiagnosticCode();
+            return switch (err) {
+                error.InvalidDtd => self.failAt(code, .invalid_dtd, location),
+                error.UnsupportedFeature => self.failAt(.unsupported_doctype, .unsupported_feature, location),
+                error.LimitExceeded => self.failAt(code, .limit_exceeded, location),
+                error.OutOfMemory => self.failOutOfMemory(),
+            };
+        }
+
+        fn dtdDiagnosticCode(self: *const Self) DiagnosticCode {
+            const failure = self.dtd_state.declarations.failure orelse return .malformed_dtd;
+            return switch (failure.code) {
+                .malformed_doctype => .malformed_doctype,
+                .malformed_declaration,
+                .malformed_comment,
+                .malformed_processing_instruction,
+                => .malformed_dtd,
+                .malformed_element_declaration => .malformed_element_declaration,
+                .malformed_attribute_list => .malformed_attribute_list_declaration,
+                .malformed_entity_declaration => .malformed_entity_declaration,
+                .malformed_notation_declaration => .malformed_notation_declaration,
+                .undeclared_parameter_entity => .undeclared_parameter_entity,
+                .recursive_parameter_entity => .recursive_parameter_entity,
+                .external_subset_unsupported => .unsupported_doctype,
+                .dtd_bytes_limit => .dtd_bytes_limit,
+                .declaration_limit => .dtd_declaration_limit,
+                .declaration_bytes_limit => .dtd_declaration_bytes_limit,
+                .element_declaration_limit => .dtd_element_declaration_limit,
+                .attribute_declaration_limit => .dtd_attribute_declaration_limit,
+                .entity_declaration_limit => .dtd_entity_declaration_limit,
+                .notation_declaration_limit => .dtd_notation_declaration_limit,
+                .grammar_depth_limit => .dtd_grammar_depth_limit,
+                .grammar_node_limit => .dtd_grammar_node_limit,
+                .replacement_bytes_limit => .dtd_replacement_bytes_limit,
+                .entity_depth_limit => .entity_depth_limit,
+                .entity_reference_limit => .entity_reference_limit,
+                .expanded_bytes_limit => .entity_expansion_limit,
+                .expansion_ratio_limit => .entity_expansion_ratio_limit,
+                .comparison_work_limit => .dtd_comparison_work_limit,
+            };
+        }
+
+        fn dtdFailureLocation(self: *const Self) Location(config) {
+            var location = self.dtd_state.doctype_data_start;
+            const failure_offset = if (self.dtd_state.declarations.failure) |failure|
+                failure.offset
+            else
+                0;
+            const bytes = self.dtd_state.declarations.doctype_bytes.items;
+            var cursor: usize = 0;
+            var pending_carriage_return = false;
+            while (cursor < @min(failure_offset, bytes.len)) {
+                const len = std.unicode.utf8ByteSequenceLength(bytes[cursor]) catch 1;
+                if (len > bytes.len - cursor) break;
+                const codepoint = std.unicode.utf8Decode(bytes[cursor..][0..len]) catch break;
+                const source_width: u64 = switch (self.source_encoding) {
+                    .utf8, .other => len,
+                    .utf16_le, .utf16_be => if (codepoint < 0x10000) 2 else 4,
+                };
+                location.byte_offset += source_width;
+                if (config.diagnostic_location == .line_column) {
+                    if (pending_carriage_return and codepoint == '\n') {
+                        pending_carriage_return = false;
+                        cursor += len;
+                        continue;
+                    }
+                    pending_carriage_return = false;
+                    if (codepoint == '\r') {
+                        location.line += 1;
+                        location.byte_column = 1;
+                        pending_carriage_return = true;
+                    } else if (codepoint == '\n') {
+                        location.line += 1;
+                        location.byte_column = 1;
+                    } else {
+                        location.byte_column += source_width;
+                    }
+                }
+                cursor += len;
+            }
+            return location;
+        }
+
+        fn validateDtdNamespaceNames(self: *Self) ReadError!void {
+            for (self.dtd_state.declarations.entities.items) |entity| {
+                const name = self.dtd_state.declarations.string(entity.name);
+                if (std.mem.indexOfScalar(u8, name, ':') != null) {
+                    return self.failAt(.malformed_ncname, .invalid_dtd, self.token_start);
+                }
+            }
+            for (self.dtd_state.declarations.notations.items) |notation| {
+                const name = self.dtd_state.declarations.string(notation.name);
+                if (std.mem.indexOfScalar(u8, name, ':') != null) {
+                    return self.failAt(.malformed_ncname, .invalid_dtd, self.token_start);
+                }
+            }
+        }
+
+        fn nextDtdReport(self: *Self) ?Step(config) {
+            const declarations = &self.dtd_state.declarations;
+            while (self.dtd_state.report_cursor < declarations.reports.items.len) {
+                const report = declarations.reports.items[self.dtd_state.report_cursor];
+                self.dtd_state.report_cursor += 1;
+                const payload: EventPayload(config) = switch (report.kind) {
+                    .comment => .{ .comment = .{
+                        .bytes = declarations.reportData(report),
+                        .complete = true,
+                    } },
+                    .processing_instruction => .{ .processing_instruction = .{
+                        .target = declarations.reportName(report),
+                        .data = declarations.reportData(report),
+                        .complete = true,
+                    } },
+                    .notation => notation: {
+                        const notation = declarations.notations.items[report.index];
+                        break :notation .{ .notation_declaration = .{
+                            .name = declarations.string(notation.name),
+                            .public_id = if (notation.external_id.public_id) |value|
+                                declarations.string(value)
+                            else
+                                null,
+                            .system_id = if (notation.external_id.system_id) |value|
+                                declarations.string(value)
+                            else
+                                null,
+                        } };
+                    },
+                    .unparsed_entity => unparsed: {
+                        const entity = declarations.entities.items[report.index];
+                        break :unparsed .{ .unparsed_entity_declaration = .{
+                            .name = declarations.string(entity.name),
+                            .public_id = if (entity.external_id.public_id) |value|
+                                declarations.string(value)
+                            else
+                                null,
+                            .system_id = if (entity.external_id.system_id) |value|
+                                declarations.string(value)
+                            else
+                                null,
+                            .notation_name = declarations.string(entity.notation_name.?),
+                        } };
+                    },
+                    .element => if (comptime config.report == .detailed)
+                        .{ .element_declaration = .{ .name = declarations.reportName(report) } }
+                    else
+                        continue,
+                    .attribute_list => if (comptime config.report == .detailed)
+                        .{ .attribute_list_declaration = .{ .name = declarations.reportName(report) } }
+                    else
+                        continue,
+                    .parsed_entity => if (comptime config.report == .detailed)
+                        .{ .parsed_entity_declaration = .{ .name = declarations.reportName(report) } }
+                    else
+                        continue,
+                };
+                return self.eventStep(payload, self.token_start, self.currentLocation());
+            }
+            return null;
         }
 
         fn readMarkupDeclarationStart(self: *Self) ReadError!bool {
@@ -3489,6 +3994,9 @@ pub fn Reader(comptime config: Config) type {
             self.reference_token_bytes = 0;
             self.reference_name = @splat(0);
             self.reference_name_len = 0;
+            if (comptime config.profile.dtdMode() != .rejected) {
+                self.dtd_state.reference_name.clearRetainingCapacity();
+            }
             if (comptime config.profile.hasNamespaces()) {
                 self.namespace_state.reference_colon = null;
             }
@@ -3573,6 +4081,7 @@ pub fn Reader(comptime config: Config) type {
                     return self.failAt(.malformed_reference, .invalid_xml, start);
                 }
                 self.reference_name_len += scalar.len;
+                try self.appendDtdReferenceName(self.utf8_bytes[0..scalar.len]);
                 self.clearUtf8Scalar();
                 self.vertical_state = .reference_entity;
                 return false;
@@ -3680,6 +4189,7 @@ pub fn Reader(comptime config: Config) type {
                     return self.failAt(.malformed_reference, .invalid_xml, start);
                 }
                 self.reference_name_len += scalar.len;
+                try self.appendDtdReferenceName(self.utf8_bytes[0..scalar.len]);
                 self.clearUtf8Scalar();
                 return false;
             }
@@ -3709,6 +4219,7 @@ pub fn Reader(comptime config: Config) type {
                 return self.failAt(.malformed_reference, .invalid_xml, start);
             }
             self.reference_name_len += scalar.len;
+            try self.appendDtdReferenceName(self.utf8_bytes[0..scalar.len]);
             self.clearUtf8Scalar();
             return false;
         }
@@ -3723,7 +4234,14 @@ pub fn Reader(comptime config: Config) type {
             if (self.reference_name_len < self.reference_name.len) {
                 self.reference_name[self.reference_name_len] = byte;
             }
+            try self.appendDtdReferenceName(&.{byte});
             self.reference_name_len += 1;
+        }
+
+        fn appendDtdReferenceName(self: *Self, bytes: []const u8) ReadError!void {
+            if (comptime config.profile.dtdMode() == .rejected) return;
+            self.dtd_state.reference_name.appendSlice(self.allocator, bytes) catch
+                return self.failOutOfMemory();
         }
 
         fn referenceNeedsInput(self: *Self) ReadError!bool {
@@ -3755,15 +4273,181 @@ pub fn Reader(comptime config: Config) type {
                     return self.failAt(.malformed_ncname, .invalid_xml, location);
                 }
             }
-            const bytes = predefinedEntity(
-                self.reference_name[0..@min(self.reference_name_len, self.reference_name.len)],
+            const short_name = self.reference_name[0..@min(self.reference_name_len, self.reference_name.len)];
+            if (predefinedEntity(
+                short_name,
                 self.reference_name_len,
-            ) orelse return self.failAt(
-                .undeclared_entity,
-                .invalid_xml,
-                self.reference_start,
+            )) |bytes| {
+                try self.finishReferenceOutput(bytes);
+                return;
+            }
+            if (comptime config.profile.dtdMode() == .rejected) {
+                return self.failAt(.undeclared_entity, .invalid_xml, self.reference_start);
+            }
+            const name = self.dtd_state.reference_name.items;
+            const entity_index = self.dtd_state.declarations.findGeneralEntity(
+                self.options.dtd_limits,
+                name,
+            ) catch |err| return self.mapDtdError(err, .undeclared_entity);
+            const index = entity_index orelse {
+                if (self.reference_context == .content and
+                    self.dtd_state.declarations.parameter_reference_seen and
+                    !(self.standalone_declared and self.standalone))
+                {
+                    self.vertical_state = .emit_skipped_entity;
+                    return;
+                }
+                return self.failAt(.undeclared_entity, .invalid_xml, self.reference_start);
+            };
+            const entity = self.dtd_state.declarations.entities.items[index];
+            if (entity.unparsed) return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
+            if (entity.value == null) {
+                if (self.reference_context == .attribute) {
+                    return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
+                }
+                return self.failAt(.unsupported_doctype, .unsupported_feature, self.reference_start);
+            }
+            if (self.reference_context == .attribute) {
+                try self.expandAttributeEntity(index);
+                self.vertical_state = .attribute_value;
+            } else {
+                try self.pushContentEntity(index);
+            }
+        }
+
+        fn mapDtdError(
+            self: *Self,
+            err: dtd_module.ParseError,
+            invalid_code: DiagnosticCode,
+        ) ReadError {
+            const code = self.dtdDiagnosticCode();
+            return switch (err) {
+                error.InvalidDtd => self.failAt(
+                    if (code == .malformed_dtd) invalid_code else code,
+                    .invalid_dtd,
+                    self.reference_start,
+                ),
+                error.UnsupportedFeature => self.failAt(.unsupported_doctype, .unsupported_feature, self.reference_start),
+                error.LimitExceeded => self.failAt(code, .limit_exceeded, self.reference_start),
+                error.OutOfMemory => self.failOutOfMemory(),
+            };
+        }
+
+        fn chargeEntity(self: *Self, reference_bytes: usize, expanded_bytes: usize) ReadError!void {
+            self.dtd_state.declarations.chargeEntity(
+                self.options.dtd_limits,
+                reference_bytes,
+                expanded_bytes,
+                @intCast(self.reference_start.byte_offset),
+            ) catch |err| return self.mapDtdError(err, .malformed_reference);
+        }
+
+        fn pushContentEntity(self: *Self, entity_index: usize) ReadError!void {
+            for (self.dtd_state.entity_sources.items) |source| {
+                if (source.entity_index == entity_index) {
+                    return self.failAt(.recursive_entity, .invalid_xml, self.reference_start);
+                }
+            }
+            if (self.dtd_state.entity_sources.items.len ==
+                self.options.dtd_limits.max_active_entity_depth)
+            {
+                return self.failAt(.entity_expansion_limit, .limit_exceeded, self.reference_start);
+            }
+            const value = self.dtd_state.declarations.string(
+                self.dtd_state.declarations.entities.items[entity_index].value.?,
             );
-            try self.finishReferenceOutput(bytes);
+            try self.chargeEntity(self.dtd_state.reference_name.items.len +| 2, value.len);
+            self.dtd_state.entity_sources.append(self.allocator, .{
+                .input = self.input,
+                .cursor = self.cursor,
+                .final_input = self.final_input,
+                .source_byte_offset = self.source_byte_offset,
+                .position = self.position,
+                .entity_index = entity_index,
+                .open_depth = self.open_elements.items.len,
+                .resume_state = .content,
+            }) catch return self.failOutOfMemory();
+            self.input = value;
+            self.cursor = 0;
+            self.final_input = false;
+            self.dtd_state.pending_entity_index = entity_index;
+            self.vertical_state = if (comptime config.report == .detailed)
+                .emit_entity_start
+            else
+                .content;
+        }
+
+        fn expandAttributeEntity(self: *Self, entity_index: usize) ReadError!void {
+            const declarations = &self.dtd_state.declarations;
+            self.dtd_state.attribute_sources.clearRetainingCapacity();
+            const initial = declarations.string(declarations.entities.items[entity_index].value.?);
+            try self.chargeEntity(self.dtd_state.reference_name.items.len +| 2, initial.len);
+            self.dtd_state.attribute_sources.append(self.allocator, .{
+                .bytes = initial,
+                .entity_index = entity_index,
+            }) catch return self.failOutOfMemory();
+            while (self.dtd_state.attribute_sources.items.len != 0) {
+                const top = &self.dtd_state.attribute_sources.items[
+                    self.dtd_state.attribute_sources.items.len - 1
+                ];
+                if (top.cursor == top.bytes.len) {
+                    _ = self.dtd_state.attribute_sources.pop();
+                    continue;
+                }
+                const amp = std.mem.indexOfScalarPos(u8, top.bytes, top.cursor, '&') orelse {
+                    const tail = top.bytes[top.cursor..];
+                    if (std.mem.indexOfScalar(u8, tail, '<') != null) {
+                        return self.failAt(.attribute_less_than, .invalid_xml, self.reference_start);
+                    }
+                    try self.appendAttributeOutput(tail);
+                    top.cursor = top.bytes.len;
+                    continue;
+                };
+                const prefix = top.bytes[top.cursor..amp];
+                if (std.mem.indexOfScalar(u8, prefix, '<') != null) {
+                    return self.failAt(.attribute_less_than, .invalid_xml, self.reference_start);
+                }
+                try self.appendAttributeOutput(prefix);
+                const end = std.mem.indexOfScalarPos(u8, top.bytes, amp + 1, ';') orelse
+                    return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
+                const name = top.bytes[amp + 1 .. end];
+                top.cursor = end + 1;
+                if (predefinedEntity(name, name.len)) |bytes| {
+                    try self.appendAttributeOutput(bytes);
+                    continue;
+                }
+                const nested = (declarations.findGeneralEntity(self.options.dtd_limits, name) catch |err|
+                    return self.mapDtdError(err, .malformed_reference)) orelse
+                    return self.failAt(.undeclared_entity, .invalid_xml, self.reference_start);
+                for (self.dtd_state.attribute_sources.items) |frame| {
+                    if (frame.entity_index == nested) {
+                        return self.failAt(.recursive_entity, .invalid_xml, self.reference_start);
+                    }
+                }
+                if (self.dtd_state.attribute_sources.items.len ==
+                    self.options.dtd_limits.max_active_entity_depth)
+                {
+                    return self.failAt(.entity_expansion_limit, .limit_exceeded, self.reference_start);
+                }
+                const entity = declarations.entities.items[nested];
+                if (entity.unparsed) return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
+                if (entity.value == null) {
+                    return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
+                }
+                const value = declarations.string(entity.value.?);
+                try self.chargeEntity(name.len +| 2, value.len);
+                self.dtd_state.attribute_sources.append(self.allocator, .{
+                    .bytes = value,
+                    .entity_index = nested,
+                }) catch return self.failOutOfMemory();
+            }
+        }
+
+        fn pendingEntityName(self: *const Self) []const u8 {
+            const entity = self.dtd_state.declarations.entities.items[
+                self.dtd_state.pending_entity_index
+            ];
+            return self.dtd_state.declarations.string(entity.name);
         }
 
         fn finishReferenceOutput(self: *Self, bytes: []const u8) ReadError!void {
@@ -3875,6 +4559,9 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn finishStartElement(self: *Self, empty_element: bool) ReadError!void {
+            if (comptime config.profile.dtdMode() != .rejected) {
+                try self.applyDtdAttributes();
+            }
             if (comptime config.profile.hasNamespaces()) {
                 const binding_mark = self.namespace_state.bindings.items.len;
                 const byte_mark = self.namespace_state.bytes.items.len;
@@ -4158,10 +4845,18 @@ pub fn Reader(comptime config: Config) type {
                 else
                     NamespaceReference.none;
                 const value_offset = record.name_offset + record.name_len;
-                self.event_attributes.appendAssumeCapacity(.{
-                    .name = self.expandedName(raw, parts, reference),
-                    .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
-                });
+                if (comptime config.profile.dtdMode() == .rejected) {
+                    self.event_attributes.appendAssumeCapacity(.{
+                        .name = self.expandedName(raw, parts, reference),
+                        .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
+                    });
+                } else {
+                    self.event_attributes.appendAssumeCapacity(.{
+                        .name = self.expandedName(raw, parts, reference),
+                        .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
+                        .specified = record.specified,
+                    });
+                }
                 self.namespace_state.expanded_indices.appendAssumeCapacity(
                     self.event_attributes.items.len - 1,
                 );
@@ -4480,11 +5175,122 @@ pub fn Reader(comptime config: Config) type {
             for (self.attribute_records.items) |record| {
                 const raw_name = self.attributeRawName(record);
                 const value_offset = record.name_offset + record.name_len;
-                self.event_attributes.appendAssumeCapacity(.{
-                    .name = nameFromRaw(config, raw_name),
-                    .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
-                });
+                if (comptime config.profile.dtdMode() == .rejected) {
+                    self.event_attributes.appendAssumeCapacity(.{
+                        .name = nameFromRaw(config, raw_name),
+                        .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
+                    });
+                } else {
+                    self.event_attributes.appendAssumeCapacity(.{
+                        .name = nameFromRaw(config, raw_name),
+                        .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
+                        .specified = record.specified,
+                    });
+                }
             }
+        }
+
+        fn applyDtdAttributes(self: *Self) ReadError!void {
+            const declarations = &self.dtd_state.declarations;
+            if (declarations.root_name == null) return;
+            const element_name = self.open_names.items[self.open_names.items.len - self.token_name_len ..];
+
+            var source_index: usize = 0;
+            while (source_index < self.attribute_records.items.len) : (source_index += 1) {
+                const record = self.attribute_records.items[source_index];
+                const declaration_index = declarations.findAttribute(
+                    self.options.dtd_limits,
+                    element_name,
+                    self.attributeRawName(record),
+                ) catch |err| return self.mapDtdError(err, .malformed_attribute);
+                if (declaration_index) |index| {
+                    if (declarations.attributes.items[index].attribute_type.isTokenized()) {
+                        self.collapseAttributeValue(source_index);
+                    }
+                }
+            }
+
+            for (declarations.attributes.items) |declaration| {
+                const applies = declarations.equalStored(
+                    self.options.dtd_limits,
+                    declaration.element_name,
+                    element_name,
+                ) catch |err| return self.mapDtdError(err, .malformed_attribute);
+                if (!applies or declaration.default_value == null) continue;
+                const name = declarations.string(declaration.name);
+                var present = false;
+                for (self.attribute_records.items) |record| {
+                    const matches = declarations.equalStored(
+                        self.options.dtd_limits,
+                        declaration.name,
+                        self.attributeRawName(record),
+                    ) catch |err| return self.mapDtdError(err, .malformed_attribute);
+                    if (matches) {
+                        present = true;
+                        break;
+                    }
+                }
+                if (present) continue;
+                try self.appendDefaultAttribute(
+                    name,
+                    declarations.string(declaration.default_value.?),
+                );
+            }
+        }
+
+        fn collapseAttributeValue(self: *Self, record_index: usize) void {
+            const record = &self.attribute_records.items[record_index];
+            const value_offset = record.name_offset + record.name_len;
+            const old_len = record.value_len;
+            const new_len = dtd_module.collapseSpaces(
+                self.attribute_bytes.items[value_offset..][0..old_len],
+            );
+            if (new_len == old_len) return;
+            const removed = old_len - new_len;
+            std.mem.copyForwards(
+                u8,
+                self.attribute_bytes.items[value_offset + new_len .. self.attribute_bytes.items.len - removed],
+                self.attribute_bytes.items[value_offset + old_len ..],
+            );
+            self.attribute_bytes.items.len -= removed;
+            record.value_len = new_len;
+            for (self.attribute_records.items[record_index + 1 ..]) |*later| {
+                later.name_offset -= removed;
+            }
+        }
+
+        fn appendDefaultAttribute(self: *Self, name: []const u8, value: []const u8) ReadError!void {
+            if (self.attribute_records.items.len == self.options.limits.max_attributes_per_element) {
+                return self.failVoid(.attribute_count_limit, .limit_exceeded);
+            }
+            if (name.len > self.options.limits.max_attribute_name_bytes) {
+                return self.failVoid(.attribute_name_limit, .limit_exceeded);
+            }
+            if (value.len > self.options.limits.max_attribute_value_bytes) {
+                return self.failVoid(.attribute_value_limit, .limit_exceeded);
+            }
+            if (comptime config.profile.hasNamespaces()) {
+                if (name.len > self.options.namespace_limits.max_qname_bytes) {
+                    return self.failVoid(.qname_limit, .limit_exceeded);
+                }
+            }
+            if (name.len +| value.len > self.options.limits.max_attribute_bytes_per_element -|
+                self.attribute_bytes.items.len)
+            {
+                return self.failVoid(.attribute_bytes_limit, .limit_exceeded);
+            }
+            const offset = self.attribute_bytes.items.len;
+            self.attribute_bytes.appendSlice(self.allocator, name) catch
+                return self.failOutOfMemory();
+            self.attribute_bytes.appendSlice(self.allocator, value) catch
+                return self.failOutOfMemory();
+            self.attribute_records.append(self.allocator, .{
+                .name_offset = offset,
+                .name_len = name.len,
+                .value_len = value.len,
+                .start = self.token_start,
+                .specified = false,
+            }) catch return self.failOutOfMemory();
         }
 
         fn rejectDuplicateAttributes(self: *Self) ReadError!void {
@@ -4640,6 +5446,16 @@ pub fn Reader(comptime config: Config) type {
                     self.endMismatchLocation(),
                     self.topFrame().start,
                 );
+            }
+            if (comptime config.profile.dtdMode() != .rejected) {
+                if (self.dtd_state.entity_sources.items.len != 0) {
+                    const source = self.dtd_state.entity_sources.items[
+                        self.dtd_state.entity_sources.items.len - 1
+                    ];
+                    if (self.open_elements.items.len <= source.open_depth) {
+                        return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
+                    }
+                }
             }
             self.vertical_state = .emit_end_element;
         }
@@ -4866,6 +5682,31 @@ pub fn Reader(comptime config: Config) type {
         fn needInput(self: *Self) InternalReadError!Step(config) {
             std.debug.assert(!self.final_input);
             std.debug.assert(self.cursor == self.input.len);
+            if (comptime config.profile.dtdMode() != .rejected) {
+                if (self.dtd_state.entity_sources.items.len != 0) {
+                    if (self.vertical_state == .content_after_carriage_return) {
+                        self.vertical_state = .content;
+                        try self.prepareInlineText("\n", self.currentLocation());
+                        return error.RefillDecodedInput;
+                    }
+                    const frame = self.dtd_state.entity_sources.pop().?;
+                    if (self.open_elements.items.len != frame.open_depth or
+                        self.vertical_state != frame.resume_state)
+                    {
+                        return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
+                    }
+                    self.input = frame.input;
+                    self.cursor = frame.cursor;
+                    self.final_input = frame.final_input;
+                    self.source_byte_offset = frame.source_byte_offset;
+                    self.position = frame.position;
+                    self.dtd_state.pending_entity_index = frame.entity_index;
+                    if (comptime config.report == .detailed) {
+                        self.vertical_state = .emit_entity_end;
+                    }
+                    return error.RefillDecodedInput;
+                }
+            }
             self.input = &.{};
             self.cursor = 0;
             if (comptime !config.profile.isUtf8Only()) {
@@ -5504,6 +6345,7 @@ fn expandedNamesEqual(left: ExpandedName, right: ExpandedName) bool {
 fn failureToError(failure: Failure) ReadError {
     return switch (failure) {
         .invalid_xml => error.InvalidXml,
+        .invalid_dtd => error.InvalidDtd,
         .unsupported_feature => error.UnsupportedFeature,
         .limit_exceeded => error.LimitExceeded,
         .out_of_memory => error.OutOfMemory,
@@ -5722,6 +6564,8 @@ fn isUtf8ThreeOrFourByteLeader(byte: u8) bool {
 fn isUtf8FourByteLeader(byte: u8) bool {
     return byte >= 0xf0 and byte <= 0xf4;
 }
+
+// --- Tests ---
 
 test "[unit] - [content SIMD]: forbidden-control scan matches scalar boundaries" {
     const vector_len = std.simd.suggestVectorLength(u8) orelse 16;

@@ -1,10 +1,10 @@
 # z-xml
 
-Status: **Active** (last updated: 2026-08-17)
+Status: **Active** (last updated: 2026-08-19)
 
 `z-xml` is a benchmark-led effort to build a complete, lightweight, high-performance XML library for Zig 0.16. The target includes compile-time-specialized streaming readers, XML namespaces, UTF-8 and UTF-16, complete non-validating DTD behavior, optional DTD validation, XML 1.1 compatibility, and a compact owned DOM. Conformance data, matched workloads, and reproducible peer builds keep correctness and performance decisions measurable.
 
-The repository contains the qualified XML 1.0 UTF-8 no-DTD reader in raw-name and namespace-aware profiles. The incremental grammar covers declarations, document metadata, XML 1.0 Fifth Edition names, normalized attributes, text and CDATA, numeric and predefined references, line endings, comments, processing instructions, prolog and epilog miscellaneous content, exact element matching, namespace declarations, expanded names, reserved binding rules, and an explicit unsupported DOCTYPE boundary. Reader-owned memory remains bounded by active structure and configured token limits, and compile-time specialization removes namespace state from raw-name readers. Stage 8 is complete for these profiles. UTF-16, DTD behavior, validation, XML 1.1, the tree, and comparative performance qualification remain later work tracked in [`plan/ROADMAP.md`](plan/ROADMAP.md).
+The repository contains qualified raw-name and namespace-aware XML 1.0 readers for no-DTD input and for internal-DTD non-validating input. The latter parses the complete internal subset, applies internal parameter and general entities, declared attribute normalization and defaults, and exposes DTD events under explicit declaration, grammar, comparison, recursion, and expansion limits. UTF-8, UTF-16LE, and UTF-16BE sources are built in. External subsets and external entities remain an explicit unsupported boundary; DTD validation, XML 1.1, and the owned tree remain later work tracked in [`plan/ROADMAP.md`](plan/ROADMAP.md).
 
 Build the current library checks with the pinned compiler:
 
