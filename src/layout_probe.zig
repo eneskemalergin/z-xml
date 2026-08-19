@@ -51,4 +51,8 @@ fn printLayout(comptime name: []const u8, comptime config: xml.Config) void {
             @sizeOf(xml.Location(config)),
         },
     );
+    std.debug.print(
+        "{s}-tree\tdocument={d}\tbuilder={d}\n",
+        .{ name, @sizeOf(xml.Document(config)), @sizeOf(xml.TreeBuilder(config)) },
+    );
 }

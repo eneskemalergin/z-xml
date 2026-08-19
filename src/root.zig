@@ -9,6 +9,7 @@ const encoding = @import("encoding.zig");
 const io = @import("io.zig");
 const resolver = @import("resolver.zig");
 const external_subset = @import("external_subset.zig");
+const tree = @import("tree.zig");
 
 /// Compile-time reader configuration.
 pub const Config = reader.Config;
@@ -123,3 +124,39 @@ pub const DrainControl = io.DrainControl;
 pub const drainSlice = io.drainSlice;
 /// Parses one buffered source through a push callback.
 pub const drainIo = io.drainIo;
+/// Immutable owned-tree node index with zero as the null sentinel.
+pub const NodeIndex = tree.NodeIndex;
+/// Immutable owned-tree node kind.
+pub const NodeKind = tree.NodeKind;
+/// Independent limits for owned-tree construction.
+pub const TreeLimits = tree.Limits;
+/// Optional initial owned-tree capacities.
+pub const TreeCapacityHints = tree.CapacityHints;
+/// Runtime owned-tree construction options.
+pub const TreeOptions = tree.Options;
+/// Errors specific to owned-tree construction.
+pub const TreeBuildError = tree.BuildError;
+/// Owned-tree capacity accounting.
+pub const TreeMemoryUsage = tree.MemoryUsage;
+/// Name whose slices borrow from an owned document.
+pub const TreeName = tree.Name;
+/// Attribute whose slices borrow from an owned document.
+pub const TreeAttribute = tree.Attribute;
+/// Namespace declaration whose slices borrow from an owned document.
+pub const TreeNamespaceDeclaration = tree.NamespaceDeclaration;
+/// XML declaration retained by an owned document.
+pub const TreeDeclaration = tree.Declaration;
+/// Document type header retained by an owned document.
+pub const TreeDocumentType = tree.DocumentType;
+/// Kind of source-ordered DTD report retained by an owned document.
+pub const TreeDtdRecordKind = tree.DtdRecordKind;
+/// Source-ordered DTD report retained by an owned document.
+pub const TreeDtdRecord = tree.DtdRecord;
+/// Returns the immutable owned document type for a reader configuration.
+pub const Document = tree.Document;
+/// Returns the allocation-free child iterator for an owned document configuration.
+pub const TreeChildIterator = tree.ChildIterator;
+/// Returns the public-event tree builder for a reader configuration.
+pub const TreeBuilder = tree.Builder;
+/// Builds an owned document from a compatible public pull reader.
+pub const buildTreeFromPull = tree.buildFromPull;

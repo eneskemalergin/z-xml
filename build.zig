@@ -429,6 +429,28 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run z-xml tests");
     test_step.dependOn(&run_public_tests.step);
 
+    const tree_tests_module = b.createModule(.{
+        .root_source_file = b.path("tests/tree.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tree_tests_module.addImport("z_xml", z_xml);
+    const tree_tests = b.addTest(.{ .root_module = tree_tests_module });
+    test_step.dependOn(&b.addRunArtifact(tree_tests).step);
+
+    const tree_adapter_module = b.createModule(.{
+        .root_source_file = b.path("tools/z_xml_tree.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    tree_adapter_module.addImport("z_xml", z_xml);
+    const tree_adapter = b.addExecutable(.{
+        .name = "z-xml-tree",
+        .root_module = tree_adapter_module,
+    });
+    b.installArtifact(tree_adapter);
+
     const reader_internal_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/reader.zig"),
