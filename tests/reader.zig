@@ -5671,13 +5671,44 @@ test "[edge] - [validation limits]: report the exact exhausted resource" {
         defer reader.deinit();
         try reader.feed(case.input, true);
         while (true) {
-            _ = reader.next() catch |err| {
+            const result = reader.next() catch |err| {
                 try std.testing.expectEqual(error.LimitExceeded, err);
                 try std.testing.expectEqual(case.code, reader.diagnostic().?.code);
                 break;
             };
+            switch (result) {
+                .event => {},
+                .done => return error.ExpectedLimitFailure,
+                .need_input => return error.UnexpectedNeedInput,
+            }
         }
     }
+}
+
+test "[edge] - [validation limits]: nested operators preserve the position boundary" {
+    const config = xml.Configs.XML10_VALIDATING;
+    var options: xml.Options(config) = .{};
+    options.validation.limits.max_content_positions = 1;
+    var reader = try xml.Reader(config).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed(
+        "<!DOCTYPE root [" ++
+            "<!ELEMENT root (((a?)?)?)>" ++
+            "<!ELEMENT a EMPTY>" ++
+            "]><root/>",
+        true,
+    );
+
+    var status: ?xml.ValidationStatus = null;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .document_end => |end| status = end.validation,
+            else => {},
+        },
+        .done => break,
+        .need_input => return error.UnexpectedNeedInput,
+    };
+    try std.testing.expectEqual(xml.ValidationStatus.valid, status.?);
 }
 
 test "[unit] - [namespace expansion]: declarations and ordinary attributes are distinct" {
@@ -6687,48 +6718,67 @@ test "[integration] - [compiled external subset]: internal declarations retain p
 
 test "[integration] - [compiled external subset]: content position limits remain per model" {
     const config = xml.Configs.XML10_VALIDATING;
-    const declarations = "<!ELEMENT root (#PCDATA|a|b)*>" ++
-        "<!ELEMENT a (#PCDATA|c|d)*>" ++
-        "<!ELEMENT b EMPTY><!ELEMENT c EMPTY><!ELEMENT d EMPTY>";
-    const document = "<!DOCTYPE root SYSTEM 'schema.dtd'><root><a><c/></a><b/></root>";
-    var subset = try xml.ExternalSubset.compileDecoded(
-        std.testing.allocator,
-        "schema.dtd",
-        declarations,
-        .{},
-    );
-    defer subset.deinit();
-
-    var options: xml.Options(config) = .{};
-    options.validation.limits.max_content_positions = 2;
-    options.validation.external_subset = &subset;
-    var reader = try xml.Reader(config).init(std.testing.allocator, options);
-    defer reader.deinit();
-    try reader.feed(document, true);
-    var status: ?xml.ValidationStatus = null;
-    while (true) switch (try reader.next()) {
-        .event => |event| switch (event) {
-            .document_end => |end| status = end.validation,
-            else => {},
+    const cases = [_]struct {
+        declarations: []const u8,
+        document: []const u8,
+    }{
+        .{
+            .declarations = "<!ELEMENT root (#PCDATA|a|b)*>" ++
+                "<!ELEMENT a (#PCDATA|c|d)*>" ++
+                "<!ELEMENT b EMPTY><!ELEMENT c EMPTY><!ELEMENT d EMPTY>",
+            .document = "<!DOCTYPE root SYSTEM 'schema.dtd'><root><a><c/></a><b/></root>",
         },
-        .done => break,
-        .need_input => return error.UnexpectedNeedInput,
+        .{
+            .declarations = "<!ELEMENT root (a,b)><!ELEMENT a EMPTY><!ELEMENT b EMPTY>",
+            .document = "<!DOCTYPE root SYSTEM 'schema.dtd'><root><a/><b/></root>",
+        },
     };
-    try std.testing.expectEqual(xml.ValidationStatus.valid, status.?);
 
-    options.validation.limits.max_content_positions = 1;
-    var strict_reader = try xml.Reader(config).init(std.testing.allocator, options);
-    defer strict_reader.deinit();
-    try strict_reader.feed(document, true);
-    while (true) {
-        _ = strict_reader.next() catch |err| {
-            try std.testing.expectEqual(error.LimitExceeded, err);
-            try std.testing.expectEqual(
-                xml.DiagnosticCode.validation_content_position_limit,
-                strict_reader.diagnostic().?.code,
-            );
-            break;
+    for (cases) |case| {
+        var subset = try xml.ExternalSubset.compileDecoded(
+            std.testing.allocator,
+            "schema.dtd",
+            case.declarations,
+            .{},
+        );
+        defer subset.deinit();
+
+        var options: xml.Options(config) = .{};
+        options.validation.limits.max_content_positions = 2;
+        options.validation.external_subset = &subset;
+        var reader = try xml.Reader(config).init(std.testing.allocator, options);
+        defer reader.deinit();
+        try reader.feed(case.document, true);
+        var status: ?xml.ValidationStatus = null;
+        while (true) switch (try reader.next()) {
+            .event => |event| switch (event) {
+                .document_end => |end| status = end.validation,
+                else => {},
+            },
+            .done => break,
+            .need_input => return error.UnexpectedNeedInput,
         };
+        try std.testing.expectEqual(xml.ValidationStatus.valid, status.?);
+
+        options.validation.limits.max_content_positions = 1;
+        var strict_reader = try xml.Reader(config).init(std.testing.allocator, options);
+        defer strict_reader.deinit();
+        try strict_reader.feed(case.document, true);
+        while (true) {
+            const result = strict_reader.next() catch |err| {
+                try std.testing.expectEqual(error.LimitExceeded, err);
+                try std.testing.expectEqual(
+                    xml.DiagnosticCode.validation_content_position_limit,
+                    strict_reader.diagnostic().?.code,
+                );
+                break;
+            };
+            switch (result) {
+                .event => {},
+                .done => return error.ExpectedLimitFailure,
+                .need_input => return error.UnexpectedNeedInput,
+            }
+        }
     }
 }
 

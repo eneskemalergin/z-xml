@@ -988,8 +988,8 @@ fn appendNfaState(
     states: *std.ArrayList(NfaState),
     limits: Limits,
 ) Error!usize {
-    if (states.items.len >= limits.max_content_positions *| 4 +| 2) {
-        return error.ContentPositionLimit;
+    if (states.items.len == limits.max_content_states) {
+        return error.ContentStateLimit;
     }
     try states.append(allocator, .{});
     return states.items.len - 1;
