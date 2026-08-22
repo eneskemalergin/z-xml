@@ -429,6 +429,17 @@ def generate_deep(output: Output, stats: Stats, depth: int) -> None:
         stats.end(b"n")
 
 
+def rejection_offset(target_bytes: int, fraction: int) -> int:
+    valid_record = b"<n>x</n>"
+    bad_record = b"<n>x</bad>"
+    payload_bytes = target_bytes - DOCUMENT_OVERHEAD
+    if payload_bytes < len(bad_record):
+        raise ValueError("rejection target is too small")
+    count = 1 + (payload_bytes - len(bad_record)) // len(valid_record)
+    bad_index = min(count - 1, max(0, round((count - 1) * fraction / 100)))
+    return len(b"<root>") + bad_index * len(valid_record) + len(b"<n>x")
+
+
 def generate_rejection(output: Output, target_bytes: int, fraction: int) -> int:
     valid_record = b"<n>x</n>"
     bad_record = b"<n>x</bad>"
@@ -438,7 +449,7 @@ def generate_rejection(output: Output, target_bytes: int, fraction: int) -> int:
     count = 1 + (payload_bytes - len(bad_record)) // len(valid_record)
     filler_bytes = payload_bytes - len(bad_record) - (count - 1) * len(valid_record)
     bad_index = min(count - 1, max(0, round((count - 1) * fraction / 100)))
-    fatal_offset = len(b"<root>") + bad_index * len(valid_record) + len(b"<n>x")
+    fatal_offset = rejection_offset(target_bytes, fraction)
     output.write(b"<root>")
     output.write_repeated(valid_record, bad_index)
     output.write(bad_record)
@@ -631,6 +642,7 @@ def verify(output_dir: Path, plan: Path | None) -> int:
                 fatal_offset = int(row["fatal_offset"])
                 declared_fraction = float(row["fatal_fraction"])
                 actual_fraction = fatal_offset * 100 / data_size
+                expected_offset = rejection_offset(data_size, requested_fraction)
                 with path.open("rb") as input_stream:
                     input_stream.seek(fatal_offset)
                     fatal_construct = input_stream.read(len(b"</bad>"))
@@ -643,7 +655,7 @@ def verify(output_dir: Path, plan: Path | None) -> int:
                     or fatal_offset < 0
                     or fatal_offset + len(b"</bad>") > data_size
                     or abs(declared_fraction - actual_fraction) > 0.000001
-                    or abs(actual_fraction - requested_fraction) > 0.01
+                    or fatal_offset != expected_offset
                     or fatal_construct != b"</bad>"
                 ):
                     errors.append(f"{item_id}: rejection position differs")

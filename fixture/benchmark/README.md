@@ -1,6 +1,6 @@
 # Benchmark Fixtures
 
-Status: **Active** (last updated: 2026-08-15)
+Status: **Active** (last updated: 2026-08-22)
 
 Benchmark data is downstream of correctness. The `smoke/` documents are tiny command and output checks, not performance baselines. Medium and large files will be generated or downloaded from pinned manifests and remain outside Git.
 
@@ -16,10 +16,19 @@ The UTF-8/no-DTD generator includes long text, dense markup, fixed and varied at
 
 [`plans/full-1g.tsv`](plans/full-1g.tsv) is the audited large recipe. It spans 1, 16, 64, 256, and 1024 MiB without allowing any file above exactly 1 GiB. After `make -C ref all`, run `make -C ref generate-corpus-full verify-corpus-full` to materialize and directly verify it outside `fixture/`.
 
-Persistent-process measurements use generated 1, 16, 64, and 256 KiB versions of every common shape. After `make -C ref all`, run `make -C ref generate-corpus-persistent` to materialize them under `data/generated/z-xml-generated-v3-persistent/`. These inputs isolate parser setup, reset, callback, and tiny-document latency without process startup dominating each parse.
+Persistent-process measurements use generated 1, 16, 64, and 256 KiB versions of every common shape. The namespace lane has its own namespace-churn manifest because its summary includes expanded-name counters. Build the maintained adapters, materialize both corpora, and run the exact qualification gate with:
+
+```sh
+zig build persistent-adapters -Doptimize=ReleaseFast
+make -C ref all
+make -C ref generate-corpus-persistent generate-namespace-corpus
+make -C ref check-generated-persistent
+```
+
+These inputs isolate parser setup, reset, callback, and tiny-document latency without process startup dominating each parse. `verify-corpus-persistent` and `verify-namespace-corpus` check existing generated files without rewriting them.
 
 Check the tracked shape references before generating data:
 
 ```sh
-python3 tools/check-shape-matrix.py
+make -C ref check-shape-matrix
 ```

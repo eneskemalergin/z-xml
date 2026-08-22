@@ -45,6 +45,17 @@ def known(codepoint: int) -> bool:
     )
 
 
+def algorithmic_hangul_pair(first: int, second: int) -> bool:
+    return (
+        0x1100 <= first <= 0x1112
+        and 0x1161 <= second <= 0x1175
+    ) or (
+        0xAC00 <= first <= 0xD7A3
+        and (first - 0xAC00) % 28 == 0
+        and 0x11A8 <= second <= 0x11C2
+    )
+
+
 def generated_data() -> tuple[
     list[tuple[int, int]],
     list[tuple[int, int, int]],
@@ -76,6 +87,9 @@ def generated_data() -> tuple[
             continue
         parts = tuple(int(value, 16) for value in decomposition.split())
         if len(parts) != 2:
+            continue
+        # Hangul composition is implemented algorithmically in canCompose.
+        if algorithmic_hangul_pair(*parts):
             continue
         pair = "".join(chr(value) for value in parts)
         if unicodedata.normalize("NFC", pair) != character:
@@ -218,11 +232,29 @@ def render() -> str:
     return "\n".join(lines)
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="verify the output instead of rewriting it",
+    )
     args = parser.parse_args()
-    args.output.write_text(render(), encoding="utf-8")
+    generated = render()
+    if args.check:
+        try:
+            observed = args.output.read_text(encoding="utf-8")
+        except OSError as error:
+            print(f"unable to read {args.output}: {error}")
+            return 1
+        if observed != generated:
+            print(f"generated Unicode table differs from {args.output}")
+            return 1
+        print(f"generated Unicode table matches {args.output}")
+        return 0
+    args.output.write_text(generated, encoding="utf-8")
+    return 0
 
 
 if __name__ == "__main__":

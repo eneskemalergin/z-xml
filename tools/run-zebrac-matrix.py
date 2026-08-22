@@ -19,6 +19,7 @@ from pathlib import Path
 
 SCHEMAS = {"z-xml-generated-v2", "z-xml-generated-v3"}
 MAX_WORKLOAD_BYTES = 1024 * 1024 * 1024
+ELIGIBILITY_FIELDS = {"target", "workload", "verdict"}
 
 
 @dataclass(frozen=True)
@@ -145,9 +146,67 @@ def read_workloads(path: Path) -> dict[str, dict[str, str]]:
 def read_eligibility(path: Path) -> dict[tuple[str, str], str]:
     verdicts: dict[tuple[str, str], str] = {}
     with path.open(encoding="utf-8", newline="") as stream:
-        for row in csv.DictReader(stream, delimiter="\t"):
-            verdicts[(row["target"], row["workload"])] = row["verdict"]
+        reader = csv.DictReader(stream, delimiter="\t")
+        if reader.fieldnames is None or ELIGIBILITY_FIELDS.difference(reader.fieldnames):
+            raise ValueError(f"{path}: incomplete eligibility report")
+        for line_number, row in enumerate(reader, 2):
+            target = row.get("target", "")
+            workload = row.get("workload", "")
+            verdict = row.get("verdict", "")
+            if not target or not workload or not verdict:
+                raise ValueError(f"{path}:{line_number}: incomplete eligibility row")
+            pair = (target, workload)
+            if pair in verdicts:
+                raise ValueError(
+                    f"{path}:{line_number}: duplicate eligibility for "
+                    f"{target}/{workload}"
+                )
+            verdicts[pair] = verdict
     return verdicts
+
+
+def validate_zebrac_results(
+    path: Path,
+    commands: list[str],
+    classification: str,
+    samples: int,
+) -> str | None:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            report = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        return f"invalid zebrac JSON: {error}"
+    if not isinstance(report, dict) or report.get("schema_version") != 1:
+        return "unexpected zebrac JSON schema"
+    config = report.get("config")
+    results = report.get("results")
+    if not isinstance(config, dict) or not isinstance(results, list):
+        return "incomplete zebrac JSON"
+    if config.get("min_samples") != samples or config.get("max_samples") != samples:
+        return "zebrac sample count differs from requested count"
+    if len(results) != len(commands):
+        return "zebrac result count differs from target count"
+    expected_failures = classification == "not-well-formed"
+    for index, result in enumerate(results):
+        if not isinstance(result, dict):
+            return f"invalid zebrac result at index {index}"
+        if result.get("command") != commands[index]:
+            return f"zebrac command differs at index {index}"
+        sample_count = result.get("sample_count")
+        failed_sample_count = result.get("failed_sample_count")
+        if (
+            type(sample_count) is not int
+            or type(failed_sample_count) is not int
+            or sample_count != samples
+            or failed_sample_count < 0
+            or failed_sample_count > sample_count
+        ):
+            return f"invalid zebrac sample counts at index {index}"
+        if expected_failures and failed_sample_count != sample_count:
+            return f"expected every malformed sample to fail at index {index}"
+        if not expected_failures and failed_sample_count != 0:
+            return f"valid workload has failed zebrac samples at index {index}"
+    return None
 
 
 def safe_name(value: str) -> str:
@@ -325,7 +384,11 @@ def main() -> int:
         stderr=subprocess.DEVNULL,
         text=True,
         check=False,
-    ).stdout.strip()
+    )
+    if version.returncode != 0:
+        print("unable to query zebrac version", file=sys.stderr)
+        return 1
+    version_text = version.stdout.strip()
     profile_stamp = (
         args.bin_dir.resolve().parent.parent
         / "build"
@@ -352,7 +415,7 @@ def main() -> int:
         "eligibility": [str(path.resolve()) for path in args.eligibility],
         "bin_dir": str(args.bin_dir.resolve()),
         "zebrac": str(zebrac),
-        "zebrac_version": version,
+        "zebrac_version": version_text,
         "targets_manifest": str(args.targets.resolve()),
         "build_profile": profile_stamp.read_text(encoding="utf-8")
         if profile_stamp.is_file()
@@ -410,9 +473,21 @@ def main() -> int:
             "status": completed.returncode,
         }
         index["runs"].append(run)
-        if completed.returncode != 0:
+        result_error = None
+        if completed.returncode == 0:
+            result_error = validate_zebrac_results(
+                json_path,
+                group["commands"],
+                workload["classification"],
+                args.samples,
+            )
+        if completed.returncode != 0 or result_error is not None:
             had_error = True
-            print(f"zebrac failed for {workload['id']} [{lane}]", file=sys.stderr)
+            reason = result_error or f"status-{completed.returncode}"
+            print(
+                f"zebrac failed for {workload['id']} [{lane}]: {reason}",
+                file=sys.stderr,
+            )
         else:
             print(f"measured {workload['id']} [{lane}]")
     temporary = args.output_dir / "index.json.tmp"

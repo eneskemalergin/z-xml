@@ -8,15 +8,17 @@ The repository contains qualified raw-name and namespace-aware XML 1.0 and XML 1
 
 Repeated validation may attach a caller-owned immutable `ExternalSubset` compiled from decoded, line-normalized UTF-8 declarations. Per-document internal declarations retain precedence. Fresh and reused validation have the same semantic and diagnostic contract; reuse avoids reparsing and recompiling an unchanged external grammar.
 
-Build the library checks with the configured Zig toolchain:
+Run the library tests and build the maintained adapters with the configured Zig toolchain:
 
 ```sh
 zig build test
 zig build test -Doptimize=ReleaseFast
+zig build corpus-adapters -Doptimize=ReleaseFast
+zig build persistent-adapters -Doptimize=ReleaseFast
 zig build layout -Doptimize=ReleaseFast
 ```
 
-The reference laboratory in [`ref/`](ref/README.md), the checked-in valid and invalid corpus in [`fixture/`](fixture/README.md), and the measurement tooling qualify parser behavior. The standards boundary, evidence, reader and validation contracts, compact tree, performance targets, and architecture live in [`plan/design/`](plan/design/README.md).
+The reference laboratory in [`ref/`](ref/README.md), the checked-in valid and invalid corpus in [`fixture/`](fixture/README.md), and the maintained tool surfaces in [`tools/`](tools/README.md) qualify parser behavior. The standards boundary, evidence, reader and validation contracts, compact tree, performance targets, and architecture live in [`plan/design/`](plan/design/README.md).
 
 Build every reference once, then run the focused correctness gate:
 
@@ -39,11 +41,13 @@ make -C ref all
 make -C ref generate-corpus-full verify-corpus-full
 ```
 
-Build and verify the persistent Expat and quick-xml protocols plus their 1, 16, 64, and 256 KiB inputs:
+Build and verify the maintained persistent protocols and their generated inputs:
 
 ```sh
+zig build persistent-adapters -Doptimize=ReleaseFast
 make -C ref all
-make -C ref check-persistent generate-corpus-persistent
+make -C ref generate-corpus-persistent generate-namespace-corpus
+make -C ref check-generated-persistent
 ```
 
 Fetch and audit the official W3C XML Test Suite separately:

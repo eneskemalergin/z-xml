@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import filecmp
 import json
+import tempfile
 from pathlib import Path
 
 
@@ -17,6 +19,8 @@ RECORDS = (
     (b'<p:n xmlns:p="urn:a" p:a="v"/>', b"urn:a"),
     (b'<p:n xmlns:p="urn:b" p:a="v"/>', b"urn:b"),
 )
+SCHEMA = "# z-xml-namespace-benchmark-v1"
+DEFAULT_SIZES_KIB = "1,16,64,256,1024"
 
 
 def fnv(value: int, data: bytes) -> int:
@@ -128,21 +132,24 @@ def generate(path: Path, size: int) -> Stats:
     return stats
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--sizes-kib", default="1,16,64,256,1024")
-    args = parser.parse_args()
-    sizes = sorted({int(value) for value in args.sizes_kib.split(",")})
-    if not sizes or any(size <= 0 or size > 1024 * 1024 for size in sizes):
-        parser.error("sizes must be positive KiB values at or below 1 GiB")
+def write_manifest(output_dir: Path, rows: list[dict[str, object]]) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest = output_dir / "manifest.tsv"
+    with manifest.open("w", encoding="utf-8", newline="") as output:
+        output.write(SCHEMA + "\n")
+        writer = csv.DictWriter(output, rows[0].keys(), delimiter="\t", lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    return manifest
 
+
+def generate_corpus(output_dir: Path, sizes: list[int]) -> Path:
     rows = []
     for size_kib in sizes:
         size = size_kib * 1024
         item_id = f"namespace-churn-{size_kib}k"
         relative = Path("valid") / f"{item_id}.xml"
-        stats = generate(args.output_dir / relative, size)
+        stats = generate(output_dir / relative, size)
         rows.append(
             {
                 "id": item_id,
@@ -153,15 +160,71 @@ def main() -> int:
                 "expected_summary": stats.summary(),
             }
         )
+    return write_manifest(output_dir, rows)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    manifest = args.output_dir / "manifest.tsv"
-    with manifest.open("w", encoding="utf-8", newline="") as output:
-        output.write("# z-xml-namespace-benchmark-v1\n")
-        writer = csv.DictWriter(output, rows[0].keys(), delimiter="\t", lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"namespace benchmark corpus: {len(rows)} workloads")
+
+def files(root: Path) -> dict[str, Path]:
+    return {
+        str(path.relative_to(root)): path
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def check_corpus(output_dir: Path, sizes: list[int]) -> None:
+    if not output_dir.is_dir():
+        raise ValueError(f"missing namespace benchmark corpus: {output_dir}")
+    with tempfile.TemporaryDirectory(prefix="z-xml-namespace-check-") as temporary:
+        expected_dir = Path(temporary)
+        generate_corpus(expected_dir, sizes)
+        observed = files(output_dir)
+        expected = files(expected_dir)
+        if set(observed) != set(expected):
+            missing = sorted(set(expected).difference(observed))
+            extra = sorted(set(observed).difference(expected))
+            details = []
+            if missing:
+                details.append(f"missing {', '.join(missing)}")
+            if extra:
+                details.append(f"unexpected {', '.join(extra)}")
+            raise ValueError("namespace benchmark corpus file set differs: " + "; ".join(details))
+        for relative in sorted(expected):
+            if not filecmp.cmp(observed[relative], expected[relative], shallow=False):
+                raise ValueError(f"namespace benchmark corpus differs: {relative}")
+
+
+def parse_sizes(parser: argparse.ArgumentParser, value: str) -> list[int]:
+    try:
+        sizes = sorted({int(item) for item in value.split(",")})
+    except ValueError:
+        parser.error("sizes must be comma-separated integers")
+    if not sizes or any(size <= 0 or size > 1024 * 1024 for size in sizes):
+        parser.error("sizes must be positive KiB values at or below 1 GiB")
+    return sizes
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--sizes-kib", default=DEFAULT_SIZES_KIB)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="verify the corpus instead of rewriting it",
+    )
+    args = parser.parse_args()
+    sizes = parse_sizes(parser, args.sizes_kib)
+    if args.check:
+        try:
+            check_corpus(args.output_dir, sizes)
+        except (OSError, ValueError) as error:
+            print(error)
+            return 1
+        print(f"namespace benchmark corpus matches: {args.output_dir}")
+        return 0
+
+    manifest = generate_corpus(args.output_dir, sizes)
+    print(f"namespace benchmark corpus: {len(sizes)} workloads")
     print(f"manifest: {manifest}")
     return 0
 

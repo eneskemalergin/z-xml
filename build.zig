@@ -428,6 +428,29 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run z-xml tests");
     test_step.dependOn(&run_public_tests.step);
+    b.default_step = test_step;
+
+    const tree_adapter_step = b.step("tree-adapter", "Build and install the owned-tree adapter");
+    const corpus_adapters_step = b.step(
+        "corpus-adapters",
+        "Build and install the focused corpus adapters",
+    );
+    const validation_bench_step = b.step(
+        "validation-bench",
+        "Build and install the fresh and reused validation adapters",
+    );
+    const persistent_adapters_step = b.step(
+        "persistent-adapters",
+        "Build and install the qualified persistent adapters",
+    );
+    const experimental_adapters_step = b.step(
+        "experimental-adapters",
+        "Build and install adapters outside the qualified lanes",
+    );
+    const tools_step = b.step(
+        "tools",
+        "Build and install all maintained adapter tools",
+    );
 
     const tree_tests_module = b.createModule(.{
         .root_source_file = b.path("tests/tree.zig"),
@@ -449,7 +472,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-tree",
         .root_module = tree_adapter_module,
     });
-    b.installArtifact(tree_adapter);
+    tree_adapter_step.dependOn(&b.addInstallArtifact(tree_adapter, .{}).step);
 
     const reader_internal_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -488,7 +511,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-check",
         .root_module = check_module,
     });
-    b.installArtifact(check);
+    corpus_adapters_step.dependOn(&b.addInstallArtifact(check, .{}).step);
     const check_tests = b.addTest(.{
         .root_module = check_module,
     });
@@ -512,7 +535,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-ns-check",
         .root_module = namespace_check_module,
     });
-    b.installArtifact(namespace_check);
+    corpus_adapters_step.dependOn(&b.addInstallArtifact(namespace_check, .{}).step);
     const namespace_check_tests = b.addTest(.{
         .root_module = namespace_check_module,
     });
@@ -536,7 +559,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-general-check",
         .root_module = general_check_module,
     });
-    b.installArtifact(general_check);
+    corpus_adapters_step.dependOn(&b.addInstallArtifact(general_check, .{}).step);
     const general_check_tests = b.addTest(.{
         .root_module = general_check_module,
     });
@@ -563,7 +586,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-general-ns-check",
         .root_module = general_namespace_check_module,
     });
-    b.installArtifact(general_namespace_check);
+    corpus_adapters_step.dependOn(&b.addInstallArtifact(general_namespace_check, .{}).step);
     const general_namespace_check_tests = b.addTest(.{
         .root_module = general_namespace_check_module,
     });
@@ -589,7 +612,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-dtd-check",
         .root_module = dtd_check_module,
     });
-    b.installArtifact(dtd_check);
+    corpus_adapters_step.dependOn(&b.addInstallArtifact(dtd_check, .{}).step);
     const dtd_check_tests = b.addTest(.{ .root_module = dtd_check_module });
     test_step.dependOn(&b.addRunArtifact(dtd_check_tests).step);
 
@@ -610,7 +633,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-dtd-ns-check",
         .root_module = dtd_namespace_check_module,
     });
-    b.installArtifact(dtd_namespace_check);
+    corpus_adapters_step.dependOn(&b.addInstallArtifact(dtd_namespace_check, .{}).step);
     const dtd_namespace_check_tests = b.addTest(.{ .root_module = dtd_namespace_check_module });
     test_step.dependOn(&b.addRunArtifact(dtd_namespace_check_tests).step);
 
@@ -631,7 +654,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-validating-check",
         .root_module = validating_check_module,
     });
-    b.installArtifact(validating_check);
+    corpus_adapters_step.dependOn(&b.addInstallArtifact(validating_check, .{}).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = validating_check_module })).step);
 
     const validating_namespace_check_module = b.createModule(.{
@@ -654,7 +677,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-validating-ns-check",
         .root_module = validating_namespace_check_module,
     });
-    b.installArtifact(validating_namespace_check);
+    corpus_adapters_step.dependOn(&b.addInstallArtifact(validating_namespace_check, .{}).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{
         .root_module = validating_namespace_check_module,
     })).step);
@@ -677,10 +700,10 @@ pub fn build(b: *std.Build) void {
         xml11_check_options.addOption(bool, "validating", true);
         xml11_check_options.addOption(bool, "xml11", true);
         xml11_check_module.addOptions("check_options", xml11_check_options);
-        b.installArtifact(b.addExecutable(.{
+        corpus_adapters_step.dependOn(&b.addInstallArtifact(b.addExecutable(.{
             .name = entry[0],
             .root_module = xml11_check_module,
-        }));
+        }), .{}).step);
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{
             .root_module = xml11_check_module,
         })).step);
@@ -704,7 +727,7 @@ pub fn build(b: *std.Build) void {
             .name = entry[0],
             .root_module = repeat_module,
         });
-        b.installArtifact(repeat);
+        validation_bench_step.dependOn(&b.addInstallArtifact(repeat, .{}).step);
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = repeat_module })).step);
     }
 
@@ -723,7 +746,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-persistent",
         .root_module = persistent_module,
     });
-    b.installArtifact(persistent);
+    persistent_adapters_step.dependOn(&b.addInstallArtifact(persistent, .{}).step);
     const persistent_tests = b.addTest(.{
         .root_module = persistent_module,
     });
@@ -748,7 +771,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-ns-persistent",
         .root_module = namespace_persistent_module,
     });
-    b.installArtifact(namespace_persistent);
+    persistent_adapters_step.dependOn(&b.addInstallArtifact(namespace_persistent, .{}).step);
     const namespace_persistent_tests = b.addTest(.{
         .root_module = namespace_persistent_module,
     });
@@ -770,7 +793,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-general-persistent",
         .root_module = general_persistent_module,
     });
-    b.installArtifact(general_persistent);
+    experimental_adapters_step.dependOn(&b.addInstallArtifact(general_persistent, .{}).step);
     const general_persistent_tests = b.addTest(.{
         .root_module = general_persistent_module,
     });
@@ -793,4 +816,11 @@ pub fn build(b: *std.Build) void {
 
     const layout_step = b.step("layout", "Print representative specialized type layouts");
     layout_step.dependOn(&run_layout_probe.step);
+
+    tools_step.dependOn(tree_adapter_step);
+    tools_step.dependOn(corpus_adapters_step);
+    tools_step.dependOn(validation_bench_step);
+    tools_step.dependOn(persistent_adapters_step);
+    tools_step.dependOn(experimental_adapters_step);
+    b.getInstallStep().dependOn(tools_step);
 }

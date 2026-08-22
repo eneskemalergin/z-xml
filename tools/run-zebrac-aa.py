@@ -51,6 +51,44 @@ def host_information() -> dict[str, object]:
     }
 
 
+def validate_zebrac_results(
+    path: Path, commands: list[str], samples: int, allow_failures: bool
+) -> str | None:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            report = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        return f"invalid zebrac JSON: {error}"
+    if not isinstance(report, dict) or report.get("schema_version") != 1:
+        return "unexpected zebrac JSON schema"
+    config = report.get("config")
+    results = report.get("results")
+    if not isinstance(config, dict) or not isinstance(results, list):
+        return "incomplete zebrac JSON"
+    if config.get("min_samples") != samples or config.get("max_samples") != samples:
+        return "zebrac sample count differs from requested count"
+    if len(results) != len(commands):
+        return "zebrac result count differs from command count"
+    for index, result in enumerate(results):
+        if not isinstance(result, dict):
+            return f"invalid zebrac result at index {index}"
+        if result.get("command") != commands[index]:
+            return f"zebrac command differs at index {index}"
+        sample_count = result.get("sample_count")
+        failed_sample_count = result.get("failed_sample_count")
+        if (
+            type(sample_count) is not int
+            or type(failed_sample_count) is not int
+            or sample_count != samples
+            or failed_sample_count < 0
+            or failed_sample_count > sample_count
+        ):
+            return f"invalid zebrac sample counts at index {index}"
+        if not allow_failures and failed_sample_count != 0:
+            return f"unexpected failed zebrac samples at index {index}"
+    return None
+
+
 def main() -> int:
     args = parse_args()
     if args.duration_ms <= 0 or args.samples <= 1 or args.warmups < 0:
@@ -116,8 +154,16 @@ def main() -> int:
 
     stdout_path.write_text(completed.stdout, encoding="utf-8")
     stderr_path.write_text(completed.stderr, encoding="utf-8")
+    result_error = None
+    if completed.returncode == 0:
+        result_error = validate_zebrac_results(
+            raw_path,
+            commands,
+            args.samples,
+            args.allow_failures,
+        )
     metadata = {
-        "schema": "z-xml-zebrac-aa-v1",
+        "schema": "z-xml-zebrac-aa-v2",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "program": str(program),
         "program_size": program.stat().st_size,
@@ -130,6 +176,7 @@ def main() -> int:
         "host": host_information(),
         "zebrac": str(zebrac),
         "zebrac_status": completed.returncode,
+        "zebrac_result_error": result_error,
         "raw": raw_path.name,
         "stdout": stdout_path.name,
         "stderr": stderr_path.name,
@@ -137,7 +184,9 @@ def main() -> int:
     temporary = args.output_dir / "index.json.tmp"
     temporary.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     temporary.replace(args.output_dir / "index.json")
-    return completed.returncode
+    if completed.returncode != 0:
+        return completed.returncode
+    return 1 if result_error is not None else 0
 
 
 if __name__ == "__main__":
