@@ -14,7 +14,7 @@ This tree is the small, checked-in correctness corpus. `manifest.tsv` is the mac
 - `invalid/dtd/` contains well-formed XML that violates DTD validity constraints. Validating processors reject it; non-validating processors normally accept it.
 - `benchmark/` contains tiny benchmark smoke data and descriptions of generated or downloaded workloads. It never serves as a correctness oracle by itself.
 
-Run `make -C ref check-corpus` before any benchmark command.
+After building the references with `make -C ref all`, run `make -C ref check-corpus` before any benchmark command.
 
 `manifest.tsv` has schema marker `z-xml-fixtures-v1` and seven tab-separated fields: ID, relative path, classification, recommendation, required features or checks, benchmark eligibility, and description. Positive cases name accepted syntax features. Negative cases use `check_` capabilities so accepting valid syntax is not confused with detecting every malformed variant.
 

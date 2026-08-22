@@ -18,33 +18,38 @@ Build the library checks with the pinned compiler:
 
 The reference laboratory in [`ref/`](ref/README.md), the checked-in valid and invalid corpus in [`fixture/`](fixture/README.md), and the measurement tooling qualify parser behavior. The standards boundary, evidence, reader and validation contracts, compact tree, performance targets, and architecture live in [`plan/design/`](plan/design/README.md).
 
-Build every reference and run the focused correctness gate:
+Build every reference once, then run the focused correctness gate:
 
 ```sh
+make -C ref all
 make -C ref check-corpus
 ```
 
 Build and verify the host-tuned binaries and deterministic performance corpus before zebrac:
 
 ```sh
-make -C ref TUNE=native audit-build smoke check-corpus check-generated
+make -C ref all
+make -C ref smoke check-corpus check-generated
 ```
 
 Generate and verify the full 1 MiB through 1 GiB matrix separately. It occupies about 10.3 GiB and is not committed:
 
 ```sh
-make -C ref TUNE=native generate-corpus-full verify-corpus-full
+make -C ref all
+make -C ref generate-corpus-full verify-corpus-full
 ```
 
 Build and verify the persistent Expat and quick-xml protocols plus their 1, 16, 64, and 256 KiB inputs:
 
 ```sh
-make -C ref TUNE=native persistent-smoke generate-corpus-persistent
+make -C ref all
+make -C ref persistent-smoke generate-corpus-persistent
 ```
 
 Fetch and audit the official W3C XML Test Suite separately:
 
 ```sh
+make -C ref all
 make -C ref check-xmlconf
 ```
 

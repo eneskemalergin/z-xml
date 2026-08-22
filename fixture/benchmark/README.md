@@ -10,13 +10,13 @@ The durable shape contract is [`plans/shape-matrix-v1.tsv`](plans/shape-matrix-v
 
 A workload becomes benchmark-eligible only when its manifest entry names a parser profile and the correctness runner passes every target included in that timing comparison. Invalid-input timing is a separate rejection workload and records whether the first fatal byte is early, middle, or late.
 
-`tools/generate-benchmark-corpus.py` creates the versioned performance corpus outside this checked-in tree. Its manifest records exact sizes, feature requirements, expected semantic summaries, and rejection positions. Use `make -C ref generate-corpus` followed by `make -C ref check-generated` before selecting commands for zebrac.
+`tools/generate-benchmark-corpus.py` creates the versioned performance corpus outside this checked-in tree. Its manifest records exact sizes, feature requirements, expected semantic summaries, and rejection positions. After `make -C ref all`, use `make -C ref generate-corpus` followed by `make -C ref check-generated` before selecting commands for zebrac.
 
 The UTF-8/no-DTD generator includes long text, dense markup, fixed and varied attribute workloads, varied shallow records, mixed content, references, Unicode, deep nesting, and early/middle/late structural rejection. The varied-record workloads are intended to prevent a benchmark from rewarding one repeated byte pattern.
 
-[`plans/full-1g.tsv`](plans/full-1g.tsv) is the audited large recipe. It spans 1, 16, 64, 256, and 1024 MiB without allowing any file above exactly 1 GiB. Run `make -C ref TUNE=native generate-corpus-full verify-corpus-full` to materialize and directly verify it outside `fixture/`.
+[`plans/full-1g.tsv`](plans/full-1g.tsv) is the audited large recipe. It spans 1, 16, 64, 256, and 1024 MiB without allowing any file above exactly 1 GiB. After `make -C ref all`, run `make -C ref generate-corpus-full verify-corpus-full` to materialize and directly verify it outside `fixture/`.
 
-Persistent-process measurements use generated 1, 16, 64, and 256 KiB versions of every common shape. Run `make -C ref generate-corpus-persistent` to materialize them under `data/generated/z-xml-generated-v3-persistent/`. These inputs isolate parser setup, reset, callback, and tiny-document latency without process startup dominating each parse.
+Persistent-process measurements use generated 1, 16, 64, and 256 KiB versions of every common shape. After `make -C ref all`, run `make -C ref generate-corpus-persistent` to materialize them under `data/generated/z-xml-generated-v3-persistent/`. These inputs isolate parser setup, reset, callback, and tiny-document latency without process startup dominating each parse.
 
 Check the tracked shape references before generating data:
 
