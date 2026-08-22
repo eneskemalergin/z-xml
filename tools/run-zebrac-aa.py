@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,12 +16,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def resolve_zebrac(explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        return explicit.resolve()
+    command = shutil.which("zebrac")
+    return Path(command).resolve() if command is not None else None
+
+
 def parse_args() -> argparse.Namespace:
-    root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument("--program", type=Path, required=True)
     parser.add_argument("--arg", action="append", default=[])
-    parser.add_argument("--zebrac", type=Path, default=root / "tools" / "zebrac")
+    parser.add_argument(
+        "--zebrac",
+        type=Path,
+        help="Zebrac executable (default: resolve zebrac from PATH)",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--duration-ms", type=int, default=5000)
     parser.add_argument("--samples", type=int, default=20)
@@ -50,9 +61,12 @@ def main() -> int:
         return 64
 
     program = args.program.resolve()
-    zebrac = args.zebrac.resolve()
+    zebrac = resolve_zebrac(args.zebrac)
     if not program.is_file():
         print(f"missing program: {program}", file=sys.stderr)
+        return 1
+    if zebrac is None:
+        print("zebrac not found on PATH; pass --zebrac PATH", file=sys.stderr)
         return 1
     if not zebrac.is_file():
         print(f"missing zebrac: {zebrac}", file=sys.stderr)

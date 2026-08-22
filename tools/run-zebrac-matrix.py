@@ -10,6 +10,7 @@ import json
 import os
 import platform
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -29,6 +30,13 @@ class Target:
     input_model: str
 
 
+def resolve_zebrac(explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        return explicit.resolve()
+    command = shutil.which("zebrac")
+    return Path(command).resolve() if command is not None else None
+
+
 def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
@@ -36,7 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eligibility", type=Path, action="append", required=True)
     parser.add_argument("--targets", type=Path, default=root / "ref" / "targets.tsv")
     parser.add_argument("--bin-dir", type=Path, required=True)
-    parser.add_argument("--zebrac", type=Path, default=root / "tools" / "zebrac")
+    parser.add_argument(
+        "--zebrac",
+        type=Path,
+        help="Zebrac executable (default: resolve zebrac from PATH)",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--workload", action="append", required=True, help="Workload ID or glob"
@@ -298,7 +310,10 @@ def main() -> int:
             )
         return 0
 
-    zebrac = args.zebrac.resolve()
+    zebrac = resolve_zebrac(args.zebrac)
+    if zebrac is None:
+        print("zebrac not found on PATH; pass --zebrac PATH", file=sys.stderr)
+        return 1
     if not zebrac.is_file():
         print(f"missing zebrac binary: {zebrac}", file=sys.stderr)
         return 1
