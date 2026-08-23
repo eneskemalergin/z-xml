@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fixture-root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "fixture",
+        default=Path(__file__).resolve().parents[2] / "fixture",
     )
     parser.add_argument("--check", action="store_true")
     return parser.parse_args()

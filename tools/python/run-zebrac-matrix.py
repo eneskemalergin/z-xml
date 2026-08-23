@@ -39,7 +39,7 @@ def resolve_zebrac(explicit: Path | None) -> Path | None:
 
 
 def parse_args() -> argparse.Namespace:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--eligibility", type=Path, action="append", required=True)

@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
     const tools_step = b.step("tools", "Build and install all adapter tools");
 
     const tree_module = b.createModule(.{
-        .root_source_file = b.path("z_xml_tree.zig"),
+        .root_source_file = b.path("zig/tree.zig"),
         .target = target,
         .optimize = optimize,
         .strip = optimize == .ReleaseFast,
@@ -222,7 +222,7 @@ fn addCheckAdapter(
     adapter: CheckAdapter,
 ) void {
     const module = b.createModule(.{
-        .root_source_file = b.path("z_xml_check.zig"),
+        .root_source_file = b.path("zig/check.zig"),
         .target = target,
         .optimize = optimize,
         .strip = optimize == .ReleaseFast,
@@ -255,7 +255,7 @@ fn addValidationAdapter(
     reuse: bool,
 ) void {
     const module = b.createModule(.{
-        .root_source_file = b.path("z_xml_validation_repeat.zig"),
+        .root_source_file = b.path("zig/validation_repeat.zig"),
         .target = target,
         .optimize = optimize,
         .strip = optimize == .ReleaseFast,
@@ -283,7 +283,7 @@ fn addPersistentAdapter(
     adapter: PersistentAdapter,
 ) void {
     const module = b.createModule(.{
-        .root_source_file = b.path("z_xml_persistent.zig"),
+        .root_source_file = b.path("zig/persistent.zig"),
         .target = target,
         .optimize = optimize,
         .strip = optimize == .ReleaseFast,

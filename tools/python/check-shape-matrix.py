@@ -32,7 +32,7 @@ VALID_STATUSES = {"ready", "planned"}
 
 
 def parse_args() -> argparse.Namespace:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--matrix",

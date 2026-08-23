@@ -570,7 +570,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "data" / "generated" / SCHEMA,
+        default=Path(__file__).resolve().parents[2] / "data" / "generated" / SCHEMA,
     )
     parser.add_argument("--sizes-mib", default="1")
     parser.add_argument("--sizes-kib")

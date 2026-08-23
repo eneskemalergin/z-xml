@@ -35,7 +35,7 @@ EXPECTED_ACCUMULATOR = "eb797883fd275cc7"
 
 
 def parse_args() -> argparse.Namespace:
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--z-xml-bin-dir", type=Path)
