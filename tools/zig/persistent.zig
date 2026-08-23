@@ -4,15 +4,6 @@ const std = @import("std");
 const xml = @import("z_xml");
 const persistent_options = @import("persistent_options");
 
-const CONFIG = if (persistent_options.general_encodings)
-    if (persistent_options.namespaces)
-        xml.Configs.XML10_NAMESPACES_NO_DTD_FAST
-    else
-        xml.Configs.XML10_NO_DTD_FAST
-else if (persistent_options.namespaces)
-    xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST
-else
-    xml.Configs.XML10_UTF8_NO_DTD_FAST;
 const ENGINE = if (persistent_options.general_encodings)
     if (persistent_options.namespaces) "z-xml-general-ns" else "z-xml-general"
 else if (persistent_options.namespaces)
@@ -177,17 +168,18 @@ const Stats = struct {
         self.bytes(&.{value});
     }
 
-    fn name(self: *Stats, value: xml.NameFor(CONFIG)) void {
+    fn name(self: *Stats, value: xml.Name) void {
         if (comptime persistent_options.namespaces) {
-            const namespace_uri = value.namespace_uri orelse "";
-            const prefix = value.prefix orelse "";
+            const expanded = value.expanded.?;
+            const namespace_uri = expanded.namespace_uri orelse "";
+            const prefix = expanded.prefix orelse "";
             self.namespace_uri_bytes += namespace_uri.len;
-            self.local_name_bytes += value.local.len;
+            self.local_name_bytes += expanded.local.len;
             self.prefix_bytes += prefix.len;
             self.marker(7);
             self.bytes(namespace_uri);
             self.marker(8);
-            self.bytes(value.local);
+            self.bytes(expanded.local);
             self.marker(9);
             self.bytes(prefix);
         } else {
@@ -195,22 +187,20 @@ const Stats = struct {
         }
     }
 
-    fn observe(self: *Stats, event: xml.EventFor(CONFIG)) void {
-        switch (event) {
+    fn observe(self: *Stats, event: xml.Event) void {
+        switch (event.data) {
             .start_element => |start| {
                 self.elements += 1;
                 self.name_bytes += start.name.raw.len;
-                if (comptime persistent_options.namespaces) {
-                    for (start.namespace_declarations) |declaration| {
-                        const prefix = declaration.prefix orelse "";
-                        self.namespace_declarations += 1;
-                        self.namespace_uri_bytes += declaration.namespace_uri.len;
-                        self.prefix_bytes += prefix.len;
-                        self.marker(5);
-                        self.bytes(prefix);
-                        self.marker(6);
-                        self.bytes(declaration.namespace_uri);
-                    }
+                for (start.namespace_declarations) |declaration| {
+                    const prefix = declaration.prefix orelse "";
+                    self.namespace_declarations += 1;
+                    self.namespace_uri_bytes += declaration.namespace_uri.len;
+                    self.prefix_bytes += prefix.len;
+                    self.marker(5);
+                    self.bytes(prefix);
+                    self.marker(6);
+                    self.bytes(declaration.namespace_uri);
                 }
                 self.marker(1);
                 self.name(start.name);
@@ -284,18 +274,27 @@ fn run(init: std.process.Init) !u8 {
         .dynamic => init.gpa,
         .fixed => fixed_allocator.allocator(),
     } };
-    var reader = try xml.ReaderFor(CONFIG).init(tracking.allocator(), .{});
+    const reader_options: xml.ReaderOptions = .{
+        .namespaces = if (persistent_options.namespaces) .process else .raw,
+        .dtd = .reject,
+    };
+    var file_reader = file.reader(init.io, input);
+    const source: xml.Source = switch (options.input) {
+        .resident => .{ .slice = input },
+        .stream => .{ .stream = &file_reader.interface },
+    };
+    var reader = try xml.Reader.init(tracking.allocator(), source, reader_options);
     var reader_live = true;
     defer if (reader_live) reader.deinit();
     var reference: ?Stats = null;
     var first_allocator_operations: u64 = 0;
     for (0..options.iterations) |iteration| {
-        if (iteration > 0) try reader.reset(.retain_capacity);
-        var stats: Stats = .{ .consumer = options.consumer };
-        switch (options.input) {
-            .resident => try parseResident(&reader, &stats, input, options.chunk_bytes),
-            .stream => try parseStream(&reader, &stats, init.io, file, file_size, input),
+        if (iteration > 0) {
+            if (options.input == .stream) try file_reader.seekTo(0);
+            try reader.reset(source, reader_options, .retain_capacity);
         }
+        var stats: Stats = .{ .consumer = options.consumer };
+        try drain(&reader, &stats);
         if (reference) |expected| {
             if (!std.meta.eql(expected, stats)) return error.IterationMismatch;
         } else {
@@ -378,62 +377,8 @@ fn parseOptions(args: []const []const u8) ?Options {
     return if (options.path.len == 0) null else options;
 }
 
-fn parseResident(
-    reader: *xml.ReaderFor(CONFIG),
-    stats: *Stats,
-    input: []const u8,
-    chunk_bytes: usize,
-) !void {
-    if (input.len == 0) {
-        try reader.feed("", true);
-        if (!try drain(reader, stats)) return error.InvalidState;
-        return;
-    }
-    var offset: usize = 0;
-    while (offset < input.len) {
-        const end = @min(input.len, offset +| chunk_bytes);
-        const final = end == input.len;
-        try reader.feed(input[offset..end], final);
-        const done = try drain(reader, stats);
-        if (done != final) return error.InvalidState;
-        offset = end;
-    }
-}
-
-fn parseStream(
-    reader: *xml.ReaderFor(CONFIG),
-    stats: *Stats,
-    io: std.Io,
-    file: std.Io.File,
-    file_size: u64,
-    buffer: []u8,
-) !void {
-    if (file_size == 0) {
-        try reader.feed("", true);
-        if (!try drain(reader, stats)) return error.InvalidState;
-        return;
-    }
-    var offset: u64 = 0;
-    while (offset < file_size) {
-        const count_u64 = @min(file_size - offset, buffer.len);
-        const count: usize = @intCast(count_u64);
-        if (try file.readPositionalAll(io, buffer[0..count], offset) != count) {
-            return error.IncompleteRead;
-        }
-        offset += count;
-        const final = offset == file_size;
-        try reader.feed(buffer[0..count], final);
-        const done = try drain(reader, stats);
-        if (done != final) return error.InvalidState;
-    }
-}
-
-fn drain(reader: *xml.ReaderFor(CONFIG), stats: *Stats) !bool {
-    while (true) switch (try reader.next()) {
-        .event => |event| stats.observe(event),
-        .need_input => return false,
-        .done => return true,
-    };
+fn drain(reader: *xml.Reader, stats: *Stats) !void {
+    while (try reader.next()) |event| stats.observe(event);
 }
 
 fn allocatorOperations(tracking: TrackingAllocator) u64 {
@@ -515,7 +460,14 @@ fn printStats(
 
 fn statusForError(err: anyerror) u8 {
     return switch (err) {
-        error.InvalidXml, error.InvalidDtd, error.NotValid => 2,
+        error.InvalidXml,
+        error.InvalidDtd,
+        error.NotValid,
+        error.InvalidEncoding,
+        error.UnsupportedEncoding,
+        error.UnsupportedVersion,
+        error.DtdForbidden,
+        => 2,
         error.LimitExceeded, error.OutOfMemory, error.InputTooLarge => 3,
         else => 1,
     };

@@ -189,16 +189,16 @@ pub const NameFor = reader.Name;
 pub const AttributeFor = reader.Attribute;
 /// Event-production error set used by specialized readers.
 pub const ProfileReadError = reader.ReadError;
-/// Returns a pull reader over one final slice.
-pub const SliceReader = io.SliceReader;
-/// Returns a pull adapter over a buffered Zig reader.
-pub const IoReader = io.IoReader;
-/// Push callback continuation result.
-pub const DrainControl = io.DrainControl;
-/// Parses one slice through a push callback.
-pub const drainSlice = io.drainSlice;
-/// Parses one buffered source through a push callback.
-pub const drainIo = io.drainIo;
+/// Returns a specialized pull reader over one final slice.
+pub const ProfileSliceReader = io.SliceReader;
+/// Returns a specialized pull adapter over a buffered Zig reader.
+pub const ProfileIoReader = io.IoReader;
+/// Push callback continuation result for a specialized reader.
+pub const ProfileDrainControl = io.DrainControl;
+/// Parses one slice through a specialized push callback.
+pub const drainProfileSlice = io.drainSlice;
+/// Parses one buffered source through a specialized push callback.
+pub const drainProfileIo = io.drainIo;
 /// Immutable owned-tree node index with zero as the null sentinel.
 pub const NodeIndex = tree.NodeIndex;
 /// Immutable owned-tree node kind.

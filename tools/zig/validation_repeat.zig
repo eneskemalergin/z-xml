@@ -108,7 +108,7 @@ fn run(init: std.process.Init) !u8 {
         if (comptime repeat_options.reuse) options.validation.external_subset = &subset.?;
         var input_buffer: [input_buffer_size]u8 = undefined;
         var file_reader = file.reader(init.io, &input_buffer);
-        var reader = try xml.IoReader(config).init(init.gpa, options, &file_reader.interface);
+        var reader = try xml.ProfileIoReader(config).init(init.gpa, options, &file_reader.interface);
         defer reader.deinit();
         while (true) switch (try reader.next()) {
             .event => |event| try totals.observe(event),

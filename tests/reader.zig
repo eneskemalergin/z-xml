@@ -275,7 +275,7 @@ const PushContext = struct {
     cancel_after: ?usize = null,
 };
 
-fn pushObserve(context: *PushContext, event: xml.EventFor(CORE_CONFIG)) xml.DrainControl {
+fn pushObserve(context: *PushContext, event: xml.EventFor(CORE_CONFIG)) xml.ProfileDrainControl {
     context.events += 1;
     switch (event) {
         .start_element => |start| context.attributes += start.attributes.len,
@@ -570,7 +570,7 @@ fn drainGeneralChunks(reader: *xml.ReaderFor(GENERAL_FAST_CONFIG), input: []cons
 }
 
 fn expectEvents(input: []const u8, expected: []const ExpectedEvent) !void {
-    const SliceReader = xml.SliceReader(CORE_CONFIG);
+    const SliceReader = xml.ProfileSliceReader(CORE_CONFIG);
     var reader = try SliceReader.init(std.testing.allocator, .{}, input);
     defer reader.deinit();
 
@@ -1462,11 +1462,14 @@ fn appendFocusedValue(output: *std.ArrayList(u8), value: []const u8) !void {
     try output.append(std.testing.allocator, 0);
 }
 
-fn summarizeNormalReader(input: []const u8) ![]u8 {
-    var reader = try xml.Reader.init(std.testing.allocator, .{ .slice = input }, .{});
+fn summarizeNormalSource(source: xml.Source) ![]u8 {
+    var reader = try xml.Reader.init(std.testing.allocator, source, .{});
     defer reader.deinit();
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(std.testing.allocator);
+    var text_origin: ?xml.TextOrigin = null;
+    var comment_active = false;
+    var instruction_active = false;
     while (try reader.next()) |event| switch (event.data) {
         .document_start => |document| {
             try output.append(std.testing.allocator, 'D');
@@ -1499,13 +1502,66 @@ fn summarizeNormalReader(input: []const u8) ![]u8 {
             );
         },
         .text => |value| {
-            try output.append(std.testing.allocator, 'T');
-            try appendFocusedValue(&output, value.bytes);
+            if (text_origin == null or text_origin.? != value.origin) {
+                try output.append(std.testing.allocator, 'T');
+                try output.append(std.testing.allocator, @intFromEnum(value.origin));
+                text_origin = value.origin;
+            }
+            try output.appendSlice(std.testing.allocator, value.bytes);
+        },
+        .comment => |value| {
+            if (!comment_active) {
+                try output.append(std.testing.allocator, 'C');
+                comment_active = true;
+            }
+            try output.appendSlice(std.testing.allocator, value.bytes);
+            if (value.final_fragment) {
+                try output.append(std.testing.allocator, 0);
+                comment_active = false;
+            }
+        },
+        .processing_instruction => |value| {
+            if (!instruction_active) {
+                try output.append(std.testing.allocator, 'P');
+                try appendFocusedValue(&output, value.target);
+                instruction_active = true;
+            }
+            try output.appendSlice(std.testing.allocator, value.data);
+            if (value.final_fragment) {
+                try output.append(std.testing.allocator, 0);
+                instruction_active = false;
+            }
         },
         .document_end => try output.append(std.testing.allocator, 'Z'),
         else => {},
     };
     return output.toOwnedSlice(std.testing.allocator);
+}
+
+fn summarizeNormalReader(input: []const u8) ![]u8 {
+    return summarizeNormalSource(.{ .slice = input });
+}
+
+const NormalFailure = struct {
+    category: xml.ReadError,
+    code: xml.DiagnosticCode,
+    byte_offset: u64,
+};
+
+fn normalFailure(source: xml.Source) !NormalFailure {
+    var reader = try xml.Reader.init(std.testing.allocator, source, .{});
+    defer reader.deinit();
+    while (true) {
+        const event = reader.next() catch |failure| {
+            const diagnostic = reader.diagnostic() orelse return error.MissingDiagnostic;
+            return .{
+                .category = failure,
+                .code = diagnostic.code,
+                .byte_offset = diagnostic.primary.byte_offset,
+            };
+        };
+        if (event == null) return error.ExpectedFailure;
+    }
 }
 
 fn summarizeSelectedEngine(input: []const u8) ![]u8 {
@@ -1545,7 +1601,8 @@ fn summarizeSelectedEngine(input: []const u8) ![]u8 {
             },
             .text => |value| {
                 try output.append(std.testing.allocator, 'T');
-                try appendFocusedValue(&output, value.bytes);
+                try output.append(std.testing.allocator, @intFromEnum(value.origin));
+                try output.appendSlice(std.testing.allocator, value.bytes);
             },
             .document_end => try output.append(std.testing.allocator, 'Z'),
             else => {},
@@ -1612,6 +1669,58 @@ test "[integration] - [Reader]: matches selected engine output and first failure
     );
 }
 
+test "[property] - [Reader source]: slice and buffered schedules agree" {
+    const input =
+        "<?setup ready?><root xmlns='urn:test' id='7'>" ++
+        "<!--note--><item/>text<![CDATA[more]]></root>";
+    const expected = try summarizeNormalReader(input);
+    defer std.testing.allocator.free(expected);
+
+    var one_byte_buffer: [1]u8 = undefined;
+    var one_byte_source: std.testing.Reader = .init(
+        &one_byte_buffer,
+        &.{.{ .buffer = input }},
+    );
+    one_byte_source.artificial_limit = .limited(1);
+    const one_byte = try summarizeNormalSource(.{ .stream = &one_byte_source.interface });
+    defer std.testing.allocator.free(one_byte);
+    try std.testing.expectEqualStrings(expected, one_byte);
+
+    var split_buffer: [7]u8 = undefined;
+    var split_source: std.testing.Reader = .init(&split_buffer, &.{
+        .{ .buffer = "" },
+        .{ .buffer = "<?setup ready?><ro" },
+        .{ .buffer = "ot xmlns='urn:test' id='7'><!--note--><it" },
+        .{ .buffer = "em/" },
+        .{ .buffer = ">text<![CDATA[more]]></root>" },
+    });
+    split_source.artificial_limit = .limited(3);
+    const split = try summarizeNormalSource(.{ .stream = &split_source.interface });
+    defer std.testing.allocator.free(split);
+    try std.testing.expectEqualStrings(expected, split);
+
+    const malformed = "<root><item></root>";
+    const expected_failure = try normalFailure(.{ .slice = malformed });
+    var failure_buffer: [2]u8 = undefined;
+    var failure_source: std.testing.Reader = .init(
+        &failure_buffer,
+        &.{.{ .buffer = malformed }},
+    );
+    failure_source.artificial_limit = .limited(1);
+    try std.testing.expectEqual(
+        expected_failure,
+        try normalFailure(.{ .stream = &failure_source.interface }),
+    );
+
+    const expected_empty = try normalFailure(.{ .slice = "" });
+    var empty_buffer: [1]u8 = undefined;
+    var empty_source: std.testing.Reader = .init(&empty_buffer, &.{});
+    try std.testing.expectEqual(
+        expected_empty,
+        try normalFailure(.{ .stream = &empty_source.interface }),
+    );
+}
+
 test "[integration] - [Reader]: namespace policy keeps one event type" {
     var reader = try xml.Reader.init(
         std.testing.allocator,
@@ -1663,11 +1772,18 @@ test "[integration] - [Reader]: event values borrow until the next read begins" 
 const NormalDiagnosticLog = struct {
     calls: usize = 0,
     code: ?xml.DiagnosticCode = null,
+    reader: ?*xml.Reader = null,
+    reset_error: ?xml.ResetError = null,
 
     fn report(context: ?*anyopaque, diagnostic: xml.Diagnostic) void {
         const self: *NormalDiagnosticLog = @ptrCast(@alignCast(context.?));
         self.calls += 1;
         self.code = diagnostic.code;
+        if (self.reader) |reader| {
+            reader.reset(.{ .slice = "<replacement/>" }, .{}, .retain_capacity) catch |failure| {
+                self.reset_error = failure;
+            };
+        }
     }
 };
 
@@ -1682,18 +1798,21 @@ test "[integration] - [Reader]: DTD rejection is sticky and reports once" {
         },
     );
     defer reader.deinit();
+    log.reader = &reader;
 
     _ = try reader.next();
     try std.testing.expectError(error.DtdForbidden, reader.next());
     try std.testing.expectError(error.DtdForbidden, reader.next());
     try std.testing.expectEqual(@as(usize, 1), log.calls);
     try std.testing.expectEqual(xml.DiagnosticCode.dtd_forbidden, log.code.?);
+    try std.testing.expectEqual(error.InvalidState, log.reset_error.?);
     try std.testing.expectEqual(xml.DiagnosticCode.dtd_forbidden, reader.diagnostic().?.code);
 }
 
 const NormalFindingLog = struct {
     calls: usize = 0,
     code: ?xml.DiagnosticCode = null,
+    action: xml.dtd.FindingAction = .continue_validation,
 
     fn report(
         context: ?*anyopaque,
@@ -1702,7 +1821,7 @@ const NormalFindingLog = struct {
         const self: *NormalFindingLog = @ptrCast(@alignCast(context.?));
         self.calls += 1;
         self.code = finding.code;
-        return .continue_validation;
+        return self.action;
     }
 };
 
@@ -1729,6 +1848,244 @@ test "[integration] - [Reader]: DTD validation keeps one event type" {
     try std.testing.expectEqual(@as(usize, 1), log.calls);
     try std.testing.expectEqual(xml.DiagnosticCode.validity_required_attribute, log.code.?);
     try std.testing.expectEqual(xml.DtdValidity.invalid, validity.?);
+}
+
+test "[failure] - [Reader cancellation]: callback cancellation is sticky until reset" {
+    const input =
+        "<!DOCTYPE root [<!ELEMENT root EMPTY>" ++
+        "<!ATTLIST root needed CDATA #REQUIRED>]>" ++
+        "<root/>";
+    var log: NormalFindingLog = .{ .action = .cancel };
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = input },
+        .{ .dtd = .{ .validate = .{
+            .finding_sink = .{ .context = &log, .report_fn = NormalFindingLog.report },
+        } } },
+    );
+    defer reader.deinit();
+
+    while (true) {
+        const event = reader.next() catch |failure| {
+            try std.testing.expectEqual(error.Cancelled, failure);
+            break;
+        };
+        if (event == null) return error.ExpectedCancellation;
+    }
+    try std.testing.expectEqual(@as(usize, 1), log.calls);
+    try std.testing.expectError(error.Cancelled, reader.next());
+
+    try reader.reset(
+        .{ .slice = "<root/>" },
+        .{ .dtd = .reject },
+        .retain_capacity,
+    );
+    while (try reader.next()) |_| {}
+    try std.testing.expect(reader.diagnostic() == null);
+}
+
+test "[integration] - [Reader lifecycle]: reset replaces every parser state" {
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "<unused/>" },
+        .{},
+    );
+    defer reader.deinit();
+
+    try reader.reset(.{ .slice = "<ready/>" }, .{ .dtd = .reject }, .retain_capacity);
+    _ = try reader.next();
+    try reader.reset(
+        .{ .slice = "<p:active xmlns:p='urn:test'/>" },
+        .{ .namespaces = .raw, .dtd = .reject },
+        .retain_capacity,
+    );
+    while (try reader.next()) |_| {}
+
+    try reader.reset(.{ .slice = "<complete/>" }, .{}, .retain_capacity);
+    while (try reader.next()) |_| {}
+    try std.testing.expect((try reader.next()) == null);
+
+    try reader.reset(.{ .slice = "<failed>" }, .{}, .release_memory);
+    while (true) {
+        const event = reader.next() catch |failure| {
+            try std.testing.expectEqual(error.InvalidXml, failure);
+            break;
+        };
+        if (event == null) return error.ExpectedFailure;
+    }
+    try std.testing.expectError(error.InvalidXml, reader.next());
+    try reader.reset(.{ .slice = "<recovered/>" }, .{ .dtd = .reject }, .retain_capacity);
+    while (try reader.next()) |_| {}
+    try std.testing.expect(reader.diagnostic() == null);
+}
+
+test "[failure] - [Reader reset]: invalid options preserve active state and borrows" {
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "<root id='7'/>" },
+        .{},
+    );
+    defer reader.deinit();
+
+    _ = try reader.next();
+    const event = (try reader.next()).?;
+    const start = event.data.start_element;
+    try std.testing.expectError(
+        error.InvalidOptions,
+        reader.reset(
+            .{ .slice = "<replacement/>" },
+            .{ .external = .resolve },
+            .release_memory,
+        ),
+    );
+    try std.testing.expectEqualStrings("root", start.name.raw);
+    try std.testing.expectEqualStrings("7", start.attribute(null, "id").?.value);
+    while (try reader.next()) |_| {}
+}
+
+test "[unit] - [Reader reset]: capacity policy is allocation free and exact" {
+    const input = "<root first='one' second='two'><child/></root>";
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var reader = try xml.Reader.init(
+        failing.allocator(),
+        .{ .slice = input },
+        .{ .dtd = .reject },
+    );
+    defer reader.deinit();
+
+    while (try reader.next()) |_| {}
+    try std.testing.expect(reader.memoryUsage().retained_capacity > 0);
+    try reader.reset(.{ .slice = input }, .{ .dtd = .reject }, .retain_capacity);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    while (try reader.next()) |_| {}
+    try std.testing.expect(!failing.has_induced_failure);
+
+    var limited_options: xml.ReaderOptions = .{ .dtd = .reject };
+    limited_options.limits.max_retained_bytes = 0;
+    try reader.reset(.{ .slice = "<root/>" }, limited_options, .retain_capacity);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().retained_capacity);
+
+    try reader.reset(.{ .slice = "<root/>" }, .{ .dtd = .reject }, .release_memory);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().retained_capacity);
+}
+
+test "[unit] - [Reader reset]: engine selection does not allocate" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    var reader = try xml.Reader.init(
+        failing.allocator(),
+        .{ .slice = "<root/>" },
+        .{},
+    );
+    defer reader.deinit();
+
+    try reader.reset(
+        .{ .slice = "<root/>" },
+        .{ .namespaces = .raw, .dtd = .{ .validate = .{} } },
+        .release_memory,
+    );
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
+test "[unit] - [Reader reset]: disabling DTD processing releases its storage" {
+    const input =
+        "<!DOCTYPE root [<!ELEMENT root (#PCDATA)><!ENTITY value 'text'>]>" ++
+        "<root>&value;</root>";
+    var reader = try xml.Reader.init(std.testing.allocator, .{ .slice = input }, .{});
+    defer reader.deinit();
+    while (try reader.next()) |_| {}
+    try std.testing.expect(reader.memoryUsage().dtd_capacity > 0);
+
+    try reader.reset(.{ .slice = "<root/>" }, .{ .dtd = .reject }, .retain_capacity);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().dtd_capacity);
+}
+
+test "[integration] - [Reader lifecycle]: early stop ignores unread input" {
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "<root><broken" },
+        .{},
+    );
+    defer reader.deinit();
+
+    _ = try reader.next();
+    const start = (try reader.next()).?.data.start_element;
+    try std.testing.expectEqualStrings("root", start.name.raw);
+    try reader.reset(.{ .slice = "<next/>" }, .{}, .retain_capacity);
+    while (try reader.next()) |_| {}
+
+    const stream_input = "<root><broken";
+    var stream_buffer: [1]u8 = undefined;
+    var source: std.testing.Reader = .init(
+        &stream_buffer,
+        &.{.{ .buffer = stream_input }},
+    );
+    source.artificial_limit = .limited(1);
+    var stream_reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .stream = &source.interface },
+        .{},
+    );
+    defer stream_reader.deinit();
+    _ = try stream_reader.next();
+    _ = try stream_reader.next();
+    try std.testing.expect(source.next_offset < stream_input.len);
+}
+
+test "[integration] - [Reader lifecycle]: stream reset starts after the last event" {
+    const input = "<one/><two/>";
+    var input_buffer: [1]u8 = undefined;
+    var source: std.testing.Reader = .init(
+        &input_buffer,
+        &.{.{ .buffer = input }},
+    );
+    source.artificial_limit = .limited(1);
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .stream = &source.interface },
+        .{},
+    );
+    defer reader.deinit();
+
+    _ = try reader.next();
+    _ = try reader.next();
+    const first_end = (try reader.next()).?.data.end_element;
+    try std.testing.expectEqualStrings("one", first_end.name.raw);
+
+    try reader.reset(.{ .stream = &source.interface }, .{}, .retain_capacity);
+    _ = try reader.next();
+    const second_start = (try reader.next()).?.data.start_element;
+    try std.testing.expectEqualStrings("two", second_start.name.raw);
+    while (try reader.next()) |_| {}
+}
+
+test "[failure] - [Reader source]: final input and read failure are sticky" {
+    const expected = try normalFailure(.{ .slice = "<root" });
+    var truncated_buffer: [2]u8 = undefined;
+    var truncated_source: std.testing.Reader = .init(
+        &truncated_buffer,
+        &.{.{ .buffer = "<root" }},
+    );
+    truncated_source.artificial_limit = .limited(1);
+    try std.testing.expectEqual(
+        expected,
+        try normalFailure(.{ .stream = &truncated_source.interface }),
+    );
+
+    var failed_buffer: [1]u8 = undefined;
+    var failed_source = std.Io.Reader.failing;
+    failed_source.buffer = &failed_buffer;
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .stream = &failed_source },
+        .{},
+    );
+    defer reader.deinit();
+    try std.testing.expectError(error.ReadFailed, reader.next());
+    try std.testing.expectEqual(xml.DiagnosticCode.read_failed, reader.diagnostic().?.code);
+    try std.testing.expectError(error.ReadFailed, reader.next());
 }
 
 test "[unit] - [Reader]: initialization validates options without allocating" {
@@ -1810,8 +2167,8 @@ test "config - representative profiles: compile specialized public types" {
         _ = xml.DiagnosticFor(config);
         _ = xml.NameFor(config);
         _ = xml.AttributeFor(config);
-        _ = xml.SliceReader(config);
-        _ = xml.IoReader(config);
+        _ = xml.ProfileSliceReader(config);
+        _ = xml.ProfileIoReader(config);
     }
 }
 
@@ -3438,7 +3795,7 @@ test "diagnostic - final input: structural and token truncation remain distinct"
 }
 
 test "adapter - whole slice: uses the same event and lifetime contract" {
-    const SliceReader = xml.SliceReader(CORE_CONFIG);
+    const SliceReader = xml.ProfileSliceReader(CORE_CONFIG);
     var slice = try SliceReader.init(std.testing.allocator, .{}, "<root><item key='value'/></root>");
     defer slice.deinit();
 
@@ -3463,7 +3820,7 @@ test "adapter - std Io Reader: greedy buffered refill handles one-byte source re
     });
     source.artificial_limit = .limited(1);
 
-    const IoReader = xml.IoReader(CORE_CONFIG);
+    const IoReader = xml.ProfileIoReader(CORE_CONFIG);
     var input = try IoReader.init(std.testing.allocator, .{}, &source.interface);
     defer input.deinit();
 
@@ -3483,7 +3840,7 @@ test "[failure] - [buffered reader]: source failure is stable and allocation-fre
     var source_buffer: [1]u8 = undefined;
     var source = std.Io.Reader.failing;
     source.buffer = &source_buffer;
-    var input = try xml.IoReader(CORE_CONFIG).init(
+    var input = try xml.ProfileIoReader(CORE_CONFIG).init(
         std.testing.allocator,
         .{},
         &source,
@@ -3500,7 +3857,7 @@ test "[failure] - [buffered reader]: source failure is stable and allocation-fre
 
 test "adapter - push drain: preserves event order and explicit cancellation" {
     var complete: PushContext = .{};
-    try xml.drainSlice(
+    try xml.drainProfileSlice(
         CORE_CONFIG,
         std.testing.allocator,
         .{},
@@ -3512,7 +3869,7 @@ test "adapter - push drain: preserves event order and explicit cancellation" {
     try std.testing.expectEqual(@as(usize, 0), complete.attributes);
 
     var markup: PushContext = .{};
-    try xml.drainSlice(
+    try xml.drainProfileSlice(
         CORE_CONFIG,
         std.testing.allocator,
         .{},
@@ -3523,7 +3880,7 @@ test "adapter - push drain: preserves event order and explicit cancellation" {
     try std.testing.expectEqual(@as(usize, 7), markup.events);
 
     var attributed: PushContext = .{};
-    try xml.drainSlice(
+    try xml.drainProfileSlice(
         CORE_CONFIG,
         std.testing.allocator,
         .{},
@@ -3537,7 +3894,7 @@ test "adapter - push drain: preserves event order and explicit cancellation" {
     var cancelled: PushContext = .{ .cancel_after = 2 };
     try std.testing.expectError(
         error.Cancelled,
-        xml.drainSlice(
+        xml.drainProfileSlice(
             CORE_CONFIG,
             std.testing.allocator,
             .{},
@@ -3832,7 +4189,7 @@ test "[property] - [attributes]: syntax whitespace is legal across every chunk b
 test "[edge] - [attributes]: nonquadratic duplicate path preserves source order" {
     var input_buffer: [2048]u8 = undefined;
     const input = try makeAttributeInput(&input_buffer, 65, false);
-    const SliceReader = xml.SliceReader(CORE_CONFIG);
+    const SliceReader = xml.ProfileSliceReader(CORE_CONFIG);
     var reader = try SliceReader.init(std.testing.allocator, .{}, input);
     defer reader.deinit();
 
@@ -4230,7 +4587,7 @@ test "[integration] - [buffered UTF-16]: one-byte source reads preserve semantic
     var io_buffer: [5]u8 = undefined;
     var source: std.testing.Reader = .init(&io_buffer, &.{.{ .buffer = UTF16LE_BOM }});
     source.artificial_limit = .limited(1);
-    var input = try xml.IoReader(GENERAL_CONFIG).init(
+    var input = try xml.ProfileIoReader(GENERAL_CONFIG).init(
         std.testing.allocator,
         .{},
         &source.interface,
@@ -4336,7 +4693,7 @@ test "[integration] - [buffered UTF-8]: one-byte source reads preserve semantics
     var source: std.testing.Reader = .init(&io_buffer, &.{.{ .buffer = source_bytes }});
     source.artificial_limit = .limited(1);
 
-    var input = try xml.IoReader(CORE_CONFIG).init(
+    var input = try xml.ProfileIoReader(CORE_CONFIG).init(
         std.testing.allocator,
         .{},
         &source.interface,
@@ -4372,7 +4729,7 @@ test "[integration] - [buffered markup]: one-byte source reads preserve markup s
     );
     source.artificial_limit = .limited(1);
 
-    var input = try xml.IoReader(CORE_CONFIG).init(
+    var input = try xml.ProfileIoReader(CORE_CONFIG).init(
         std.testing.allocator,
         .{},
         &source.interface,
@@ -6763,7 +7120,7 @@ test "[unit] - [namespace expansion]: declarations and ordinary attributes are d
     const input =
         "<root xmlns=\"urn:elements\" attribute=\"no-namespace\" " ++
         "xmlns:p=\"urn:attributes\" p:attribute=\"namespaced\"/>\n";
-    const Reader = xml.SliceReader(NS_CONFIG);
+    const Reader = xml.ProfileSliceReader(NS_CONFIG);
     var reader = try Reader.init(std.testing.allocator, .{}, input);
     defer reader.deinit();
 
@@ -6866,7 +7223,7 @@ test "[unit] - [namespace scope]: rebinding undeclaration and predefined xml res
         _ = try parseParts(NS_CONFIG, std.testing.allocator, .{}, &parts);
     }
 
-    var reader = try xml.SliceReader(NS_CONFIG).init(
+    var reader = try xml.ProfileSliceReader(NS_CONFIG).init(
         std.testing.allocator,
         .{},
         rebinding,
@@ -6899,7 +7256,7 @@ test "[unit] - [namespace scope]: rebinding undeclaration and predefined xml res
     try std.testing.expectEqual(expected_uris.len, item_index);
     try std.testing.expectEqual(expected_uris.len, end_item_index);
 
-    var undeclare_reader = try xml.SliceReader(NS_CONFIG).init(
+    var undeclare_reader = try xml.ProfileSliceReader(NS_CONFIG).init(
         std.testing.allocator,
         .{},
         default_undeclaration,
@@ -6971,7 +7328,7 @@ test "[unit] - [namespace normalization]: reference-expanded URI values resolve 
     const input =
         "<root xmlns:a=\"urn:example&amp;value\" xmlns:b=\"urn:example&#38;value\">" ++
         "<a:item/><b:item/></root>\n";
-    var reader = try xml.SliceReader(NS_CONFIG).init(
+    var reader = try xml.ProfileSliceReader(NS_CONFIG).init(
         std.testing.allocator,
         .{},
         input,
@@ -7432,6 +7789,8 @@ const TestResolver = struct {
     max_read_len: usize = 3,
     parameter_inclusion_source_id: ?u32 = null,
     parameter_inclusion_offset: ?u64 = null,
+    reader: ?*xml.Reader = null,
+    close_reset_error: ?xml.ResetError = null,
 
     fn resolver(self: *@This()) xml.Resolver {
         return .{ .context = self, .resolveFn = resolve };
@@ -7478,6 +7837,11 @@ const TestResolver = struct {
         const self: *@This() = @ptrCast(@alignCast(context.?));
         self.closes += 1;
         self.active = null;
+        if (self.reader) |reader| {
+            reader.reset(.{ .slice = "<replacement/>" }, .{}, .retain_capacity) catch |failure| {
+                self.close_reset_error = failure;
+            };
+        }
     }
 };
 
@@ -7503,6 +7867,88 @@ const TestSubsetProvider = struct {
         return .skipped;
     }
 };
+
+test "[integration] - [Reader lifecycle]: reset and deinit close active external sources" {
+    const document =
+        "<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]>" ++
+        "<root>&message;</root>";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "message.ent", .bytes = "long external text", .source_id = 6 },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    const options: xml.ReaderOptions = .{
+        .external = .resolve,
+        .resolver = resolver.resolver(),
+    };
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = document },
+        options,
+    );
+    var reader_live = true;
+    defer if (reader_live) reader.deinit();
+
+    var saw_first_text = false;
+    first: while (try reader.next()) |event| switch (event.data) {
+        .text => {
+            saw_first_text = true;
+            break :first;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_first_text);
+    try std.testing.expectEqual(@as(usize, 0), resolver.closes);
+    try reader.reset(.{ .slice = document }, options, .retain_capacity);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+
+    var saw_second_text = false;
+    second: while (try reader.next()) |event| switch (event.data) {
+        .text => {
+            saw_second_text = true;
+            break :second;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_second_text);
+    resolver.reader = &reader;
+    reader.deinit();
+    reader_live = false;
+    try std.testing.expectEqual(@as(usize, 2), resolver.closes);
+    try std.testing.expectEqual(error.InvalidState, resolver.close_reset_error.?);
+}
+
+test "[unit] - [Reader reset]: disabling external sources releases inclusion storage" {
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "broken.ent", .bytes = "<broken", .source_id = 7 },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{
+            .slice = "<!DOCTYPE root [<!ENTITY broken SYSTEM 'broken.ent'>]>" ++
+                "<root>&broken;</root>",
+        },
+        .{ .external = .resolve, .resolver = resolver.resolver() },
+    );
+    defer reader.deinit();
+
+    while (true) {
+        const event = reader.next() catch |failure| {
+            try std.testing.expectEqual(error.InvalidXml, failure);
+            break;
+        };
+        if (event == null) return error.ExpectedFailure;
+    }
+    try std.testing.expectEqual(@as(usize, 1), reader.diagnostic().?.inclusion_trace.len);
+    try std.testing.expect(reader.memoryUsage().retained_capacity > 0);
+
+    try reader.reset(
+        .{ .slice = "<root/>" },
+        .{ .dtd = .reject },
+        .retain_capacity,
+    );
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().retained_capacity);
+}
 
 test "[integration] - [XML 1.1 external entity]: text declarations and lines are processed" {
     const config = xml.Configs.XML11_NONVALIDATING;

@@ -19,7 +19,7 @@ fn parseWithReaderOptions(
     input: []const u8,
     tree_options: xml.TreeOptions,
 ) !xml.Document(config) {
-    var pull = try xml.SliceReader(config).init(allocator, reader_options, input);
+    var pull = try xml.ProfileSliceReader(config).init(allocator, reader_options, input);
     defer pull.deinit();
     return xml.buildTreeFromPull(config, allocator, tree_options, &pull);
 }
@@ -471,7 +471,7 @@ const Summary = struct {
 };
 
 fn eventSummary(comptime config: xml.Config, input: []const u8) !Summary {
-    var pull = try xml.SliceReader(config).init(std.testing.allocator, .{}, input);
+    var pull = try xml.ProfileSliceReader(config).init(std.testing.allocator, .{}, input);
     defer pull.deinit();
     var result: Summary = .{};
     while (true) switch (try pull.next()) {

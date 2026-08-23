@@ -919,7 +919,7 @@ pub const ResetError = error{
     InvalidState,
 };
 
-/// Caller-owned input that remains valid until the reader is deinitialized.
+/// Caller-owned input that remains valid until a successful reset or deinitialization.
 pub const NormalSource = union(enum) {
     slice: []const u8,
     stream: *std.Io.Reader,
@@ -1017,7 +1017,7 @@ pub const NormalDiagnosticSink = struct {
 };
 
 /// Runtime options retain caller-owned pointers, slices, and callback contexts.
-/// Those borrows must remain valid through deinit.
+/// Those borrows must remain valid until a successful reset or deinitialization.
 pub const NormalReaderOptions = struct {
     limits: Limits = Limits.general,
     namespaces: NormalNamespacePolicy = .process,
@@ -9992,8 +9992,10 @@ pub const NormalReader = struct {
     source_started: bool = false,
     source_finished: bool = false,
     pending_toss: usize = 0,
+    source_tossed: u64 = 0,
     complete: bool = false,
     deinitialized: bool = false,
+    in_call: bool = false,
     failure: ?NormalReadError = null,
     first_diagnostic: ?NormalDiagnosticCore = null,
     diagnostic_inclusions: std.ArrayList(NormalLocation) = .empty,
@@ -10020,6 +10022,8 @@ pub const NormalReader = struct {
     /// Releases parser-owned memory. The caller retains the root source.
     pub fn deinit(self: *Self) void {
         std.debug.assert(!self.deinitialized);
+        std.debug.assert(!self.in_call);
+        self.in_call = true;
         switch (self.engine) {
             inline else => |*parser| parser.deinit(),
         }
@@ -10027,13 +10031,106 @@ pub const NormalReader = struct {
         self.event_attributes.deinit(self.allocator);
         self.event_namespace_declarations.deinit(self.allocator);
         self.deinitialized = true;
+        self.in_call = false;
+    }
+
+    /// Replaces the source and options without reading or allocating.
+    pub fn reset(
+        self: *Self,
+        source: NormalSource,
+        options: NormalReaderOptions,
+        mode: ResetMode,
+    ) NormalResetError!void {
+        if (self.deinitialized or self.in_call) return error.InvalidState;
+        if (!validNormalOptions(options)) return error.InvalidOptions;
+
+        self.in_call = true;
+        defer self.in_call = false;
+
+        const retain_facade_capacity = mode == .retain_capacity and
+            self.memoryUsage().retained_capacity <= options.limits.max_retained_bytes;
+        const retain_engine_capacity = retain_facade_capacity and
+            !normalOptionsDisableStorage(self.options, options);
+        const engine_mode: ResetMode = if (retain_engine_capacity)
+            .retain_capacity
+        else
+            .release_memory;
+        const selected = normalEngineKind(options);
+        if (std.meta.activeTag(self.engine) == selected) {
+            switch (self.engine) {
+                .raw => |*parser| resetNormalParser(
+                    normal_raw_config,
+                    parser,
+                    options,
+                    engine_mode,
+                ),
+                .namespaces => |*parser| resetNormalParser(
+                    normal_namespace_config,
+                    parser,
+                    options,
+                    engine_mode,
+                ),
+                .raw_validating => |*parser| resetNormalParser(
+                    normal_raw_validating_config,
+                    parser,
+                    options,
+                    engine_mode,
+                ),
+                .namespaces_validating => |*parser| resetNormalParser(
+                    normal_namespace_validating_config,
+                    parser,
+                    options,
+                    engine_mode,
+                ),
+            }
+        } else {
+            const replacement = initNormalEngine(self.allocator, options) catch
+                return error.InvalidOptions;
+            switch (self.engine) {
+                inline else => |*parser| parser.deinit(),
+            }
+            self.engine = replacement;
+        }
+
+        if (!retain_facade_capacity) {
+            self.releaseFacadeStorage();
+        } else {
+            if (normalOptionsUseExternalStorage(options)) {
+                self.diagnostic_inclusions.clearRetainingCapacity();
+            } else {
+                self.diagnostic_inclusions.deinit(self.allocator);
+                self.diagnostic_inclusions = .empty;
+            }
+            self.event_attributes.clearRetainingCapacity();
+            if (options.namespaces == .raw) {
+                self.event_namespace_declarations.deinit(self.allocator);
+                self.event_namespace_declarations = .empty;
+            } else {
+                self.event_namespace_declarations.clearRetainingCapacity();
+            }
+        }
+        self.options = options;
+        self.source = source;
+        self.source_started = false;
+        self.source_finished = false;
+        self.pending_toss = 0;
+        self.source_tossed = 0;
+        self.complete = false;
+        self.failure = null;
+        self.first_diagnostic = null;
+        self.effective_version = .xml10;
+        self.external_content_skipped = false;
     }
 
     /// Produces the next stable event or returns null after the document ends.
     pub fn next(self: *Self) NormalReadError!?NormalEvent {
         if (self.deinitialized) return error.InvalidState;
+        if (self.in_call) return error.InvalidState;
         if (self.failure) |failure| return failure;
         if (self.complete) return null;
+
+        self.in_call = true;
+        defer self.in_call = false;
 
         self.event_attributes.clearRetainingCapacity();
         self.event_namespace_declarations.clearRetainingCapacity();
@@ -10131,7 +10228,10 @@ pub const NormalReader = struct {
                         );
                         return failure;
                     };
-                    if (converted) |value| return value;
+                    if (converted) |value| {
+                        if (value.span.source_id == 0) self.commitRootStreamBytes(value.span.end);
+                        return value;
+                    }
                 },
             }
         }
@@ -10151,6 +10251,7 @@ pub const NormalReader = struct {
             .stream => |input| {
                 if (self.pending_toss != 0) {
                     input.toss(self.pending_toss);
+                    self.source_tossed += @intCast(self.pending_toss);
                     self.pending_toss = 0;
                 }
                 if (self.source_finished) return error.InvalidState;
@@ -10433,6 +10534,29 @@ pub const NormalReader = struct {
         const sink = self.options.diagnostic_sink orelse return;
         sink.report(self.diagnostic().?);
     }
+
+    fn releaseFacadeStorage(self: *Self) void {
+        self.diagnostic_inclusions.deinit(self.allocator);
+        self.event_attributes.deinit(self.allocator);
+        self.event_namespace_declarations.deinit(self.allocator);
+        self.diagnostic_inclusions = .empty;
+        self.event_attributes = .empty;
+        self.event_namespace_declarations = .empty;
+    }
+
+    fn commitRootStreamBytes(self: *Self, event_end: u64) void {
+        const input = switch (self.source) {
+            .slice => return,
+            .stream => |value| value,
+        };
+        if (event_end <= self.source_tossed) return;
+        const count = std.math.cast(usize, event_end - self.source_tossed) orelse
+            unreachable;
+        std.debug.assert(count <= self.pending_toss);
+        input.toss(count);
+        self.source_tossed += @intCast(count);
+        self.pending_toss -= count;
+    }
 };
 
 fn validNormalOptions(options: NormalReaderOptions) bool {
@@ -10476,6 +10600,43 @@ fn initNormalEngine(
         allocator,
         options,
     ) };
+}
+
+fn normalEngineKind(options: NormalReaderOptions) std.meta.Tag(NormalEngine) {
+    if (options.dtd == .validate) {
+        return if (options.namespaces == .process)
+            .namespaces_validating
+        else
+            .raw_validating;
+    }
+    return if (options.namespaces == .process) .namespaces else .raw;
+}
+
+fn normalOptionsDisableStorage(
+    previous: NormalReaderOptions,
+    replacement: NormalReaderOptions,
+) bool {
+    if (previous.dtd != .reject and replacement.dtd == .reject) return true;
+    return previous.external == .resolve and replacement.external != .resolve;
+}
+
+fn normalOptionsUseExternalStorage(options: NormalReaderOptions) bool {
+    if (options.external == .resolve) return true;
+    return switch (options.dtd) {
+        .validate => |validation_options| validation_options.external_subset != null,
+        else => false,
+    };
+}
+
+fn resetNormalParser(
+    comptime config: Config,
+    parser: *Reader(config),
+    options: NormalReaderOptions,
+    mode: ResetMode,
+) void {
+    parser.options = normalEngineOptions(config, options);
+    parser.reset(mode) catch unreachable;
+    parser.dtd_state.reject_doctype = options.dtd == .reject;
 }
 
 fn initNormalParser(

@@ -45,7 +45,7 @@ fn run(init: std.process.Init) !u8 {
     defer file.close(init.io);
     var input_buffer: [INPUT_BUFFER_SIZE]u8 = undefined;
     var file_reader = file.reader(init.io, &input_buffer);
-    var pull = try xml.IoReader(CONFIG).init(init.gpa, .{}, &file_reader.interface);
+    var pull = try xml.ProfileIoReader(CONFIG).init(init.gpa, .{}, &file_reader.interface);
     defer pull.deinit();
     const build_start = std.Io.Clock.awake.now(init.io);
     var document = xml.buildTreeFromPull(CONFIG, init.gpa, .{}, &pull) catch |err| {

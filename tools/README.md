@@ -52,6 +52,8 @@ Measurement:
 - `tools/zig/tree.zig` builds and walks an owned document tree.
 - `tools/zig/validation_repeat.zig` compares validation with a new or reused external DTD subset.
 
+The persistent adapter gives resident input to `Reader` as one slice. `--chunk-bytes` sizes the buffered file reader only for stream input. The resident result keeps the requested value in its protocol metadata, so resident rows with different chunk values are not different source schedules.
+
 Build only the adapters you need:
 
 ```sh

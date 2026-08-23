@@ -1,15 +1,15 @@
-//! Whole-slice and buffered `std.Io.Reader` adapters.
+//! Pull and push adapters for specialized readers used by package tools.
 
 const std = @import("std");
 const reader = @import("reader.zig");
 
-/// Control returned by push-drain callbacks.
+/// Control returned by specialized push-drain callbacks.
 pub const DrainControl = enum {
     continue_parsing,
     cancel,
 };
 
-/// Pull reader initialized from one final caller-owned slice.
+/// Specialized pull reader initialized from one final caller-owned slice.
 pub fn SliceReader(comptime config: reader.Config) type {
     return struct {
         const Self = @This();
@@ -50,7 +50,7 @@ pub fn SliceReader(comptime config: reader.Config) type {
     };
 }
 
-/// Pull adapter over a buffered Zig 0.16 `std.Io.Reader`.
+/// Specialized pull adapter over a buffered Zig 0.16 `std.Io.Reader`.
 pub fn IoReader(comptime config: reader.Config) type {
     return struct {
         const Self = @This();

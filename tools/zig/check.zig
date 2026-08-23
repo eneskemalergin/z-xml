@@ -5,6 +5,7 @@ const xml = @import("z_xml");
 const check_options = @import("check_options");
 
 const XML11 = if (@hasDecl(check_options, "xml11")) check_options.xml11 else false;
+const USE_NORMAL_READER = !check_options.dtd;
 const CONFIG = if (XML11)
     if (check_options.namespaces)
         xml.Configs.XML11_NAMESPACES_VALIDATING
@@ -49,7 +50,15 @@ const Stats = struct {
     }
 
     fn observe(self: *Stats, event: xml.EventFor(CONFIG)) void {
-        switch (event) {
+        self.observePayload(event);
+    }
+
+    fn observeNormal(self: *Stats, event: xml.Event) void {
+        self.observePayload(event.data);
+    }
+
+    fn observePayload(self: *Stats, payload: anytype) void {
+        switch (payload) {
             .start_element => |start| {
                 self.elements += 1;
                 self.marker(1);
@@ -129,25 +138,45 @@ fn run(init: std.process.Init) !u8 {
     }
     var input_buffer: [INPUT_BUFFER_SIZE]u8 = undefined;
     var file_reader = file.reader(init.io, &input_buffer);
-    var reader = try xml.IoReader(CONFIG).init(init.gpa, options, &file_reader.interface);
-    defer reader.deinit();
-
     var stats: Stats = .{};
-    while (true) {
-        const step = reader.next() catch |err| {
-            if (reader.diagnostic()) |diagnostic| {
-                std.debug.print(
-                    "z-xml-check: {s} at source {d} byte {d}\n",
-                    .{ @tagName(diagnostic.code), diagnostic.primary.source_id, diagnostic.primary.byte_offset },
-                );
+    if (comptime USE_NORMAL_READER) {
+        var reader = try xml.Reader.init(
+            init.gpa,
+            .{ .stream = &file_reader.interface },
+            .{
+                .namespaces = if (check_options.namespaces) .process else .raw,
+                .dtd = .reject,
+            },
+        );
+        defer reader.deinit();
+        while (true) {
+            const event = reader.next() catch |err| {
+                if (reader.diagnostic()) |diagnostic| printDiagnostic(diagnostic);
+                if (statusForReadError(err)) |status| return status;
+                return err;
+            };
+            if (event) |value| {
+                stats.observeNormal(value);
+            } else break;
+        }
+    } else {
+        var reader = try xml.ProfileIoReader(CONFIG).init(
+            init.gpa,
+            options,
+            &file_reader.interface,
+        );
+        defer reader.deinit();
+        while (true) {
+            const step = reader.next() catch |err| {
+                if (reader.diagnostic()) |diagnostic| printDiagnostic(diagnostic);
+                if (statusForReadError(err)) |status| return status;
+                return err;
+            };
+            switch (step) {
+                .event => |event| stats.observe(event),
+                .done => break,
+                .need_input => return error.InvalidState,
             }
-            if (statusForReadError(err)) |status| return status;
-            return err;
-        };
-        switch (step) {
-            .event => |event| stats.observe(event),
-            .done => break,
-            .need_input => return error.InvalidState,
         }
     }
 
@@ -162,9 +191,23 @@ fn run(init: std.process.Init) !u8 {
     return 0;
 }
 
-fn statusForReadError(err: xml.ProfileReadError) ?u8 {
+fn printDiagnostic(diagnostic: anytype) void {
+    std.debug.print(
+        "z-xml-check: {s} at source {d} byte {d}\n",
+        .{ @tagName(diagnostic.code), diagnostic.primary.source_id, diagnostic.primary.byte_offset },
+    );
+}
+
+fn statusForReadError(err: anyerror) ?u8 {
     return switch (err) {
-        error.InvalidXml, error.InvalidDtd, error.NotValid => 2,
+        error.InvalidXml,
+        error.InvalidDtd,
+        error.NotValid,
+        error.InvalidEncoding,
+        error.UnsupportedEncoding,
+        error.UnsupportedVersion,
+        error.DtdForbidden,
+        => 2,
         error.LimitExceeded, error.OutOfMemory => 3,
         else => null,
     };
@@ -178,6 +221,9 @@ test "[unit] - [corpus adapter]: maps parser outcomes to contract statuses" {
     try std.testing.expectEqual(@as(?u8, 2), statusForReadError(error.NotValid));
     try std.testing.expectEqual(@as(?u8, 3), statusForReadError(error.LimitExceeded));
     try std.testing.expectEqual(@as(?u8, 3), statusForReadError(error.OutOfMemory));
+    try std.testing.expectEqual(@as(?u8, 2), statusForReadError(error.InvalidEncoding));
+    try std.testing.expectEqual(@as(?u8, 2), statusForReadError(error.UnsupportedVersion));
+    try std.testing.expectEqual(@as(?u8, 2), statusForReadError(error.DtdForbidden));
     try std.testing.expectEqual(@as(?u8, null), statusForReadError(error.UnsupportedFeature));
     try std.testing.expectEqual(@as(?u8, null), statusForReadError(error.ReadFailed));
 }
