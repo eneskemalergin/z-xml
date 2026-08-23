@@ -1462,16 +1462,41 @@ fn appendFocusedValue(output: *std.ArrayList(u8), value: []const u8) !void {
     try output.append(std.testing.allocator, 0);
 }
 
-fn summarizeNormalSource(source: xml.Source) ![]u8 {
+const NormalSummary = struct {
+    events: []u8,
+    source_encoding: xml.SourceEncoding,
+    declared_encoding: [32]u8 = @splat(0),
+    declared_encoding_len: usize = 0,
+
+    fn deinit(self: *NormalSummary) void {
+        std.testing.allocator.free(self.events);
+        self.* = undefined;
+    }
+};
+
+fn summarizeNormalSource(source: xml.Source) !NormalSummary {
     var reader = try xml.Reader.init(std.testing.allocator, source, .{});
     defer reader.deinit();
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(std.testing.allocator);
+    var source_encoding: ?xml.SourceEncoding = null;
+    var declared_encoding: [32]u8 = @splat(0);
+    var declared_encoding_len: usize = 0;
     var text_origin: ?xml.TextOrigin = null;
     var comment_active = false;
     var instruction_active = false;
     while (try reader.next()) |event| switch (event.data) {
         .document_start => |document| {
+            source_encoding = document.source_encoding;
+            if (document.declaration) |declaration| {
+                if (declaration.encoding) |value| {
+                    if (value.len > declared_encoding.len) {
+                        return error.DeclaredEncodingSummaryTooLarge;
+                    }
+                    @memcpy(declared_encoding[0..value.len], value);
+                    declared_encoding_len = value.len;
+                }
+            }
             try output.append(std.testing.allocator, 'D');
             try output.append(std.testing.allocator, @intFromEnum(document.effective_version));
         },
@@ -1535,17 +1560,77 @@ fn summarizeNormalSource(source: xml.Source) ![]u8 {
         .document_end => try output.append(std.testing.allocator, 'Z'),
         else => {},
     };
-    return output.toOwnedSlice(std.testing.allocator);
+    const detected_encoding = source_encoding orelse return error.MissingDocumentStart;
+    return .{
+        .events = try output.toOwnedSlice(std.testing.allocator),
+        .source_encoding = detected_encoding,
+        .declared_encoding = declared_encoding,
+        .declared_encoding_len = declared_encoding_len,
+    };
 }
 
-fn summarizeNormalReader(input: []const u8) ![]u8 {
+fn summarizeNormalReader(input: []const u8) !NormalSummary {
     return summarizeNormalSource(.{ .slice = input });
+}
+
+fn expectNormalEncodingSummary(
+    actual: *const NormalSummary,
+    expected_events: []const u8,
+    expected_encoding: xml.SourceEncoding,
+    expected_declaration: ?[]const u8,
+) !void {
+    try std.testing.expectEqualStrings(expected_events, actual.events);
+    try std.testing.expectEqual(expected_encoding, actual.source_encoding);
+    if (expected_declaration) |value| {
+        try std.testing.expectEqualStrings(
+            value,
+            actual.declared_encoding[0..actual.declared_encoding_len],
+        );
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), actual.declared_encoding_len);
+    }
+}
+
+fn expectNormalEncodingSchedules(
+    input: []const u8,
+    expected_events: []const u8,
+    expected_encoding: xml.SourceEncoding,
+    expected_declaration: ?[]const u8,
+) !void {
+    var slice = try summarizeNormalReader(input);
+    defer slice.deinit();
+    try expectNormalEncodingSummary(
+        &slice,
+        expected_events,
+        expected_encoding,
+        expected_declaration,
+    );
+
+    inline for (.{ 1, 2, 3, 5, 7 }) |chunk_size| {
+        var input_buffer: [chunk_size]u8 = undefined;
+        var source: std.testing.Reader = .init(
+            &input_buffer,
+            &.{.{ .buffer = input }},
+        );
+        source.artificial_limit = .limited(chunk_size);
+        var streamed = try summarizeNormalSource(.{ .stream = &source.interface });
+        defer streamed.deinit();
+        try expectNormalEncodingSummary(
+            &streamed,
+            expected_events,
+            expected_encoding,
+            expected_declaration,
+        );
+    }
 }
 
 const NormalFailure = struct {
     category: xml.ReadError,
     code: xml.DiagnosticCode,
     byte_offset: u64,
+    related_byte_offset: ?u64,
+    line: ?u64,
+    byte_column: ?u64,
 };
 
 fn normalFailure(source: xml.Source) !NormalFailure {
@@ -1558,9 +1643,31 @@ fn normalFailure(source: xml.Source) !NormalFailure {
                 .category = failure,
                 .code = diagnostic.code,
                 .byte_offset = diagnostic.primary.byte_offset,
+                .related_byte_offset = if (diagnostic.related) |related|
+                    related.byte_offset
+                else
+                    null,
+                .line = diagnostic.primary.line,
+                .byte_column = diagnostic.primary.byte_column,
             };
         };
         if (event == null) return error.ExpectedFailure;
+    }
+}
+
+fn expectNormalFailureSchedules(input: []const u8, expected: NormalFailure) !void {
+    try std.testing.expectEqual(expected, try normalFailure(.{ .slice = input }));
+    inline for (.{ 1, 2, 3, 5, 7 }) |chunk_size| {
+        var input_buffer: [chunk_size]u8 = undefined;
+        var source: std.testing.Reader = .init(
+            &input_buffer,
+            &.{.{ .buffer = input }},
+        );
+        source.artificial_limit = .limited(chunk_size);
+        try std.testing.expectEqual(
+            expected,
+            try normalFailure(.{ .stream = &source.interface }),
+        );
     }
 }
 
@@ -1612,11 +1719,11 @@ fn summarizeSelectedEngine(input: []const u8) ![]u8 {
 
 test "[integration] - [Reader]: matches selected engine output and first failure" {
     const input = "<root xmlns='urn:test' id='7'>value</root>";
-    const normal = try summarizeNormalReader(input);
-    defer std.testing.allocator.free(normal);
+    var normal = try summarizeNormalReader(input);
+    defer normal.deinit();
     const selected = try summarizeSelectedEngine(input);
     defer std.testing.allocator.free(selected);
-    try std.testing.expectEqualStrings(selected, normal);
+    try std.testing.expectEqualStrings(selected, normal.events);
 
     var normal_reader = try xml.Reader.init(
         std.testing.allocator,
@@ -1673,8 +1780,8 @@ test "[property] - [Reader source]: slice and buffered schedules agree" {
     const input =
         "<?setup ready?><root xmlns='urn:test' id='7'>" ++
         "<!--note--><item/>text<![CDATA[more]]></root>";
-    const expected = try summarizeNormalReader(input);
-    defer std.testing.allocator.free(expected);
+    var expected = try summarizeNormalReader(input);
+    defer expected.deinit();
 
     var one_byte_buffer: [1]u8 = undefined;
     var one_byte_source: std.testing.Reader = .init(
@@ -1682,9 +1789,10 @@ test "[property] - [Reader source]: slice and buffered schedules agree" {
         &.{.{ .buffer = input }},
     );
     one_byte_source.artificial_limit = .limited(1);
-    const one_byte = try summarizeNormalSource(.{ .stream = &one_byte_source.interface });
-    defer std.testing.allocator.free(one_byte);
-    try std.testing.expectEqualStrings(expected, one_byte);
+    var one_byte = try summarizeNormalSource(.{ .stream = &one_byte_source.interface });
+    defer one_byte.deinit();
+    try std.testing.expectEqualStrings(expected.events, one_byte.events);
+    try std.testing.expectEqual(expected.source_encoding, one_byte.source_encoding);
 
     var split_buffer: [7]u8 = undefined;
     var split_source: std.testing.Reader = .init(&split_buffer, &.{
@@ -1695,9 +1803,10 @@ test "[property] - [Reader source]: slice and buffered schedules agree" {
         .{ .buffer = ">text<![CDATA[more]]></root>" },
     });
     split_source.artificial_limit = .limited(3);
-    const split = try summarizeNormalSource(.{ .stream = &split_source.interface });
-    defer std.testing.allocator.free(split);
-    try std.testing.expectEqualStrings(expected, split);
+    var split = try summarizeNormalSource(.{ .stream = &split_source.interface });
+    defer split.deinit();
+    try std.testing.expectEqualStrings(expected.events, split.events);
+    try std.testing.expectEqual(expected.source_encoding, split.source_encoding);
 
     const malformed = "<root><item></root>";
     const expected_failure = try normalFailure(.{ .slice = malformed });
@@ -1719,6 +1828,221 @@ test "[property] - [Reader source]: slice and buffered schedules agree" {
         expected_empty,
         try normalFailure(.{ .stream = &empty_source.interface }),
     );
+}
+
+test "[property] - [Reader decoder]: built-in encodings preserve events across source schedules" {
+    const logical = "<根 属性='值'>one\r\ntwo🙂</根>";
+    var expected = try summarizeNormalReader(logical);
+    defer expected.deinit();
+
+    try expectNormalEncodingSchedules(
+        "\xef\xbb\xbf" ++ logical,
+        expected.events,
+        .utf8,
+        null,
+    );
+
+    const little = try encodeUtf16(std.testing.allocator, logical, .little, true);
+    defer std.testing.allocator.free(little);
+    try expectNormalEncodingSchedules(little, expected.events, .utf16_le, null);
+
+    const big = try encodeUtf16(std.testing.allocator, logical, .big, true);
+    defer std.testing.allocator.free(big);
+    try expectNormalEncodingSchedules(big, expected.events, .utf16_be, null);
+
+    var explicit_expected = try summarizeNormalReader("<root>λ🙂</root>");
+    defer explicit_expected.deinit();
+    try expectNormalEncodingSchedules(
+        UTF16LE_BOM,
+        explicit_expected.events,
+        .utf16_le,
+        "UTF-16",
+    );
+    try expectNormalEncodingSchedules(
+        UTF16BE_BOM,
+        explicit_expected.events,
+        .utf16_be,
+        "UTF-16",
+    );
+
+    const xml11_normalized =
+        "<?xml version='1.1'?><root>A\nB\nC\nD</root>";
+    var xml11_expected = try summarizeNormalReader(xml11_normalized);
+    defer xml11_expected.deinit();
+    const xml11 =
+        "<?xml version='1.1'?><root>A\xc2\x85B\xe2\x80\xa8C\r\xc2\x85D</root>";
+    try expectNormalEncodingSchedules(
+        xml11,
+        xml11_expected.events,
+        .utf8,
+        null,
+    );
+
+    const xml11_little = try encodeUtf16(
+        std.testing.allocator,
+        xml11,
+        .little,
+        true,
+    );
+    defer std.testing.allocator.free(xml11_little);
+    try expectNormalEncodingSchedules(
+        xml11_little,
+        xml11_expected.events,
+        .utf16_le,
+        null,
+    );
+
+    const xml11_big = try encodeUtf16(
+        std.testing.allocator,
+        xml11,
+        .big,
+        true,
+    );
+    defer std.testing.allocator.free(xml11_big);
+    try expectNormalEncodingSchedules(
+        xml11_big,
+        xml11_expected.events,
+        .utf16_be,
+        null,
+    );
+}
+
+test "[failure] - [Reader decoder]: malformed and incomplete input keeps physical locations" {
+    const malformed_utf8 = [_]struct {
+        input: []const u8,
+        offset: u64,
+    }{
+        .{ .input = "<root>\x80</root>", .offset = 6 },
+        .{ .input = "<root>\xe2(</root>", .offset = 7 },
+        .{ .input = "<root>\xed\xa0\x80</root>", .offset = 7 },
+    };
+    for (malformed_utf8) |case| {
+        try expectNormalFailureSchedules(case.input, .{
+            .category = error.InvalidEncoding,
+            .code = .malformed_utf8,
+            .byte_offset = case.offset,
+            .related_byte_offset = null,
+            .line = 1,
+            .byte_column = case.offset + 1,
+        });
+    }
+
+    const incomplete_utf8 = "<root>\xe2\x82";
+    try expectNormalFailureSchedules(incomplete_utf8, .{
+        .category = error.InvalidEncoding,
+        .code = .malformed_utf8,
+        .byte_offset = 6,
+        .related_byte_offset = null,
+        .line = 1,
+        .byte_column = 7,
+    });
+
+    const utf16_cases = [_]struct {
+        input: []const u8,
+        offset: u64,
+    }{
+        .{ .input = UTF16LE_ODD_BYTE, .offset = UTF16LE_ODD_BYTE.len - 1 },
+        .{ .input = UTF16LE_UNPAIRED_HIGH, .offset = 14 },
+        .{ .input = UTF16BE_UNPAIRED_LOW, .offset = 14 },
+    };
+    for (utf16_cases) |case| {
+        try expectNormalFailureSchedules(case.input, .{
+            .category = error.InvalidEncoding,
+            .code = .malformed_encoding,
+            .byte_offset = case.offset,
+            .related_byte_offset = null,
+            .line = 1,
+            .byte_column = case.offset - 1,
+        });
+    }
+
+    try expectNormalFailureSchedules("\x00\x00\xfe\xff", .{
+        .category = error.UnsupportedEncoding,
+        .code = .unsupported_encoding,
+        .byte_offset = 0,
+        .related_byte_offset = null,
+        .line = 1,
+        .byte_column = 1,
+    });
+}
+
+test "[failure] - [Reader decoder]: signatures and declarations fail at original bytes" {
+    const unsigned_source = "<?xml version='1.0'?><r/>";
+    const unsigned = try encodeUtf16(
+        std.testing.allocator,
+        unsigned_source,
+        .big,
+        false,
+    );
+    defer std.testing.allocator.free(unsigned);
+    try expectNormalFailureSchedules(unsigned, .{
+        .category = error.InvalidEncoding,
+        .code = .missing_encoding_signature,
+        .byte_offset = 0,
+        .related_byte_offset = null,
+        .line = 1,
+        .byte_column = 1,
+    });
+
+    inline for (.{
+        .{
+            .endian = TestEndian.little,
+            .source = "<?xml version='1.0' encoding='UTF-16BE'?><r/>",
+            .declared = "UTF-16BE",
+        },
+        .{
+            .endian = TestEndian.big,
+            .source = "<?xml version='1.0' encoding='UTF-16LE'?><r/>",
+            .declared = "UTF-16LE",
+        },
+    }) |case| {
+        const encoded = try encodeUtf16(
+            std.testing.allocator,
+            case.source,
+            case.endian,
+            true,
+        );
+        defer std.testing.allocator.free(encoded);
+        const token = std.mem.indexOf(u8, case.source, case.declared).?;
+        const offset = 2 + 2 * token;
+        try expectNormalFailureSchedules(encoded, .{
+            .category = error.InvalidEncoding,
+            .code = .encoding_mismatch,
+            .byte_offset = offset,
+            .related_byte_offset = null,
+            .line = 1,
+            .byte_column = 2 * token + 1,
+        });
+    }
+
+    const utf8_declared_utf16 = "<?xml version='1.0' encoding='UTF-16'?><r/>";
+    const token = std.mem.indexOf(u8, utf8_declared_utf16, "UTF-16").?;
+    try expectNormalFailureSchedules(utf8_declared_utf16, .{
+        .category = error.InvalidEncoding,
+        .code = .encoding_mismatch,
+        .byte_offset = token,
+        .related_byte_offset = null,
+        .line = 1,
+        .byte_column = token + 1,
+    });
+}
+
+test "[failure] - [Reader decoder]: UTF-16 grammar diagnostics keep physical locations" {
+    const source = "<r>\r\n<x></y></r>";
+    const mismatch = std.mem.indexOf(u8, source, "y").?;
+    const related = std.mem.indexOf(u8, source, "<x").?;
+    inline for (.{ TestEndian.little, TestEndian.big }) |endian| {
+        const encoded = try encodeUtf16(std.testing.allocator, source, endian, true);
+        defer std.testing.allocator.free(encoded);
+        try expectNormalFailureSchedules(encoded, .{
+            .category = error.InvalidXml,
+            .code = .mismatched_end_tag,
+            .byte_offset = 2 + 2 * mismatch,
+            .related_byte_offset = 2 + 2 * related,
+            .line = 2,
+            .byte_column = 11,
+        });
+    }
 }
 
 test "[integration] - [Reader]: namespace policy keeps one event type" {
