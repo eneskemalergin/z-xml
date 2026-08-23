@@ -1,0 +1,303 @@
+//! Builds development adapters, probes, and their tests.
+
+const std = @import("std");
+
+const CheckAdapter = struct {
+    name: []const u8,
+    namespaces: bool,
+    general_encodings: bool,
+    dtd: bool,
+    validating: bool,
+    xml11: bool = false,
+};
+
+const PersistentAdapter = struct {
+    name: []const u8,
+    namespaces: bool,
+    general_encodings: bool,
+};
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const z_xml = b.createModule(.{
+        .root_source_file = b.path("../src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const test_step = b.step("test", "Run development tool tests");
+    const tree_adapter_step = b.step("tree-adapter", "Build and install the owned-tree adapter");
+    const corpus_adapters_step = b.step(
+        "corpus-adapters",
+        "Build and install the focused corpus adapters",
+    );
+    const validation_bench_step = b.step(
+        "validation-bench",
+        "Build and install the fresh and reused validation adapters",
+    );
+    const persistent_adapters_step = b.step(
+        "persistent-adapters",
+        "Build and install the qualified persistent adapters",
+    );
+    const experimental_adapters_step = b.step(
+        "experimental-adapters",
+        "Build and install adapters outside the qualified lanes",
+    );
+    const tools_step = b.step("tools", "Build and install all adapter tools");
+
+    const tree_module = b.createModule(.{
+        .root_source_file = b.path("z_xml_tree.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    tree_module.addImport("z_xml", z_xml);
+    const tree_adapter = b.addExecutable(.{
+        .name = "z-xml-tree",
+        .root_module = tree_module,
+    });
+    tree_adapter_step.dependOn(&b.addInstallArtifact(tree_adapter, .{}).step);
+
+    inline for ([_]CheckAdapter{
+        .{
+            .name = "z-xml-check",
+            .namespaces = false,
+            .general_encodings = false,
+            .dtd = false,
+            .validating = false,
+        },
+        .{
+            .name = "z-xml-ns-check",
+            .namespaces = true,
+            .general_encodings = false,
+            .dtd = false,
+            .validating = false,
+        },
+        .{
+            .name = "z-xml-general-check",
+            .namespaces = false,
+            .general_encodings = true,
+            .dtd = false,
+            .validating = false,
+        },
+        .{
+            .name = "z-xml-general-ns-check",
+            .namespaces = true,
+            .general_encodings = true,
+            .dtd = false,
+            .validating = false,
+        },
+        .{
+            .name = "z-xml-dtd-check",
+            .namespaces = false,
+            .general_encodings = true,
+            .dtd = true,
+            .validating = false,
+        },
+        .{
+            .name = "z-xml-dtd-ns-check",
+            .namespaces = true,
+            .general_encodings = true,
+            .dtd = true,
+            .validating = false,
+        },
+        .{
+            .name = "z-xml-validating-check",
+            .namespaces = false,
+            .general_encodings = true,
+            .dtd = true,
+            .validating = true,
+        },
+        .{
+            .name = "z-xml-validating-ns-check",
+            .namespaces = true,
+            .general_encodings = true,
+            .dtd = true,
+            .validating = true,
+        },
+        .{
+            .name = "z-xml11-validating-check",
+            .namespaces = false,
+            .general_encodings = true,
+            .dtd = true,
+            .validating = true,
+            .xml11 = true,
+        },
+        .{
+            .name = "z-xml11-validating-ns-check",
+            .namespaces = true,
+            .general_encodings = true,
+            .dtd = true,
+            .validating = true,
+            .xml11 = true,
+        },
+    }) |adapter| {
+        addCheckAdapter(
+            b,
+            z_xml,
+            target,
+            optimize,
+            test_step,
+            corpus_adapters_step,
+            adapter,
+        );
+    }
+
+    inline for (.{
+        .{ "z-xml-validation-fresh", false },
+        .{ "z-xml-validation-reused", true },
+    }) |adapter| {
+        addValidationAdapter(
+            b,
+            z_xml,
+            target,
+            optimize,
+            test_step,
+            validation_bench_step,
+            adapter[0],
+            adapter[1],
+        );
+    }
+
+    inline for ([_]PersistentAdapter{
+        .{ .name = "z-xml-persistent", .namespaces = false, .general_encodings = false },
+        .{ .name = "z-xml-ns-persistent", .namespaces = true, .general_encodings = false },
+    }) |adapter| {
+        addPersistentAdapter(
+            b,
+            z_xml,
+            target,
+            optimize,
+            test_step,
+            persistent_adapters_step,
+            adapter,
+        );
+    }
+    addPersistentAdapter(
+        b,
+        z_xml,
+        target,
+        optimize,
+        test_step,
+        experimental_adapters_step,
+        .{
+            .name = "z-xml-general-persistent",
+            .namespaces = false,
+            .general_encodings = true,
+        },
+    );
+
+    const layout_module = b.createModule(.{
+        .root_source_file = b.path("../src/layout_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    layout_module.addImport("z_xml", z_xml);
+    const layout_probe = b.addExecutable(.{
+        .name = "z-xml-layout",
+        .root_module = layout_module,
+    });
+    const layout_step = b.step("layout", "Print representative specialized type layouts");
+    layout_step.dependOn(&b.addRunArtifact(layout_probe).step);
+
+    tools_step.dependOn(tree_adapter_step);
+    tools_step.dependOn(corpus_adapters_step);
+    tools_step.dependOn(validation_bench_step);
+    tools_step.dependOn(persistent_adapters_step);
+    tools_step.dependOn(experimental_adapters_step);
+    b.getInstallStep().dependOn(tools_step);
+    b.default_step = test_step;
+}
+
+fn addCheckAdapter(
+    b: *std.Build,
+    z_xml: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    test_step: *std.Build.Step,
+    install_step: *std.Build.Step,
+    adapter: CheckAdapter,
+) void {
+    const module = b.createModule(.{
+        .root_source_file = b.path("z_xml_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    module.addImport("z_xml", z_xml);
+    const options = b.addOptions();
+    options.addOption(bool, "namespaces", adapter.namespaces);
+    options.addOption(bool, "general_encodings", adapter.general_encodings);
+    options.addOption(bool, "dtd", adapter.dtd);
+    options.addOption(bool, "validating", adapter.validating);
+    if (adapter.xml11) options.addOption(bool, "xml11", true);
+    module.addOptions("check_options", options);
+
+    const executable = b.addExecutable(.{
+        .name = adapter.name,
+        .root_module = module,
+    });
+    install_step.dependOn(&b.addInstallArtifact(executable, .{}).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+}
+
+fn addValidationAdapter(
+    b: *std.Build,
+    z_xml: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    test_step: *std.Build.Step,
+    install_step: *std.Build.Step,
+    name: []const u8,
+    reuse: bool,
+) void {
+    const module = b.createModule(.{
+        .root_source_file = b.path("z_xml_validation_repeat.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    module.addImport("z_xml", z_xml);
+    const options = b.addOptions();
+    options.addOption(bool, "reuse", reuse);
+    module.addOptions("repeat_options", options);
+
+    const executable = b.addExecutable(.{
+        .name = name,
+        .root_module = module,
+    });
+    install_step.dependOn(&b.addInstallArtifact(executable, .{}).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+}
+
+fn addPersistentAdapter(
+    b: *std.Build,
+    z_xml: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    test_step: *std.Build.Step,
+    install_step: *std.Build.Step,
+    adapter: PersistentAdapter,
+) void {
+    const module = b.createModule(.{
+        .root_source_file = b.path("z_xml_persistent.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    module.addImport("z_xml", z_xml);
+    const options = b.addOptions();
+    options.addOption(bool, "namespaces", adapter.namespaces);
+    options.addOption(bool, "general_encodings", adapter.general_encodings);
+    module.addOptions("persistent_options", options);
+
+    const executable = b.addExecutable(.{
+        .name = adapter.name,
+        .root_module = module,
+    });
+    install_step.dependOn(&b.addInstallArtifact(executable, .{}).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module })).step);
+}

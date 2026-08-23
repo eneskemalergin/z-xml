@@ -23,6 +23,8 @@ tmp/
 ref/
 temp/
 data/
+!tests/data/
+!tests/data/**
 plan/
 assets/
 experiments/

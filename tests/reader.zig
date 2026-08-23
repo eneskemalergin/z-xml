@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const xml = @import("z_xml");
-const fixtures = @import("reader_fixtures");
 
 const CORE_CONFIG = xml.Configs.XML10_UTF8_NO_DTD;
 const FAST_CONFIG = xml.Configs.XML10_UTF8_NO_DTD_FAST;
@@ -14,11 +13,33 @@ const DTD_NS_CONFIG = xml.Configs.XML10_NAMESPACES_NONVALIDATING;
 const INTERNAL_DTD_CONFIG = xml.Configs.XML10_NONVALIDATING_INTERNAL;
 const CoreReader = xml.Reader(CORE_CONFIG);
 
+const UTF16LE_BOM = @embedFile("data/encoding/utf16le-bom.xml");
+const UTF16BE_BOM = @embedFile("data/encoding/utf16be-bom.xml");
+const UTF16LE_ODD_BYTE = @embedFile("data/encoding/utf16le-odd-byte.xml");
+const UTF16LE_UNPAIRED_HIGH = @embedFile(
+    "data/encoding/utf16le-unpaired-high-surrogate.xml",
+);
+const UTF16BE_UNPAIRED_LOW = @embedFile(
+    "data/encoding/utf16be-unpaired-low-surrogate.xml",
+);
+
+const NAMESPACE_CHURN_INPUT =
+    "<r:root xmlns:r=\"urn:root\" xmlns:a=\"urn:outer-a\" " ++
+    "xmlns:b=\"urn:outer-b\" xmlns=\"urn:default\">\n" ++
+    "  <a:item a:kind=\"one\">\n" ++
+    "    <inner xmlns:a=\"urn:inner-a\" xmlns=\"urn:inner-default\">\n" ++
+    "      <a:item b:kind=\"two\"/>\n" ++
+    "    </inner>\n" ++
+    "  </a:item>\n" ++
+    "  <b:item xmlns:b=\"urn:inner-b\" b:kind=\"three\"/>\n" ++
+    "  <plain xmlns=\"\"><leaf xmlns=\"urn:leaf\"/></plain>\n" ++
+    "</r:root>\n";
+
 const Summary = struct {
     const max_attribute_event_bytes = 4096;
     const max_name_event_bytes = 4096;
     const max_text_bytes = 4096;
-    const max_misc_bytes = 4096;
+    const max_summary_bytes = 4096;
     const start_element_marker = 0xfe;
     const name_end_marker = 0;
     const attribute_end_marker = 0xff;
@@ -42,19 +63,19 @@ const Summary = struct {
     attribute_event_bytes_len: usize = 0,
     text_bytes: [max_text_bytes]u8 = @splat(0),
     text_bytes_len: usize = 0,
-    cdata_bytes: [max_misc_bytes]u8 = @splat(0),
+    cdata_bytes: [max_summary_bytes]u8 = @splat(0),
     cdata_bytes_len: usize = 0,
     complete_comments: usize = 0,
-    comment_bytes: [max_misc_bytes]u8 = @splat(0),
+    comment_bytes: [max_summary_bytes]u8 = @splat(0),
     comment_bytes_len: usize = 0,
     complete_processing_instructions: usize = 0,
     processing_instruction_active: bool = false,
-    processing_instruction_bytes: [max_misc_bytes]u8 = @splat(0),
+    processing_instruction_bytes: [max_summary_bytes]u8 = @splat(0),
     processing_instruction_bytes_len: usize = 0,
     name_event_bytes: [max_name_event_bytes]u8 = @splat(0),
     name_event_bytes_len: usize = 0,
     namespace_declarations: usize = 0,
-    namespace_event_bytes: [max_misc_bytes]u8 = @splat(0),
+    namespace_event_bytes: [max_summary_bytes]u8 = @splat(0),
     namespace_event_bytes_len: usize = 0,
 
     fn observe(self: *Summary, event: anytype) !void {
@@ -529,7 +550,7 @@ fn appendUtf16Unit(
 }
 
 fn allocationUtf16Parse(allocator: std.mem.Allocator) !void {
-    const parts = [_][]const u8{fixtures.utf16le_bom};
+    const parts = [_][]const u8{UTF16LE_BOM};
     _ = try parseParts(GENERAL_CONFIG, allocator, .{}, &parts);
 }
 
@@ -1037,7 +1058,7 @@ fn allocationTextParse(allocator: std.mem.Allocator) !void {
     );
 }
 
-fn allocationMiscMarkupParse(allocator: std.mem.Allocator) !void {
+fn allocationMarkupParse(allocator: std.mem.Allocator) !void {
     const input =
         "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>" ++
         "<?setup data?><r><!--comment--><![CDATA[<text>&data]]></r><?done?>";
@@ -1056,7 +1077,7 @@ fn allocationMiscMarkupParse(allocator: std.mem.Allocator) !void {
 }
 
 fn allocationNamespaceParse(allocator: std.mem.Allocator) !void {
-    const parts = [_][]const u8{fixtures.ns_churn};
+    const parts = [_][]const u8{NAMESPACE_CHURN_INPUT};
     const summary = try parseParts(NS_CONFIG, allocator, .{}, &parts);
     try std.testing.expectEqual(@as(usize, 7), summary.starts);
     try std.testing.expectEqual(@as(usize, 7), summary.ends);
@@ -2836,14 +2857,14 @@ test "reader - vertical slice: whole every-split and one-byte schedules agree" {
     );
 }
 
-test "success - element structure: nested siblings preserve names and syntax metadata" {
+test "[unit] - [element structure]: nested siblings preserve names and syntax metadata" {
     try expectEvents("<root></root>", &.{
         .document_start,
         .{ .start_element = .{ .name = "root", .empty_element_syntax = false } },
         .{ .end_element = "root" },
         .document_end,
     });
-    try expectEvents(fixtures.empty_explicit, &.{
+    try expectEvents("<root><empty></empty><also-empty /></root>\n", &.{
         .document_start,
         .{ .start_element = .{ .name = "root", .empty_element_syntax = false } },
         .{ .start_element = .{ .name = "empty", .empty_element_syntax = false } },
@@ -2867,8 +2888,8 @@ test "success - element structure: nested siblings preserve names and syntax met
     });
 }
 
-test "streaming - element structure: all required chunk schedules agree" {
-    const input = fixtures.nested;
+test "[property] - [element structure]: all required chunk schedules agree" {
+    const input = "<root><level-one><level-two><leaf/></level-two></level-one></root>\n";
     const whole_parts = [_][]const u8{input};
     const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &whole_parts);
 
@@ -2903,8 +2924,8 @@ test "streaming - element structure: all required chunk schedules agree" {
     }
 }
 
-test "streaming - explicit and empty fixture: all required chunk schedules agree" {
-    const input = fixtures.empty_explicit;
+test "[property] - [element structure]: explicit and empty forms agree across schedules" {
+    const input = "<root><empty></empty><also-empty /></root>\n";
     const whole_parts = [_][]const u8{input};
     const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &whole_parts);
 
@@ -2933,30 +2954,30 @@ test "streaming - explicit and empty fixture: all required chunk schedules agree
     }
 }
 
-test "[integration] - [document structure fixtures]: registered cases have exact diagnostics" {
+test "[property] - [document structure]: malformed examples have exact diagnostics" {
     try expectCoreFailureSchedules(
-        fixtures.mismatched,
+        "<root><item></root>\n",
         error.InvalidXml,
         .mismatched_end_tag,
         14,
         6,
     );
     try expectCoreFailureSchedules(
-        fixtures.unexpected_end,
+        "</root>\n",
         error.InvalidXml,
         .unexpected_end_tag,
         1,
         null,
     );
     try expectCoreFailureSchedules(
-        fixtures.unclosed,
+        "<root><item/></root\n",
         error.InvalidXml,
         .incomplete_input,
         20,
         null,
     );
     try expectCoreFailureSchedules(
-        fixtures.end_space,
+        "<root></ root>\n",
         error.InvalidXml,
         .malformed_end_tag,
         8,
@@ -3358,8 +3379,9 @@ test "[property] - [document text]: UTF-8 before, after, and without a root is e
     }
 }
 
-test "[integration] - [attributes]: fixture preserves source order and values" {
-    try expectEvents(fixtures.attributes, &.{
+test "[property] - [attributes]: source order and values survive every schedule" {
+    const input = "<root first=\"one\" second='two' third = \"three\" fourth= 'four'/>\n";
+    try expectEvents(input, &.{
         .document_start,
         .{ .start_element = .{
             .name = "root",
@@ -3375,7 +3397,7 @@ test "[integration] - [attributes]: fixture preserves source order and values" {
         .document_end,
     });
 
-    try expectSummarySchedules(fixtures.attributes, .{
+    try expectSummarySchedules(input, .{
         .sequence = 1234,
         .starts = 1,
         .ends = 1,
@@ -3518,40 +3540,41 @@ test "[edge] - [attributes]: nonquadratic duplicate path preserves source order"
     });
 }
 
-test "[failure] - [attributes]: registered malformed fixtures have exact diagnostics" {
+test "[failure] - [attributes]: malformed forms have exact diagnostics" {
     try expectCoreFailureSchedules(
-        fixtures.duplicate_attribute,
+        "<root value=\"one\" value=\"two\"/>\n",
         error.InvalidXml,
         .duplicate_attribute,
         18,
         6,
     );
     try expectCoreFailureSchedules(
-        fixtures.unquoted_attribute,
+        "<root value=unquoted/>\n",
         error.InvalidXml,
         .malformed_attribute,
         12,
         null,
     );
     try expectCoreFailureSchedules(
-        fixtures.missing_equals,
+        "<root value \"missing\"/>\n",
         error.InvalidXml,
         .malformed_attribute,
         12,
         null,
     );
     try expectCoreFailureSchedules(
-        fixtures.attribute_lt,
+        "<root value=\"illegal<character\"/>\n",
         error.InvalidXml,
         .attribute_less_than,
         20,
         null,
     );
+    const truncated = "<root value=\"never closed>\n";
     try expectCoreFailureSchedules(
-        fixtures.truncated_attribute,
+        truncated,
         error.InvalidXml,
         .incomplete_input,
-        fixtures.truncated_attribute.len,
+        truncated.len,
         null,
     );
     try expectCoreFailureSchedules(
@@ -3597,7 +3620,7 @@ test "[failure] - [attribute diagnostics]: complete syntax precedes duplicate re
     );
 }
 
-test "[integration] - [attribute normalization]: literal whitespace and references are semantic" {
+test "[property] - [attribute normalization]: literal whitespace and references are semantic" {
     const expected_attributes = [_]ExpectedAttribute{
         .{ .name = "value", .value = "one two three" },
         .{ .name = "tabs", .value = "one\ttwo" },
@@ -3613,7 +3636,10 @@ test "[integration] - [attribute normalization]: literal whitespace and referenc
         .{ .end_element = "root" },
         .document_end,
     };
-    try expectEvents(fixtures.attribute_normalization, &expected_events);
+    try expectEvents(
+        "<root value=\"one two three\" tabs=\"one&#9;two\" newlines=\"one&#10;two\"/>\n",
+        &expected_events,
+    );
 
     const literal_whitespace = "<root value='one\ttwo\r\nthree\rfour\nfive'/>";
     const expected_literal = [_]ExpectedAttribute{
@@ -3651,7 +3677,8 @@ test "[integration] - [attribute normalization]: literal whitespace and referenc
 
 test "[property] - [text]: mixed content concatenates under every input schedule" {
     try expectSemanticSchedules(
-        fixtures.mixed_content,
+        "<paragraph>before <emphasis role=\"strong\">inside</emphasis> " ++
+            "after <empty/> tail</paragraph>\n",
         "before inside after  tail",
         3,
         3,
@@ -3660,15 +3687,20 @@ test "[property] - [text]: mixed content concatenates under every input schedule
 }
 
 test "[property] - [references]: predefined and numeric values are semantic" {
+    const predefined =
+        "<root attribute=\"&lt;&gt;&amp;&quot;&apos;\">&lt;&gt;&amp;&quot;&apos;</root>\n";
+    const numeric =
+        "<root decimal=\"&#65;\" hexadecimal=\"&#x41;\">" ++
+        "&#9;&#10;&#13;&#x20;&#x1F642;</root>\n";
     try expectSemanticSchedules(
-        fixtures.predefined_entities,
+        predefined,
         "<>&\"'",
         1,
         1,
         1,
     );
     try expectSemanticSchedules(
-        fixtures.numeric_references,
+        numeric,
         "\t\n\r 🙂",
         1,
         1,
@@ -3693,7 +3725,7 @@ test "[property] - [references]: predefined and numeric values are semantic" {
         .{ .end_element = "root" },
         .document_end,
     };
-    try expectEvents(fixtures.predefined_entities, &predefined_events);
+    try expectEvents(predefined, &predefined_events);
 
     const numeric_attributes = [_]ExpectedAttribute{
         .{ .name = "decimal", .value = "A" },
@@ -3714,20 +3746,20 @@ test "[property] - [references]: predefined and numeric values are semantic" {
         .{ .end_element = "root" },
         .document_end,
     };
-    try expectEvents(fixtures.numeric_references, &numeric_events);
+    try expectEvents(numeric, &numeric_events);
 }
 
 test "[property] - [UTF-8]: BOM and scalar widths survive every split" {
-    try expectSemanticSchedules(fixtures.utf8_bom, "é🙂", 1, 1, 0);
+    try expectSemanticSchedules("\xef\xbb\xbf<root>é🙂</root>", "é🙂", 1, 1, 0);
     try expectSemanticSchedules(
-        fixtures.utf8_boundaries,
+        "<root>\xc2\x80\xe0\xa0\x80\xf0\x90\x80\x80\xf4\x8f\xbf\xbf</root>",
         "ࠀ𐀀􏿿",
         1,
         1,
         0,
     );
     try expectSemanticSchedules(
-        fixtures.unicode_text,
+        "<root>ASCII, e acute: é, CJK: 漢字, emoji: 🙂</root>\n",
         "ASCII, e acute: é, CJK: 漢字, emoji: 🙂",
         1,
         1,
@@ -3736,19 +3768,19 @@ test "[property] - [UTF-8]: BOM and scalar widths survive every split" {
 }
 
 test "[property] - [UTF-16]: byte order code units and surrogates survive every split" {
-    const little_parts = [_][]const u8{fixtures.utf16le_bom};
+    const little_parts = [_][]const u8{UTF16LE_BOM};
     const little = try parseParts(GENERAL_CONFIG, std.testing.allocator, .{}, &little_parts);
     try std.testing.expectEqual(xml.SourceEncoding.utf16_le, little.source_encoding);
     try std.testing.expectEqualStrings("UTF-16", little.declared_encoding[0..little.declared_encoding_len]);
     try std.testing.expectEqualStrings("λ🙂", little.text_bytes[0..little.text_bytes_len]);
-    try expectSummarySchedulesWithOptions(GENERAL_CONFIG, .{}, fixtures.utf16le_bom, little);
+    try expectSummarySchedulesWithOptions(GENERAL_CONFIG, .{}, UTF16LE_BOM, little);
 
-    const big_parts = [_][]const u8{fixtures.utf16be_bom};
+    const big_parts = [_][]const u8{UTF16BE_BOM};
     const big = try parseParts(GENERAL_CONFIG, std.testing.allocator, .{}, &big_parts);
     try std.testing.expectEqual(xml.SourceEncoding.utf16_be, big.source_encoding);
     try std.testing.expectEqualStrings("UTF-16", big.declared_encoding[0..big.declared_encoding_len]);
     try std.testing.expectEqualStrings("λ🙂", big.text_bytes[0..big.text_bytes_len]);
-    try expectSummarySchedulesWithOptions(GENERAL_CONFIG, .{}, fixtures.utf16be_bom, big);
+    try expectSummarySchedulesWithOptions(GENERAL_CONFIG, .{}, UTF16BE_BOM, big);
 }
 
 test "[property] - [general UTF-8]: direct source path agrees across schedules" {
@@ -3767,17 +3799,17 @@ test "[property] - [general UTF-8]: direct source path agrees across schedules" 
 
 test "[failure] - [UTF-16]: odd bytes and unpaired surrogates have stable source offsets" {
     try expectGeneralFailureSchedules(
-        fixtures.utf16le_odd_byte,
+        UTF16LE_ODD_BYTE,
         .malformed_encoding,
-        fixtures.utf16le_odd_byte.len - 1,
+        UTF16LE_ODD_BYTE.len - 1,
     );
     try expectGeneralFailureSchedules(
-        fixtures.utf16le_unpaired_high,
+        UTF16LE_UNPAIRED_HIGH,
         .malformed_encoding,
         14,
     );
     try expectGeneralFailureSchedules(
-        fixtures.utf16be_unpaired_low,
+        UTF16BE_UNPAIRED_LOW,
         .malformed_encoding,
         14,
     );
@@ -3828,10 +3860,11 @@ test "[failure] - [encoding detection]: missing signatures and declaration confl
         2 + 2 * encoding_index,
     );
 
+    const declared_utf16 = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><root/>";
     try expectGeneralFailureSchedules(
-        fixtures.declared_utf16,
+        declared_utf16,
         .encoding_mismatch,
-        std.mem.indexOf(u8, fixtures.declared_utf16, "UTF-16").?,
+        std.mem.indexOf(u8, declared_utf16, "UTF-16").?,
     );
 
     const unsupported_four_byte_signatures = [_][4]u8{
@@ -3859,7 +3892,7 @@ test "[failure] - [encoding detection]: missing signatures and declaration confl
 
 test "[integration] - [buffered UTF-16]: one-byte source reads preserve semantics" {
     var io_buffer: [5]u8 = undefined;
-    var source: std.testing.Reader = .init(&io_buffer, &.{.{ .buffer = fixtures.utf16le_bom }});
+    var source: std.testing.Reader = .init(&io_buffer, &.{.{ .buffer = UTF16LE_BOM }});
     source.artificial_limit = .limited(1);
     var input = try xml.IoReader(GENERAL_CONFIG).init(
         std.testing.allocator,
@@ -3922,7 +3955,7 @@ test "[property] - [UTF-16 memory]: decoded storage is independent of document l
     try std.testing.expectEqual(@as(usize, 2 * 16 * 1024), capacity);
 
     try reader.reset(.retain_capacity);
-    try drainGeneralChunks(&reader, fixtures.utf16le_bom);
+    try drainGeneralChunks(&reader, UTF16LE_BOM);
     try std.testing.expectEqual(capacity, reader.memoryUsage().decoder_capacity);
     try reader.reset(.release_memory);
     try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().decoder_capacity);
@@ -3957,8 +3990,8 @@ test "[failure] - [UTF-16 locations]: grammar diagnostics use original byte offs
 }
 
 test "[property] - [line normalization]: CR and CRLF produce one LF" {
-    try expectSemanticSchedules(fixtures.cr_line_endings, "one\ntwo\n", 1, 1, 0);
-    try expectSemanticSchedules(fixtures.crlf_line_endings, "one\ntwo\n", 1, 1, 0);
+    try expectSemanticSchedules("<root>one\rtwo\r</root>\r", "one\ntwo\n", 1, 1, 0);
+    try expectSemanticSchedules("<root>one\r\ntwo\r\n</root>\r\n", "one\ntwo\n", 1, 1, 0);
 }
 
 test "[integration] - [buffered UTF-8]: one-byte source reads preserve semantics" {
@@ -3989,10 +4022,17 @@ test "[integration] - [buffered UTF-8]: one-byte source reads preserve semantics
 }
 
 test "[integration] - [buffered markup]: one-byte source reads preserve markup semantics" {
+    const source_bytes =
+        "<?xml version=\"1.0\"?>\n" ++
+        "<!--before-->\n" ++
+        "<?setup ready?>\n" ++
+        "<root>content</root>\n" ++
+        "<?done?>\n" ++
+        "<!--after-->\n";
     var io_buffer: [7]u8 = undefined;
     var source: std.testing.Reader = .init(
         &io_buffer,
-        &.{.{ .buffer = fixtures.prolog_epilog_misc }},
+        &.{.{ .buffer = source_bytes }},
     );
     source.artificial_limit = .limited(1);
 
@@ -4021,6 +4061,7 @@ test "[integration] - [buffered markup]: one-byte source reads preserve markup s
 }
 
 test "[integration] - [XML names]: Fifth Edition names preserve UTF-8 bytes" {
+    const unicode_names = "<文書 属性=\"値\"><項目/></文書>\n";
     const unicode_attributes = [_]ExpectedAttribute{
         .{ .name = "属性", .value = "値" },
     };
@@ -4039,8 +4080,8 @@ test "[integration] - [XML names]: Fifth Edition names preserve UTF-8 bytes" {
         .{ .end_element = "文書" },
         .document_end,
     };
-    try expectEvents(fixtures.unicode_names, &unicode_events);
-    try expectSemanticSchedules(fixtures.unicode_names, "", 2, 2, 1);
+    try expectEvents(unicode_names, &unicode_events);
+    try expectSemanticSchedules(unicode_names, "", 2, 2, 1);
 
     const name_character_events = [_]ExpectedEvent{
         .document_start,
@@ -4056,8 +4097,9 @@ test "[integration] - [XML names]: Fifth Edition names preserve UTF-8 bytes" {
         .{ .end_element = "_root" },
         .document_end,
     };
-    try expectEvents(fixtures.name_characters, &name_character_events);
-    try expectSemanticSchedules(fixtures.name_characters, "", 5, 5, 0);
+    const name_characters = "<_root><a-b/><a.b/><name_2/><éclair/></_root>\n";
+    try expectEvents(name_characters, &name_character_events);
+    try expectSemanticSchedules(name_characters, "", 5, 5, 0);
 }
 
 test "[property] - [XML names]: Fifth Edition range boundaries are exact" {
@@ -4099,22 +4141,23 @@ test "[property] - [XML names]: Fifth Edition range boundaries are exact" {
 }
 
 test "[failure] - [references]: malformed, illegal, and undeclared forms are exact" {
+    const malformed = "<root>&#xZZ;</root>\n";
     const malformed_offset = std.mem.indexOfScalar(
         u8,
-        fixtures.malformed_character_reference,
+        malformed,
         'Z',
     ).?;
     try expectCoreFailureSchedules(
-        fixtures.malformed_character_reference,
+        malformed,
         error.InvalidXml,
         .malformed_reference,
         @intCast(malformed_offset),
         null,
     );
     inline for (.{
-        fixtures.zero_character_reference,
-        fixtures.surrogate_character_reference,
-        fixtures.out_of_range_character_reference,
+        "<root>&#0;</root>\n",
+        "<root>&#xD800;</root>\n",
+        "<root>&#x110000;</root>\n",
         "<root>&#999999999999999999999999;</root>",
     }) |input| {
         const offset = std.mem.indexOfScalar(u8, input, '&').?;
@@ -4126,21 +4169,19 @@ test "[failure] - [references]: malformed, illegal, and undeclared forms are exa
             null,
         );
     }
-    const undefined_offset = std.mem.indexOfScalar(u8, fixtures.undefined_entity, '&').?;
+    const undefined_entity = "<root>&undefined;</root>\n";
+    const undefined_offset = std.mem.indexOfScalar(u8, undefined_entity, '&').?;
     try expectCoreFailureSchedules(
-        fixtures.undefined_entity,
+        undefined_entity,
         error.InvalidXml,
         .undeclared_entity,
         @intCast(undefined_offset),
         null,
     );
-    const truncated_offset = std.mem.indexOf(
-        u8,
-        fixtures.truncated_entity[1..],
-        "<",
-    ).? + 1;
+    const truncated = "<root>&amp</root>\n";
+    const truncated_offset = std.mem.indexOf(u8, truncated[1..], "<").? + 1;
     try expectCoreFailureSchedules(
-        fixtures.truncated_entity,
+        truncated,
         error.InvalidXml,
         .malformed_reference,
         @intCast(truncated_offset),
@@ -4149,9 +4190,10 @@ test "[failure] - [references]: malformed, illegal, and undeclared forms are exa
 }
 
 test "[failure] - [character data]: literal CDATA close is rejected across schedules" {
-    const close = std.mem.lastIndexOf(u8, fixtures.cdata_close_in_text, "]]>").?;
+    const input = "<root>illegal ]]&gt; sequence: ]]></root>\n";
+    const close = std.mem.lastIndexOf(u8, input, "]]>").?;
     try expectCoreFailureSchedules(
-        fixtures.cdata_close_in_text,
+        input,
         error.InvalidXml,
         .cdata_close_in_text,
         @intCast(close + 2),
@@ -4164,12 +4206,12 @@ test "[failure] - [UTF-8]: invalid sequence diagnostics identify the first inval
         input: []const u8,
         offset: u64,
     }{
-        .{ .input = fixtures.utf8_lone_continuation, .offset = 6 },
-        .{ .input = fixtures.utf8_overlong, .offset = 6 },
-        .{ .input = fixtures.utf8_truncated, .offset = 8 },
-        .{ .input = fixtures.utf8_surrogate, .offset = 7 },
-        .{ .input = fixtures.utf8_out_of_range, .offset = 7 },
-        .{ .input = fixtures.utf8_invalid_byte, .offset = 6 },
+        .{ .input = "<root>\x80</root>", .offset = 6 },
+        .{ .input = "<root>\xc0\xaf</root>", .offset = 6 },
+        .{ .input = "<root>\xe2\x82</root>", .offset = 8 },
+        .{ .input = "<root>\xed\xa0\x80</root>", .offset = 7 },
+        .{ .input = "<root>\xf4\x90\x80\x80</root>", .offset = 7 },
+        .{ .input = "<root>\xff</root>", .offset = 6 },
     };
     for (cases) |case| {
         try expectCoreFailureSchedules(
@@ -4206,7 +4248,7 @@ test "[failure] - [UTF-8 contexts]: markup, names, values, and references valida
 }
 
 test "[failure] - [XML characters]: literal forbidden scalars are exact" {
-    inline for (.{ fixtures.literal_null, fixtures.literal_control }) |input| {
+    inline for (.{ "<root>before\x00after</root>", "<root>before\x01after</root>" }) |input| {
         const offset = std.mem.indexOfAny(u8, input, "\x00\x01").?;
         try expectCoreFailureSchedules(
             input,
@@ -4533,7 +4575,9 @@ test "[unit] - [text reset]: pending scalar, reference, and CR state is discarde
 }
 
 test "[property] - [declaration]: metadata is final before document start across schedules" {
-    const parts = [_][]const u8{fixtures.declaration};
+    const input =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<root/>\n";
+    const parts = [_][]const u8{input};
     const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
     try std.testing.expectEqualStrings(
         "1.0",
@@ -4545,7 +4589,7 @@ test "[property] - [declaration]: metadata is final before document start across
     );
     try std.testing.expect(expected.standalone);
     try std.testing.expect(expected.standalone_declared);
-    try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, fixtures.declaration, expected);
+    try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, input, expected);
 
     const version_input = "<?xml version='1.7'?><r/>";
     const version_parts = [_][]const u8{version_input};
@@ -4578,9 +4622,16 @@ test "[property] - [declaration]: metadata is final before document start across
     try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, stylesheet_input, stylesheet);
 }
 
-test "[property] - [miscellaneous markup]: logical events agree across schedules" {
+test "[property] - [event summaries]: comments processing instructions CDATA and records agree across schedules" {
     {
-        const parts = [_][]const u8{fixtures.prolog_epilog_misc};
+        const input =
+            "<?xml version=\"1.0\"?>\n" ++
+            "<!--before-->\n" ++
+            "<?setup ready?>\n" ++
+            "<root>content</root>\n" ++
+            "<?done?>\n" ++
+            "<!--after-->\n";
+        const parts = [_][]const u8{input};
         const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
         try std.testing.expectEqualStrings(
             "content",
@@ -4598,22 +4649,24 @@ test "[property] - [miscellaneous markup]: logical events agree across schedules
         try expectSummarySchedulesWithOptions(
             CORE_CONFIG,
             .{},
-            fixtures.prolog_epilog_misc,
+            input,
             expected,
         );
     }
     {
-        const parts = [_][]const u8{fixtures.comment_edges};
+        const input = "<root><!-- hyphen-allowed --><!--empty--></root>\n";
+        const parts = [_][]const u8{input};
         const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
         try std.testing.expectEqualStrings(
             " hyphen-allowed empty",
             expected.comment_bytes[0..expected.comment_bytes_len],
         );
         try std.testing.expectEqual(@as(usize, 2), expected.complete_comments);
-        try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, fixtures.comment_edges, expected);
+        try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, input, expected);
     }
     {
-        const parts = [_][]const u8{fixtures.processing_instruction};
+        const input = "<?before data?><root><?inside more data?></root><?after?>\n";
+        const parts = [_][]const u8{input};
         const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
         try std.testing.expectEqualStrings(
             "before\x00data\xffinside\x00more data\xffafter\x00\xff",
@@ -4623,20 +4676,32 @@ test "[property] - [miscellaneous markup]: logical events agree across schedules
         try expectSummarySchedulesWithOptions(
             CORE_CONFIG,
             .{},
-            fixtures.processing_instruction,
+            input,
             expected,
         );
     }
     {
-        const parts = [_][]const u8{fixtures.cdata};
+        const input = "<root><![CDATA[<not-markup>&not-an-entity;]]></root>\n";
+        const parts = [_][]const u8{input};
         const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
         const text = "<not-markup>&not-an-entity;";
         try std.testing.expectEqualStrings(text, expected.text_bytes[0..expected.text_bytes_len]);
         try std.testing.expectEqualStrings(text, expected.cdata_bytes[0..expected.cdata_bytes_len]);
-        try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, fixtures.cdata, expected);
+        try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, input, expected);
     }
     {
-        const parts = [_][]const u8{fixtures.shape_records};
+        const input =
+            "<catalog>\n" ++
+            "  <entry id=\"a\" kind=\"short\">alpha</entry>\n" ++
+            "  <entry id='medium-id' kind='mixed'>\n" ++
+            "    <title>Title &amp; &#x03bb;</title>\n" ++
+            "    <meta key=\"one\" value=\"1\"/>\n" ++
+            "    <meta key='two' value='2'/>\n" ++
+            "    <![CDATA[tail <raw>]]>\n" ++
+            "  </entry>\n" ++
+            "  <entry id=\"longer-id-0003\" kind=\"unicode\">é λ 🙂</entry>\n" ++
+            "</catalog>\n";
+        const parts = [_][]const u8{input};
         const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
         try std.testing.expectEqual(@as(usize, 7), expected.starts);
         try std.testing.expectEqual(@as(usize, 10), expected.attributes);
@@ -4644,38 +4709,42 @@ test "[property] - [miscellaneous markup]: logical events agree across schedules
             "tail <raw>",
             expected.cdata_bytes[0..expected.cdata_bytes_len],
         );
-        try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, fixtures.shape_records, expected);
+        try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, input, expected);
     }
 }
 
 test "[failure] - [declaration]: syntax placement version and encoding are distinct" {
-    const order_offset = std.mem.indexOf(u8, fixtures.declaration_attribute_order, "encoding").?;
+    const attribute_order = "<?xml encoding=\"UTF-8\" version=\"1.0\"?><root/>\n";
+    const order_offset = std.mem.indexOf(u8, attribute_order, "encoding").?;
     try expectCoreFailureSchedules(
-        fixtures.declaration_attribute_order,
+        attribute_order,
         error.InvalidXml,
         .malformed_declaration,
         @intCast(order_offset),
         null,
     );
-    const misplaced_offset = std.mem.indexOf(u8, fixtures.declaration_not_first, "<?xml").?;
+    const not_first = "<!--before--><?xml version=\"1.0\"?><root/>\n";
+    const misplaced_offset = std.mem.indexOf(u8, not_first, "<?xml").?;
     try expectCoreFailureSchedules(
-        fixtures.declaration_not_first,
+        not_first,
         error.InvalidXml,
         .misplaced_xml_declaration,
         @intCast(misplaced_offset),
         null,
     );
-    const duplicate_offset = std.mem.lastIndexOf(u8, fixtures.duplicate_declaration, "<?xml").?;
+    const duplicate = "<?xml version=\"1.0\"?><?xml version=\"1.0\"?><root/>\n";
+    const duplicate_offset = std.mem.lastIndexOf(u8, duplicate, "<?xml").?;
     try expectCoreFailureSchedules(
-        fixtures.duplicate_declaration,
+        duplicate,
         error.InvalidXml,
         .misplaced_xml_declaration,
         @intCast(duplicate_offset),
         null,
     );
-    const version_offset = std.mem.indexOf(u8, fixtures.unsupported_version, "2.0").?;
+    const unsupported_version = "<?xml version=\"2.0\"?><root/>\n";
+    const version_offset = std.mem.indexOf(u8, unsupported_version, "2.0").?;
     try expectCoreFailureSchedules(
-        fixtures.unsupported_version,
+        unsupported_version,
         error.InvalidXml,
         .unsupported_version,
         @intCast(version_offset),
@@ -4685,10 +4754,10 @@ test "[failure] - [declaration]: syntax placement version and encoding are disti
         input: []const u8,
         value: []const u8,
     }{
-        .{ .input = fixtures.declared_utf16, .value = "UTF-16" },
-        .{ .input = fixtures.ascii_declared, .value = "US-ASCII" },
-        .{ .input = fixtures.iso_8859_1, .value = "ISO-8859-1" },
-        .{ .input = fixtures.declared_ascii_high_byte, .value = "US-ASCII" },
+        .{ .input = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><root/>", .value = "UTF-16" },
+        .{ .input = "<?xml version=\"1.0\" encoding=\"US-ASCII\"?><root>ASCII</root>", .value = "US-ASCII" },
+        .{ .input = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>", .value = "ISO-8859-1" },
+        .{ .input = "<?xml version=\"1.0\" encoding=\"US-ASCII\"?><root>é</root>", .value = "US-ASCII" },
     };
     for (encodings) |encoding| {
         const encoding_offset = std.mem.indexOf(u8, encoding.input, encoding.value).?;
@@ -4702,47 +4771,52 @@ test "[failure] - [declaration]: syntax placement version and encoding are disti
     }
 }
 
-test "[failure] - [miscellaneous markup]: malformed forms retain exact categories" {
-    const comment_offset = std.mem.indexOf(u8, fixtures.comment_double_hyphen, "-- comment").? + 2;
+test "[failure] - [markup constructs]: malformed comments processing instructions CDATA and DOCTYPE are exact" {
+    const double_hyphen = "<root><!-- invalid -- comment --></root>\n";
+    const comment_offset = std.mem.indexOf(u8, double_hyphen, "-- comment").? + 2;
     try expectCoreFailureSchedules(
-        fixtures.comment_double_hyphen,
+        double_hyphen,
         error.InvalidXml,
         .malformed_comment,
         @intCast(comment_offset),
         null,
     );
+    const unclosed_comment = "<root><!-- never closed</root>\n";
     try expectCoreFailureSchedules(
-        fixtures.unclosed_comment,
+        unclosed_comment,
         error.InvalidXml,
         .unclosed_comment,
-        @intCast(fixtures.unclosed_comment.len),
+        @intCast(unclosed_comment.len),
         null,
     );
-    const pi_offset = std.mem.indexOf(u8, fixtures.reserved_pi_target, "<?XmL").?;
+    const reserved_target = "<root><?XmL reserved?></root>\n";
+    const pi_offset = std.mem.indexOf(u8, reserved_target, "<?XmL").?;
     try expectCoreFailureSchedules(
-        fixtures.reserved_pi_target,
+        reserved_target,
         error.InvalidXml,
         .reserved_processing_instruction_target,
         @intCast(pi_offset),
         null,
     );
+    const unclosed_cdata = "<root><![CDATA[never closed</root>\n";
     try expectCoreFailureSchedules(
-        fixtures.unclosed_cdata,
+        unclosed_cdata,
         error.InvalidXml,
         .unclosed_cdata,
-        @intCast(fixtures.unclosed_cdata.len),
+        @intCast(unclosed_cdata.len),
         null,
     );
-    const misplaced_doctype = std.mem.indexOf(u8, fixtures.doctype_after_root, "<!DOCTYPE").?;
+    const doctype_after_root = "<root/><!DOCTYPE root>\n";
+    const misplaced_doctype = std.mem.indexOf(u8, doctype_after_root, "<!DOCTYPE").?;
     try expectCoreFailureSchedules(
-        fixtures.doctype_after_root,
+        doctype_after_root,
         error.InvalidXml,
         .misplaced_doctype,
         @intCast(misplaced_doctype),
         null,
     );
     try expectCoreFailureSchedules(
-        fixtures.multiple_doctypes,
+        "<!DOCTYPE root><!DOCTYPE root><root/>\n",
         error.UnsupportedFeature,
         .unsupported_doctype,
         0,
@@ -4819,7 +4893,7 @@ test "[failure] - [document characters]: malformed UTF-8 and forbidden bytes win
     );
 }
 
-test "[edge] - [miscellaneous fragments]: semantic limits preserve complete values" {
+test "[edge] - [markup fragments]: limits preserve complete comments processing instructions and CDATA" {
     var options: xml.Options(CORE_CONFIG) = .{};
     options.limits.max_fragment_bytes = 4;
     const input = "<?target abcdefgh?><r><!--abcdefgh--><![CDATA[abcdefgh]]></r>";
@@ -4865,12 +4939,12 @@ test "[edge] - [miscellaneous fragments]: semantic limits preserve complete valu
 test "[failure] - [markup storage]: every allocation failure cleans up" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
-        allocationMiscMarkupParse,
+        allocationMarkupParse,
         .{},
     );
 }
 
-test "[property] - [miscellaneous normalization]: UTF-8 CRLF and delimiter suffixes are semantic" {
+test "[property] - [markup normalization]: comments processing instructions and CDATA normalize line endings" {
     const input = "<r><!--a\r\né--><?π a\r\né?><![CDATA[a\r\né]]]></r>";
     const parts = [_][]const u8{input};
     const expected = try parseParts(CORE_CONFIG, std.testing.allocator, .{}, &parts);
@@ -4889,7 +4963,7 @@ test "[property] - [miscellaneous normalization]: UTF-8 CRLF and delimiter suffi
     try expectSummarySchedulesWithOptions(CORE_CONFIG, .{}, input, expected);
 }
 
-test "[property] - [miscellaneous fragments]: contiguous UTF-8 stays in borrowed runs" {
+test "[property] - [markup fragments]: comments processing instructions and CDATA preserve borrowed UTF-8 runs" {
     const input = "<r><!--é🙂--><?pi é🙂?><![CDATA[é🙂]]></r>";
     var reader = try CoreReader.init(std.testing.allocator, .{});
     defer reader.deinit();
@@ -6087,10 +6161,10 @@ test "[fuzz] - [arbitrary bytes]: parsing is bounded and schedule invariant" {
             "<!DOCTYPE root [<!ENTITY loop '&loop;'>]><root>&loop;</root>",
             "\xef\xbb\xbf<root>\xf0\x9f\x99\x82</root>",
             "<root>\xc0\x80</root>",
-            fixtures.utf16le_bom,
-            fixtures.utf16le_odd_byte,
-            fixtures.utf16le_unpaired_high,
-            fixtures.utf16be_unpaired_low,
+            UTF16LE_BOM,
+            UTF16LE_ODD_BYTE,
+            UTF16LE_UNPAIRED_HIGH,
+            UTF16BE_UNPAIRED_LOW,
         },
     });
 }
@@ -6350,8 +6424,11 @@ test "[edge] - [validation limits]: nested operators preserve the position bound
 }
 
 test "[unit] - [namespace expansion]: declarations and ordinary attributes are distinct" {
+    const input =
+        "<root xmlns=\"urn:elements\" attribute=\"no-namespace\" " ++
+        "xmlns:p=\"urn:attributes\" p:attribute=\"namespaced\"/>\n";
     const Reader = xml.SliceReader(NS_CONFIG);
-    var reader = try Reader.init(std.testing.allocator, .{}, fixtures.ns_default_attributes);
+    var reader = try Reader.init(std.testing.allocator, .{}, input);
     defer reader.deinit();
 
     _ = try reader.next();
@@ -6436,11 +6513,17 @@ test "[unit] - [namespace event lifetime]: slices survive source-buffer reuse" {
 }
 
 test "[unit] - [namespace scope]: rebinding undeclaration and predefined xml resolve exactly" {
+    const rebinding =
+        "<root xmlns:p=\"urn:outer\"><p:item/><scope xmlns:p=\"urn:inner\">" ++
+        "<p:item/></scope><p:item/></root>\n";
+    const default_undeclaration =
+        "<root xmlns=\"urn:outer\"><child xmlns=\"\"><leaf/></child></root>\n";
     const inputs = [_][]const u8{
-        fixtures.ns_rebinding,
-        fixtures.ns_default_undeclare,
-        fixtures.ns_xml_prefix,
-        fixtures.ns_equivalent_uri,
+        rebinding,
+        default_undeclaration,
+        "<root xml:lang=\"en\" xml:space=\"preserve\"> text </root>\n",
+        "<root xmlns:a=\"urn:example&amp;value\" xmlns:b=\"urn:example&#38;value\">" ++
+            "<a:item/><b:item/></root>\n",
     };
     for (inputs) |input| {
         const parts = [_][]const u8{input};
@@ -6450,7 +6533,7 @@ test "[unit] - [namespace scope]: rebinding undeclaration and predefined xml res
     var reader = try xml.SliceReader(NS_CONFIG).init(
         std.testing.allocator,
         .{},
-        fixtures.ns_rebinding,
+        rebinding,
     );
     defer reader.deinit();
     var item_index: usize = 0;
@@ -6483,7 +6566,7 @@ test "[unit] - [namespace scope]: rebinding undeclaration and predefined xml res
     var undeclare_reader = try xml.SliceReader(NS_CONFIG).init(
         std.testing.allocator,
         .{},
-        fixtures.ns_default_undeclare,
+        default_undeclaration,
     );
     defer undeclare_reader.deinit();
     var start_index: usize = 0;
@@ -6549,10 +6632,13 @@ test "[unit] - [namespace scope]: rebinding undeclaration and predefined xml res
 }
 
 test "[unit] - [namespace normalization]: reference-expanded URI values resolve exactly" {
+    const input =
+        "<root xmlns:a=\"urn:example&amp;value\" xmlns:b=\"urn:example&#38;value\">" ++
+        "<a:item/><b:item/></root>\n";
     var reader = try xml.SliceReader(NS_CONFIG).init(
         std.testing.allocator,
         .{},
-        fixtures.ns_equivalent_uri,
+        input,
     );
     defer reader.deinit();
 
@@ -6585,16 +6671,19 @@ test "[unit] - [namespace normalization]: reference-expanded URI values resolve 
     try std.testing.expectEqual(@as(usize, 2), item_count);
 }
 
-test "[property] - [namespace fixtures]: every valid fixture agrees across schedules" {
+test "[property] - [namespace processing]: valid forms agree across schedules" {
     inline for (.{
-        fixtures.ns_default,
-        fixtures.ns_prefixed,
-        fixtures.ns_rebinding,
-        fixtures.ns_default_attributes,
-        fixtures.ns_xml_prefix,
-        fixtures.ns_default_undeclare,
-        fixtures.ns_equivalent_uri,
-        fixtures.ns_churn,
+        "<root xmlns=\"urn:example:default\"><child/></root>\n",
+        "<p:root xmlns:p=\"urn:example:p\"><p:child p:attribute=\"value\"/></p:root>\n",
+        "<root xmlns:p=\"urn:outer\"><p:item/><scope xmlns:p=\"urn:inner\">" ++
+            "<p:item/></scope><p:item/></root>\n",
+        "<root xmlns=\"urn:elements\" attribute=\"no-namespace\" " ++
+            "xmlns:p=\"urn:attributes\" p:attribute=\"namespaced\"/>\n",
+        "<root xml:lang=\"en\" xml:space=\"preserve\"> text </root>\n",
+        "<root xmlns=\"urn:outer\"><child xmlns=\"\"><leaf/></child></root>\n",
+        "<root xmlns:a=\"urn:example&amp;value\" xmlns:b=\"urn:example&#38;value\">" ++
+            "<a:item/><b:item/></root>\n",
+        NAMESPACE_CHURN_INPUT,
     }) |input| {
         const parts = [_][]const u8{input};
         const expected = try parseParts(NS_CONFIG, std.testing.allocator, .{}, &parts);
@@ -6602,43 +6691,51 @@ test "[property] - [namespace fixtures]: every valid fixture agrees across sched
     }
 }
 
-test "[failure] - [namespace fixtures]: invalid cases have stable diagnostics across schedules" {
+test "[failure] - [namespace processing]: invalid forms have stable diagnostics across schedules" {
     const Case = struct {
         input: []const u8,
         code: xml.DiagnosticCode,
         primary: usize,
         related: ?usize = null,
     };
+    const bad_xml_binding = "<root xmlns:xml=\"urn:not-the-xml-namespace\"/>\n";
+    const bad_xmlns_binding = "<root xmlns:xmlns=\"urn:not-allowed\"/>\n";
+    const duplicate_expanded =
+        "<root xmlns:a=\"urn:same\" xmlns:b=\"urn:same\" " ++
+        "a:value=\"one\" b:value=\"two\"/>\n";
+    const prefix_undeclaration =
+        "<root xmlns:p=\"urn:p\"><child xmlns:p=\"\"/></root>\n";
+    const bad_default_uri = "<root xmlns=\"http://www.w3.org/2000/xmlns/\"/>\n";
     const cases = [_]Case{
-        .{ .input = fixtures.ns_unbound_element, .code = .unbound_prefix, .primary = 1 },
-        .{ .input = fixtures.ns_unbound_attribute, .code = .unbound_prefix, .primary = 6 },
+        .{ .input = "<p:root/>\n", .code = .unbound_prefix, .primary = 1 },
+        .{ .input = "<root p:attribute=\"value\"/>\n", .code = .unbound_prefix, .primary = 6 },
         .{
-            .input = fixtures.ns_bad_xml_binding,
+            .input = bad_xml_binding,
             .code = .illegal_namespace_declaration,
-            .primary = std.mem.indexOf(u8, fixtures.ns_bad_xml_binding, "xmlns:xml").?,
+            .primary = std.mem.indexOf(u8, bad_xml_binding, "xmlns:xml").?,
         },
         .{
-            .input = fixtures.ns_bad_xmlns_binding,
+            .input = bad_xmlns_binding,
             .code = .illegal_namespace_declaration,
-            .primary = std.mem.indexOf(u8, fixtures.ns_bad_xmlns_binding, "xmlns:xmlns").?,
+            .primary = std.mem.indexOf(u8, bad_xmlns_binding, "xmlns:xmlns").?,
         },
-        .{ .input = fixtures.ns_xmlns_element, .code = .reserved_namespace_name, .primary = 1 },
+        .{ .input = "<xmlns:root/>\n", .code = .reserved_namespace_name, .primary = 1 },
         .{
-            .input = fixtures.ns_duplicate_expanded,
+            .input = duplicate_expanded,
             .code = .duplicate_expanded_attribute,
-            .primary = std.mem.indexOf(u8, fixtures.ns_duplicate_expanded, "b:value").?,
-            .related = std.mem.indexOf(u8, fixtures.ns_duplicate_expanded, "a:value").?,
+            .primary = std.mem.indexOf(u8, duplicate_expanded, "b:value").?,
+            .related = std.mem.indexOf(u8, duplicate_expanded, "a:value").?,
         },
-        .{ .input = fixtures.ns_multiple_colons, .code = .malformed_qname, .primary = 4 },
+        .{ .input = "<a:b:c xmlns:a=\"urn:a\"/>\n", .code = .malformed_qname, .primary = 4 },
         .{
-            .input = fixtures.ns_prefix_undeclare,
+            .input = prefix_undeclaration,
             .code = .illegal_namespace_declaration,
-            .primary = std.mem.lastIndexOf(u8, fixtures.ns_prefix_undeclare, "xmlns:p").?,
+            .primary = std.mem.lastIndexOf(u8, prefix_undeclaration, "xmlns:p").?,
         },
         .{
-            .input = fixtures.ns_bad_default_uri,
+            .input = bad_default_uri,
             .code = .illegal_namespace_declaration,
-            .primary = std.mem.indexOf(u8, fixtures.ns_bad_default_uri, "xmlns").?,
+            .primary = std.mem.indexOf(u8, bad_default_uri, "xmlns").?,
         },
     };
     for (cases) |case| {
@@ -6885,14 +6982,14 @@ test "[unit] - [namespace storage]: warm fixed scope performs no allocator opera
     var reader = try xml.Reader(NS_CONFIG).init(failing.allocator(), .{});
     defer reader.deinit();
 
-    try reader.feed(fixtures.ns_churn, true);
+    try reader.feed(NAMESPACE_CHURN_INPUT, true);
     try std.testing.expectEqual(@as(usize, 7), (try drainNamespace(&reader)).starts);
     try std.testing.expect(failing.alloc_index > 0);
 
     try reader.reset(.retain_capacity);
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
-    try reader.feed(fixtures.ns_churn, true);
+    try reader.feed(NAMESPACE_CHURN_INPUT, true);
     try std.testing.expectEqual(@as(usize, 7), (try drainNamespace(&reader)).starts);
     try std.testing.expect(!failing.has_induced_failure);
 }
