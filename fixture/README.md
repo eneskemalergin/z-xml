@@ -2,10 +2,25 @@
 
 Status: **Active** (last updated: 2026-08-23)
 
-`fixture/` is the checked-in parser validation corpus. It is excluded from the Zig package so package tests remain self-contained. Package tests keep only byte-sensitive inputs under `tests/data/`; readable unit-test XML stays in its owning test.
+`fixture/` contains XML files used to check parser behavior. These files are tracked in the repository but are not included in the Zig package.
 
-`manifest.tsv` is the validation oracle. Each row states the expected classification and required processor features. Positive files combine compatible accepted behavior where one complete parse can exercise it. Negative files isolate one rejection because parsing stops at the first fatal error. Encoding files remain separate when byte order, declarations, malformed sequences, or line endings are the behavior under test. DTD and entity companions stay beside the document that resolves them.
+`manifest.tsv` lists each test file, its expected XML classification, and the parser features needed to check it. Accepted files can cover several related rules at once. Rejected files usually cover one error because parsing stops at the first fatal error.
 
-`valid/` contains accepted core XML, encoding, namespace, DTD, and XML 1.1 cases. `invalid/` separates not-well-formed XML, encoding failures, namespace violations, DTD validity failures, and XML 1.1 violations. Local benchmark inputs and plans belong under ignored `bench/`; generated, downloaded, and measured data belongs under ignored `data/`. Neither is part of this validation corpus.
+- `valid/` contains accepted core XML, encoding, namespace, DTD, and XML 1.1 cases.
+- `invalid/` contains malformed XML, encoding errors, namespace errors, DTD validation errors, and XML 1.1 errors.
+- DTD and entity files stay beside the XML document that refers to them.
+- Byte-sensitive package tests stay under `tests/data/`. Readable unit-test XML stays in the test source.
 
-Run `make -C ref check-byte-fixtures` after changing byte-sensitive fixtures. After building the adapters, run `make -C ref check-corpus` to check the manifest against the parser lanes.
+Benchmark files do not belong here. Local benchmark plans and small inputs live under ignored `bench/`. Generated files, downloads, and results live under ignored `data/`.
+
+After changing byte-sensitive fixtures, run:
+
+```sh
+make -C ref check-byte-fixtures
+```
+
+After building the parser adapters, check the complete manifest with:
+
+```sh
+make -C ref check-corpus
+```
