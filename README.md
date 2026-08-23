@@ -23,39 +23,15 @@ zig build --build-file tools/build.zig persistent-adapters -Doptimize=ReleaseFas
 zig build --build-file tools/build.zig layout -Doptimize=ReleaseFast
 ```
 
-The library surface is the `z_xml` module rooted at [`src/root.zig`](src/root.zig). The checked-in fixtures, [`tools/`](tools/README.md), and local reference laboratory in [`ref/`](ref/README.md) qualify it; they are qualification inputs, not runtime dependencies. Detailed XML support, API, engine, and consumer design is in [`plan/idea/`](plan/idea/README.md).
+The library surface is the `z_xml` module rooted at [`src/root.zig`](src/root.zig). The checked-in validation fixtures, [`tools/`](tools/README.md), and local reference laboratory in [`ref/`](ref/README.md) check it; they are development inputs, not runtime dependencies. Detailed XML support, API, engine, and consumer design is in [`plan/idea/`](plan/idea/README.md).
 
-The two test commands above cover the library. The remaining commands are qualification and measurement workflows.
+The two test commands above cover the library. The remaining commands are development checks.
 
 Build every reference once, then run the focused correctness gate:
 
 ```sh
 make -C ref all
 make -C ref check-corpus
-```
-
-Build and verify the host-tuned binaries and deterministic performance corpus before zebrac:
-
-```sh
-make -C ref all
-make -C ref smoke
-make -C ref check-generated
-```
-
-Generate and verify the full 1 MiB through 1 GiB matrix separately. It occupies about 10.3 GiB and is not committed:
-
-```sh
-make -C ref all
-make -C ref generate-corpus-full verify-corpus-full
-```
-
-Build and verify the maintained persistent protocols and their generated inputs:
-
-```sh
-zig build --build-file tools/build.zig persistent-adapters -Doptimize=ReleaseFast
-make -C ref all
-make -C ref generate-corpus-persistent generate-namespace-corpus
-make -C ref check-generated-persistent
 ```
 
 Fetch and check the official W3C XML Test Suite separately:
@@ -65,7 +41,7 @@ make -C ref all
 make -C ref check-xmlconf
 ```
 
-The focused peer corpus and W3C checks expose known reference-parser disagreements and exit nonzero. Generated and real benchmark artifacts are not committed, and Zebrac measurements wait until each selected workload passes its declared correctness profile and exact-output gate. The reference builder and Zebrac wrappers use the configured project commands; the wrappers also accept an explicit `--zebrac` override.
+The focused peer corpus and W3C checks expose known reference-parser disagreements and exit nonzero. `fixture/` contains validation cases only. Local benchmark plans and smoke inputs belong under ignored `bench/`; generated inputs, downloads, and results belong under ignored `data/`. They are local experiments, not repository evidence. Their commands and requirements are documented in [`tools/README.md`](tools/README.md).
 
 ---
 
