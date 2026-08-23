@@ -1,22 +1,14 @@
 # z-xml-fixtures-v1
 # id	path	classification	recommendation	feature_checks	benchmark_eligible	description
-core-minimal	valid/core/minimal.xml	well-formed	XML1.0-5e	document	yes	Minimal empty document element
-core-declaration	valid/core/declaration.xml	well-formed	XML1.0-5e	document,xml_declaration	yes	XML declaration with UTF-8 and standalone
-core-prolog-epilog	valid/core/prolog_epilog_misc.xml	well-formed	XML1.0-5e	document,xml_declaration,comments,pi	yes	Comments and processing instructions around root
-core-nested	valid/core/nested.xml	well-formed	XML1.0-5e	document,element_matching	yes	Nested and empty elements
-core-attributes	valid/core/attributes.xml	well-formed	XML1.0-5e	document,attributes	yes	Both quote styles and legal spacing
+core-declaration	valid/core/declaration.xml	well-formed	XML1.0-5e	document,xml_declaration	no	XML declaration with UTF-8 and standalone
 core-mixed	valid/core/mixed_content.xml	well-formed	XML1.0-5e	document	yes	Mixed text and element content
-core-cdata	valid/core/cdata.xml	well-formed	XML1.0-5e	document,cdata	yes	CDATA content containing markup-like bytes
+core-cdata	valid/core/cdata.xml	well-formed	XML1.0-5e	document,cdata	no	CDATA content containing markup-like bytes
 core-predefined	valid/core/predefined_entities.xml	well-formed	XML1.0-5e	document,predefined_entities	yes	Five predefined entities in text and attribute
-core-numeric	valid/core/numeric_references.xml	well-formed	XML1.0-5e	document,numeric_references	yes	Decimal hexadecimal and non-ASCII references
+core-numeric	valid/core/numeric_references.xml	well-formed	XML1.0-5e	document,numeric_references	no	Decimal hexadecimal and non-ASCII references
 core-unicode-text	valid/core/unicode_text.xml	well-formed	XML1.0-5e	document,utf8	yes	Valid UTF-8 text across code point widths
-core-unicode-names	valid/core/unicode_names.xml	well-formed	XML1.0-5e	document,unicode_names,utf8	yes	Non-ASCII element and attribute names
-core-name-characters	valid/core/name_characters.xml	well-formed	XML1.0-5e	document,unicode_names	yes	Legal punctuation digits and non-ASCII name starts
-core-whitespace	valid/core/whitespace.xml	well-formed	XML1.0-5e	document	yes	Legal document and element whitespace
-core-attribute-normalization	valid/core/attribute_normalization.xml	well-formed	XML1.0-5e	document,attributes,numeric_references	yes	Attribute whitespace and references
-core-comments	valid/core/comment_edges.xml	well-formed	XML1.0-5e	document,comments	yes	Legal comments with isolated hyphens
-core-pi	valid/core/processing_instruction.xml	well-formed	XML1.0-5e	document,pi	yes	Processing instructions in all legal regions
-core-explicit-empty	valid/core/empty_explicit.xml	well-formed	XML1.0-5e	document,element_matching	yes	Explicit and self-closing empty elements
+core-name-characters	valid/core/name_characters.xml	well-formed	XML1.0-5e	document,element_matching,unicode_names,utf8,attributes	no	Legal punctuation and non-ASCII element and attribute names
+core-comments	valid/core/comment_edges.xml	well-formed	XML1.0-5e	document,comments	no	Legal comments with isolated hyphens
+core-pi	valid/core/processing_instruction.xml	well-formed	XML1.0-5e	document,pi	no	Processing instructions in all legal regions
 shape-core-records	valid/core/shape_records.xml	well-formed	XML1.0-5e	document,attributes,element_matching,cdata,predefined_entities,numeric_references,utf8	yes	Varied record shape with nesting references CDATA and Unicode
 shape-core-attributes-wide	valid/core/shape_attributes_wide.xml	well-formed	XML1.0-5e	document,attributes	yes	Wide start tag with many source-ordered attributes
 shape-core-depth	valid/core/shape_depth.xml	well-formed	XML1.0-5e	document,element_matching	yes	Eight-level active nesting with a text leaf
@@ -34,33 +26,15 @@ encoding-latin1	valid/encoding/iso-8859-1.xml	well-formed	XML1.0-5e	document,lat
 encoding-ascii	valid/encoding/ascii-declared.xml	well-formed	XML1.0-5e	document,ascii	no	Declared US-ASCII document
 encoding-cr	valid/encoding/cr-line-endings.xml	well-formed	XML1.0-5e	document	no	Literal carriage-return line endings accepted and normalized by event adapters
 encoding-crlf	valid/encoding/crlf-line-endings.xml	well-formed	XML1.0-5e	document	no	Literal CRLF line endings accepted and normalized by event adapters
-ns-default	valid/namespaces/default.xml	namespace-valid	NS1.0-3e	document,namespaces	no	Default namespace
-ns-prefixed	valid/namespaces/prefixed.xml	namespace-valid	NS1.0-3e	document,namespaces	no	Prefixed elements and attributes
-ns-rebinding	valid/namespaces/rebinding.xml	namespace-valid	NS1.0-3e	document,namespaces	no	Nested prefix rebinding
-ns-default-attributes	valid/namespaces/default_does_not_apply_to_attributes.xml	namespace-valid	NS1.0-3e	document,namespaces	no	Default namespace exclusion for attributes
-ns-xml-prefix	valid/namespaces/xml_prefix.xml	namespace-valid	NS1.0-3e	document,namespaces	no	Predeclared xml prefix
-ns-default-undeclare	valid/namespaces/default_undeclaration.xml	namespace-valid	NS1.0-3e	document,namespaces	no	Default namespace undeclaration
-ns-equivalent-uri	valid/namespaces/equivalent_uri_spelling.xml	namespace-valid	NS1.0-3e	document,namespaces,numeric_references	no	Equivalent escaped namespace names
-shape-ns-churn	valid/namespaces/shape_namespace_churn.xml	namespace-valid	NS1.0-3e	document,namespaces,attributes,element_matching	no	Frequent prefix rebinding and default namespace changes
-dtd-empty	valid/dtd/empty.xml	dtd-valid	XML1.0-5e	dtd	no	EMPTY element declaration
-dtd-sequence	valid/dtd/sequence.xml	dtd-valid	XML1.0-5e	dtd	no	Sequence content model
-dtd-choice-repeat	valid/dtd/choice_and_repetition.xml	dtd-valid	XML1.0-5e	dtd	yes	Choice and repetition content model
-dtd-attributes	valid/dtd/attributes.xml	dtd-valid	XML1.0-5e	dtd	no	Required implied fixed and default attributes
-dtd-id-idref	valid/dtd/id_idref.xml	dtd-valid	XML1.0-5e	dtd	yes	ID and IDREF constraints
-dtd-internal-entity	valid/dtd/internal_entity.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	no	Declared internal general entity
-dtd-mixed	valid/dtd/mixed.xml	dtd-valid	XML1.0-5e	dtd	no	Mixed element content declaration
-dtd-enumeration	valid/dtd/enumeration.xml	dtd-valid	XML1.0-5e	dtd	no	Enumerated attribute value
-dtd-external	valid/dtd/external.xml	dtd-valid	XML1.0-5e	dtd,external_dtd	no	Local external DTD
+shape-ns-churn	valid/namespaces/shape_namespace_churn.xml	namespace-valid	NS1.0-3e	document,namespaces,attributes,element_matching,numeric_references	no	Default, prefixed, rebound, undeclared, reserved, and equivalent namespace bindings
 dtd-external-entities	valid/dtd/external_entities.xml	dtd-valid	XML1.0-5e	dtd,external_dtd,external_general_entities,external_parameter_entities	no	External subset, parameter entity, general entity, text declarations, and default attribute
 dtd-bounded-expansion	valid/dtd/bounded_entity_expansion.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	no	Bounded three-level internal entity expansion with 1000 output bytes
 dtd-parameter-entity	valid/dtd/parameter_entity_declaration.xml	dtd-valid	XML1.0-5e	dtd,internal_parameter_entities	no	Internal parameter entity supplies an element declaration
-dtd-any	valid/dtd/any.xml	dtd-valid	XML1.0-5e	dtd	no	ANY content with text child comment and processing instruction
 dtd-tokenized-attributes	valid/dtd/tokenized_attributes.xml	dtd-valid	XML1.0-5e	dtd	no	Every tokenized and enumerated attribute type with an unparsed entity
 dtd-standalone	valid/dtd/standalone.xml	dtd-valid	XML1.0-5e	dtd,external_dtd	no	Standalone document with an external declaration that does not affect content
-shape-dtd-density	valid/dtd/shape_declaration_density.xml	dtd-valid	XML1.0-5e	dtd,attributes	no	Declaration-dense catalog with IDs defaults and repeated metadata
+shape-dtd-density	valid/dtd/shape_declaration_density.xml	dtd-valid	XML1.0-5e	dtd,attributes	yes	Valid sequence, choice, repetition, mixed, ANY, EMPTY, attribute, ID, and IDREF constraints
 shape-dtd-entities	valid/dtd/shape_entities.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	no	Repeated internal general entity expansion
 bad-empty	invalid/not_well_formed/empty.xml	not-well-formed	XML1.0-5e	check_document_element	no	Empty document
-bad-whitespace-only	invalid/not_well_formed/whitespace_only.xml	not-well-formed	XML1.0-5e	check_document_element	no	Whitespace without document element
 bad-text-only	invalid/not_well_formed/text_only.xml	not-well-formed	XML1.0-5e	check_document_element	no	Character data without document element
 bad-multiple-roots	invalid/not_well_formed/multiple_roots.xml	not-well-formed	XML1.0-5e	check_single_root	no	Two document elements
 bad-mismatched	invalid/not_well_formed/mismatched_tags.xml	not-well-formed	XML1.0-5e	check_element_matching	no	Mismatched end tag
@@ -94,7 +68,6 @@ bad-attribute-truncated	invalid/not_well_formed/truncated_attribute.xml	not-well
 bad-start-tag-truncated	invalid/not_well_formed/truncated_start_tag.xml	not-well-formed	XML1.0-5e	check_complete_start_tag	no	Truncated start tag
 bad-entity-truncated	invalid/not_well_formed/truncated_entity.xml	not-well-formed	XML1.0-5e	check_entity_reference_syntax	no	Entity reference without semicolon
 bad-shape-duplicate-attribute	invalid/not_well_formed/shape_duplicate_attribute_late.xml	not-well-formed	XML1.0-5e	check_duplicate_attributes	no	Duplicate attribute after a wide start tag prefix
-bad-shape-mismatch-late	invalid/not_well_formed/shape_mismatch_late.xml	not-well-formed	XML1.0-5e	check_element_matching	no	Mismatched closing tag after valid nested records
 encoding-bad-utf8-continuation	invalid/encoding/utf8-lone-continuation.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	Lone UTF-8 continuation byte
 encoding-bad-utf8-overlong	invalid/encoding/utf8-overlong.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	Overlong UTF-8 encoding
 encoding-bad-utf8-truncated	invalid/encoding/utf8-truncated.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	Truncated UTF-8 multibyte sequence
@@ -152,7 +125,7 @@ dtd-bad-nmtokens	invalid/dtd/nmtokens_value.xml	dtd-invalid	XML1.0-5e	dtd	no	NMT
 dtd-bad-empty-comment	invalid/dtd/empty_contains_comment.xml	dtd-invalid	XML1.0-5e	dtd	no	EMPTY element contains a comment
 dtd-bad-element-cdata-space	invalid/dtd/element_content_cdata_whitespace.xml	dtd-invalid	XML1.0-5e	dtd	no	Element-only content contains CDATA whitespace
 dtd-bad-element-reference-space	invalid/dtd/element_content_reference_whitespace.xml	dtd-invalid	XML1.0-5e	dtd	no	Element-only content contains referenced whitespace
-dtd-bad-missing-doctype	invalid/dtd/missing_doctype.xml	dtd-invalid	XML1.0-5e	dtd	no	Document has no document type declaration
+dtd-bad-missing-doctype	benchmark/smoke/common.xml	dtd-invalid	XML1.0-5e	dtd	no	Document has no document type declaration
 dtd-bad-xml-space	invalid/dtd/xml_space_declaration.xml	dtd-invalid	XML1.0-5e	dtd	no	xml:space declaration contains an unsupported token
 dtd-bad-undeclared-attribute	invalid/dtd/undeclared_attribute.xml	dtd-invalid	XML1.0-5e	dtd	no	Element specifies an undeclared attribute
 dtd-bad-duplicate-notation	invalid/dtd/duplicate_notation_declaration.xml	dtd-invalid	XML1.0-5e	dtd	no	Notation name is declared twice
@@ -163,5 +136,5 @@ dtd-bad-standalone-whitespace	invalid/dtd/standalone_whitespace.xml	dtd-invalid	
 xml11-restricted-reference	valid/xml11/restricted_reference.xml	dtd-valid	XML1.1-2e	xml_version_1_1,dtd,numeric_references	no	Restricted XML 1.1 character produced by a numeric reference
 xml11-prefix-undeclaration	valid/xml11/prefix_undeclaration.xml	dtd-valid	NS1.1-2e	xml_version_1_1,dtd,namespaces	no	Prefixed namespace binding is undeclared for a child scope
 xml11-unbound-after-undeclaration	invalid/xml11/unbound_after_undeclaration.xml	namespace-invalid	NS1.1-2e	xml_version_1_1,dtd,namespaces,check_namespaces	no	Undeclared prefix is used after its binding is removed
-bench-common	benchmark/smoke/common.xml	benchmark-valid	XML1.0-5e	document,attributes,element_matching	yes	Shared basic adapter summary
+bench-common	benchmark/smoke/common.xml	benchmark-valid	XML1.0-5e	document,attributes,element_matching	yes	Shared event adapter summary
 bench-normalized	benchmark/smoke/normalized.xml	benchmark-valid	XML1.0-5e	document,attributes,numeric_references,cdata,predefined_entities	yes	Shared normalized adapter summary

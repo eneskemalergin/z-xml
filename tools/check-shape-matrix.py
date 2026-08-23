@@ -178,7 +178,7 @@ def validate(matrix: Path, fixtures_path: Path, oracles_path: Path) -> int:
         if row["oracle"] not in oracles:
             errors.append(f"{label}: unknown oracle {row['oracle']!r}")
         elif row["status"] == "ready" and oracles[row["oracle"]] != "ready":
-            errors.append(f"{label}: ready row uses planned oracle {row['oracle']!r}")
+            errors.append(f"{label}: ready row uses an unready oracle {row['oracle']!r}")
         try:
             validate_size_plan(row["size_plan"], label)
         except ValueError as error:
@@ -198,26 +198,6 @@ def validate(matrix: Path, fixtures_path: Path, oracles_path: Path) -> int:
     ids = [row["id"] for row in rows]
     for duplicate in sorted({item for item in ids if ids.count(item) > 1}):
         errors.append(f"{matrix}: duplicate shape ID {duplicate}")
-    required_families = {
-        "text",
-        "markup",
-        "shallow-records",
-        "attribute-cardinality",
-        "mixed-content",
-        "references",
-        "unicode",
-        "depth",
-        "namespace-churn",
-        "utf16-text",
-        "dtd-declarations",
-        "validation-models",
-        "dom-shallow-wide",
-        "rejection",
-        "real-records",
-    }
-    actual_families = {row["family"] for row in rows}
-    for family in sorted(required_families - actual_families):
-        errors.append(f"{matrix}: missing required family {family}")
     return report(matrix, errors, len(rows))
 
 

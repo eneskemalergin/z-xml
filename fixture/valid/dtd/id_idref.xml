@@ -1,6 +1,0 @@
-<!DOCTYPE graph [
-<!ELEMENT graph (node+)>
-<!ELEMENT node EMPTY>
-<!ATTLIST node id ID #REQUIRED link IDREF #IMPLIED>
-]>
-<graph><node id="first"/><node id="second" link="first"/></graph>

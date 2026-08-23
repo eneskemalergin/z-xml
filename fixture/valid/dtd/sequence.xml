@@ -1,6 +1,0 @@
-<!DOCTYPE record [
-<!ELEMENT record (title,year)>
-<!ELEMENT title (#PCDATA)>
-<!ELEMENT year (#PCDATA)>
-]>
-<record><title>Example</title><year>2026</year></record>

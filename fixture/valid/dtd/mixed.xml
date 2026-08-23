@@ -1,5 +1,0 @@
-<!DOCTYPE paragraph [
-<!ELEMENT paragraph (#PCDATA|emphasis)*>
-<!ELEMENT emphasis (#PCDATA)>
-]>
-<paragraph>before <emphasis>inside</emphasis> after</paragraph>

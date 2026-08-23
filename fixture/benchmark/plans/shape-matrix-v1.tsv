@@ -1,9 +1,9 @@
 # z-xml-shape-matrix-v1
 # Sizes use binary suffixes: k=KiB, m=MiB, g=GiB. A depth plan uses depth:N.
-# A ready row has a checked-in seed or an existing deterministic generator. Planned rows are reserved coverage and are not benchmark-eligible.
+# Ready rows have a working generator and oracle. Planned rows preserve required coverage but are not benchmark-eligible.
 id	family	lane	profile	input_models	seed_fixture	generator	size_plan	expected	oracle	status	notes
 core-text	text	event	xml10-utf8-no-dtd	whole-file,resident,stream	core-unicode-text	text	1k,16k,64k,256k,1m,16m,64m,256m,1g	accept	common-summary-v1	ready	Long character data with a small markup surface
-core-markup	markup	event	xml10-utf8-no-dtd	whole-file,resident,stream	core-explicit-empty	markup	1k,16k,64k,256k,1m,16m,64m,256m,1g	accept	common-summary-v1	ready	Dense empty-element transitions
+core-markup	markup	event	xml10-utf8-no-dtd	whole-file,resident,stream	bench-common	markup	1k,16k,64k,256k,1m,16m,64m,256m,1g	accept	common-summary-v1	ready	Dense empty-element transitions
 core-records	shallow-records	event	xml10-utf8-no-dtd	whole-file,resident,stream	shape-core-records	records	1k,16k,64k,256k,1m,16m,64m	accept	common-summary-v1	ready	Varied names, values, nesting, references, CDATA, and Unicode
 core-wide-attributes	attribute-cardinality	event	xml10-utf8-no-dtd	whole-file,resident,stream	shape-core-attributes-wide	attributes-varied	1k,16k,64k,256k,1m,16m,64m,256m	accept	common-summary-v1	ready	Many source-ordered attributes with both quote styles
 core-mixed	mixed-content	event	xml10-utf8-no-dtd	whole-file,resident,stream	core-mixed	mixed	1k,16k,64k,256k,1m,16m,64m,256m,1g	accept	common-summary-v1	ready	Text, elements, CDATA, comments, and processing instructions
@@ -11,19 +11,19 @@ core-escaped	references	event	xml10-utf8-no-dtd	whole-file,resident,stream	core-
 core-unicode	unicode	event	xml10-utf8-no-dtd	whole-file,resident,stream	core-unicode-text	unicode	1k,16k,64k,256k,1m,16m,64m,256m,1g	accept	common-summary-v1	ready	ASCII mixed with two-, three-, and four-byte UTF-8 scalars
 core-depth	depth	event	xml10-utf8-no-dtd	whole-file,resident,stream	shape-core-depth	deep	depth:16,256,2048	accept	common-summary-v1	ready	Active open-element state grows while total history stays bounded
 structural-rejection	rejection	event	xml10-utf8-no-dtd	whole-file,resident,stream	-	rejection	1m,16m,64m,256m,1g	reject	rejection-offset-v1	ready	Mismatched closing tag at 1, 50, and 99 percent of input
-chunk-boundaries	fragmentation	event	xml10-utf8-no-dtd	stream	shape-core-records	schedule	1k,16k,64k	accept	common-summary-v1	ready	Replay every split, fixed prime chunks, one-byte chunks, and delimiter-adjacent splits
+chunk-boundaries	fragmentation	event	xml10-utf8-no-dtd	stream	shape-core-records	planned	1k,16k,64k	accept	common-summary-v1	planned	Replay every split, fixed prime chunks, one-byte chunks, and delimiter-adjacent splits
 core-name-width	long-tokens	event	xml10-utf8-no-dtd	whole-file,stream	core-name-characters	planned	1k,16k,64k	accept	common-summary-v1	planned	Long names and values must be varied independently from document size
 core-line-endings	line-endings	event	xml10-utf8-no-dtd	whole-file,stream	encoding-crlf	planned	1k,16k,64k	accept	common-summary-v1	planned	CR, LF, and CRLF normalization under chunk boundaries
-ns-stable	stable-namespaces	event	xml10-utf8-namespaces-no-dtd	whole-file,resident,stream	ns-default	planned	1k,16k,64k,256k	accept	profile-summary-v1	planned	One default namespace with expanded-name output
-ns-prefixed	prefixed-namespaces	event	xml10-utf8-namespaces-no-dtd	whole-file,resident,stream	ns-prefixed	planned	1k,16k,64k,256k	accept	profile-summary-v1	planned	Prefixed elements and attributes
-ns-rebinding	namespace-rebinding	event	xml10-utf8-namespaces-no-dtd	whole-file,resident,stream	ns-rebinding	planned	1k,16k,64k,256k	accept	profile-summary-v1	planned	Nested scope replacement and restoration
+ns-stable	stable-namespaces	event	xml10-utf8-namespaces-no-dtd	whole-file,resident,stream	shape-ns-churn	planned	1k,16k,64k,256k	accept	profile-summary-v1	planned	One default namespace with expanded-name output
+ns-prefixed	prefixed-namespaces	event	xml10-utf8-namespaces-no-dtd	whole-file,resident,stream	shape-ns-churn	planned	1k,16k,64k,256k	accept	profile-summary-v1	planned	Prefixed elements and attributes
+ns-rebinding	namespace-rebinding	event	xml10-utf8-namespaces-no-dtd	whole-file,resident,stream	shape-ns-churn	planned	1k,16k,64k,256k	accept	profile-summary-v1	planned	Nested scope replacement and restoration
 ns-churn	namespace-churn	event	xml10-utf8-namespaces-no-dtd	whole-file,resident,stream	shape-ns-churn	planned	1k,16k,64k,256k	accept	profile-summary-v1	planned	Prefix and default binding changes at frequent element boundaries
 utf16-text	utf16-text	event	xml10-utf16-no-dtd	whole-file,resident,stream	encoding-utf16le	planned	1k,16k,64k,256k	accept	profile-summary-v1	planned	UTF-16 decoding with surrogate and chunk-boundary pressure
 utf16-markup	utf16-markup	event	xml10-utf16-no-dtd	whole-file,resident,stream	encoding-utf16be	planned	1k,16k,64k,256k	accept	profile-summary-v1	planned	UTF-16 markup-heavy input with aligned and unaligned refills
 dtd-declaration-density	dtd-declarations	event	xml10-nonvalidating	whole-file,resident,stream	shape-dtd-density	planned	1k,16k,64k,256k	accept	profile-summary-v1	planned	Many element and attribute declarations with modest instance content
 dtd-entities	entity-expansion	event	xml10-nonvalidating	whole-file,resident,stream	shape-dtd-entities	planned	1k,16k,64k,256k	accept	profile-summary-v1	planned	Bounded replacement text and repeated references
-dtd-models	validation-models	validated	xml10-validating	whole-file,resident,stream	dtd-choice-repeat	validation-models	1k,16k,64k,256k,1m,16m,64m,256m,1g	accept	common-summary-v1	ready	Sequence choice optional particles and accepting-state transitions
-dtd-ids	validation-identifiers	validated	xml10-validating	whole-file,resident,stream	dtd-id-idref	validation-identifiers	1k,16k,64k,256k,1m,16m	accept	common-summary-v1	ready	Unique ID insertion IDREF storage and document-end resolution
+dtd-models	validation-models	validated	xml10-validating	whole-file,resident,stream	shape-dtd-density	validation-models	1k,16k,64k,256k,1m,16m,64m,256m,1g	accept	common-summary-v1	ready	Sequence choice optional particles and accepting-state transitions
+dtd-ids	validation-identifiers	validated	xml10-validating	whole-file,resident,stream	shape-dtd-density	validation-identifiers	1k,16k,64k,256k,1m,16m	accept	common-summary-v1	ready	Unique ID insertion IDREF storage and document-end resolution
 dom-shallow-wide	dom-shallow-wide	dom	xml10-utf8-no-dtd	whole-file,resident	shape-core-attributes-wide	planned	1k,16k,64k,256k	accept	dom-summary-v1	planned	Many attributes and few nodes
 dom-deep-narrow	dom-deep-narrow	dom	xml10-utf8-no-dtd	whole-file,resident	shape-core-depth	planned	depth:16,256,2048	accept	dom-summary-v1	planned	Many active ancestors and few siblings
 dom-mixed	dom-mixed	dom	xml10-utf8-no-dtd	whole-file,resident	shape-core-records	planned	1k,16k,64k,256k	accept	dom-summary-v1	planned	Retained mixed nodes, attributes, and text

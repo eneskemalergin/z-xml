@@ -1,4 +1,4 @@
-<r:root xmlns:r="urn:root" xmlns:a="urn:outer-a" xmlns:b="urn:outer-b" xmlns="urn:default">
+<r:root xmlns:r="urn:root" xmlns:a="urn:outer-a" xmlns:b="urn:outer-b" xmlns="urn:default" plain="no-namespace" xml:lang="en">
   <a:item a:kind="one">
     <inner xmlns:a="urn:inner-a" xmlns="urn:inner-default">
       <a:item b:kind="two"/>
@@ -6,4 +6,5 @@
   </a:item>
   <b:item xmlns:b="urn:inner-b" b:kind="three"/>
   <plain xmlns=""><leaf xmlns="urn:leaf"/></plain>
+  <aliases xmlns:x="urn:example&amp;value" xmlns:y="urn:example&#38;value"><x:item/><y:item/></aliases>
 </r:root>
