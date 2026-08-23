@@ -23,8 +23,11 @@ tmp/
 ref/
 temp/
 data/
-!tests/data/
-!tests/data/**
 plan/
+bench/
 assets/
 experiments/
+
+# Exceptions
+!tests/data/
+!tests/data/**

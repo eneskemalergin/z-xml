@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=Path,
-        default=root / "fixture" / "benchmark" / "smoke" / "common.xml",
+        default=root / "bench" / "smoke" / "common.xml",
     )
     return parser.parse_args()
 

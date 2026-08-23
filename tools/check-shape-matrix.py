@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the tracked XML shape matrix and its checked-in seed references."""
+"""Validate the local XML shape matrix and its fixture references."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 SCHEMA = "z-xml-shape-matrix-v1"
+FIXTURE_SCHEMA = "z-xml-fixtures-v2"
 EXPECTED_COLUMNS = [
     "id",
     "family",
@@ -36,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--matrix",
         type=Path,
-        default=root / "fixture" / "benchmark" / "plans" / "shape-matrix-v1.tsv",
+        default=root / "bench" / "shapes.tsv",
     )
     parser.add_argument(
         "--fixtures",
@@ -46,13 +47,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--oracles",
         type=Path,
-        default=root / "fixture" / "benchmark" / "plans" / "oracles-v1.tsv",
+        default=root / "bench" / "oracles.tsv",
     )
     return parser.parse_args()
 
 
-def read_fixture_manifest(path: Path) -> dict[str, tuple[Path, str, str]]:
-    fixtures: dict[str, tuple[Path, str, str]] = {}
+def read_fixture_manifest(path: Path) -> dict[str, Path]:
+    fixtures: dict[str, Path] = {}
     with path.open(encoding="utf-8", newline="") as stream:
         lines = list(stream)
     header = next(
@@ -61,6 +62,8 @@ def read_fixture_manifest(path: Path) -> dict[str, tuple[Path, str, str]]:
     )
     if header is None:
         raise ValueError(f"{path}: missing fixture manifest header")
+    if not any(line.strip() == f"# {FIXTURE_SCHEMA}" for line in lines):
+        raise ValueError(f"{path}: missing {FIXTURE_SCHEMA} marker")
     data_lines = [header] + [line for line in lines if line.strip() and not line.startswith("#")]
     rows = csv.DictReader(data_lines, delimiter="\t")
     if rows.fieldnames != [
@@ -69,7 +72,6 @@ def read_fixture_manifest(path: Path) -> dict[str, tuple[Path, str, str]]:
         "classification",
         "recommendation",
         "feature_checks",
-        "benchmark_eligible",
         "description",
     ]:
         raise ValueError(f"{path}: unexpected fixture manifest columns")
@@ -84,11 +86,7 @@ def read_fixture_manifest(path: Path) -> dict[str, tuple[Path, str, str]]:
             raise ValueError(f"{path}:{line_number}: fixture path escapes root") from error
         if not fixture_path.is_file():
             raise ValueError(f"{path}:{line_number}: missing {fixture_path}")
-        fixtures[fixture_id] = (
-            fixture_path,
-            row["classification"],
-            row["benchmark_eligible"],
-        )
+        fixtures[fixture_id] = fixture_path
     if not fixtures:
         raise ValueError(f"{path}: empty fixture manifest")
     return fixtures
@@ -187,8 +185,6 @@ def validate(matrix: Path, fixtures_path: Path, oracles_path: Path) -> int:
         if seed != "-":
             if seed not in fixtures:
                 errors.append(f"{label}: unknown seed fixture {seed!r}")
-            elif row["status"] == "ready" and fixtures[seed][2] != "yes":
-                errors.append(f"{label}: ready seed {seed!r} is not benchmark eligible")
         elif row["status"] == "ready" and row["generator"] == "seed-only":
             errors.append(f"{label}: seed-only ready row has no seed fixture")
         if row["expected"] == "reject" and row["oracle"] == "common-summary-v1":

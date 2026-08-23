@@ -1,140 +1,138 @@
-# z-xml-fixtures-v1
-# id	path	classification	recommendation	feature_checks	benchmark_eligible	description
-core-declaration	valid/core/declaration.xml	well-formed	XML1.0-5e	document,xml_declaration	no	XML declaration with UTF-8 and standalone
-core-mixed	valid/core/mixed_content.xml	well-formed	XML1.0-5e	document	yes	Mixed text and element content
-core-cdata	valid/core/cdata.xml	well-formed	XML1.0-5e	document,cdata	no	CDATA content containing markup-like bytes
-core-predefined	valid/core/predefined_entities.xml	well-formed	XML1.0-5e	document,predefined_entities	yes	Five predefined entities in text and attribute
-core-numeric	valid/core/numeric_references.xml	well-formed	XML1.0-5e	document,numeric_references	no	Decimal hexadecimal and non-ASCII references
-core-unicode-text	valid/core/unicode_text.xml	well-formed	XML1.0-5e	document,utf8	yes	Valid UTF-8 text across code point widths
-core-name-characters	valid/core/name_characters.xml	well-formed	XML1.0-5e	document,element_matching,unicode_names,utf8,attributes	no	Legal punctuation and non-ASCII element and attribute names
-core-comments	valid/core/comment_edges.xml	well-formed	XML1.0-5e	document,comments	no	Legal comments with isolated hyphens
-core-pi	valid/core/processing_instruction.xml	well-formed	XML1.0-5e	document,pi	no	Processing instructions in all legal regions
-shape-core-records	valid/core/shape_records.xml	well-formed	XML1.0-5e	document,attributes,element_matching,cdata,predefined_entities,numeric_references,utf8	yes	Varied record shape with nesting references CDATA and Unicode
-shape-core-attributes-wide	valid/core/shape_attributes_wide.xml	well-formed	XML1.0-5e	document,attributes	yes	Wide start tag with many source-ordered attributes
-shape-core-depth	valid/core/shape_depth.xml	well-formed	XML1.0-5e	document,element_matching	yes	Eight-level active nesting with a text leaf
-encoding-utf8-bom	valid/encoding/utf8-bom.xml	well-formed	XML1.0-5e	document,utf8	no	UTF-8 byte order mark and multibyte text
-encoding-utf8-boundaries	valid/encoding/utf8-codepoint-boundaries.xml	well-formed	XML1.0-5e	document,utf8	no	Lowest legal two three and four byte UTF-8 sequences plus U+10FFFF
-encoding-utf16le	valid/encoding/utf16le-bom.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 little-endian document with required byte order mark
-encoding-utf16be	valid/encoding/utf16be-bom.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 big-endian document with required byte order mark
-encoding-utf16le-explicit	valid/encoding/utf16le-explicit.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 little-endian document with explicit endian declaration
-encoding-utf16be-explicit	valid/encoding/utf16be-explicit.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 big-endian document with explicit endian declaration
-encoding-utf16le-markup	valid/encoding/utf16le-markup.xml	well-formed	XML1.0-5e	document,utf16,unicode_names,attributes	no	UTF-16 names attributes supplementary text and CRLF normalization
-encoding-utf16be-no-declaration	valid/encoding/utf16be-no-declaration.xml	well-formed	XML1.0-5e	document,utf16	no	UTF-16 big-endian document without an XML declaration
-encoding-utf32le	valid/encoding/utf32le-bom.xml	well-formed	XML1.0-5e	document,utf32	no	UTF-32 little-endian document with required byte order mark
-encoding-utf32be	valid/encoding/utf32be-bom.xml	well-formed	XML1.0-5e	document,utf32	no	UTF-32 big-endian document with required byte order mark
-encoding-latin1	valid/encoding/iso-8859-1.xml	well-formed	XML1.0-5e	document,latin1	no	Declared ISO-8859-1 document with a non-ASCII byte
-encoding-ascii	valid/encoding/ascii-declared.xml	well-formed	XML1.0-5e	document,ascii	no	Declared US-ASCII document
-encoding-cr	valid/encoding/cr-line-endings.xml	well-formed	XML1.0-5e	document	no	Literal carriage-return line endings accepted and normalized by event adapters
-encoding-crlf	valid/encoding/crlf-line-endings.xml	well-formed	XML1.0-5e	document	no	Literal CRLF line endings accepted and normalized by event adapters
-shape-ns-churn	valid/namespaces/shape_namespace_churn.xml	namespace-valid	NS1.0-3e	document,namespaces,attributes,element_matching,numeric_references	no	Default, prefixed, rebound, undeclared, reserved, and equivalent namespace bindings
-dtd-external-entities	valid/dtd/external_entities.xml	dtd-valid	XML1.0-5e	dtd,external_dtd,external_general_entities,external_parameter_entities	no	External subset, parameter entity, general entity, text declarations, and default attribute
-dtd-bounded-expansion	valid/dtd/bounded_entity_expansion.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	no	Bounded three-level internal entity expansion with 1000 output bytes
-dtd-parameter-entity	valid/dtd/parameter_entity_declaration.xml	dtd-valid	XML1.0-5e	dtd,internal_parameter_entities	no	Internal parameter entity supplies an element declaration
-dtd-tokenized-attributes	valid/dtd/tokenized_attributes.xml	dtd-valid	XML1.0-5e	dtd	no	Every tokenized and enumerated attribute type with an unparsed entity
-dtd-standalone	valid/dtd/standalone.xml	dtd-valid	XML1.0-5e	dtd,external_dtd	no	Standalone document with an external declaration that does not affect content
-shape-dtd-density	valid/dtd/shape_declaration_density.xml	dtd-valid	XML1.0-5e	dtd,attributes	yes	Valid sequence, choice, repetition, mixed, ANY, EMPTY, attribute, ID, and IDREF constraints
-shape-dtd-entities	valid/dtd/shape_entities.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	no	Repeated internal general entity expansion
-bad-empty	invalid/not_well_formed/empty.xml	not-well-formed	XML1.0-5e	check_document_element	no	Empty document
-bad-text-only	invalid/not_well_formed/text_only.xml	not-well-formed	XML1.0-5e	check_document_element	no	Character data without document element
-bad-multiple-roots	invalid/not_well_formed/multiple_roots.xml	not-well-formed	XML1.0-5e	check_single_root	no	Two document elements
-bad-mismatched	invalid/not_well_formed/mismatched_tags.xml	not-well-formed	XML1.0-5e	check_element_matching	no	Mismatched end tag
-bad-unclosed-element	invalid/not_well_formed/unclosed_element.xml	not-well-formed	XML1.0-5e	check_complete_end_tag	no	Truncated end tag
-bad-unexpected-end	invalid/not_well_formed/unexpected_end.xml	not-well-formed	XML1.0-5e	check_element_matching	no	End tag without start
-bad-duplicate-attribute	invalid/not_well_formed/duplicate_attribute.xml	not-well-formed	XML1.0-5e	check_duplicate_attributes	no	Duplicate raw attribute name
-bad-unquoted-attribute	invalid/not_well_formed/unquoted_attribute.xml	not-well-formed	XML1.0-5e	check_attribute_syntax	no	Unquoted attribute value
-bad-missing-equals	invalid/not_well_formed/missing_equals.xml	not-well-formed	XML1.0-5e	check_attribute_syntax	no	Missing attribute equals sign
-bad-attribute-lt	invalid/not_well_formed/attribute_lt.xml	not-well-formed	XML1.0-5e	check_attribute_lt	no	Raw less-than in attribute value
-bad-undefined-entity	invalid/not_well_formed/undefined_entity.xml	not-well-formed	XML1.0-5e	check_declared_entities	no	Reference to undeclared entity
-bad-character-reference	invalid/not_well_formed/malformed_character_reference.xml	not-well-formed	XML1.0-5e	check_numeric_reference_syntax	no	Malformed hexadecimal character reference
-bad-zero-reference	invalid/not_well_formed/zero_character_reference.xml	not-well-formed	XML1.0-5e	check_zero_reference	no	Reference to forbidden null character
-bad-surrogate-reference	invalid/not_well_formed/surrogate_character_reference.xml	not-well-formed	XML1.0-5e	check_surrogate_reference	no	Reference to surrogate code point
-bad-range-reference	invalid/not_well_formed/out_of_range_character_reference.xml	not-well-formed	XML1.0-5e	check_range_reference	no	Reference above Unicode range
-bad-cdata-close-text	invalid/not_well_formed/cdata_close_in_text.xml	not-well-formed	XML1.0-5e	check_cdata_close	no	CDATA closing delimiter in normal text
-bad-comment-hyphen	invalid/not_well_formed/comment_double_hyphen.xml	not-well-formed	XML1.0-5e	check_comment_syntax	no	Double hyphen inside comment
-bad-comment-unclosed	invalid/not_well_formed/unclosed_comment.xml	not-well-formed	XML1.0-5e	check_comment_syntax	no	Unclosed comment
-bad-pi-target	invalid/not_well_formed/reserved_pi_target.xml	not-well-formed	XML1.0-5e	check_pi_target	no	Reserved xml processing instruction target
-bad-cdata-unclosed	invalid/not_well_formed/unclosed_cdata.xml	not-well-formed	XML1.0-5e	check_cdata_syntax	no	Unclosed CDATA section
-bad-text-before-root	invalid/not_well_formed/text_before_root.xml	not-well-formed	XML1.0-5e	check_document_text	no	Character data before root
-bad-text-after-root	invalid/not_well_formed/text_after_root.xml	not-well-formed	XML1.0-5e	check_document_text	no	Character data after root
-bad-declaration-position	invalid/not_well_formed/declaration_not_first.xml	not-well-formed	XML1.0-5e	check_xml_declaration_position	no	XML declaration after comment
-bad-declaration-duplicate	invalid/not_well_formed/duplicate_declaration.xml	not-well-formed	XML1.0-5e	check_xml_declaration_single	no	Two XML declarations
-bad-declaration-order	invalid/not_well_formed/declaration_attribute_order.xml	not-well-formed	XML1.0-5e	check_xml_declaration_order	no	Version not first in XML declaration
-bad-version	invalid/not_well_formed/unsupported_version.xml	not-well-formed	XML1.0-5e	check_xml_version_1_0	no	Unsupported XML version
-bad-doctype-position	invalid/not_well_formed/doctype_after_root.xml	not-well-formed	XML1.0-5e	check_doctype_position	no	DOCTYPE after document element
-bad-doctype-duplicate	invalid/not_well_formed/multiple_doctypes.xml	not-well-formed	XML1.0-5e	check_doctype_single	no	Two document type declarations
-bad-name-digit	invalid/not_well_formed/name_starts_with_digit.xml	not-well-formed	XML1.0-5e	check_name_syntax	no	Element name begins with digit
-bad-end-name-space	invalid/not_well_formed/space_in_end_tag.xml	not-well-formed	XML1.0-5e	check_element_matching	no	Whitespace before end-tag name
-bad-attribute-truncated	invalid/not_well_formed/truncated_attribute.xml	not-well-formed	XML1.0-5e	check_attribute_syntax	no	Truncated quoted attribute
-bad-start-tag-truncated	invalid/not_well_formed/truncated_start_tag.xml	not-well-formed	XML1.0-5e	check_complete_start_tag	no	Truncated start tag
-bad-entity-truncated	invalid/not_well_formed/truncated_entity.xml	not-well-formed	XML1.0-5e	check_entity_reference_syntax	no	Entity reference without semicolon
-bad-shape-duplicate-attribute	invalid/not_well_formed/shape_duplicate_attribute_late.xml	not-well-formed	XML1.0-5e	check_duplicate_attributes	no	Duplicate attribute after a wide start tag prefix
-encoding-bad-utf8-continuation	invalid/encoding/utf8-lone-continuation.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	Lone UTF-8 continuation byte
-encoding-bad-utf8-overlong	invalid/encoding/utf8-overlong.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	Overlong UTF-8 encoding
-encoding-bad-utf8-truncated	invalid/encoding/utf8-truncated.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	Truncated UTF-8 multibyte sequence
-encoding-bad-utf8-surrogate	invalid/encoding/utf8-surrogate.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	UTF-8 encoding of a surrogate code point
-encoding-bad-utf8-range	invalid/encoding/utf8-out-of-range.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	UTF-8 sequence above U+10FFFF
-encoding-bad-utf8-byte	invalid/encoding/utf8-invalid-byte.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	no	Byte FF in UTF-8 input
-encoding-bad-null	invalid/encoding/literal-null.xml	not-well-formed	XML1.0-5e	utf8,check_xml_characters	no	Literal null byte in character data
-encoding-bad-control	invalid/encoding/literal-control.xml	not-well-formed	XML1.0-5e	utf8,check_xml_characters	no	Forbidden literal XML control character U+0001
-encoding-bad-utf16-odd	invalid/encoding/utf16le-odd-byte.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	Odd byte count in UTF-16 little-endian input
-encoding-bad-utf16-high	invalid/encoding/utf16le-unpaired-high-surrogate.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	Unpaired UTF-16 high surrogate
-encoding-bad-utf16-low	invalid/encoding/utf16be-unpaired-low-surrogate.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	Unpaired UTF-16 low surrogate
-encoding-bad-utf16le-signature	invalid/encoding/utf16le-missing-signature.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	UTF-16 little-endian document without its required signature
-encoding-bad-utf16be-signature	invalid/encoding/utf16be-missing-signature.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	UTF-16 big-endian document without its required signature
-encoding-bad-utf16le-declared-be	invalid/encoding/utf16le-declared-be.xml	not-well-formed	XML1.0-5e	utf16,check_encoding_declaration	no	UTF-16 little-endian signature conflicts with big-endian declaration
-encoding-bad-utf16be-declared-le	invalid/encoding/utf16be-declared-le.xml	not-well-formed	XML1.0-5e	utf16,check_encoding_declaration	no	UTF-16 big-endian signature conflicts with little-endian declaration
-encoding-bad-utf16-high-final	invalid/encoding/utf16le-high-surrogate-final.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	no	UTF-16 stream ends after a high surrogate
-encoding-bad-declaration-utf16	invalid/encoding/declared-utf16-but-utf8.xml	not-well-formed	XML1.0-5e	utf16,check_encoding_declaration	no	UTF-8 bytes conflict with declared UTF-16 encoding
-encoding-bad-declaration-ascii	invalid/encoding/declared-ascii-with-high-byte.xml	not-well-formed	XML1.0-5e	ascii,check_encoding_declaration	no	Non-ASCII input conflicts with US-ASCII declaration
-bad-recursive-entity	invalid/not_well_formed/recursive_entity.xml	not-well-formed	XML1.0-5e	dtd,internal_entities,check_general_entity_recursion	no	Recursive internal general entity violates the no-recursion constraint
-bad-recursive-parameter-entity	invalid/not_well_formed/recursive_parameter_entity.xml	not-well-formed	XML1.0-5e	dtd,internal_parameter_entities,check_parameter_entity_recursion	no	Recursive internal parameter entity violates the no-recursion constraint
-bad-unparsed-entity-reference	invalid/not_well_formed/unparsed_entity_reference.xml	not-well-formed	XML1.0-5e	dtd,unparsed_entities,check_parsed_entity_reference	no	Reference to an unparsed entity in document content
-ns-bad-unbound-element	invalid/namespaces/unbound_element_prefix.xml	namespace-invalid	NS1.0-3e	check_namespaces	no	Unbound element prefix
-ns-bad-unbound-attribute	invalid/namespaces/unbound_attribute_prefix.xml	namespace-invalid	NS1.0-3e	check_namespaces	no	Unbound attribute prefix
-ns-bad-xml-binding	invalid/namespaces/xml_prefix_wrong_uri.xml	namespace-invalid	NS1.0-3e	check_namespaces	no	xml prefix bound to wrong URI
-ns-bad-xmlns-binding	invalid/namespaces/xmlns_prefix_binding.xml	namespace-invalid	NS1.0-3e	check_namespaces	no	xmlns prefix rebound
-ns-bad-xmlns-element	invalid/namespaces/xmlns_as_element_prefix.xml	namespace-invalid	NS1.0-3e	check_namespaces	no	xmlns used as element prefix
-ns-bad-expanded-attribute	invalid/namespaces/duplicate_expanded_attribute.xml	namespace-invalid	NS1.0-3e	check_namespaces,check_duplicate_attributes	no	Duplicate expanded attribute names
-ns-bad-multiple-colons	invalid/namespaces/multiple_colons.xml	namespace-invalid	NS1.0-3e	check_namespaces	no	Qualified name with multiple colons
-ns-bad-prefix-undeclare	invalid/namespaces/prefixed_undeclaration.xml	namespace-invalid	NS1.0-3e	check_namespaces	no	Prefixed namespace undeclaration
-ns-bad-default-uri	invalid/namespaces/default_bound_to_xmlns_uri.xml	namespace-invalid	NS1.0-3e	check_namespaces	no	Default namespace bound to reserved xmlns URI
-dtd-bad-root	invalid/dtd/root_name_mismatch.xml	dtd-invalid	XML1.0-5e	dtd	no	DOCTYPE name differs from document element
-dtd-bad-undeclared-element	invalid/dtd/undeclared_element.xml	dtd-invalid	XML1.0-5e	dtd	no	Element lacks declaration
-dtd-bad-sequence	invalid/dtd/wrong_sequence.xml	dtd-invalid	XML1.0-5e	dtd	no	Children violate declared sequence
-dtd-bad-required-attribute	invalid/dtd/required_attribute_missing.xml	dtd-invalid	XML1.0-5e	dtd	no	Required attribute missing
-dtd-bad-fixed-attribute	invalid/dtd/fixed_attribute_wrong.xml	dtd-invalid	XML1.0-5e	dtd	no	Fixed attribute has different value
-dtd-bad-duplicate-id	invalid/dtd/duplicate_id.xml	dtd-invalid	XML1.0-5e	dtd	no	Duplicate ID value
-dtd-bad-idref	invalid/dtd/missing_idref_target.xml	dtd-invalid	XML1.0-5e	dtd	no	IDREF has no matching ID
-dtd-bad-enumeration	invalid/dtd/enumeration_value.xml	dtd-invalid	XML1.0-5e	dtd	no	Attribute value outside enumeration
-dtd-bad-empty	invalid/dtd/empty_contains_child.xml	dtd-invalid	XML1.0-5e	dtd	no	EMPTY element contains child
-dtd-bad-element-text	invalid/dtd/element_content_text.xml	dtd-invalid	XML1.0-5e	dtd	no	Element-only content contains text
-dtd-bad-external	invalid/dtd/external_wrong_content.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	no	External DTD content model violation
-external-entity-unclosed	invalid/not_well_formed/external_entity_unclosed.xml	not-well-formed	XML1.0-5e	dtd,external_general_entities,check_element_matching	no	External parsed entity leaves an element open across its boundary
-dtd-bad-undeclared-root	invalid/dtd/undeclared_root.xml	dtd-invalid	XML1.0-5e	dtd	no	Document element has no declaration
-dtd-bad-nondeterministic	invalid/dtd/nondeterministic_content_model.xml	dtd-invalid	XML1.0-5e	dtd	no	Content model permits one child to match two particles
-dtd-bad-duplicate-element	invalid/dtd/duplicate_element_declaration.xml	dtd-invalid	XML1.0-5e	dtd	no	Element type is declared twice
-dtd-bad-multiple-id	invalid/dtd/multiple_id_declarations.xml	dtd-invalid	XML1.0-5e	dtd	no	Element type declares two ID attributes
-dtd-bad-id-default	invalid/dtd/id_default_value.xml	dtd-invalid	XML1.0-5e	dtd	no	ID attribute has a literal default
-dtd-bad-duplicate-mixed-name	invalid/dtd/duplicate_mixed_name.xml	dtd-invalid	XML1.0-5e	dtd	no	Mixed content names one child type twice
-dtd-bad-notation-empty	invalid/dtd/notation_on_empty_element.xml	dtd-invalid	XML1.0-5e	dtd	no	EMPTY element declares a NOTATION attribute
-dtd-bad-multiple-notation	invalid/dtd/multiple_notation_declarations.xml	dtd-invalid	XML1.0-5e	dtd	no	Element type declares two NOTATION attributes
-dtd-bad-undeclared-notation	invalid/dtd/undeclared_notation.xml	dtd-invalid	XML1.0-5e	dtd	no	NOTATION attribute names an undeclared notation
-dtd-bad-duplicate-enumeration	invalid/dtd/duplicate_enumeration_token.xml	dtd-invalid	XML1.0-5e	dtd	no	Enumeration repeats one token
-dtd-bad-entity-attribute	invalid/dtd/entity_attribute_value.xml	dtd-invalid	XML1.0-5e	dtd	no	ENTITY attribute names a parsed entity
-dtd-bad-nmtokens	invalid/dtd/nmtokens_value.xml	dtd-invalid	XML1.0-5e	dtd	no	NMTOKENS attribute contains non-name punctuation
-dtd-bad-empty-comment	invalid/dtd/empty_contains_comment.xml	dtd-invalid	XML1.0-5e	dtd	no	EMPTY element contains a comment
-dtd-bad-element-cdata-space	invalid/dtd/element_content_cdata_whitespace.xml	dtd-invalid	XML1.0-5e	dtd	no	Element-only content contains CDATA whitespace
-dtd-bad-element-reference-space	invalid/dtd/element_content_reference_whitespace.xml	dtd-invalid	XML1.0-5e	dtd	no	Element-only content contains referenced whitespace
-dtd-bad-missing-doctype	benchmark/smoke/common.xml	dtd-invalid	XML1.0-5e	dtd	no	Document has no document type declaration
-dtd-bad-xml-space	invalid/dtd/xml_space_declaration.xml	dtd-invalid	XML1.0-5e	dtd	no	xml:space declaration contains an unsupported token
-dtd-bad-undeclared-attribute	invalid/dtd/undeclared_attribute.xml	dtd-invalid	XML1.0-5e	dtd	no	Element specifies an undeclared attribute
-dtd-bad-duplicate-notation	invalid/dtd/duplicate_notation_declaration.xml	dtd-invalid	XML1.0-5e	dtd	no	Notation name is declared twice
-dtd-bad-standalone-default	invalid/dtd/standalone_default.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	no	Standalone document depends on an external default attribute
-dtd-bad-standalone-normalization	invalid/dtd/standalone_normalization.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	no	Standalone document depends on external tokenized normalization
-dtd-wf-standalone-entity	invalid/dtd/standalone_entity.xml	not-well-formed	XML1.0-5e	dtd,external_dtd,check_declared_entities	no	Standalone document references an externally declared entity
-dtd-bad-standalone-whitespace	invalid/dtd/standalone_whitespace.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	no	Standalone element-only content contains externally significant whitespace
-xml11-restricted-reference	valid/xml11/restricted_reference.xml	dtd-valid	XML1.1-2e	xml_version_1_1,dtd,numeric_references	no	Restricted XML 1.1 character produced by a numeric reference
-xml11-prefix-undeclaration	valid/xml11/prefix_undeclaration.xml	dtd-valid	NS1.1-2e	xml_version_1_1,dtd,namespaces	no	Prefixed namespace binding is undeclared for a child scope
-xml11-unbound-after-undeclaration	invalid/xml11/unbound_after_undeclaration.xml	namespace-invalid	NS1.1-2e	xml_version_1_1,dtd,namespaces,check_namespaces	no	Undeclared prefix is used after its binding is removed
-bench-common	benchmark/smoke/common.xml	benchmark-valid	XML1.0-5e	document,attributes,element_matching	yes	Shared event adapter summary
-bench-normalized	benchmark/smoke/normalized.xml	benchmark-valid	XML1.0-5e	document,attributes,numeric_references,cdata,predefined_entities	yes	Shared normalized adapter summary
+# z-xml-fixtures-v2
+# id	path	classification	recommendation	feature_checks	description
+core-declaration	valid/core/declaration.xml	well-formed	XML1.0-5e	document,xml_declaration	XML declaration with UTF-8 and standalone
+core-mixed	valid/core/mixed_content.xml	well-formed	XML1.0-5e	document	Mixed text and element content
+core-cdata	valid/core/cdata.xml	well-formed	XML1.0-5e	document,cdata	CDATA content containing markup-like bytes
+core-predefined	valid/core/predefined_entities.xml	well-formed	XML1.0-5e	document,predefined_entities	Five predefined entities in text and attribute
+core-numeric	valid/core/numeric_references.xml	well-formed	XML1.0-5e	document,numeric_references	Decimal hexadecimal and non-ASCII references
+core-unicode-text	valid/core/unicode_text.xml	well-formed	XML1.0-5e	document,utf8	Valid UTF-8 text across code point widths
+core-name-characters	valid/core/name_characters.xml	well-formed	XML1.0-5e	document,element_matching,unicode_names,utf8,attributes	Legal punctuation and non-ASCII element and attribute names
+core-comments	valid/core/comment_edges.xml	well-formed	XML1.0-5e	document,comments	Legal comments with isolated hyphens
+core-pi	valid/core/processing_instruction.xml	well-formed	XML1.0-5e	document,pi	Processing instructions in all legal regions
+core-combined-content	valid/core/combined_content.xml	well-formed	XML1.0-5e	document,attributes,element_matching,cdata,predefined_entities,numeric_references,utf8	Nested elements references CDATA attributes and Unicode
+core-many-attributes	valid/core/many_attributes.xml	well-formed	XML1.0-5e	document,attributes	Many source-ordered attributes using both quote styles
+core-nested-elements	valid/core/nested_elements.xml	well-formed	XML1.0-5e	document,element_matching	Eight nested elements with a text leaf
+encoding-utf8-bom	valid/encoding/utf8-bom.xml	well-formed	XML1.0-5e	document,utf8	UTF-8 byte order mark and multibyte text
+encoding-utf8-boundaries	valid/encoding/utf8-codepoint-boundaries.xml	well-formed	XML1.0-5e	document,utf8	Lowest legal two three and four byte UTF-8 sequences plus U+10FFFF
+encoding-utf16le	valid/encoding/utf16le-bom.xml	well-formed	XML1.0-5e	document,utf16	UTF-16 little-endian document with required byte order mark
+encoding-utf16be	valid/encoding/utf16be-bom.xml	well-formed	XML1.0-5e	document,utf16	UTF-16 big-endian document with required byte order mark
+encoding-utf16le-explicit	valid/encoding/utf16le-explicit.xml	well-formed	XML1.0-5e	document,utf16	UTF-16 little-endian document with explicit endian declaration
+encoding-utf16be-explicit	valid/encoding/utf16be-explicit.xml	well-formed	XML1.0-5e	document,utf16	UTF-16 big-endian document with explicit endian declaration
+encoding-utf16le-markup	valid/encoding/utf16le-markup.xml	well-formed	XML1.0-5e	document,utf16,unicode_names,attributes	UTF-16 names attributes supplementary text and CRLF normalization
+encoding-utf16be-no-declaration	valid/encoding/utf16be-no-declaration.xml	well-formed	XML1.0-5e	document,utf16	UTF-16 big-endian document without an XML declaration
+encoding-utf32le	valid/encoding/utf32le-bom.xml	well-formed	XML1.0-5e	document,utf32	UTF-32 little-endian document with required byte order mark
+encoding-utf32be	valid/encoding/utf32be-bom.xml	well-formed	XML1.0-5e	document,utf32	UTF-32 big-endian document with required byte order mark
+encoding-latin1	valid/encoding/iso-8859-1.xml	well-formed	XML1.0-5e	document,latin1	Declared ISO-8859-1 document with a non-ASCII byte
+encoding-ascii	valid/encoding/ascii-declared.xml	well-formed	XML1.0-5e	document,ascii	Declared US-ASCII document
+encoding-cr	valid/encoding/cr-line-endings.xml	well-formed	XML1.0-5e	document	Literal carriage-return line endings accepted and normalized by event adapters
+encoding-crlf	valid/encoding/crlf-line-endings.xml	well-formed	XML1.0-5e	document	Literal CRLF line endings accepted and normalized by event adapters
+ns-scope-rebinding	valid/namespaces/scope_rebinding.xml	namespace-valid	NS1.0-3e	document,namespaces,attributes,element_matching,numeric_references	Default and prefixed namespace rebinding undeclaration reserved names and equivalent URI references
+dtd-external-entities	valid/dtd/external_entities.xml	dtd-valid	XML1.0-5e	dtd,external_dtd,external_general_entities,external_parameter_entities	External subset, parameter entity, general entity, text declarations, and default attribute
+dtd-bounded-expansion	valid/dtd/bounded_entity_expansion.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	Bounded three-level internal entity expansion with 1000 output bytes
+dtd-parameter-entity	valid/dtd/parameter_entity_declaration.xml	dtd-valid	XML1.0-5e	dtd,internal_parameter_entities	Internal parameter entity supplies an element declaration
+dtd-tokenized-attributes	valid/dtd/tokenized_attributes.xml	dtd-valid	XML1.0-5e	dtd	Every tokenized and enumerated attribute type with an unparsed entity
+dtd-standalone	valid/dtd/standalone.xml	dtd-valid	XML1.0-5e	dtd,external_dtd	Standalone document with an external declaration that does not affect content
+dtd-combined-declarations	valid/dtd/combined_declarations.xml	dtd-valid	XML1.0-5e	dtd,attributes	Sequence choice repetition mixed ANY EMPTY attribute ID and IDREF constraints
+dtd-repeated-entities	valid/dtd/repeated_entities.xml	dtd-valid	XML1.0-5e	dtd,internal_entities	Repeated internal general entity references
+bad-empty	invalid/not_well_formed/empty.xml	not-well-formed	XML1.0-5e	check_document_element	Empty document
+bad-text-only	invalid/not_well_formed/text_only.xml	not-well-formed	XML1.0-5e	check_document_element	Character data without document element
+bad-multiple-roots	invalid/not_well_formed/multiple_roots.xml	not-well-formed	XML1.0-5e	check_single_root	Two document elements
+bad-mismatched	invalid/not_well_formed/mismatched_tags.xml	not-well-formed	XML1.0-5e	check_element_matching	Mismatched end tag
+bad-unclosed-element	invalid/not_well_formed/unclosed_element.xml	not-well-formed	XML1.0-5e	check_complete_end_tag	Truncated end tag
+bad-unexpected-end	invalid/not_well_formed/unexpected_end.xml	not-well-formed	XML1.0-5e	check_element_matching	End tag without start
+bad-duplicate-attribute	invalid/not_well_formed/duplicate_attribute.xml	not-well-formed	XML1.0-5e	check_duplicate_attributes	Duplicate raw attribute name
+bad-unquoted-attribute	invalid/not_well_formed/unquoted_attribute.xml	not-well-formed	XML1.0-5e	check_attribute_syntax	Unquoted attribute value
+bad-missing-equals	invalid/not_well_formed/missing_equals.xml	not-well-formed	XML1.0-5e	check_attribute_syntax	Missing attribute equals sign
+bad-attribute-lt	invalid/not_well_formed/attribute_lt.xml	not-well-formed	XML1.0-5e	check_attribute_lt	Raw less-than in attribute value
+bad-undefined-entity	invalid/not_well_formed/undefined_entity.xml	not-well-formed	XML1.0-5e	check_declared_entities	Reference to undeclared entity
+bad-character-reference	invalid/not_well_formed/malformed_character_reference.xml	not-well-formed	XML1.0-5e	check_numeric_reference_syntax	Malformed hexadecimal character reference
+bad-zero-reference	invalid/not_well_formed/zero_character_reference.xml	not-well-formed	XML1.0-5e	check_zero_reference	Reference to forbidden null character
+bad-surrogate-reference	invalid/not_well_formed/surrogate_character_reference.xml	not-well-formed	XML1.0-5e	check_surrogate_reference	Reference to surrogate code point
+bad-range-reference	invalid/not_well_formed/out_of_range_character_reference.xml	not-well-formed	XML1.0-5e	check_range_reference	Reference above Unicode range
+bad-cdata-close-text	invalid/not_well_formed/cdata_close_in_text.xml	not-well-formed	XML1.0-5e	check_cdata_close	CDATA closing delimiter in normal text
+bad-comment-hyphen	invalid/not_well_formed/comment_double_hyphen.xml	not-well-formed	XML1.0-5e	check_comment_syntax	Double hyphen inside comment
+bad-comment-unclosed	invalid/not_well_formed/unclosed_comment.xml	not-well-formed	XML1.0-5e	check_comment_syntax	Unclosed comment
+bad-pi-target	invalid/not_well_formed/reserved_pi_target.xml	not-well-formed	XML1.0-5e	check_pi_target	Reserved xml processing instruction target
+bad-cdata-unclosed	invalid/not_well_formed/unclosed_cdata.xml	not-well-formed	XML1.0-5e	check_cdata_syntax	Unclosed CDATA section
+bad-text-before-root	invalid/not_well_formed/text_before_root.xml	not-well-formed	XML1.0-5e	check_document_text	Character data before root
+bad-text-after-root	invalid/not_well_formed/text_after_root.xml	not-well-formed	XML1.0-5e	check_document_text	Character data after root
+bad-declaration-position	invalid/not_well_formed/declaration_not_first.xml	not-well-formed	XML1.0-5e	check_xml_declaration_position	XML declaration after comment
+bad-declaration-duplicate	invalid/not_well_formed/duplicate_declaration.xml	not-well-formed	XML1.0-5e	check_xml_declaration_single	Two XML declarations
+bad-declaration-order	invalid/not_well_formed/declaration_attribute_order.xml	not-well-formed	XML1.0-5e	check_xml_declaration_order	Version not first in XML declaration
+bad-version	invalid/not_well_formed/unsupported_version.xml	not-well-formed	XML1.0-5e	check_xml_version_1_0	Unsupported XML version
+bad-doctype-position	invalid/not_well_formed/doctype_after_root.xml	not-well-formed	XML1.0-5e	check_doctype_position	DOCTYPE after document element
+bad-doctype-duplicate	invalid/not_well_formed/multiple_doctypes.xml	not-well-formed	XML1.0-5e	check_doctype_single	Two document type declarations
+bad-name-digit	invalid/not_well_formed/name_starts_with_digit.xml	not-well-formed	XML1.0-5e	check_name_syntax	Element name begins with digit
+bad-end-name-space	invalid/not_well_formed/space_in_end_tag.xml	not-well-formed	XML1.0-5e	check_element_matching	Whitespace before end-tag name
+bad-attribute-truncated	invalid/not_well_formed/truncated_attribute.xml	not-well-formed	XML1.0-5e	check_attribute_syntax	Truncated quoted attribute
+bad-start-tag-truncated	invalid/not_well_formed/truncated_start_tag.xml	not-well-formed	XML1.0-5e	check_complete_start_tag	Truncated start tag
+bad-entity-truncated	invalid/not_well_formed/truncated_entity.xml	not-well-formed	XML1.0-5e	check_entity_reference_syntax	Entity reference without semicolon
+bad-shape-duplicate-attribute	invalid/not_well_formed/shape_duplicate_attribute_late.xml	not-well-formed	XML1.0-5e	check_duplicate_attributes	Duplicate attribute after a wide start tag prefix
+encoding-bad-utf8-continuation	invalid/encoding/utf8-lone-continuation.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	Lone UTF-8 continuation byte
+encoding-bad-utf8-overlong	invalid/encoding/utf8-overlong.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	Overlong UTF-8 encoding
+encoding-bad-utf8-truncated	invalid/encoding/utf8-truncated.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	Truncated UTF-8 multibyte sequence
+encoding-bad-utf8-surrogate	invalid/encoding/utf8-surrogate.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	UTF-8 encoding of a surrogate code point
+encoding-bad-utf8-range	invalid/encoding/utf8-out-of-range.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	UTF-8 sequence above U+10FFFF
+encoding-bad-utf8-byte	invalid/encoding/utf8-invalid-byte.xml	not-well-formed	XML1.0-5e	utf8,check_utf8_encoding	Byte FF in UTF-8 input
+encoding-bad-null	invalid/encoding/literal-null.xml	not-well-formed	XML1.0-5e	utf8,check_xml_characters	Literal null byte in character data
+encoding-bad-control	invalid/encoding/literal-control.xml	not-well-formed	XML1.0-5e	utf8,check_xml_characters	Forbidden literal XML control character U+0001
+encoding-bad-utf16-odd	invalid/encoding/utf16le-odd-byte.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	Odd byte count in UTF-16 little-endian input
+encoding-bad-utf16-high	invalid/encoding/utf16le-unpaired-high-surrogate.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	Unpaired UTF-16 high surrogate
+encoding-bad-utf16-low	invalid/encoding/utf16be-unpaired-low-surrogate.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	Unpaired UTF-16 low surrogate
+encoding-bad-utf16le-signature	invalid/encoding/utf16le-missing-signature.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	UTF-16 little-endian document without its required signature
+encoding-bad-utf16be-signature	invalid/encoding/utf16be-missing-signature.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	UTF-16 big-endian document without its required signature
+encoding-bad-utf16le-declared-be	invalid/encoding/utf16le-declared-be.xml	not-well-formed	XML1.0-5e	utf16,check_encoding_declaration	UTF-16 little-endian signature conflicts with big-endian declaration
+encoding-bad-utf16be-declared-le	invalid/encoding/utf16be-declared-le.xml	not-well-formed	XML1.0-5e	utf16,check_encoding_declaration	UTF-16 big-endian signature conflicts with little-endian declaration
+encoding-bad-utf16-high-final	invalid/encoding/utf16le-high-surrogate-final.xml	not-well-formed	XML1.0-5e	utf16,check_utf16_encoding	UTF-16 stream ends after a high surrogate
+encoding-bad-declaration-utf16	invalid/encoding/declared-utf16-but-utf8.xml	not-well-formed	XML1.0-5e	utf16,check_encoding_declaration	UTF-8 bytes conflict with declared UTF-16 encoding
+encoding-bad-declaration-ascii	invalid/encoding/declared-ascii-with-high-byte.xml	not-well-formed	XML1.0-5e	ascii,check_encoding_declaration	Non-ASCII input conflicts with US-ASCII declaration
+bad-recursive-entity	invalid/not_well_formed/recursive_entity.xml	not-well-formed	XML1.0-5e	dtd,internal_entities,check_general_entity_recursion	Recursive internal general entity violates the no-recursion constraint
+bad-recursive-parameter-entity	invalid/not_well_formed/recursive_parameter_entity.xml	not-well-formed	XML1.0-5e	dtd,internal_parameter_entities,check_parameter_entity_recursion	Recursive internal parameter entity violates the no-recursion constraint
+bad-unparsed-entity-reference	invalid/not_well_formed/unparsed_entity_reference.xml	not-well-formed	XML1.0-5e	dtd,unparsed_entities,check_parsed_entity_reference	Reference to an unparsed entity in document content
+ns-bad-unbound-element	invalid/namespaces/unbound_element_prefix.xml	namespace-invalid	NS1.0-3e	check_namespaces	Unbound element prefix
+ns-bad-unbound-attribute	invalid/namespaces/unbound_attribute_prefix.xml	namespace-invalid	NS1.0-3e	check_namespaces	Unbound attribute prefix
+ns-bad-xml-binding	invalid/namespaces/xml_prefix_wrong_uri.xml	namespace-invalid	NS1.0-3e	check_namespaces	xml prefix bound to wrong URI
+ns-bad-xmlns-binding	invalid/namespaces/xmlns_prefix_binding.xml	namespace-invalid	NS1.0-3e	check_namespaces	xmlns prefix rebound
+ns-bad-xmlns-element	invalid/namespaces/xmlns_as_element_prefix.xml	namespace-invalid	NS1.0-3e	check_namespaces	xmlns used as element prefix
+ns-bad-expanded-attribute	invalid/namespaces/duplicate_expanded_attribute.xml	namespace-invalid	NS1.0-3e	check_namespaces,check_duplicate_attributes	Duplicate expanded attribute names
+ns-bad-multiple-colons	invalid/namespaces/multiple_colons.xml	namespace-invalid	NS1.0-3e	check_namespaces	Qualified name with multiple colons
+ns-bad-prefix-undeclare	invalid/namespaces/prefixed_undeclaration.xml	namespace-invalid	NS1.0-3e	check_namespaces	Prefixed namespace undeclaration
+ns-bad-default-uri	invalid/namespaces/default_bound_to_xmlns_uri.xml	namespace-invalid	NS1.0-3e	check_namespaces	Default namespace bound to reserved xmlns URI
+dtd-bad-root	invalid/dtd/root_name_mismatch.xml	dtd-invalid	XML1.0-5e	dtd	DOCTYPE name differs from document element
+dtd-bad-undeclared-element	invalid/dtd/undeclared_element.xml	dtd-invalid	XML1.0-5e	dtd	Element lacks declaration
+dtd-bad-sequence	invalid/dtd/wrong_sequence.xml	dtd-invalid	XML1.0-5e	dtd	Children violate declared sequence
+dtd-bad-required-attribute	invalid/dtd/required_attribute_missing.xml	dtd-invalid	XML1.0-5e	dtd	Required attribute missing
+dtd-bad-fixed-attribute	invalid/dtd/fixed_attribute_wrong.xml	dtd-invalid	XML1.0-5e	dtd	Fixed attribute has different value
+dtd-bad-duplicate-id	invalid/dtd/duplicate_id.xml	dtd-invalid	XML1.0-5e	dtd	Duplicate ID value
+dtd-bad-idref	invalid/dtd/missing_idref_target.xml	dtd-invalid	XML1.0-5e	dtd	IDREF has no matching ID
+dtd-bad-enumeration	invalid/dtd/enumeration_value.xml	dtd-invalid	XML1.0-5e	dtd	Attribute value outside enumeration
+dtd-bad-empty	invalid/dtd/empty_contains_child.xml	dtd-invalid	XML1.0-5e	dtd	EMPTY element contains child
+dtd-bad-element-text	invalid/dtd/element_content_text.xml	dtd-invalid	XML1.0-5e	dtd	Element-only content contains text
+dtd-bad-external	invalid/dtd/external_wrong_content.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	External DTD content model violation
+external-entity-unclosed	invalid/not_well_formed/external_entity_unclosed.xml	not-well-formed	XML1.0-5e	dtd,external_general_entities,check_element_matching	External parsed entity leaves an element open across its boundary
+dtd-bad-undeclared-root	invalid/dtd/undeclared_root.xml	dtd-invalid	XML1.0-5e	dtd	Document element has no declaration
+dtd-bad-nondeterministic	invalid/dtd/nondeterministic_content_model.xml	dtd-invalid	XML1.0-5e	dtd	Content model permits one child to match two particles
+dtd-bad-duplicate-element	invalid/dtd/duplicate_element_declaration.xml	dtd-invalid	XML1.0-5e	dtd	Element type is declared twice
+dtd-bad-multiple-id	invalid/dtd/multiple_id_declarations.xml	dtd-invalid	XML1.0-5e	dtd	Element type declares two ID attributes
+dtd-bad-id-default	invalid/dtd/id_default_value.xml	dtd-invalid	XML1.0-5e	dtd	ID attribute has a literal default
+dtd-bad-duplicate-mixed-name	invalid/dtd/duplicate_mixed_name.xml	dtd-invalid	XML1.0-5e	dtd	Mixed content names one child type twice
+dtd-bad-notation-empty	invalid/dtd/notation_on_empty_element.xml	dtd-invalid	XML1.0-5e	dtd	EMPTY element declares a NOTATION attribute
+dtd-bad-multiple-notation	invalid/dtd/multiple_notation_declarations.xml	dtd-invalid	XML1.0-5e	dtd	Element type declares two NOTATION attributes
+dtd-bad-undeclared-notation	invalid/dtd/undeclared_notation.xml	dtd-invalid	XML1.0-5e	dtd	NOTATION attribute names an undeclared notation
+dtd-bad-duplicate-enumeration	invalid/dtd/duplicate_enumeration_token.xml	dtd-invalid	XML1.0-5e	dtd	Enumeration repeats one token
+dtd-bad-entity-attribute	invalid/dtd/entity_attribute_value.xml	dtd-invalid	XML1.0-5e	dtd	ENTITY attribute names a parsed entity
+dtd-bad-nmtokens	invalid/dtd/nmtokens_value.xml	dtd-invalid	XML1.0-5e	dtd	NMTOKENS attribute contains non-name punctuation
+dtd-bad-empty-comment	invalid/dtd/empty_contains_comment.xml	dtd-invalid	XML1.0-5e	dtd	EMPTY element contains a comment
+dtd-bad-element-cdata-space	invalid/dtd/element_content_cdata_whitespace.xml	dtd-invalid	XML1.0-5e	dtd	Element-only content contains CDATA whitespace
+dtd-bad-element-reference-space	invalid/dtd/element_content_reference_whitespace.xml	dtd-invalid	XML1.0-5e	dtd	Element-only content contains referenced whitespace
+dtd-bad-missing-doctype	valid/core/mixed_content.xml	dtd-invalid	XML1.0-5e	dtd	Document has no document type declaration
+dtd-bad-xml-space	invalid/dtd/xml_space_declaration.xml	dtd-invalid	XML1.0-5e	dtd	xml:space declaration contains an unsupported token
+dtd-bad-undeclared-attribute	invalid/dtd/undeclared_attribute.xml	dtd-invalid	XML1.0-5e	dtd	Element specifies an undeclared attribute
+dtd-bad-duplicate-notation	invalid/dtd/duplicate_notation_declaration.xml	dtd-invalid	XML1.0-5e	dtd	Notation name is declared twice
+dtd-bad-standalone-default	invalid/dtd/standalone_default.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	Standalone document depends on an external default attribute
+dtd-bad-standalone-normalization	invalid/dtd/standalone_normalization.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	Standalone document depends on external tokenized normalization
+dtd-wf-standalone-entity	invalid/dtd/standalone_entity.xml	not-well-formed	XML1.0-5e	dtd,external_dtd,check_declared_entities	Standalone document references an externally declared entity
+dtd-bad-standalone-whitespace	invalid/dtd/standalone_whitespace.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	Standalone element-only content contains externally significant whitespace
+xml11-restricted-reference	valid/xml11/restricted_reference.xml	dtd-valid	XML1.1-2e	xml_version_1_1,dtd,numeric_references	Restricted XML 1.1 character produced by a numeric reference
+xml11-prefix-undeclaration	valid/xml11/prefix_undeclaration.xml	dtd-valid	NS1.1-2e	xml_version_1_1,dtd,namespaces	Prefixed namespace binding is undeclared for a child scope
+xml11-unbound-after-undeclaration	invalid/xml11/unbound_after_undeclaration.xml	namespace-invalid	NS1.1-2e	xml_version_1_1,dtd,namespaces,check_namespaces	Undeclared prefix is used after its binding is removed
