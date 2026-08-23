@@ -1,4 +1,4 @@
-//! Compile-time reader shape and lifecycle contract.
+//! Incremental XML parsing and the normal Reader API.
 
 const std = @import("std");
 const encoding_module = @import("encoding.zig");
@@ -77,12 +77,6 @@ pub const Profile = enum {
             else => false,
         };
     }
-
-    /// Returns whether the reader implements the profile's complete grammar.
-    pub fn isImplemented(comptime self: Profile) bool {
-        _ = self;
-        return true;
-    }
 };
 
 /// DTD capability implied by a profile.
@@ -124,7 +118,7 @@ pub const Config = struct {
     }
 };
 
-/// Named configurations for normal callers and benchmark lanes.
+/// Named configurations for specialized parser users and package tools.
 pub const Configs = struct {
     /// Line-aware XML 1.0 UTF-8 core profile.
     pub const XML10_UTF8_NO_DTD: Config = .{
@@ -242,6 +236,9 @@ pub const Lifecycle = enum {
 
 /// Runtime limits enforced by the reader.
 pub const Limits = struct {
+    /// Finite default limits for the normal reader.
+    pub const general: Limits = .{};
+
     /// Maximum simultaneously open element count.
     max_depth: usize = 256,
     /// Maximum cumulative raw-name bytes for open elements.
@@ -368,8 +365,9 @@ pub const MemoryUsage = struct {
 
 /// Stable diagnostic category returned by the reader.
 pub const DiagnosticCode = enum {
-    invalid_state,
-    unsupported_profile,
+    dtd_forbidden,
+    external_resource_forbidden,
+    out_of_memory,
     empty_document,
     unexpected_document_text,
     malformed_start_tag,
@@ -429,7 +427,6 @@ pub const DiagnosticCode = enum {
     unclosed_cdata,
     malformed_markup_declaration,
     misplaced_doctype,
-    unsupported_doctype,
     malformed_doctype,
     external_subset_mismatch,
     malformed_dtd,
@@ -922,6 +919,332 @@ pub const ResetError = error{
     InvalidState,
 };
 
+/// Caller-owned input that remains valid until the reader is deinitialized.
+pub const NormalSource = union(enum) {
+    slice: []const u8,
+    stream: *std.Io.Reader,
+};
+
+/// Namespace handling selected at runtime by the normal reader.
+pub const NormalNamespacePolicy = enum {
+    process,
+    raw,
+};
+
+/// External-resource handling selected at runtime by the normal reader.
+pub const NormalExternalPolicy = enum {
+    forbid,
+    skip,
+    resolve,
+};
+
+/// One DTD validity finding.
+pub const NormalDtdFinding = struct {
+    code: DiagnosticCode,
+    primary: NormalLocation,
+    related: ?NormalLocation = null,
+};
+
+/// Action returned by a DTD validity finding callback.
+pub const NormalDtdFindingAction = enum {
+    continue_validation,
+    cancel,
+};
+
+/// Synchronous DTD validity finding callback.
+pub const NormalDtdFindingSink = struct {
+    context: ?*anyopaque,
+    report_fn: *const fn (?*anyopaque, NormalDtdFinding) NormalDtdFindingAction,
+
+    /// Reports one borrowed finding.
+    pub fn report(self: NormalDtdFindingSink, finding: NormalDtdFinding) NormalDtdFindingAction {
+        return self.report_fn(self.context, finding);
+    }
+};
+
+/// Runtime options used when DTD validation is enabled.
+pub const NormalDtdValidationOptions = struct {
+    finding_sink: ?NormalDtdFindingSink = null,
+    external_subset: ?*const external_subset_module.ExternalSubset = null,
+};
+
+/// DTD behavior selected at runtime by the normal reader.
+pub const NormalDtdPolicy = union(enum) {
+    reject,
+    process,
+    validate: NormalDtdValidationOptions,
+};
+
+/// Runtime XML 1.1 normalization behavior for the normal reader.
+pub const NormalNormalizationPolicy = enum {
+    report,
+    require,
+    unchecked,
+};
+
+/// Original physical byte range in one XML source.
+pub const NormalSourceSpan = struct {
+    source_id: u32,
+    start: u64,
+    end: u64,
+};
+
+/// Physical source location with optional line information.
+pub const NormalLocation = struct {
+    source_id: u32,
+    byte_offset: u64,
+    line: ?u64,
+    byte_column: ?u64,
+};
+
+/// Fatal reader diagnostic whose inclusion trace borrows reader storage.
+pub const NormalDiagnostic = struct {
+    code: DiagnosticCode,
+    primary: NormalLocation,
+    related: ?NormalLocation,
+    inclusion_trace: []const NormalLocation,
+};
+
+/// Synchronous fatal diagnostic callback.
+pub const NormalDiagnosticSink = struct {
+    context: ?*anyopaque,
+    report_fn: *const fn (?*anyopaque, NormalDiagnostic) void,
+
+    /// Reports one borrowed fatal diagnostic.
+    pub fn report(self: NormalDiagnosticSink, diagnostic: NormalDiagnostic) void {
+        self.report_fn(self.context, diagnostic);
+    }
+};
+
+/// Runtime options retain caller-owned pointers, slices, and callback contexts.
+/// Those borrows must remain valid through deinit.
+pub const NormalReaderOptions = struct {
+    limits: Limits = Limits.general,
+    namespaces: NormalNamespacePolicy = .process,
+    dtd: NormalDtdPolicy = .process,
+    external: NormalExternalPolicy = .forbid,
+    resolver: ?resolver_module.Resolver = null,
+    document_base_id: ?[]const u8 = null,
+    transcoder: ?encoding_module.Transcoder = null,
+    track_lines: bool = true,
+    normalization: NormalNormalizationPolicy = .report,
+    diagnostic_sink: ?NormalDiagnosticSink = null,
+};
+
+/// Errors reported while constructing the normal reader.
+pub const NormalInitError = error{InvalidOptions};
+
+/// Errors reported while producing a normal reader event.
+pub const NormalReadError = error{
+    InvalidXml,
+    UnsupportedVersion,
+    InvalidEncoding,
+    UnsupportedEncoding,
+    DtdForbidden,
+    ExternalResourceForbidden,
+    ExternalResourceUnavailable,
+    ExternalResourceFailed,
+    NotNormalized,
+    LimitExceeded,
+    ReadFailed,
+    Cancelled,
+    OutOfMemory,
+    InvalidState,
+};
+
+/// Errors reported while replacing a normal reader source and options.
+pub const NormalResetError = error{
+    InvalidOptions,
+    InvalidState,
+};
+
+/// Resolved identity of a namespace-aware name.
+pub const NormalExpandedName = struct {
+    prefix: ?[]const u8,
+    local: []const u8,
+    namespace_uri: ?[]const u8,
+};
+
+/// Raw name spelling with optional namespace identity.
+pub const NormalName = struct {
+    raw: []const u8,
+    expanded: ?NormalExpandedName,
+
+    /// Returns whether the expanded identity matches.
+    pub fn eql(self: NormalName, namespace_uri: ?[]const u8, local: []const u8) bool {
+        const expanded = self.expanded orelse return false;
+        return optionalBytesOrder(expanded.namespace_uri, namespace_uri) == .eq and
+            std.mem.eql(u8, expanded.local, local);
+    }
+
+    /// Returns whether the raw source spelling matches.
+    pub fn eqlRaw(self: NormalName, raw: []const u8) bool {
+        return std.mem.eql(u8, self.raw, raw);
+    }
+};
+
+/// Attribute borrowed from one start-element event.
+pub const NormalAttribute = struct {
+    name: NormalName,
+    value: []const u8,
+    span: ?NormalSourceSpan,
+    specified: bool,
+    declared_type: ?dtd_module.AttributeType,
+};
+
+/// Namespace declaration borrowed from one start-element event.
+pub const NormalNamespaceDeclaration = struct {
+    prefix: ?[]const u8,
+    namespace_uri: []const u8,
+    span: ?NormalSourceSpan,
+    specified: bool,
+};
+
+/// XML declaration reported by the normal reader.
+pub const NormalXmlDeclaration = struct {
+    version: XmlVersion,
+    encoding: ?[]const u8,
+    standalone: ?bool,
+};
+
+/// Document-start information.
+pub const NormalDocumentStart = struct {
+    effective_version: XmlVersion,
+    source_encoding: SourceEncoding,
+    declaration: ?NormalXmlDeclaration,
+};
+
+/// Document type header.
+pub const NormalDocumentType = struct {
+    root_name: []const u8,
+    public_id: ?[]const u8,
+    system_id: ?[]const u8,
+};
+
+/// Start-element payload.
+pub const NormalStartElement = struct {
+    name: NormalName,
+    attributes: []const NormalAttribute,
+    namespace_declarations: []const NormalNamespaceDeclaration,
+    empty_syntax: bool,
+
+    /// Returns the first attribute with the requested expanded identity.
+    pub fn attribute(
+        self: NormalStartElement,
+        namespace_uri: ?[]const u8,
+        local: []const u8,
+    ) ?NormalAttribute {
+        for (self.attributes) |value| {
+            if (value.name.eql(namespace_uri, local)) return value;
+        }
+        return null;
+    }
+
+    /// Returns the first attribute with the requested raw spelling.
+    pub fn attributeRaw(self: NormalStartElement, raw: []const u8) ?NormalAttribute {
+        for (self.attributes) |value| {
+            if (value.name.eqlRaw(raw)) return value;
+        }
+        return null;
+    }
+};
+
+/// End-element payload.
+pub const NormalEndElement = struct {
+    name: NormalName,
+};
+
+/// Text fragment payload.
+pub const NormalText = struct {
+    bytes: []const u8,
+    origin: TextOrigin,
+    final_fragment: bool,
+};
+
+/// Comment fragment payload.
+pub const NormalComment = struct {
+    bytes: []const u8,
+    final_fragment: bool,
+};
+
+/// Processing-instruction fragment payload.
+pub const NormalProcessingInstruction = struct {
+    target: []const u8,
+    data: []const u8,
+    final_fragment: bool,
+};
+
+/// Kind of external source intentionally skipped.
+pub const NormalSkippedExternalSourceKind = enum {
+    external_subset,
+    parameter_entity,
+    general_entity,
+};
+
+/// External source omitted by the selected policy.
+pub const NormalSkippedExternalSource = struct {
+    kind: NormalSkippedExternalSourceKind,
+    name: ?[]const u8,
+    public_id: ?[]const u8,
+    system_id: ?[]const u8,
+};
+
+/// Completeness of parsed document content.
+pub const NormalDocumentContent = enum {
+    complete,
+    external_content_skipped,
+};
+
+/// Final DTD validity result.
+pub const NormalDtdValidity = enum {
+    not_requested,
+    valid,
+    invalid,
+    incomplete,
+};
+
+/// Final XML 1.1 normalization result.
+pub const NormalDocumentNormalization = enum {
+    not_applicable,
+    unchecked,
+    normalized,
+    not_normalized,
+    indeterminate,
+    incomplete,
+};
+
+/// Document-end results.
+pub const NormalDocumentEnd = struct {
+    content: NormalDocumentContent,
+    dtd_validity: NormalDtdValidity,
+    normalization: NormalDocumentNormalization,
+};
+
+/// Stable event payload for the normal reader.
+pub const NormalEventData = union(enum) {
+    document_start: NormalDocumentStart,
+    document_type: NormalDocumentType,
+    start_element: NormalStartElement,
+    end_element: NormalEndElement,
+    text: NormalText,
+    comment: NormalComment,
+    processing_instruction: NormalProcessingInstruction,
+    skipped_external_source: NormalSkippedExternalSource,
+    document_end: NormalDocumentEnd,
+};
+
+/// Stable event whose slices remain valid until the next read begins.
+pub const NormalEvent = struct {
+    span: NormalSourceSpan,
+    data: NormalEventData,
+};
+
+/// First XML 1.1 normalization finding.
+pub const NormalNormalizationFinding = struct {
+    kind: NormalizationIssueKind,
+    location: NormalLocation,
+};
+
 fn PositionState(comptime config: Config) type {
     return if (config.diagnostic_location == .line_column)
         struct {
@@ -1084,6 +1407,7 @@ fn DtdState(comptime config: Config) type {
         struct {}
     else
         struct {
+            reject_doctype: bool = false,
             declarations: dtd_module.State = .{},
             entity_sources: std.ArrayList(EntitySourceFrame(config)) = .empty,
             attribute_sources: std.ArrayList(AttributeEntityFrame) = .empty,
@@ -1628,10 +1952,6 @@ pub fn Reader(comptime config: Config) type {
                 .done => return .done,
                 .producing => {},
             }
-            if (comptime !config.profile.isImplemented()) {
-                return self.fail(.unsupported_profile, .unsupported_feature);
-            }
-
             if (comptime !config.profile.isUtf8Only()) {
                 const internal_entity_active = if (comptime config.profile.dtdMode() == .rejected)
                     false
@@ -2669,11 +2989,18 @@ pub fn Reader(comptime config: Config) type {
                         if (self.markup_context == .prolog) {
                             if (comptime config.profile.dtdMode() == .rejected) {
                                 return self.failAt(
-                                    .unsupported_doctype,
+                                    .dtd_forbidden,
                                     .unsupported_feature,
                                     self.token_start,
                                 );
                             } else {
+                                if (self.dtd_state.reject_doctype) {
+                                    return self.failAt(
+                                        .dtd_forbidden,
+                                        .unsupported_feature,
+                                        self.token_start,
+                                    );
+                                }
                                 if (self.dtd_state.seen_doctype) {
                                     return self.failAt(.malformed_doctype, .invalid_dtd, self.token_start);
                                 }
@@ -4190,7 +4517,7 @@ pub fn Reader(comptime config: Config) type {
             return switch (err) {
                 error.InvalidDtd => self.failAt(external_code orelse code, .invalid_dtd, location),
                 error.UnsupportedFeature => self.failAt(
-                    external_code orelse .unsupported_doctype,
+                    external_code orelse code,
                     .unsupported_feature,
                     location,
                 ),
@@ -4220,7 +4547,7 @@ pub fn Reader(comptime config: Config) type {
                 .malformed_notation_declaration => .malformed_notation_declaration,
                 .undeclared_parameter_entity => .undeclared_parameter_entity,
                 .recursive_parameter_entity => .recursive_parameter_entity,
-                .external_subset_unsupported => .unsupported_doctype,
+                .external_subset_unsupported => .external_resource_forbidden,
                 .dtd_bytes_limit => .dtd_bytes_limit,
                 .declaration_limit => .dtd_declaration_limit,
                 .declaration_bytes_limit => .dtd_declaration_bytes_limit,
@@ -6113,7 +6440,7 @@ pub fn Reader(comptime config: Config) type {
                     .invalid_dtd,
                     self.reference_start,
                 ),
-                error.UnsupportedFeature => self.failAt(.unsupported_doctype, .unsupported_feature, self.reference_start),
+                error.UnsupportedFeature => self.failAt(code, .unsupported_feature, self.reference_start),
                 error.LimitExceeded => self.failAt(external_code orelse code, .limit_exceeded, self.reference_start),
                 error.OutOfMemory => self.failOutOfMemory(),
                 error.ResolverFailed => self.failAt(external_code orelse .resolver_io_failure, .resolver_failed, self.reference_start),
@@ -9617,11 +9944,684 @@ fn externalAsciiByte(raw: []const u8, offset: usize, encoding: SourceEncoding) ?
     };
 }
 
+const normal_raw_config: Config = .{
+    .profile = .xml11_nonvalidating,
+    .event_locations = true,
+    .external_sources = true,
+};
+
+const normal_namespace_config: Config = .{
+    .profile = .xml11_ns_nonvalidating,
+    .event_locations = true,
+    .external_sources = true,
+};
+
+const normal_raw_validating_config: Config = .{
+    .profile = .xml11_dtd_validating,
+    .event_locations = true,
+    .external_sources = true,
+};
+
+const normal_namespace_validating_config: Config = .{
+    .profile = .xml11_ns_dtd_validating,
+    .event_locations = true,
+    .external_sources = true,
+};
+
+const NormalEngine = union(enum) {
+    raw: Reader(normal_raw_config),
+    namespaces: Reader(normal_namespace_config),
+    raw_validating: Reader(normal_raw_validating_config),
+    namespaces_validating: Reader(normal_namespace_validating_config),
+};
+
+const NormalDiagnosticCore = struct {
+    code: DiagnosticCode,
+    primary: NormalLocation,
+    related: ?NormalLocation,
+};
+
+/// Normal reader with runtime namespace and DTD policy selection.
+pub const NormalReader = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    options: NormalReaderOptions,
+    source: NormalSource,
+    engine: NormalEngine,
+    source_started: bool = false,
+    source_finished: bool = false,
+    pending_toss: usize = 0,
+    complete: bool = false,
+    deinitialized: bool = false,
+    failure: ?NormalReadError = null,
+    first_diagnostic: ?NormalDiagnosticCore = null,
+    diagnostic_inclusions: std.ArrayList(NormalLocation) = .empty,
+    event_attributes: std.ArrayList(NormalAttribute) = .empty,
+    event_namespace_declarations: std.ArrayList(NormalNamespaceDeclaration) = .empty,
+    effective_version: XmlVersion = .xml10,
+    external_content_skipped: bool = false,
+
+    /// Initializes the normal reader without reading or allocating.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        source: NormalSource,
+        options: NormalReaderOptions,
+    ) NormalInitError!Self {
+        if (!validNormalOptions(options)) return error.InvalidOptions;
+        return .{
+            .allocator = allocator,
+            .options = options,
+            .source = source,
+            .engine = try initNormalEngine(allocator, options),
+        };
+    }
+
+    /// Releases parser-owned memory. The caller retains the root source.
+    pub fn deinit(self: *Self) void {
+        std.debug.assert(!self.deinitialized);
+        switch (self.engine) {
+            inline else => |*parser| parser.deinit(),
+        }
+        self.diagnostic_inclusions.deinit(self.allocator);
+        self.event_attributes.deinit(self.allocator);
+        self.event_namespace_declarations.deinit(self.allocator);
+        self.deinitialized = true;
+    }
+
+    /// Produces the next stable event or returns null after the document ends.
+    pub fn next(self: *Self) NormalReadError!?NormalEvent {
+        if (self.deinitialized) return error.InvalidState;
+        if (self.failure) |failure| return failure;
+        if (self.complete) return null;
+
+        self.event_attributes.clearRetainingCapacity();
+        self.event_namespace_declarations.clearRetainingCapacity();
+
+        return switch (self.engine) {
+            .raw => |*parser| self.nextFrom(normal_raw_config, parser),
+            .namespaces => |*parser| self.nextFrom(normal_namespace_config, parser),
+            .raw_validating => |*parser| self.nextFrom(normal_raw_validating_config, parser),
+            .namespaces_validating => |*parser| self.nextFrom(
+                normal_namespace_validating_config,
+                parser,
+            ),
+        };
+    }
+
+    /// Returns the first fatal diagnostic, if one exists.
+    pub fn diagnostic(self: *const Self) ?NormalDiagnostic {
+        const value = self.first_diagnostic orelse return null;
+        return .{
+            .code = value.code,
+            .primary = value.primary,
+            .related = value.related,
+            .inclusion_trace = self.diagnostic_inclusions.items,
+        };
+    }
+
+    /// Reports memory owned by the selected parser and event conversion storage.
+    pub fn memoryUsage(self: *const Self) MemoryUsage {
+        var usage = switch (self.engine) {
+            inline else => |*parser| parser.memoryUsage(),
+        };
+        const attribute_capacity = self.event_attributes.capacity *| @sizeOf(NormalAttribute);
+        const namespace_capacity = self.event_namespace_declarations.capacity *|
+            @sizeOf(NormalNamespaceDeclaration);
+        const diagnostic_capacity = self.diagnostic_inclusions.capacity *| @sizeOf(NormalLocation);
+        usage.attribute_event_capacity +|= self.event_attributes.capacity;
+        usage.namespace_capacity +|= namespace_capacity;
+        usage.retained_capacity +|= attribute_capacity +| namespace_capacity +| diagnostic_capacity;
+        return usage;
+    }
+
+    /// Returns the first XML 1.1 normalization finding, if one exists.
+    pub fn normalizationFinding(self: *const Self) ?NormalNormalizationFinding {
+        return switch (self.engine) {
+            inline else => |*parser| finding: {
+                const result = parser.normalizationResult();
+                if (@hasField(@TypeOf(result), "issue")) {
+                    const issue = result.issue orelse break :finding null;
+                    break :finding .{
+                        .kind = issue.kind,
+                        .location = normalLocation(
+                            self.options.track_lines,
+                            issue.location,
+                        ),
+                    };
+                }
+                break :finding null;
+            },
+        };
+    }
+
+    fn nextFrom(
+        self: *Self,
+        comptime config: Config,
+        parser: *Reader(config),
+    ) NormalReadError!?NormalEvent {
+        while (true) {
+            if (comptime config.profile.dtdMode() == .validating) {
+                parser.options.validation.sink = if (self.dtdFindingSink()) |_| .{
+                    .context = self,
+                    .reportFn = normalValidityReporter(config),
+                } else null;
+            }
+            if (parser.lifecycle == .ready or parser.lifecycle == .needs_input) {
+                self.refill(config, parser) catch |failure| {
+                    return self.recordInternalFailure(config, parser, failure);
+                };
+            }
+
+            const step = parser.next() catch |failure| {
+                return self.recordInternalFailure(config, parser, failure);
+            };
+            switch (step) {
+                .need_input => continue,
+                .done => {
+                    self.complete = true;
+                    return null;
+                },
+                .event => |event| {
+                    const converted = self.convertEvent(config, parser, event) catch |failure| {
+                        if (self.failure == null) self.recordGeneratedFailure(
+                            failure,
+                            .out_of_memory,
+                            normalLocation(self.options.track_lines, event.span.start),
+                        );
+                        return failure;
+                    };
+                    if (converted) |value| return value;
+                },
+            }
+        }
+    }
+
+    fn refill(
+        self: *Self,
+        comptime config: Config,
+        parser: *Reader(config),
+    ) ReadError!void {
+        switch (self.source) {
+            .slice => |input| {
+                if (self.source_started) return error.InvalidState;
+                self.source_started = true;
+                parser.feed(input, true) catch return error.InvalidState;
+            },
+            .stream => |input| {
+                if (self.pending_toss != 0) {
+                    input.toss(self.pending_toss);
+                    self.pending_toss = 0;
+                }
+                if (self.source_finished) return error.InvalidState;
+                const bytes = input.peekGreedy(1) catch |read_error| switch (read_error) {
+                    error.EndOfStream => {
+                        self.source_finished = true;
+                        parser.feed("", true) catch return error.InvalidState;
+                        return;
+                    },
+                    error.ReadFailed => return AdapterAccess(config).recordReadFailure(parser),
+                };
+                self.source_started = true;
+                parser.feed(bytes, false) catch return error.InvalidState;
+                self.pending_toss = bytes.len;
+            },
+        }
+    }
+
+    fn convertEvent(
+        self: *Self,
+        comptime config: Config,
+        parser: *Reader(config),
+        event: Event(config),
+    ) NormalReadError!?NormalEvent {
+        const span = normalSpan(config, event.span);
+        const payload = event.payload;
+        return switch (payload) {
+            .document_start => |document| result: {
+                self.effective_version = document.effective_version;
+                break :result .{ .span = span, .data = .{ .document_start = .{
+                    .effective_version = document.effective_version,
+                    .source_encoding = document.source_encoding,
+                    .declaration = if (document.declared_version) |version| .{
+                        .version = if (std.mem.eql(u8, version, "1.1")) .xml11 else .xml10,
+                        .encoding = document.declared_encoding,
+                        .standalone = if (document.standalone_declared)
+                            document.standalone
+                        else
+                            null,
+                    } else null,
+                } } };
+            },
+            .document_type => |document_type| .{ .span = span, .data = .{ .document_type = .{
+                .root_name = document_type.root_name,
+                .public_id = document_type.public_id,
+                .system_id = document_type.system_id,
+            } } },
+            .notation_declaration, .unparsed_entity_declaration => null,
+            .start_element => |element| result: {
+                try self.copyAttributes(config, element.attributes);
+                if (comptime config.profile.hasNamespaces()) {
+                    try self.copyNamespaceDeclarations(element.namespace_declarations);
+                }
+                break :result .{ .span = span, .data = .{ .start_element = .{
+                    .name = normalName(config, element.name),
+                    .attributes = self.event_attributes.items,
+                    .namespace_declarations = self.event_namespace_declarations.items,
+                    .empty_syntax = element.empty_element_syntax,
+                } } };
+            },
+            .end_element => |element| .{
+                .span = span,
+                .data = .{ .end_element = .{ .name = normalName(config, element.name) } },
+            },
+            .text => |value| .{
+                .span = span,
+                .data = .{ .text = .{
+                    .bytes = value.bytes,
+                    .origin = value.origin,
+                    .final_fragment = AdapterAccess(config).fragmentComplete(parser),
+                } },
+            },
+            .comment => |value| .{
+                .span = span,
+                .data = .{ .comment = .{
+                    .bytes = value.bytes,
+                    .final_fragment = value.complete,
+                } },
+            },
+            .processing_instruction => |value| .{
+                .span = span,
+                .data = .{ .processing_instruction = .{
+                    .target = value.target,
+                    .data = value.data,
+                    .final_fragment = value.complete,
+                } },
+            },
+            .skipped_entity => |value| result: {
+                if (self.options.external == .forbid) {
+                    self.recordGeneratedFailure(
+                        error.ExternalResourceForbidden,
+                        .external_resource_forbidden,
+                        normalLocation(self.options.track_lines, event.span.start),
+                    );
+                    return error.ExternalResourceForbidden;
+                }
+                self.external_content_skipped = true;
+                break :result .{ .span = span, .data = .{ .skipped_external_source = .{
+                    .kind = switch (value.kind) {
+                        .external_subset => .external_subset,
+                        .parameter_entity => .parameter_entity,
+                        .general_entity => .general_entity,
+                    },
+                    .name = value.name,
+                    .public_id = value.public_id,
+                    .system_id = value.system_id,
+                } } };
+            },
+            .document_end => |value| .{
+                .span = span,
+                .data = .{ .document_end = self.normalDocumentEnd(config, value) },
+            },
+        };
+    }
+
+    fn copyAttributes(
+        self: *Self,
+        comptime config: Config,
+        attributes: []const Attribute(config),
+    ) NormalReadError!void {
+        self.event_attributes.ensureTotalCapacity(self.allocator, attributes.len) catch
+            return error.OutOfMemory;
+        for (attributes) |attribute| {
+            self.event_attributes.appendAssumeCapacity(.{
+                .name = normalName(config, attribute.name),
+                .value = attribute.value,
+                .span = null,
+                .specified = if (@hasField(@TypeOf(attribute), "specified"))
+                    attribute.specified
+                else
+                    true,
+                .declared_type = if (@hasField(@TypeOf(attribute), "declared_type"))
+                    attribute.declared_type
+                else
+                    null,
+            });
+        }
+    }
+
+    fn copyNamespaceDeclarations(
+        self: *Self,
+        declarations: []const NamespaceDeclaration,
+    ) NormalReadError!void {
+        self.event_namespace_declarations.ensureTotalCapacity(
+            self.allocator,
+            declarations.len,
+        ) catch return error.OutOfMemory;
+        for (declarations) |declaration| {
+            self.event_namespace_declarations.appendAssumeCapacity(.{
+                .prefix = declaration.prefix,
+                .namespace_uri = declaration.namespace_uri,
+                .span = null,
+                .specified = true,
+            });
+        }
+    }
+
+    fn normalDocumentEnd(
+        self: *Self,
+        comptime config: Config,
+        value: DocumentEnd(config),
+    ) NormalDocumentEnd {
+        const validity: NormalDtdValidity = if (comptime config.profile.dtdMode() == .validating)
+            switch (value.validation) {
+                .valid => .valid,
+                .invalid => .invalid,
+                .incomplete => .incomplete,
+            }
+        else
+            .not_requested;
+        const normalization_status = self.engineNormalizationStatus();
+        std.debug.assert(normalization_status != .checking);
+        const normalization: NormalDocumentNormalization = if (self.effective_version == .xml10)
+            .not_applicable
+        else switch (normalization_status) {
+            .unchecked => .unchecked,
+            .checking => .incomplete,
+            .normalized => if (self.external_content_skipped) .incomplete else .normalized,
+            .not_normalized => .not_normalized,
+            .indeterminate => .indeterminate,
+        };
+        return .{
+            .content = if (self.external_content_skipped)
+                .external_content_skipped
+            else
+                .complete,
+            .dtd_validity = validity,
+            .normalization = normalization,
+        };
+    }
+
+    fn engineNormalizationStatus(self: *const Self) NormalizationStatus {
+        return switch (self.engine) {
+            inline else => |*parser| parser.normalizationResult().status,
+        };
+    }
+
+    fn dtdFindingSink(self: *const Self) ?NormalDtdFindingSink {
+        return switch (self.options.dtd) {
+            .validate => |options| options.finding_sink,
+            else => null,
+        };
+    }
+
+    fn recordInternalFailure(
+        self: *Self,
+        comptime config: Config,
+        parser: *Reader(config),
+        failure: ReadError,
+    ) NormalReadError {
+        const internal_diagnostic = parser.diagnostic();
+        const mapped = mapNormalReadError(failure, if (internal_diagnostic) |value|
+            value.code
+        else
+            null);
+        if (mapped == error.InvalidState) return mapped;
+        if (internal_diagnostic) |value| {
+            self.diagnostic_inclusions.clearRetainingCapacity();
+            self.diagnostic_inclusions.ensureTotalCapacity(
+                self.allocator,
+                value.inclusion_trace.len,
+            ) catch {
+                self.recordGeneratedFailure(
+                    error.OutOfMemory,
+                    .out_of_memory,
+                    normalLocation(
+                        self.options.track_lines,
+                        AdapterAccess(config).currentLocation(parser),
+                    ),
+                );
+                return error.OutOfMemory;
+            };
+            for (value.inclusion_trace) |source| {
+                self.diagnostic_inclusions.appendAssumeCapacity(
+                    normalLocation(self.options.track_lines, source),
+                );
+            }
+            self.failure = mapped;
+            self.first_diagnostic = .{
+                .code = value.code,
+                .primary = normalLocation(self.options.track_lines, value.primary),
+                .related = if (value.related) |related|
+                    normalLocation(self.options.track_lines, related)
+                else
+                    null,
+            };
+            self.reportFatalDiagnostic();
+        } else if (mapped == error.OutOfMemory) {
+            self.recordGeneratedFailure(
+                mapped,
+                .out_of_memory,
+                normalLocation(
+                    self.options.track_lines,
+                    AdapterAccess(config).currentLocation(parser),
+                ),
+            );
+        } else {
+            self.failure = mapped;
+        }
+        return mapped;
+    }
+
+    fn recordGeneratedFailure(
+        self: *Self,
+        failure: NormalReadError,
+        code: DiagnosticCode,
+        location: NormalLocation,
+    ) void {
+        self.failure = failure;
+        self.diagnostic_inclusions.clearRetainingCapacity();
+        self.first_diagnostic = .{
+            .code = code,
+            .primary = location,
+            .related = null,
+        };
+        self.reportFatalDiagnostic();
+    }
+
+    fn reportFatalDiagnostic(self: *const Self) void {
+        const sink = self.options.diagnostic_sink orelse return;
+        sink.report(self.diagnostic().?);
+    }
+};
+
+fn validNormalOptions(options: NormalReaderOptions) bool {
+    if (!options.limits.validate()) return false;
+    if (options.transcoder != null) return false;
+    if (options.external == .resolve and options.resolver == null) return false;
+    if (options.external != .resolve and options.resolver != null) return false;
+    if (options.external != .resolve and options.document_base_id != null) return false;
+    if (options.dtd == .reject and options.external != .forbid) return false;
+    return true;
+}
+
+fn initNormalEngine(
+    allocator: std.mem.Allocator,
+    options: NormalReaderOptions,
+) NormalInitError!NormalEngine {
+    const validating = options.dtd == .validate;
+    if (validating) {
+        if (options.namespaces == .process) {
+            return .{ .namespaces_validating = try initNormalParser(
+                normal_namespace_validating_config,
+                allocator,
+                options,
+            ) };
+        }
+        return .{ .raw_validating = try initNormalParser(
+            normal_raw_validating_config,
+            allocator,
+            options,
+        ) };
+    }
+    if (options.namespaces == .process) {
+        return .{ .namespaces = try initNormalParser(
+            normal_namespace_config,
+            allocator,
+            options,
+        ) };
+    }
+    return .{ .raw = try initNormalParser(
+        normal_raw_config,
+        allocator,
+        options,
+    ) };
+}
+
+fn initNormalParser(
+    comptime config: Config,
+    allocator: std.mem.Allocator,
+    options: NormalReaderOptions,
+) NormalInitError!Reader(config) {
+    var parser = try Reader(config).init(allocator, normalEngineOptions(config, options));
+    parser.dtd_state.reject_doctype = options.dtd == .reject;
+    return parser;
+}
+
+fn normalEngineOptions(
+    comptime config: Config,
+    options: NormalReaderOptions,
+) Options(config) {
+    var result: Options(config) = .{};
+    result.limits = options.limits;
+    result.resolver.policy = if (options.external == .resolve) .resolve else .skip;
+    result.resolver.resolver = options.resolver;
+    result.resolver.document_base_id = options.document_base_id;
+    result.normalization = switch (options.normalization) {
+        .report => .report,
+        .require => .require,
+        .unchecked => .unchecked,
+    };
+    if (comptime config.profile.dtdMode() == .validating) {
+        result.validation.collect_validity_errors = true;
+        if (options.dtd == .validate) {
+            result.validation.external_subset = options.dtd.validate.external_subset;
+        }
+    }
+    return result;
+}
+
+fn normalName(comptime config: Config, name: Name(config)) NormalName {
+    if (comptime config.profile.hasNamespaces()) {
+        return .{
+            .raw = name.raw,
+            .expanded = .{
+                .prefix = name.prefix,
+                .local = name.local,
+                .namespace_uri = name.namespace_uri,
+            },
+        };
+    }
+    return .{ .raw = name.raw, .expanded = null };
+}
+
+fn normalLocation(track_lines: bool, location: anytype) NormalLocation {
+    return .{
+        .source_id = location.source_id,
+        .byte_offset = location.byte_offset,
+        .line = if (track_lines and @hasField(@TypeOf(location), "line")) location.line else null,
+        .byte_column = if (track_lines and @hasField(@TypeOf(location), "byte_column"))
+            location.byte_column
+        else
+            null,
+    };
+}
+
+fn normalSpan(comptime config: Config, span: Span(config)) NormalSourceSpan {
+    std.debug.assert(span.start.source_id == span.end.source_id);
+    return .{
+        .source_id = span.start.source_id,
+        .start = span.start.byte_offset,
+        .end = span.end.byte_offset,
+    };
+}
+
+fn mapNormalReadError(failure: ReadError, code: ?DiagnosticCode) NormalReadError {
+    return switch (failure) {
+        error.InvalidXml => if (code) |value|
+            switch (value) {
+                .malformed_utf8,
+                .malformed_encoding,
+                .missing_encoding_signature,
+                .encoding_mismatch,
+                => error.InvalidEncoding,
+                .unsupported_version => error.UnsupportedVersion,
+                .unsupported_encoding => error.UnsupportedEncoding,
+                else => error.InvalidXml,
+            }
+        else
+            error.InvalidXml,
+        error.InvalidDtd, error.NotValid => error.InvalidXml,
+        error.UnsupportedFeature => if (code) |value|
+            switch (value) {
+                .unsupported_version => error.UnsupportedVersion,
+                .unsupported_encoding => error.UnsupportedEncoding,
+                .dtd_forbidden => error.DtdForbidden,
+                .external_resource_forbidden => error.ExternalResourceForbidden,
+                else => error.InvalidXml,
+            }
+        else
+            error.InvalidXml,
+        error.LimitExceeded => error.LimitExceeded,
+        error.ResolverFailed => switch (code orelse .resolver_io_failure) {
+            .resolver_forbidden, .external_resource_forbidden => error.ExternalResourceForbidden,
+            .resolver_not_found, .resolver_unsupported_scheme => error.ExternalResourceUnavailable,
+            else => error.ExternalResourceFailed,
+        },
+        error.ReadFailed => error.ReadFailed,
+        error.Cancelled => error.Cancelled,
+        error.NotNormalized => error.NotNormalized,
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidState => error.InvalidState,
+    };
+}
+
+fn normalValidityReporter(
+    comptime config: Config,
+) *const fn (?*anyopaque, Diagnostic(config)) ValidityAction {
+    return struct {
+        fn report(context: ?*anyopaque, diagnostic: Diagnostic(config)) ValidityAction {
+            const self: *NormalReader = @ptrCast(@alignCast(context.?));
+            const sink = self.dtdFindingSink() orelse return .continue_validation;
+            const action = sink.report(.{
+                .code = diagnostic.code,
+                .primary = normalLocation(self.options.track_lines, diagnostic.primary),
+                .related = if (diagnostic.related) |related|
+                    normalLocation(self.options.track_lines, related)
+                else
+                    null,
+            });
+            return switch (action) {
+                .continue_validation => .continue_validation,
+                .cancel => .cancel,
+            };
+        }
+    }.report;
+}
+
 /// Internal bridge used by package adapters without exposing parser state.
 pub fn AdapterAccess(comptime config: Config) type {
     return struct {
         pub fn recordReadFailure(reader: *Reader(config)) ReadError {
             return reader.fail(.read_failed, .read_failed);
+        }
+
+        pub fn fragmentComplete(reader: *const Reader(config)) bool {
+            return reader.fragment_complete;
+        }
+
+        pub fn currentLocation(reader: *const Reader(config)) Location(config) {
+            return reader.currentLocation();
         }
     };
 }

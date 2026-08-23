@@ -48,7 +48,7 @@ const Stats = struct {
         self.bytes(&.{value});
     }
 
-    fn observe(self: *Stats, event: xml.Event(CONFIG)) void {
+    fn observe(self: *Stats, event: xml.EventFor(CONFIG)) void {
         switch (event) {
             .start_element => |start| {
                 self.elements += 1;
@@ -102,7 +102,7 @@ fn run(init: std.process.Init) !u8 {
     var root_dir: ?std.Io.Dir = null;
     defer if (root_dir) |dir| dir.close(init.io);
     var filesystem_resolver: if (check_options.dtd) xml.RootedFilesystemResolver else void = undefined;
-    var options: xml.Options(CONFIG) = .{};
+    var options: xml.OptionsFor(CONFIG) = .{};
     if (comptime check_options.dtd) {
         options.dtd_limits.max_comparison_work = 512 * 1024 * 1024;
         options.dtd_limits.max_entity_references = 8 * 1024 * 1024;
@@ -162,7 +162,7 @@ fn run(init: std.process.Init) !u8 {
     return 0;
 }
 
-fn statusForReadError(err: xml.ReadError) ?u8 {
+fn statusForReadError(err: xml.ProfileReadError) ?u8 {
     return switch (err) {
         error.InvalidXml, error.InvalidDtd, error.NotValid => 2,
         error.LimitExceeded, error.OutOfMemory => 3,

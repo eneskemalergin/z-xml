@@ -20,7 +20,7 @@ const Stats = struct {
         }
     }
 
-    fn observe(self: *Stats, event: xml.Event(config)) !void {
+    fn observe(self: *Stats, event: xml.EventFor(config)) !void {
         switch (event) {
             .start_element => |start| {
                 self.elements += 1;
@@ -94,7 +94,7 @@ fn run(init: std.process.Init) !u8 {
     for (0..repetitions) |_| {
         const file = try std.Io.Dir.cwd().openFile(init.io, args[2], .{});
         defer file.close(init.io);
-        var options: xml.Options(config) = .{};
+        var options: xml.OptionsFor(config) = .{};
         options.dtd_limits.max_comparison_work = 512 * 1024 * 1024;
         options.validation.limits.max_ids = 8 * 1024 * 1024;
         options.validation.limits.max_idrefs = 8 * 1024 * 1024;

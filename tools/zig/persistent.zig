@@ -177,7 +177,7 @@ const Stats = struct {
         self.bytes(&.{value});
     }
 
-    fn name(self: *Stats, value: xml.Name(CONFIG)) void {
+    fn name(self: *Stats, value: xml.NameFor(CONFIG)) void {
         if (comptime persistent_options.namespaces) {
             const namespace_uri = value.namespace_uri orelse "";
             const prefix = value.prefix orelse "";
@@ -195,7 +195,7 @@ const Stats = struct {
         }
     }
 
-    fn observe(self: *Stats, event: xml.Event(CONFIG)) void {
+    fn observe(self: *Stats, event: xml.EventFor(CONFIG)) void {
         switch (event) {
             .start_element => |start| {
                 self.elements += 1;
@@ -284,7 +284,7 @@ fn run(init: std.process.Init) !u8 {
         .dynamic => init.gpa,
         .fixed => fixed_allocator.allocator(),
     } };
-    var reader = try xml.Reader(CONFIG).init(tracking.allocator(), .{});
+    var reader = try xml.ReaderFor(CONFIG).init(tracking.allocator(), .{});
     var reader_live = true;
     defer if (reader_live) reader.deinit();
     var reference: ?Stats = null;
@@ -379,7 +379,7 @@ fn parseOptions(args: []const []const u8) ?Options {
 }
 
 fn parseResident(
-    reader: *xml.Reader(CONFIG),
+    reader: *xml.ReaderFor(CONFIG),
     stats: *Stats,
     input: []const u8,
     chunk_bytes: usize,
@@ -401,7 +401,7 @@ fn parseResident(
 }
 
 fn parseStream(
-    reader: *xml.Reader(CONFIG),
+    reader: *xml.ReaderFor(CONFIG),
     stats: *Stats,
     io: std.Io,
     file: std.Io.File,
@@ -428,7 +428,7 @@ fn parseStream(
     }
 }
 
-fn drain(reader: *xml.Reader(CONFIG), stats: *Stats) !bool {
+fn drain(reader: *xml.ReaderFor(CONFIG), stats: *Stats) !bool {
     while (true) switch (try reader.next()) {
         .event => |event| stats.observe(event),
         .need_input => return false,

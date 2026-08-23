@@ -1,10 +1,10 @@
-//! A bounded, incremental XML reader for Zig.
+//! A bounded XML reader for Zig.
 //!
-//! The public API is specialized by a compile-time configuration. The library
-//! provides XML 1.0 and XML 1.1 non-validating and DTD-validating readers,
-//! plus specialized XML 1.0 no-DTD readers, with raw-name and namespace-aware profiles.
+//! Normal callers use `Reader`. Explicit `...For(config)` aliases expose the
+//! specialized reader shapes used by package tools.
 
 const reader = @import("reader.zig");
+const dtd_module = @import("dtd.zig");
 const encoding = @import("encoding.zig");
 const io = @import("io.zig");
 const resolver = @import("resolver.zig");
@@ -13,36 +13,26 @@ const tree = @import("tree.zig");
 
 /// Compile-time reader configuration.
 pub const Config = reader.Config;
-/// XML capability profile.
-pub const Profile = reader.Profile;
-/// DTD capability implied by a profile.
-pub const DtdMode = reader.DtdMode;
-/// Optional semantic or detailed event reporting.
-pub const Report = reader.Report;
-/// Diagnostic position precision.
-pub const DiagnosticLocation = reader.DiagnosticLocation;
 /// Reader reset capacity policy.
 pub const ResetMode = reader.ResetMode;
-/// Runtime policy for external declarations.
-pub const ExternalPolicy = reader.ExternalPolicy;
-/// Continuation selected by a validity diagnostic callback.
-pub const ValidityAction = reader.ValidityAction;
-/// Final validating-reader result.
-pub const ValidationStatus = reader.ValidationStatus;
-/// Runtime XML 1.1 full-normalization policy.
-pub const NormalizationPolicy = reader.NormalizationPolicy;
-/// Progress or final XML 1.1 full-normalization result.
-pub const NormalizationStatus = reader.NormalizationStatus;
+/// External-resource handling selected by the normal reader.
+pub const ExternalPolicy = reader.NormalExternalPolicy;
+/// Continuation selected by a specialized validity callback.
+pub const ProfileValidityAction = reader.ValidityAction;
+/// Final result from a specialized validating reader.
+pub const ProfileValidationStatus = reader.ValidationStatus;
+/// XML 1.1 normalization handling selected by the normal reader.
+pub const NormalizationPolicy = reader.NormalNormalizationPolicy;
+/// Progress or final result from a specialized XML 1.1 reader.
+pub const ProfileNormalizationStatus = reader.NormalizationStatus;
 /// Reason XML 1.1 full-normalization verification did not succeed.
 pub const NormalizationIssueKind = reader.NormalizationIssueKind;
 /// Declared DTD attribute type.
-pub const AttributeType = @import("dtd.zig").AttributeType;
-/// Observable reader lifecycle.
-pub const Lifecycle = reader.Lifecycle;
+pub const AttributeType = dtd_module.AttributeType;
+/// Observable lifecycle of a specialized reader.
+pub const ProfileLifecycle = reader.Lifecycle;
 /// Runtime resource limits.
 pub const Limits = reader.Limits;
-/// Namespace limits omitted from namespace-off options.
-pub const NamespaceLimits = reader.NamespaceLimits;
 /// Reader-owned memory categories.
 pub const MemoryUsage = reader.MemoryUsage;
 /// Stable diagnostic category.
@@ -69,8 +59,8 @@ pub const ResolverSource = resolver.Source;
 pub const ResolverReadResult = resolver.ReadResult;
 /// Kind of external entity requested.
 pub const ExternalEntityKind = resolver.EntityKind;
-/// Kind reported for external input intentionally skipped by policy.
-pub const SkippedEntityKind = reader.SkippedEntityKind;
+/// Kind reported by a specialized reader for skipped external input.
+pub const ProfileSkippedEntityKind = reader.SkippedEntityKind;
 /// Optional handle-relative filesystem resolver with no network behavior.
 pub const RootedFilesystemResolver = resolver.RootedFilesystem;
 /// Immutable compiled declarations shared by validating readers.
@@ -89,41 +79,116 @@ pub const ExternalSubsetResult = external_subset.Result;
 pub const ExternalSubsetContent = external_subset.Content;
 /// Semantic origin reported by text fragments.
 pub const TextOrigin = reader.TextOrigin;
-/// Input-feed misuse errors.
-pub const FeedError = reader.FeedError;
-/// Event production errors.
-pub const ReadError = reader.ReadError;
-/// Reset misuse errors.
-pub const ResetError = reader.ResetError;
-/// Reader construction errors.
-pub const InitError = reader.InitError;
+/// Event production errors from the normal reader.
+pub const ReadError = reader.NormalReadError;
+/// Reset errors from the normal reader.
+pub const ResetError = reader.NormalResetError;
+/// Construction errors from the normal reader.
+pub const InitError = reader.NormalInitError;
 /// Named configurations for supported parser profiles.
 pub const Configs = reader.Configs;
 
-/// Returns the incremental reader type for a compile-time configuration.
-pub const Reader = reader.Reader;
-/// Returns the specialized semantic event type.
-pub const Event = reader.Event;
-/// Returns the specialized pull result type.
-pub const Step = reader.Step;
-/// Returns the specialized runtime option type.
-pub const Options = reader.Options;
-/// Returns the specialized source location type.
-pub const Location = reader.Location;
-/// Returns the specialized diagnostic type.
-pub const Diagnostic = reader.Diagnostic;
-/// Returns the XML 1.1 full-normalization finding type.
-pub const NormalizationIssue = reader.NormalizationIssue;
-/// Returns the specialized XML 1.1 full-normalization result type.
-pub const NormalizationResult = reader.NormalizationResult;
-/// Returns the specialized validity diagnostic callback type.
-pub const ValiditySink = reader.ValiditySink;
-/// Returns the specialized element or attribute name type.
-pub const Name = reader.Name;
-/// Returns the specialized source attribute type.
-pub const Attribute = reader.Attribute;
-/// Namespace declaration whose slices follow the enclosing event lifetime.
-pub const NamespaceDeclaration = reader.NamespaceDeclaration;
+/// DTD types used by the normal Reader.
+pub const dtd = struct {
+    /// Declared attribute type.
+    pub const AttributeType = dtd_module.AttributeType;
+    /// One validity finding.
+    pub const Finding = reader.NormalDtdFinding;
+    /// Action returned by a validity finding callback.
+    pub const FindingAction = reader.NormalDtdFindingAction;
+    /// Synchronous validity finding callback.
+    pub const FindingSink = reader.NormalDtdFindingSink;
+    /// Immutable compiled declarations shared by validating readers.
+    pub const ExternalSubset = external_subset.ExternalSubset;
+};
+
+/// Caller-owned input for the normal reader.
+pub const Source = reader.NormalSource;
+/// Normal reader with runtime policy selection.
+pub const Reader = reader.NormalReader;
+/// Runtime options for the normal reader.
+pub const ReaderOptions = reader.NormalReaderOptions;
+/// Namespace handling selected by the normal reader.
+pub const NamespacePolicy = reader.NormalNamespacePolicy;
+/// DTD handling selected by the normal reader.
+pub const DtdPolicy = reader.NormalDtdPolicy;
+/// DTD validation options for the normal reader.
+pub const DtdValidationOptions = reader.NormalDtdValidationOptions;
+/// Stable event returned by the normal reader.
+pub const Event = reader.NormalEvent;
+/// Stable event payload returned by the normal reader.
+pub const EventData = reader.NormalEventData;
+/// Original physical byte range in one source.
+pub const SourceSpan = reader.NormalSourceSpan;
+/// Physical source location with optional line information.
+pub const Location = reader.NormalLocation;
+/// Fatal reader diagnostic.
+pub const Diagnostic = reader.NormalDiagnostic;
+/// Synchronous fatal diagnostic callback.
+pub const DiagnosticSink = reader.NormalDiagnosticSink;
+/// First XML 1.1 normalization finding.
+pub const NormalizationFinding = reader.NormalNormalizationFinding;
+/// Raw name spelling with optional namespace identity.
+pub const Name = reader.NormalName;
+/// Resolved namespace identity.
+pub const ExpandedName = reader.NormalExpandedName;
+/// Attribute borrowed from one start-element event.
+pub const Attribute = reader.NormalAttribute;
+/// Namespace declaration borrowed from one start-element event.
+pub const NamespaceDeclaration = reader.NormalNamespaceDeclaration;
+/// XML declaration reported at document start.
+pub const XmlDeclaration = reader.NormalXmlDeclaration;
+/// Document-start event payload.
+pub const DocumentStart = reader.NormalDocumentStart;
+/// Document-type event payload.
+pub const DocumentType = reader.NormalDocumentType;
+/// Start-element event payload.
+pub const StartElement = reader.NormalStartElement;
+/// End-element event payload.
+pub const EndElement = reader.NormalEndElement;
+/// Text fragment event payload.
+pub const Text = reader.NormalText;
+/// Comment fragment event payload.
+pub const Comment = reader.NormalComment;
+/// Processing-instruction fragment event payload.
+pub const ProcessingInstruction = reader.NormalProcessingInstruction;
+/// External source omitted by policy.
+pub const SkippedExternalSource = reader.NormalSkippedExternalSource;
+/// Kind of external source omitted by policy.
+pub const SkippedExternalSourceKind = reader.NormalSkippedExternalSourceKind;
+/// Final document results.
+pub const DocumentEnd = reader.NormalDocumentEnd;
+/// Final document-content result.
+pub const DocumentContent = reader.NormalDocumentContent;
+/// Final DTD validity result.
+pub const DtdValidity = reader.NormalDtdValidity;
+/// Final XML 1.1 normalization result.
+pub const DocumentNormalization = reader.NormalDocumentNormalization;
+
+/// Returns the specialized reader type for a compile-time configuration.
+pub const ReaderFor = reader.Reader;
+/// Returns the specialized event type for a compile-time configuration.
+pub const EventFor = reader.Event;
+/// Returns the specialized pull result for a compile-time configuration.
+pub const StepFor = reader.Step;
+/// Returns the specialized options for a compile-time configuration.
+pub const OptionsFor = reader.Options;
+/// Returns the specialized location for a compile-time configuration.
+pub const LocationFor = reader.Location;
+/// Returns the specialized diagnostic for a compile-time configuration.
+pub const DiagnosticFor = reader.Diagnostic;
+/// Returns the specialized normalization finding for a compile-time configuration.
+pub const NormalizationIssueFor = reader.NormalizationIssue;
+/// Returns the specialized normalization result for a compile-time configuration.
+pub const NormalizationResultFor = reader.NormalizationResult;
+/// Returns the specialized validity callback for a compile-time configuration.
+pub const ValiditySinkFor = reader.ValiditySink;
+/// Returns the specialized name for a compile-time configuration.
+pub const NameFor = reader.Name;
+/// Returns the specialized attribute for a compile-time configuration.
+pub const AttributeFor = reader.Attribute;
+/// Event-production error set used by specialized readers.
+pub const ProfileReadError = reader.ReadError;
 /// Returns a pull reader over one final slice.
 pub const SliceReader = io.SliceReader;
 /// Returns a pull adapter over a buffered Zig reader.

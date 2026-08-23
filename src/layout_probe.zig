@@ -1,58 +1,35 @@
-//! Prints type layouts for the specialization evidence log.
+//! Prints the normal reader layout and private split evidence.
 
 const std = @import("std");
 const xml = @import("z_xml");
 
 pub fn main() void {
-    printLayout("xml10-utf8-no-dtd-fast", xml.Configs.XML10_UTF8_NO_DTD_FAST);
-    printLayout("xml10-utf8-no-dtd", xml.Configs.XML10_UTF8_NO_DTD);
-    printLayout("xml10-utf8-no-dtd-located", xml.Configs.XML10_UTF8_NO_DTD_LOCATED);
-    printLayout("xml10-utf8-ns-no-dtd", xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD);
-    printLayout(
-        "xml10-utf8-ns-no-dtd-fast",
-        xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST,
+    std.debug.print(
+        "reader\treader={d}\tevent={d}\tattribute={d}\tlocation={d}\n",
+        .{
+            @sizeOf(xml.Reader),
+            @sizeOf(xml.Event),
+            @sizeOf(xml.Attribute),
+            @sizeOf(xml.Location),
+        },
     );
-    printLayout("xml10-no-dtd", xml.Configs.XML10_NO_DTD);
-    printLayout("xml10-no-dtd-fast", xml.Configs.XML10_NO_DTD_FAST);
-    printLayout("xml10-ns-no-dtd", xml.Configs.XML10_NAMESPACES_NO_DTD);
-    printLayout(
-        "xml10-ns-no-dtd-fast",
-        xml.Configs.XML10_NAMESPACES_NO_DTD_FAST,
-    );
-    printLayout("xml10-nonvalidating", xml.Configs.XML10_NONVALIDATING);
-    printLayout(
-        "xml10-nonvalidating-internal",
-        xml.Configs.XML10_NONVALIDATING_INTERNAL,
-    );
-    printLayout(
-        "xml10-ns-nonvalidating",
-        xml.Configs.XML10_NAMESPACES_NONVALIDATING,
-    );
-    printLayout(
-        "xml10-ns-nonvalidating-internal",
-        xml.Configs.XML10_NAMESPACES_NONVALIDATING_INTERNAL,
-    );
-    printLayout("xml10-validating", xml.Configs.XML10_VALIDATING);
-    printLayout(
-        "xml10-ns-validating-detailed",
-        xml.Configs.XML10_NAMESPACES_VALIDATING_DETAILED,
-    );
-    printLayout("xml11-ns-validating", xml.Configs.XML11_NAMESPACES_VALIDATING);
+    printPrivate("no-dtd-byte-offset", xml.Configs.XML10_UTF8_NO_DTD_FAST);
+    printPrivate("no-dtd-line-column", xml.Configs.XML10_UTF8_NO_DTD);
+    printPrivate("no-dtd-namespaces", xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD);
+    printPrivate("dtd-process-raw", xml.Configs.XML11_NONVALIDATING);
+    printPrivate("dtd-process-namespaces", xml.Configs.XML11_NAMESPACES_NONVALIDATING);
+    printPrivate("dtd-validate-namespaces", xml.Configs.XML11_NAMESPACES_VALIDATING);
 }
 
-fn printLayout(comptime name: []const u8, comptime config: xml.Config) void {
+fn printPrivate(comptime name: []const u8, comptime config: xml.Config) void {
     std.debug.print(
         "{s}\treader={d}\tevent={d}\tattribute={d}\tlocation={d}\n",
         .{
             name,
-            @sizeOf(xml.Reader(config)),
-            @sizeOf(xml.Event(config)),
-            @sizeOf(xml.Attribute(config)),
-            @sizeOf(xml.Location(config)),
+            @sizeOf(xml.ReaderFor(config)),
+            @sizeOf(xml.EventFor(config)),
+            @sizeOf(xml.AttributeFor(config)),
+            @sizeOf(xml.LocationFor(config)),
         },
-    );
-    std.debug.print(
-        "{s}-tree\tdocument={d}\tbuilder={d}\n",
-        .{ name, @sizeOf(xml.Document(config)), @sizeOf(xml.TreeBuilder(config)) },
     );
 }

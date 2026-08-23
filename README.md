@@ -11,12 +11,14 @@ Status: **Active** (last updated: 2026-08-23)
 - Parsing without DTD support, DTD processing without validation, or DTD validation
 - Internal and external DTD subsets, parameter entities, parsed general entities, declared attributes, content models, IDs, references, notations, and standalone rules
 - UTF-8, UTF-16LE, and UTF-16BE input
-- Other encodings through a caller-provided `Transcoder`
+- Other external-source encodings through a caller-provided `Transcoder`
 - Optional XML 1.1 Unicode normalization checks
 
-`Reader(config)` selects the XML version, namespace handling, DTD behavior, event details, and diagnostic locations at compile time. Common choices are available under `Configs`.
+Normal code calls `Reader.init(allocator, source, options)`. XML version and UTF-8 or UTF-16 decoding are automatic. Namespace, DTD, external-source, normalization, line-tracking, diagnostic, and limit choices are runtime options on the same `Reader` and `Event` types. Root transcoding is not implemented yet.
 
-The parser never opens files or uses the network on its own. External DTDs and entities require a caller-provided `Resolver`. A validating reader can also reuse a compiled `ExternalSubset` across documents instead of parsing the same external declarations again.
+Package tests and development tools that still need a compile-time parser shape use `ReaderFor(config)` and `Configs`.
+
+The parser never opens files or uses the network on its own. External DTDs and entities require a caller-provided `Resolver`. A validating reader can also reuse a compiled `dtd.ExternalSubset` across documents instead of parsing the same external declarations again.
 
 ## Package
 

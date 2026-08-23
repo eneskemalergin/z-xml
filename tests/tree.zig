@@ -15,7 +15,7 @@ fn parse(
 fn parseWithReaderOptions(
     comptime config: xml.Config,
     allocator: std.mem.Allocator,
-    reader_options: xml.Options(config),
+    reader_options: xml.OptionsFor(config),
     input: []const u8,
     tree_options: xml.TreeOptions,
 ) !xml.Document(config) {
@@ -89,7 +89,7 @@ test "[integration] - [owned tree]: preserves XML 1.1 declaration and normalized
 
 test "[integration] - [owned tree]: joins fragmented comments and processing instructions" {
     const config = xml.Configs.XML10_UTF8_NO_DTD;
-    var reader_options: xml.Options(config) = .{};
+    var reader_options: xml.OptionsFor(config) = .{};
     reader_options.limits.max_fragment_bytes = 2;
     var document = try parseWithReaderOptions(
         config,
@@ -162,7 +162,7 @@ test "[integration] - [owned tree]: preserves skipped external entity boundaries
     try std.testing.expectEqualStrings("b", document.nodeValue(second).?);
     const skipped = document.dtdRecordAt(document.dtdRecordCount() - 1).?;
     try std.testing.expectEqual(xml.TreeDtdRecordKind.skipped_entity, skipped.kind);
-    try std.testing.expectEqual(xml.SkippedEntityKind.general_entity, skipped.skipped_entity_kind.?);
+    try std.testing.expectEqual(xml.ProfileSkippedEntityKind.general_entity, skipped.skipped_entity_kind.?);
 }
 
 test "[integration] - [owned tree]: retains validating whitespace classification" {
@@ -173,7 +173,7 @@ test "[integration] - [owned tree]: retains validating whitespace classification
 
     const text = document.firstChild(document.documentElement());
     try std.testing.expect(document.isIgnorableWhitespace(text));
-    try std.testing.expectEqual(xml.ValidationStatus.valid, document.validationStatus().?);
+    try std.testing.expectEqual(xml.ProfileValidationStatus.valid, document.validationStatus().?);
 }
 
 test "[integration] - [owned tree]: preserves namespaces and default attributes" {
