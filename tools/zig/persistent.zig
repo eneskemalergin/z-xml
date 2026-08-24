@@ -1,11 +1,11 @@
-//! Persistent benchmark adapter for XML 1.0 no-DTD profiles.
+//! Persistent adapter for normal Reader profiles.
 
 const std = @import("std");
 const xml = @import("z_xml");
 const persistent_options = @import("persistent_options");
 
-const ENGINE = if (persistent_options.general_encodings)
-    if (persistent_options.namespaces) "z-xml-general-ns" else "z-xml-general"
+const ENGINE = if (persistent_options.default_options)
+    "z-xml-default"
 else if (persistent_options.namespaces)
     "z-xml-ns"
 else
@@ -130,6 +130,7 @@ const TrackingAllocator = struct {
 };
 
 const MemoryStats = struct {
+    input_bytes: u64,
     first_allocator_operations: u64,
     warm_allocator_operations: u64,
     allocator_allocs: u64,
@@ -169,7 +170,7 @@ const Stats = struct {
     }
 
     fn name(self: *Stats, value: xml.Name) void {
-        if (comptime persistent_options.namespaces) {
+        if (comptime persistent_options.namespace_summary) {
             const expanded = value.expanded.?;
             const namespace_uri = expanded.namespace_uri orelse "";
             const prefix = expanded.prefix orelse "";
@@ -274,10 +275,13 @@ fn run(init: std.process.Init) !u8 {
         .dynamic => init.gpa,
         .fixed => fixed_allocator.allocator(),
     } };
-    const reader_options: xml.ReaderOptions = .{
-        .namespaces = if (persistent_options.namespaces) .process else .raw,
-        .dtd = .reject,
-    };
+    const reader_options: xml.ReaderOptions = if (persistent_options.default_options)
+        .{}
+    else
+        .{
+            .namespaces = if (persistent_options.namespaces) .process else .raw,
+            .dtd = .reject,
+        };
     var file_reader = file.reader(init.io, input);
     const source: xml.Source = switch (options.input) {
         .resident => .{ .slice = input },
@@ -310,6 +314,7 @@ fn run(init: std.process.Init) !u8 {
     reader.deinit();
     reader_live = false;
     const memory_stats: MemoryStats = .{
+        .input_bytes = file_size,
         .first_allocator_operations = first_allocator_operations,
         .warm_allocator_operations = allocatorOperations(tracking) - first_allocator_operations,
         .allocator_allocs = tracking.allocs,
@@ -413,7 +418,7 @@ fn printStats(
             stats.fragments,
         },
     );
-    if (comptime persistent_options.namespaces) {
+    if (comptime persistent_options.namespace_summary) {
         try output.print(
             ",\"namespace_declarations\":{d},\"namespace_uri_bytes\":{d}," ++
                 "\"local_name_bytes\":{d},\"prefix_bytes\":{d}",
@@ -433,13 +438,15 @@ fn printStats(
     }
     if (options.report_memory) {
         try output.print(
-            ",\"parser_storage\":\"{s}\",\"first_allocator_operations\":{d}," ++
+            ",\"input_bytes\":{d},\"parser_storage\":\"{s}\"," ++
+                "\"first_allocator_operations\":{d}," ++
                 "\"warm_allocator_operations\":{d},\"allocator_allocs\":{d}," ++
                 "\"allocator_resizes\":{d},\"allocator_remaps\":{d}," ++
                 "\"requested_bytes\":{d},\"peak_live_bytes\":{d}," ++
                 "\"retained_capacity\":{d},\"live_bytes_before_deinit\":{d}," ++
                 "\"live_bytes_after_deinit\":{d}",
             .{
+                memory.input_bytes,
                 @tagName(options.parser_storage),
                 memory.first_allocator_operations,
                 memory.warm_allocator_operations,

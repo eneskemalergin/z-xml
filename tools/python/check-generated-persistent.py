@@ -8,8 +8,8 @@ import csv
 import json
 import subprocess
 import sys
+from itertools import pairwise
 from pathlib import Path
-
 
 EXPECTED_FIELDS = {
     "engine",
@@ -30,6 +30,30 @@ NAMESPACE_FIELDS = {
     "namespace_uri_bytes",
     "local_name_bytes",
     "prefix_bytes",
+}
+MEMORY_FIELDS = {
+    "input_bytes",
+    "parser_storage",
+    "first_allocator_operations",
+    "warm_allocator_operations",
+    "allocator_allocs",
+    "allocator_resizes",
+    "allocator_remaps",
+    "requested_bytes",
+    "peak_live_bytes",
+    "retained_capacity",
+    "live_bytes_before_deinit",
+    "live_bytes_after_deinit",
+}
+FLAT_MEMORY_FIELDS = {
+    "first_allocator_operations",
+    "allocator_allocs",
+    "allocator_resizes",
+    "allocator_remaps",
+    "requested_bytes",
+    "peak_live_bytes",
+    "retained_capacity",
+    "live_bytes_before_deinit",
 }
 COMMON_SUMMARY_FIELDS = {"elements", "attributes", "text_bytes", "checksum"}
 NAMESPACE_SUMMARY_FIELDS = COMMON_SUMMARY_FIELDS | {
@@ -68,6 +92,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--max-bytes", type=int, default=1024 * 1024)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--report-memory", action="store_true")
+    parser.add_argument("--check-scale", action="store_true")
     return parser.parse_args()
 
 
@@ -87,6 +113,7 @@ def read_workloads(
     required = {
         "id",
         "path",
+        "shape",
         "actual_bytes",
         "classification",
         "expected_summary",
@@ -150,6 +177,7 @@ def observe(
     iterations: int,
     timeout: float,
     namespace: bool,
+    report_memory: bool,
 ) -> tuple[str, str, dict[str, object] | None]:
     command = [
         str(program),
@@ -158,14 +186,15 @@ def observe(
         f"--consumer={consumer}",
         f"--iterations={iterations}",
         f"--chunk-bytes={chunk_bytes}",
-        str(workload["resolved_path"]),
     ]
+    if report_memory:
+        command.append("--report-memory")
+    command.append(str(workload["resolved_path"]))
     try:
         completed = subprocess.run(
             command,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=timeout,
             check=False,
         )
@@ -175,10 +204,14 @@ def observe(
         return "error", str(error), None
 
     if workload["classification"] == "not-well-formed":
-        return ("pass", "-", None) if completed.returncode == 2 else (
-            "fail",
-            f"expected-status-2-observed-{completed.returncode}",
-            None,
+        return (
+            ("pass", "-", None)
+            if completed.returncode == 2
+            else (
+                "fail",
+                f"expected-status-2-observed-{completed.returncode}",
+                None,
+            )
         )
     if completed.returncode != 0:
         return "error", f"status-{completed.returncode}", None
@@ -187,7 +220,11 @@ def observe(
         observed = json.loads(completed.stdout)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return "error", "invalid-json", None
-    expected_output_fields = EXPECTED_FIELDS | (NAMESPACE_FIELDS if namespace else set())
+    expected_output_fields = (
+        EXPECTED_FIELDS
+        | (NAMESPACE_FIELDS if namespace else set())
+        | (MEMORY_FIELDS if report_memory else set())
+    )
     if not isinstance(observed, dict) or set(observed) != expected_output_fields:
         return "error", "unexpected-fields", None
     metadata = {
@@ -214,7 +251,68 @@ def observe(
     for field in ("name_bytes", "value_bytes", "fragments"):
         if type(observed[field]) is not int or observed[field] < 0:
             return "error", f"invalid-{field}", observed
+    if report_memory:
+        integer_fields = MEMORY_FIELDS - {"parser_storage"}
+        for field in integer_fields:
+            if type(observed[field]) is not int or observed[field] < 0:
+                return "error", f"invalid-{field}", observed
+        if observed["input_bytes"] != int(workload["actual_bytes"]):
+            return "fail", "input-bytes-mismatch", observed
+        expected_storage = "dynamic"
+        for argument in program_args:
+            if argument.startswith("--parser-storage="):
+                expected_storage = argument.removeprefix("--parser-storage=")
+        if observed["parser_storage"] != expected_storage:
+            return "fail", "parser-storage-mismatch", observed
+        allocator_operations = (
+            observed["allocator_allocs"]
+            + observed["allocator_resizes"]
+            + observed["allocator_remaps"]
+        )
+        if (
+            observed["first_allocator_operations"]
+            + observed["warm_allocator_operations"]
+            != allocator_operations
+        ):
+            return "fail", "allocator-operations-mismatch", observed
+        if observed["live_bytes_after_deinit"] != 0:
+            return "fail", "live-bytes-after-deinit", observed
+        if observed["live_bytes_before_deinit"] > observed["peak_live_bytes"]:
+            return "fail", "live-bytes-exceed-peak", observed
+        if observed["retained_capacity"] > observed["live_bytes_before_deinit"]:
+            return "fail", "retained-capacity-exceeds-live-bytes", observed
     return "pass", "-", observed
+
+
+def check_scale(samples: list[dict[str, object]]) -> list[str]:
+    if not samples:
+        return ["scale check has no passing samples"]
+
+    groups: dict[tuple[str, str, str, int], list[dict[str, object]]] = {}
+    for sample in samples:
+        key = (
+            str(sample["shape"]),
+            str(sample["input"]),
+            str(sample["consumer"]),
+            int(sample["chunk_bytes"]),
+        )
+        groups.setdefault(key, []).append(sample)
+
+    errors: list[str] = []
+    for key, values in sorted(groups.items()):
+        values.sort(key=lambda value: int(value["input_bytes"]))
+        sizes = [int(value["input_bytes"]) for value in values]
+        label = "/".join(map(str, key))
+        if len(sizes) < 4:
+            errors.append(f"{label}: scale check needs at least four input sizes")
+            continue
+        if any(current < previous * 4 for previous, current in pairwise(sizes)):
+            errors.append(f"{label}: input sizes are not geometrically increasing")
+        for field in sorted(FLAT_MEMORY_FIELDS):
+            observed = {int(value[field]) for value in values}
+            if len(observed) != 1:
+                errors.append(f"{label}: {field} changes with total input bytes")
+    return errors
 
 
 def main() -> int:
@@ -227,8 +325,13 @@ def main() -> int:
         or args.max_bytes <= 0
         or args.timeout <= 0
         or any(chunk <= 0 for chunk in chunks)
+        or (args.check_scale and not args.report_memory)
+        or (args.check_scale and inputs != ["stream"])
     ):
-        print("iterations, byte limits, timeout, and chunks must be positive", file=sys.stderr)
+        print(
+            "invalid limits, chunks, or scale-check options",
+            file=sys.stderr,
+        )
         return 64
 
     program = args.program.resolve()
@@ -248,6 +351,11 @@ def main() -> int:
         return 1
 
     args.results.parent.mkdir(parents=True, exist_ok=True)
+    result_fields = (
+        [*RESULT_FIELDS, *sorted(MEMORY_FIELDS)]
+        if args.report_memory
+        else RESULT_FIELDS
+    )
     fieldnames = [
         "target",
         "workload",
@@ -259,10 +367,11 @@ def main() -> int:
         "program_args",
         "verdict",
         "reason",
-        *RESULT_FIELDS,
+        *result_fields,
     ]
     passes = 0
     failures = 0
+    scale_samples: list[dict[str, object]] = []
     with args.results.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames, delimiter="\t", lineterminator="\n")
         writer.writeheader()
@@ -281,19 +390,30 @@ def main() -> int:
                             args.iterations,
                             args.timeout,
                             args.namespace,
+                            args.report_memory,
                         )
                         passes += verdict == "pass"
                         failures += verdict != "pass"
                         observed_fields: dict[str, object] = {
-                            field: "-" for field in RESULT_FIELDS
+                            field: "-" for field in result_fields
                         }
                         if observed is not None:
-                            for field in RESULT_FIELDS:
+                            for field in result_fields:
                                 if field in observed:
                                     value = observed[field]
                                     observed_fields[field] = (
                                         "null" if value is None else value
                                     )
+                            if verdict == "pass" and args.check_scale:
+                                scale_samples.append(
+                                    {
+                                        "shape": workload["shape"],
+                                        "input": input_model,
+                                        "consumer": consumer,
+                                        "chunk_bytes": chunk_bytes,
+                                        **observed,
+                                    }
+                                )
                         writer.writerow(
                             {
                                 "target": f"{args.engine}-persistent",
@@ -313,8 +433,13 @@ def main() -> int:
         f"{args.engine} persistent generated qualification: "
         f"{passes} pass, {failures} fail"
     )
+    scale_errors = check_scale(scale_samples) if args.check_scale else []
+    if args.check_scale and not scale_errors:
+        print(f"{args.engine} streaming scale: {len(scale_samples)} samples pass")
+    for error in scale_errors:
+        print(error, file=sys.stderr)
     print(f"results: {args.results}")
-    return 1 if failures else 0
+    return 1 if failures or scale_errors else 0
 
 
 if __name__ == "__main__":

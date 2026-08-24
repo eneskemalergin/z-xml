@@ -7,10 +7,14 @@ const check_options = @import("check_options");
 const INPUT_BUFFER_SIZE = 64 * 1024;
 
 const Stats = struct {
+    document_starts: u8 = 0,
+    document_ends: u8 = 0,
     elements: u64 = 0,
+    end_elements: u64 = 0,
     attributes: u64 = 0,
     text_bytes: u64 = 0,
     checksum: u64 = 14695981039346656037,
+    semantic_match: bool = true,
 
     fn bytes(self: *Stats, value: []const u8) void {
         for (value) |byte| {
@@ -29,8 +33,13 @@ const Stats = struct {
 
     fn observePayload(self: *Stats, payload: anytype) void {
         switch (payload) {
+            .document_start => self.document_starts +|= 1,
             .start_element => |start| {
                 self.elements += 1;
+                self.observeName(start.name);
+                if (!check_options.namespaces and start.namespace_declarations.len != 0) {
+                    self.semantic_match = false;
+                }
                 self.marker(1);
                 self.bytes(start.name.raw);
                 if (@hasField(@TypeOf(start), "namespace_declarations")) {
@@ -43,6 +52,7 @@ const Stats = struct {
                 }
                 for (start.attributes) |attribute| {
                     self.attributes += 1;
+                    self.observeName(attribute.name);
                     self.marker(2);
                     self.bytes(attribute.name.raw);
                     self.marker(3);
@@ -50,6 +60,8 @@ const Stats = struct {
                 }
             },
             .end_element => |end| {
+                self.end_elements += 1;
+                self.observeName(end.name);
                 self.marker(4);
                 self.bytes(end.name.raw);
             },
@@ -57,8 +69,25 @@ const Stats = struct {
                 self.text_bytes += text.bytes.len;
                 self.bytes(text.bytes);
             },
+            .document_end => |result| {
+                self.document_ends +|= 1;
+                if (!check_options.validating and result.dtd_validity != .not_requested) {
+                    self.semantic_match = false;
+                }
+            },
             else => {},
         }
+    }
+
+    fn observeName(self: *Stats, name: xml.Name) void {
+        if ((name.expanded != null) != check_options.namespaces) {
+            self.semantic_match = false;
+        }
+    }
+
+    fn complete(self: Stats) bool {
+        return self.semantic_match and self.document_starts == 1 and
+            self.document_ends == 1 and self.elements == self.end_elements;
     }
 };
 
@@ -137,6 +166,7 @@ fn run(init: std.process.Init) !u8 {
             stats.observe(value);
         } else break;
     }
+    if (!stats.complete()) return error.SemanticMismatch;
 
     var output_buffer: [160]u8 = undefined;
     var output_file = std.Io.File.stdout().writer(init.io, &output_buffer);
@@ -184,4 +214,16 @@ test "[unit] - [corpus adapter]: maps parser outcomes to contract statuses" {
     try std.testing.expectEqual(@as(?u8, 2), statusForReadError(error.DtdForbidden));
     try std.testing.expectEqual(@as(?u8, null), statusForReadError(error.UnsupportedFeature));
     try std.testing.expectEqual(@as(?u8, null), statusForReadError(error.ReadFailed));
+}
+
+test "[unit] - [corpus adapter]: requires one balanced document" {
+    var stats: Stats = .{};
+    try std.testing.expect(!stats.complete());
+    stats.document_starts = 1;
+    stats.document_ends = 1;
+    stats.elements = 2;
+    stats.end_elements = 2;
+    try std.testing.expect(stats.complete());
+    stats.semantic_match = false;
+    try std.testing.expect(!stats.complete());
 }

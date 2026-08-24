@@ -17,7 +17,19 @@ from pathlib import Path
 XML_BASE = "{http://www.w3.org/XML/1998/namespace}base"
 MANIFEST_ROOTS = {"TESTCASES", "TESTSUITE"}
 SUPPORTED_PROCESSOR_CLASSES = {"wf", "validating"}
+KNOWN_PROCESSOR_CLASSES = SUPPORTED_PROCESSOR_CLASSES | {
+    "partial",
+    "subset",
+    "lexical",
+    "index",
+}
+TARGET_SCHEMAS = {"z-xml-targets-v1", "z-xml-targets-v2"}
 NON_APPLICABLE_VERDICTS = {"unsupported-feature", "out-of-profile", "optional"}
+CASE_TYPES = {"valid", "invalid", "not-wf", "error"}
+ENTITY_MODES = {"none", "general", "parameter", "both"}
+XML_VERSIONS = {"1.0", "1.1"}
+XML_EDITIONS = {"1", "2", "3", "4", "5"}
+NAMESPACE_MODES = {"yes", "no"}
 
 
 @dataclass(frozen=True)
@@ -49,13 +61,32 @@ def local_name(tag: str) -> str:
 
 def read_targets(path: Path, bin_dir: Path, selected: set[str]) -> list[Target]:
     targets: list[Target] = []
+    seen: set[str] = set()
     with path.open(newline="", encoding="utf-8") as stream:
-        for row in csv.reader(stream, delimiter="\t"):
+        lines = list(stream)
+        comments = {line[1:].strip() for line in lines if line.startswith("#")}
+        if not TARGET_SCHEMAS.intersection(comments):
+            raise ValueError(f"{path}: unsupported target schema")
+        for row in csv.reader(lines, delimiter="\t"):
             if not row or row[0].startswith("#"):
                 continue
             if len(row) != 6:
                 raise ValueError(f"{path}: expected 6 fields, got {len(row)}")
             name, executable, processor_class, features, work_lane, input_model = row
+            feature_list = features.split(",")
+            if not name or name in seen:
+                raise ValueError(f"{path}: duplicate or empty target name {name}")
+            if processor_class not in KNOWN_PROCESSOR_CLASSES:
+                raise ValueError(f"{path}: {name}: unknown processor class")
+            if (
+                not executable
+                or not work_lane
+                or not input_model
+                or any(not feature for feature in feature_list)
+                or len(feature_list) != len(set(feature_list))
+            ):
+                raise ValueError(f"{path}: {name}: invalid target fields")
+            seen.add(name)
             if selected and name not in selected:
                 continue
             targets.append(
@@ -63,7 +94,7 @@ def read_targets(path: Path, bin_dir: Path, selected: set[str]) -> list[Target]:
                     name=name,
                     executable=(bin_dir / executable).resolve(),
                     processor_class=processor_class,
-                    features=frozenset(features.split(",")),
+                    features=frozenset(feature_list),
                     work_lane=work_lane,
                     input_model=input_model,
                 )
@@ -102,11 +133,32 @@ def read_cases(suite: Path) -> list[Case]:
             case_type = element.get("TYPE")
             if uri is None or test_id is None or case_type is None:
                 raise ValueError(f"{manifest}: TEST is missing ID, TYPE, or URI")
+            entities = element.get("ENTITIES", "none")
+            versions = element.get("VERSION", "1.0").split()
+            edition = element.get("EDITION", "unspecified")
+            namespace = element.get("NAMESPACE", "yes")
+            if case_type not in CASE_TYPES:
+                raise ValueError(f"{manifest}: {test_id}: unknown TYPE {case_type}")
+            if entities not in ENTITY_MODES:
+                raise ValueError(f"{manifest}: {test_id}: unknown ENTITIES {entities}")
+            if not versions or any(version not in XML_VERSIONS for version in versions):
+                raise ValueError(f"{manifest}: {test_id}: unknown VERSION")
+            if edition != "unspecified" and (
+                not edition.split()
+                or any(value not in XML_EDITIONS for value in edition.split())
+            ):
+                raise ValueError(f"{manifest}: {test_id}: unknown EDITION")
+            if namespace not in NAMESPACE_MODES:
+                raise ValueError(
+                    f"{manifest}: {test_id}: unknown NAMESPACE {namespace}"
+                )
             input_path = (base / uri).resolve()
             try:
                 input_path.relative_to(suite)
             except ValueError as error:
-                raise ValueError(f"{manifest}: test path escapes suite: {uri}") from error
+                raise ValueError(
+                    f"{manifest}: test path escapes suite: {uri}"
+                ) from error
             key = (manifest.resolve(), test_id, uri)
             if key in seen:
                 continue
@@ -117,10 +169,10 @@ def read_cases(suite: Path) -> list[Case]:
                     manifest=manifest.resolve(),
                     input_path=input_path,
                     case_type=case_type,
-                    entities=element.get("ENTITIES", "none"),
-                    version=element.get("VERSION", "1.0"),
-                    edition=element.get("EDITION", "unspecified"),
-                    namespace=element.get("NAMESPACE", "yes"),
+                    entities=entities,
+                    version=" ".join(versions),
+                    edition=edition,
+                    namespace=namespace,
                     sections=element.get("SECTIONS", ""),
                 )
             )
@@ -133,6 +185,10 @@ def input_encoding(path: Path) -> str:
         return "utf32"
     if data.startswith((b"\xfe\xff", b"\xff\xfe")):
         return "utf16"
+    if data.startswith((b"\x00\x00\x00\x3c", b"\x3c\x00\x00\x00")):
+        return "utf32"
+    if data.startswith((b"\x00\x3c\x00\x3f", b"\x3c\x00\x3f\x00")):
+        return "utf16"
     sample = data[3:] if data.startswith(b"\xef\xbb\xbf") else data
     for encoding in ("ascii", "utf-16", "utf-32"):
         try:
@@ -142,10 +198,10 @@ def input_encoding(path: Path) -> str:
         if "<?xml" in decoded:
             sample = decoded.encode("ascii", errors="ignore")
             break
-    match = re.search(br"encoding\s*=\s*['\"]([^'\"]+)['\"]", sample, re.IGNORECASE)
+    match = re.search(rb"encoding\s*=\s*['\"]([^'\"]+)['\"]", sample, re.IGNORECASE)
     if match is None:
         return "utf8"
-    declared = re.sub(br"[^a-z0-9]", b"", match.group(1).lower()).decode("ascii")
+    declared = re.sub(rb"[^a-z0-9]", b"", match.group(1).lower()).decode("ascii")
     if declared in {"utf8"}:
         return "utf8"
     if declared in {"utf16", "iso10646ucs2"}:
@@ -172,12 +228,15 @@ def document_text(path: Path, encoding: str) -> str:
 
 def requirements(target: Target, case: Case) -> tuple[set[str], str | None]:
     versions = case.version.split()
-    if not any(f"xml_version_{version.replace('.', '_')}" in target.features for version in versions):
+    if not any(
+        f"xml_version_{version.replace('.', '_')}" in target.features
+        for version in versions
+    ):
         return set(), "xml-version"
     if case.case_type == "error":
         return set(), "optional-error"
     if case.case_type not in {"valid", "invalid", "not-wf"}:
-        return set(), "unknown-type"
+        raise ValueError(f"unclassified W3C case type: {case.case_type}")
     raw_names = "raw_names" in target.features
     if raw_names and case.namespace != "no":
         return set(), "namespace-processing-mode"
@@ -279,7 +338,12 @@ def main() -> int:
     if shutil.which("prlimit") is None:
         print("W3C runner requires prlimit from util-linux", file=sys.stderr)
         return 1
-    if args.address_space_mib <= 0 or args.cpu_seconds <= 0 or args.open_files <= 0 or args.timeout <= 0:
+    if (
+        args.address_space_mib <= 0
+        or args.cpu_seconds <= 0
+        or args.open_files <= 0
+        or args.timeout <= 0
+    ):
         print("resource limits and timeout must be positive", file=sys.stderr)
         return 64
     limit_probe = subprocess.run(
@@ -314,11 +378,26 @@ def main() -> int:
 
     args.results.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
-        "target", "work_lane", "input_model", "test_id", "manifest", "type", "entities",
-        "version", "edition", "namespace", "encoding", "expected", "observed", "verdict",
-        "reason", "uri", "sections",
+        "target",
+        "work_lane",
+        "input_model",
+        "test_id",
+        "manifest",
+        "type",
+        "entities",
+        "version",
+        "edition",
+        "namespace",
+        "encoding",
+        "expected",
+        "observed",
+        "verdict",
+        "reason",
+        "uri",
+        "sections",
     ]
     totals: Counter[str] = Counter()
+    exclusion_reasons: Counter[tuple[str, str]] = Counter()
     with args.results.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames, delimiter="\t")
         writer.writeheader()
@@ -350,6 +429,14 @@ def main() -> int:
                         verdict = "pass" if observed == expected else "fail"
                 counts[verdict] += 1
                 totals[verdict] += 1
+                if verdict in NON_APPLICABLE_VERDICTS:
+                    if not reason:
+                        print(
+                            f"{target.name}: {case.test_id}: exclusion has no reason",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    exclusion_reasons[(verdict, reason)] += 1
                 writer.writerow(
                     {
                         "target": target.name,
@@ -384,6 +471,8 @@ def main() -> int:
         f"out-of-profile={totals['out-of-profile']} optional={totals['optional']} "
         f"error={totals['error']}"
     )
+    for (verdict, reason), count in sorted(exclusion_reasons.items()):
+        print(f"excluded {verdict} {reason}: {count}")
     print(f"results: {args.results}")
     return 1 if totals["fail"] or totals["error"] else 0
 

@@ -12,7 +12,8 @@ const CheckAdapter = struct {
 const PersistentAdapter = struct {
     name: []const u8,
     namespaces: bool,
-    general_encodings: bool,
+    default_options: bool,
+    namespace_summary: bool,
 };
 
 pub fn build(b: *std.Build) void {
@@ -42,10 +43,6 @@ pub fn build(b: *std.Build) void {
     const persistent_adapters_step = b.step(
         "persistent-adapters",
         "Build and install the qualified persistent adapters",
-    );
-    const experimental_adapters_step = b.step(
-        "experimental-adapters",
-        "Build and install adapters outside the qualified lanes",
     );
     const tools_step = b.step("tools", "Build and install all adapter tools");
 
@@ -77,61 +74,37 @@ pub fn build(b: *std.Build) void {
 
     inline for ([_]CheckAdapter{
         .{
-            .name = "z-xml-check",
+            .name = "z-xml-raw-reject-check",
             .namespaces = false,
             .dtd = false,
             .validating = false,
         },
         .{
-            .name = "z-xml-ns-check",
+            .name = "z-xml-namespace-reject-check",
             .namespaces = true,
             .dtd = false,
             .validating = false,
         },
         .{
-            .name = "z-xml-general-check",
-            .namespaces = false,
-            .dtd = false,
-            .validating = false,
-        },
-        .{
-            .name = "z-xml-general-ns-check",
-            .namespaces = true,
-            .dtd = false,
-            .validating = false,
-        },
-        .{
-            .name = "z-xml-dtd-check",
+            .name = "z-xml-raw-process-check",
             .namespaces = false,
             .dtd = true,
             .validating = false,
         },
         .{
-            .name = "z-xml-dtd-ns-check",
+            .name = "z-xml-namespace-process-check",
             .namespaces = true,
             .dtd = true,
             .validating = false,
         },
         .{
-            .name = "z-xml-validating-check",
+            .name = "z-xml-raw-validate-check",
             .namespaces = false,
             .dtd = true,
             .validating = true,
         },
         .{
-            .name = "z-xml-validating-ns-check",
-            .namespaces = true,
-            .dtd = true,
-            .validating = true,
-        },
-        .{
-            .name = "z-xml11-validating-check",
-            .namespaces = false,
-            .dtd = true,
-            .validating = true,
-        },
-        .{
-            .name = "z-xml11-validating-ns-check",
+            .name = "z-xml-namespace-validate-check",
             .namespaces = true,
             .dtd = true,
             .validating = true,
@@ -165,8 +138,24 @@ pub fn build(b: *std.Build) void {
     }
 
     inline for ([_]PersistentAdapter{
-        .{ .name = "z-xml-persistent", .namespaces = false, .general_encodings = false },
-        .{ .name = "z-xml-ns-persistent", .namespaces = true, .general_encodings = false },
+        .{
+            .name = "z-xml-persistent",
+            .namespaces = false,
+            .default_options = false,
+            .namespace_summary = false,
+        },
+        .{
+            .name = "z-xml-ns-persistent",
+            .namespaces = true,
+            .default_options = false,
+            .namespace_summary = true,
+        },
+        .{
+            .name = "z-xml-default-persistent",
+            .namespaces = true,
+            .default_options = true,
+            .namespace_summary = false,
+        },
     }) |adapter| {
         addPersistentAdapter(
             b,
@@ -178,19 +167,6 @@ pub fn build(b: *std.Build) void {
             adapter,
         );
     }
-    addPersistentAdapter(
-        b,
-        z_xml,
-        target,
-        optimize,
-        test_step,
-        experimental_adapters_step,
-        .{
-            .name = "z-xml-general-persistent",
-            .namespaces = false,
-            .general_encodings = true,
-        },
-    );
 
     const layout_module = b.createModule(.{
         .root_source_file = b.path("../src/layout_probe.zig"),
@@ -210,7 +186,6 @@ pub fn build(b: *std.Build) void {
     tools_step.dependOn(corpus_adapters_step);
     tools_step.dependOn(validation_bench_step);
     tools_step.dependOn(persistent_adapters_step);
-    tools_step.dependOn(experimental_adapters_step);
     b.getInstallStep().dependOn(tools_step);
     b.default_step = test_step;
 }
@@ -292,7 +267,8 @@ fn addPersistentAdapter(
     module.addImport("z_xml", z_xml);
     const options = b.addOptions();
     options.addOption(bool, "namespaces", adapter.namespaces);
-    options.addOption(bool, "general_encodings", adapter.general_encodings);
+    options.addOption(bool, "default_options", adapter.default_options);
+    options.addOption(bool, "namespace_summary", adapter.namespace_summary);
     module.addOptions("persistent_options", options);
 
     const executable = b.addExecutable(.{

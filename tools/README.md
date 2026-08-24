@@ -20,6 +20,7 @@ Fixture checks:
 
 - `make -C ref check-byte-fixtures` checks that byte-sensitive fixture files match their generator.
 - `make -C ref check-corpus` runs each fixture through the parsers that support its XML features.
+- `make -C ref check-reader-conformance` runs the focused and W3C cases applicable to the six z-xml Reader profiles.
 
 Local benchmark checks:
 
@@ -31,6 +32,7 @@ Generated XML:
 - `make -C ref generate-corpus check-generated` generates valid and malformed XML, then checks parser output.
 - `make -C ref generate-namespace-corpus verify-namespace-corpus` generates XML with frequent namespace changes, then checks it.
 - `make -C ref check-generated-persistent` checks repeated parsing from memory and from a stream.
+- `make -C ref check-reader-scale` checks semantic output and parser-owned memory for the default Reader on increasing flat and bounded-depth streams.
 
 Standard test data:
 
@@ -48,7 +50,7 @@ Measurement:
 ## Zig adapters
 
 - `tools/zig/check.zig` reads XML and prints event counts and a checksum.
-- `tools/zig/persistent.zig` measures repeated parsing from memory or a stream.
+- `tools/zig/persistent.zig` measures repeated parsing from memory or a stream. The `z-xml-default-persistent` build uses `Reader.init` defaults.
 - `tools/zig/tree.zig` builds and walks an owned document tree.
 - `tools/zig/validation_repeat.zig` compares validation with a new or reused external DTD subset.
 
@@ -64,7 +66,7 @@ zig build --build-file tools/build.zig validation-bench -Doptimize=ReleaseFast
 zig build --build-file tools/build.zig reader-audit -Doptimize=Debug
 ```
 
-The `tools` build step installs every adapter. The `experimental-adapters` step installs adapters that do not yet have a fully checked workload. The `test` step runs tests for the tool code. The separate `reader-audit` step installs the Reader test executable used for Memcheck; it is not part of the adapter union.
+The `tools` build step installs every adapter. The `test` step runs tests for the tool code. The separate `reader-audit` step installs the Reader test executable used for Memcheck; it is not part of the adapter union.
 
 Run that executable under Memcheck with:
 
