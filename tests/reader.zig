@@ -1539,7 +1539,7 @@ fn summarizeNormalSourceWithOptions(
             try appendFocusedValue(&output, element.name.raw);
             try appendFocusedValue(
                 &output,
-                element.name.expanded.?.namespace_uri orelse "",
+                if (element.name.expanded) |expanded| expanded.namespace_uri orelse "" else "",
             );
             for (element.attributes) |attribute| {
                 attributes = std.math.add(usize, attributes, 1) catch
@@ -1557,6 +1557,13 @@ fn summarizeNormalSourceWithOptions(
                 attribute_values_len = value_end + 1;
                 try output.append(std.testing.allocator, 'A');
                 try appendFocusedValue(&output, attribute.name.raw);
+                try appendFocusedValue(
+                    &output,
+                    if (attribute.name.expanded) |expanded|
+                        expanded.namespace_uri orelse ""
+                    else
+                        "",
+                );
                 try appendFocusedValue(&output, attribute.value);
             }
             for (element.namespace_declarations) |declaration| {
@@ -1571,7 +1578,7 @@ fn summarizeNormalSourceWithOptions(
             try appendFocusedValue(&output, element.name.raw);
             try appendFocusedValue(
                 &output,
-                element.name.expanded.?.namespace_uri orelse "",
+                if (element.name.expanded) |expanded| expanded.namespace_uri orelse "" else "",
             );
         },
         .text => |value| {
@@ -1760,6 +1767,40 @@ fn normalFailureWithOptions(
             };
         };
         if (event == null) return error.ExpectedFailure;
+    }
+}
+
+fn normalStartsBeforeFailure(source: xml.Source, options: xml.ReaderOptions) !usize {
+    var reader = try xml.Reader.init(std.testing.allocator, source, options);
+    defer reader.deinit();
+    var starts: usize = 0;
+    while (true) {
+        const event = reader.next() catch return starts;
+        const value = event orelse return error.ExpectedFailure;
+        if (value.data == .start_element) starts += 1;
+    }
+}
+
+fn expectNormalStartsBeforeFailureSchedules(
+    input: []const u8,
+    options: xml.ReaderOptions,
+    expected: usize,
+) !void {
+    try std.testing.expectEqual(
+        expected,
+        try normalStartsBeforeFailure(.{ .slice = input }, options),
+    );
+    inline for (.{ 1, 2, 3, 5, 7 }) |chunk_size| {
+        var input_buffer: [chunk_size]u8 = undefined;
+        var source: std.testing.Reader = .init(
+            &input_buffer,
+            &.{.{ .buffer = input }},
+        );
+        source.artificial_limit = .limited(chunk_size);
+        try std.testing.expectEqual(
+            expected,
+            try normalStartsBeforeFailure(.{ .stream = &source.interface }, options),
+        );
     }
 }
 
@@ -2075,6 +2116,7 @@ fn summarizeSelectedEngine(input: []const u8) ![]u8 {
                 for (element.attributes) |attribute| {
                     try output.append(std.testing.allocator, 'A');
                     try appendFocusedValue(&output, attribute.name.raw);
+                    try appendFocusedValue(&output, attribute.name.namespace_uri orelse "");
                     try appendFocusedValue(&output, attribute.value);
                 }
                 for (element.namespace_declarations) |declaration| {
@@ -2923,16 +2965,216 @@ test "[failure] - [Reader decoder]: UTF-16 grammar diagnostics keep physical loc
     }
 }
 
-test "[integration] - [Reader]: namespace policy keeps one event type" {
+fn expectNormalExpandedName(
+    name: xml.Name,
+    raw: []const u8,
+    prefix: ?[]const u8,
+    local: []const u8,
+    namespace_uri: ?[]const u8,
+) !void {
+    try std.testing.expectEqualStrings(raw, name.raw);
+    const expanded = name.expanded orelse return error.MissingExpandedName;
+    if (prefix) |expected| {
+        try std.testing.expectEqualStrings(expected, expanded.prefix.?);
+    } else {
+        try std.testing.expect(expanded.prefix == null);
+    }
+    try std.testing.expectEqualStrings(local, expanded.local);
+    if (namespace_uri) |expected| {
+        try std.testing.expectEqualStrings(expected, expanded.namespace_uri.?);
+    } else {
+        try std.testing.expect(expanded.namespace_uri == null);
+    }
+}
+
+test "[integration] - [Reader namespaces]: expanded names and declarations follow scope" {
+    const ExpectedName = struct {
+        raw: []const u8,
+        prefix: ?[]const u8 = null,
+        local: []const u8,
+        namespace_uri: ?[]const u8 = null,
+    };
+    const ExpectedDeclaration = struct {
+        prefix: ?[]const u8 = null,
+        namespace_uri: []const u8,
+    };
+    const ExpectedNamespaceAttribute = struct {
+        name: ExpectedName,
+        value: []const u8,
+    };
+    const ExpectedStart = struct {
+        name: ExpectedName,
+        declarations: []const ExpectedDeclaration = &.{},
+        attributes: []const ExpectedNamespaceAttribute = &.{},
+    };
+    const expected_starts = [_]ExpectedStart{
+        .{
+            .name = .{ .raw = "root", .local = "root", .namespace_uri = "urn:outer" },
+            .declarations = &.{
+                .{ .namespace_uri = "urn:outer" },
+                .{ .prefix = "p", .namespace_uri = "urn:p" },
+            },
+            .attributes = &.{
+                .{ .name = .{ .raw = "plain", .local = "plain" }, .value = "0" },
+                .{ .name = .{
+                    .raw = "p:value",
+                    .prefix = "p",
+                    .local = "value",
+                    .namespace_uri = "urn:p",
+                }, .value = "1" },
+                .{ .name = .{
+                    .raw = "xml:lang",
+                    .prefix = "xml",
+                    .local = "lang",
+                    .namespace_uri = "http://www.w3.org/XML/1998/namespace",
+                }, .value = "en" },
+            },
+        },
+        .{
+            .name = .{
+                .raw = "p:child",
+                .prefix = "p",
+                .local = "child",
+                .namespace_uri = "urn:inner-p",
+            },
+            .declarations = &.{
+                .{ .namespace_uri = "urn:inner" },
+                .{ .prefix = "p", .namespace_uri = "urn:inner-p" },
+            },
+            .attributes = &.{
+                .{
+                    .name = .{
+                        .raw = "p:value",
+                        .prefix = "p",
+                        .local = "value",
+                        .namespace_uri = "urn:inner-p",
+                    },
+                    .value = "2",
+                },
+            },
+        },
+        .{
+            .name = .{ .raw = "leaf", .local = "leaf" },
+            .declarations = &.{
+                .{ .namespace_uri = "" },
+            },
+        },
+        .{
+            .name = .{ .raw = "plain", .local = "plain", .namespace_uri = "urn:inner" },
+            .declarations = &.{
+                .{ .prefix = "p", .namespace_uri = "" },
+            },
+        },
+        .{
+            .name = .{
+                .raw = "p:child",
+                .prefix = "p",
+                .local = "child",
+                .namespace_uri = "urn:p",
+            },
+        },
+    };
+    const expected_ends = [_]ExpectedName{
+        .{ .raw = "leaf", .local = "leaf" },
+        .{ .raw = "plain", .local = "plain", .namespace_uri = "urn:inner" },
+        .{
+            .raw = "p:child",
+            .prefix = "p",
+            .local = "child",
+            .namespace_uri = "urn:inner-p",
+        },
+        .{
+            .raw = "p:child",
+            .prefix = "p",
+            .local = "child",
+            .namespace_uri = "urn:p",
+        },
+        .{ .raw = "root", .local = "root", .namespace_uri = "urn:outer" },
+    };
+    const input =
+        "<?xml version='1.1'?><root xmlns='urn:outer' xmlns:p='urn:p' " ++
+        "plain='0' p:value='1' xml:lang='en'>" ++
+        "<p:child xmlns='urn:inner' xmlns:p='urn:inner-p' p:value='2'>" ++
+        "<leaf xmlns=''/><plain xmlns:p=''/></p:child><p:child/></root>";
     var reader = try xml.Reader.init(
         std.testing.allocator,
-        .{ .slice = "<p:root xmlns:p='urn:test'/>" },
-        .{ .namespaces = .raw },
+        .{ .slice = input },
+        .{},
     );
     defer reader.deinit();
 
+    var start_index: usize = 0;
+    var end_index: usize = 0;
     while (try reader.next()) |event| switch (event.data) {
         .start_element => |element| {
+            if (start_index == expected_starts.len) return error.UnexpectedStartElement;
+            const expected = expected_starts[start_index];
+            try expectNormalExpandedName(
+                element.name,
+                expected.name.raw,
+                expected.name.prefix,
+                expected.name.local,
+                expected.name.namespace_uri,
+            );
+            try std.testing.expectEqual(
+                expected.declarations.len,
+                element.namespace_declarations.len,
+            );
+            for (element.namespace_declarations, expected.declarations) |actual, wanted| {
+                if (wanted.prefix) |prefix| {
+                    try std.testing.expectEqualStrings(prefix, actual.prefix.?);
+                } else {
+                    try std.testing.expect(actual.prefix == null);
+                }
+                try std.testing.expectEqualStrings(wanted.namespace_uri, actual.namespace_uri);
+            }
+            try std.testing.expectEqual(expected.attributes.len, element.attributes.len);
+            for (element.attributes, expected.attributes) |actual, wanted| {
+                try expectNormalExpandedName(
+                    actual.name,
+                    wanted.name.raw,
+                    wanted.name.prefix,
+                    wanted.name.local,
+                    wanted.name.namespace_uri,
+                );
+                try std.testing.expectEqualStrings(wanted.value, actual.value);
+                const found = element.attribute(
+                    wanted.name.namespace_uri,
+                    wanted.name.local,
+                ) orelse return error.MissingExpectedAttribute;
+                try std.testing.expectEqualStrings(wanted.value, found.value);
+            }
+            start_index += 1;
+        },
+        .end_element => |element| {
+            if (end_index == expected_ends.len) return error.UnexpectedEndElement;
+            const expected = expected_ends[end_index];
+            try expectNormalExpandedName(
+                element.name,
+                expected.raw,
+                expected.prefix,
+                expected.local,
+                expected.namespace_uri,
+            );
+            end_index += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 5), start_index);
+    try std.testing.expectEqual(@as(usize, 5), end_index);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_binding_count);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_bytes);
+
+    try reader.reset(
+        .{ .slice = "<p:root xmlns:p='urn:test'/>" },
+        .{ .namespaces = .raw },
+        .retain_capacity,
+    );
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_capacity);
+    var raw_starts: usize = 0;
+    while (try reader.next()) |event| switch (event.data) {
+        .start_element => |element| {
+            raw_starts += 1;
             try std.testing.expectEqualStrings("p:root", element.name.raw);
             try std.testing.expectEqual(@as(?xml.ExpandedName, null), element.name.expanded);
             try std.testing.expectEqual(@as(usize, 0), element.namespace_declarations.len);
@@ -2940,11 +3182,234 @@ test "[integration] - [Reader]: namespace policy keeps one event type" {
                 "urn:test",
                 element.attributeRaw("xmlns:p").?.value,
             );
-            return;
         },
         else => {},
     };
-    return error.MissingStartElement;
+    try std.testing.expectEqual(@as(usize, 1), raw_starts);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_capacity);
+}
+
+test "[property] - [Reader namespaces]: each policy agrees across source schedules" {
+    const input =
+        "<root xmlns='urn:outer' xmlns:p='urn:p' plain='0'>" ++
+        "<p:child xmlns:p='urn:inner' p:value='1'/><leaf xmlns=''/></root>";
+    const policies = [_]xml.ReaderOptions{
+        .{},
+        .{ .namespaces = .raw },
+    };
+    for (policies) |options| {
+        var expected = try summarizeNormalSourceWithOptions(.{ .slice = input }, options);
+        defer expected.deinit();
+        try expectNormalEncodingSchedulesWithOptions(
+            input,
+            options,
+            expected.events,
+            .utf8,
+            null,
+        );
+    }
+}
+
+test "[property] - [Reader namespaces]: raw mode changes only namespace handling" {
+    const neutral = "<root id='1'><child/></root>";
+    var processed = try summarizeNormalSourceWithOptions(.{ .slice = neutral }, .{});
+    defer processed.deinit();
+    var raw = try summarizeNormalSourceWithOptions(
+        .{ .slice = neutral },
+        .{ .namespaces = .raw },
+    );
+    defer raw.deinit();
+    try std.testing.expectEqualStrings(processed.events, raw.events);
+
+    var raw_reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "<a:b:c xmlns:xml='not-reserved'/>" },
+        .{ .namespaces = .raw },
+    );
+    defer raw_reader.deinit();
+    var raw_starts: usize = 0;
+    while (try raw_reader.next()) |event| switch (event.data) {
+        .start_element => |element| {
+            raw_starts += 1;
+            try std.testing.expectEqualStrings("a:b:c", element.name.raw);
+            try std.testing.expect(element.name.expanded == null);
+            try std.testing.expectEqual(@as(usize, 0), element.namespace_declarations.len);
+            try std.testing.expectEqualStrings(
+                "not-reserved",
+                element.attributeRaw("xmlns:xml").?.value,
+            );
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), raw_starts);
+
+    const duplicate = "<root id='1' id='2'/>";
+    const primary = std.mem.lastIndexOf(u8, duplicate, "id").?;
+    const related = std.mem.indexOf(u8, duplicate, "id").?;
+    try expectNormalFailureSchedulesWithOptions(
+        duplicate,
+        .{ .namespaces = .raw },
+        .{
+            .category = error.InvalidXml,
+            .code = .duplicate_attribute,
+            .byte_offset = primary,
+            .related_byte_offset = related,
+            .line = 1,
+            .byte_column = primary + 1,
+        },
+    );
+}
+
+test "[failure] - [Reader namespaces]: invalid states keep diagnostics and publish no invalid start" {
+    const duplicate_expanded =
+        "<root xmlns:a='urn:same' xmlns:b='urn:same' a:value='1' b:value='2'/>";
+    const bad_xml_binding = "<root xmlns:xml='urn:not-the-xml-namespace'/>";
+    const bad_xmlns_binding = "<root xmlns:xmlns='urn:not-allowed'/>";
+    const prefix_undeclaration = "<root xmlns:p='urn:p'><child xmlns:p=''/></root>";
+    const xml11_unbound_after_undeclaration =
+        "<?xml version='1.1'?><root xmlns:p='urn:p'><child xmlns:p=''><p:item/></child></root>";
+    const bad_default_uri = "<root xmlns='http://www.w3.org/2000/xmlns/'/>";
+    const Case = struct {
+        input: []const u8,
+        code: xml.DiagnosticCode,
+        primary: usize,
+        related: ?usize = null,
+        published_starts: usize = 0,
+    };
+    const cases = [_]Case{
+        .{ .input = "<p:root/>", .code = .unbound_prefix, .primary = 1 },
+        .{ .input = "<root p:attribute='value'/>", .code = .unbound_prefix, .primary = 6 },
+        .{
+            .input = bad_xml_binding,
+            .code = .illegal_namespace_declaration,
+            .primary = std.mem.indexOf(u8, bad_xml_binding, "xmlns:xml").?,
+        },
+        .{
+            .input = bad_xmlns_binding,
+            .code = .illegal_namespace_declaration,
+            .primary = std.mem.indexOf(u8, bad_xmlns_binding, "xmlns:xmlns").?,
+        },
+        .{ .input = "<xmlns:root/>", .code = .reserved_namespace_name, .primary = 1 },
+        .{
+            .input = duplicate_expanded,
+            .code = .duplicate_expanded_attribute,
+            .primary = std.mem.indexOf(u8, duplicate_expanded, "b:value").?,
+            .related = std.mem.indexOf(u8, duplicate_expanded, "a:value").?,
+        },
+        .{ .input = "<a:b:c xmlns:a='urn:a'/>", .code = .malformed_qname, .primary = 4 },
+        .{
+            .input = prefix_undeclaration,
+            .code = .illegal_namespace_declaration,
+            .primary = std.mem.lastIndexOf(u8, prefix_undeclaration, "xmlns:p").?,
+            .published_starts = 1,
+        },
+        .{
+            .input = xml11_unbound_after_undeclaration,
+            .code = .unbound_prefix,
+            .primary = std.mem.indexOf(u8, xml11_unbound_after_undeclaration, "p:item").?,
+            .published_starts = 2,
+        },
+        .{
+            .input = bad_default_uri,
+            .code = .illegal_namespace_declaration,
+            .primary = std.mem.indexOf(u8, bad_default_uri, "xmlns").?,
+        },
+    };
+    for (cases) |case| {
+        try expectNormalStartsBeforeFailureSchedules(
+            case.input,
+            .{},
+            case.published_starts,
+        );
+        try expectNormalFailureSchedulesWithOptions(
+            case.input,
+            .{},
+            .{
+                .category = error.InvalidXml,
+                .code = case.code,
+                .byte_offset = @intCast(case.primary),
+                .related_byte_offset = if (case.related) |offset| @intCast(offset) else null,
+                .line = 1,
+                .byte_column = @intCast(case.primary + 1),
+            },
+        );
+    }
+}
+
+test "[edge] - [Reader namespace limits]: each boundary accepts at limit and rejects one over" {
+    const declarations = "<r xmlns:a='u' xmlns:b='v'/>";
+    const bindings = "<r xmlns:a='u'><c xmlns:b='v'/></r>";
+    const binding_bytes = "<r xmlns:a='urn'/>";
+    const qname = "<root></root>";
+    const comparison = "<r xmlns:a='u' a:x='1'/>";
+    inline for (.{
+        .{
+            .field = "max_namespace_declarations_per_element",
+            .input = declarations,
+            .at_limit = 2,
+            .one_over = 1,
+            .code = xml.DiagnosticCode.namespace_declaration_limit,
+            .primary = std.mem.indexOf(u8, declarations, "xmlns:b").?,
+        },
+        .{
+            .field = "max_active_namespace_bindings",
+            .input = bindings,
+            .at_limit = 2,
+            .one_over = 1,
+            .code = xml.DiagnosticCode.namespace_binding_limit,
+            .primary = std.mem.indexOf(u8, bindings, "xmlns:b").?,
+        },
+        .{
+            .field = "max_namespace_binding_bytes",
+            .input = binding_bytes,
+            .at_limit = 4,
+            .one_over = 3,
+            .code = xml.DiagnosticCode.namespace_binding_bytes_limit,
+            .primary = std.mem.indexOf(u8, binding_bytes, "xmlns:a").?,
+        },
+        .{
+            .field = "max_qname_bytes",
+            .input = qname,
+            .at_limit = 4,
+            .one_over = 3,
+            .code = xml.DiagnosticCode.qname_limit,
+            .primary = 4,
+        },
+        .{
+            .field = "max_namespace_comparison_work",
+            .input = comparison,
+            .at_limit = 5,
+            .one_over = 4,
+            .code = xml.DiagnosticCode.namespace_comparison_limit,
+            .primary = std.mem.indexOf(u8, comparison, "a:x").?,
+        },
+    }) |case| {
+        var options: xml.ReaderOptions = .{};
+        @field(options.limits, case.field) = case.at_limit;
+        var expected = try summarizeNormalSourceWithOptions(.{ .slice = case.input }, options);
+        defer expected.deinit();
+        try expectNormalEncodingSchedulesWithOptions(
+            case.input,
+            options,
+            expected.events,
+            .utf8,
+            null,
+        );
+
+        @field(options.limits, case.field) = case.one_over;
+        try expectNormalFailureSchedulesWithOptions(
+            case.input,
+            options,
+            .{
+                .category = error.LimitExceeded,
+                .code = case.code,
+                .byte_offset = case.primary,
+                .related_byte_offset = null,
+                .line = 1,
+                .byte_column = case.primary + 1,
+            },
+        );
+    }
 }
 
 test "[integration] - [Reader]: event values borrow until the next read begins" {
@@ -3318,6 +3783,25 @@ test "[unit] - [Reader]: initialization validates options without allocating" {
             .{ .external = .resolve },
         ),
     );
+
+    inline for (.{
+        "max_namespace_declarations_per_element",
+        "max_active_namespace_bindings",
+        "max_namespace_binding_bytes",
+        "max_qname_bytes",
+        "max_namespace_comparison_work",
+    }) |field_name| {
+        var options: xml.ReaderOptions = .{};
+        @field(options.limits, field_name) = 0;
+        try std.testing.expectError(
+            error.InvalidOptions,
+            xml.Reader.init(
+                std.testing.allocator,
+                .{ .slice = "<root/>" },
+                options,
+            ),
+        );
+    }
 }
 
 test "[integration] - [Reader]: errors keep their public class and line policy" {

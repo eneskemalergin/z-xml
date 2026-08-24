@@ -236,7 +236,7 @@ pub const Lifecycle = enum {
 
 /// Runtime limits enforced by the reader.
 pub const Limits = struct {
-    /// Finite default limits for the normal reader.
+    /// Finite default limits for specialized readers.
     pub const general: Limits = .{};
 
     /// Maximum simultaneously open element count.
@@ -306,6 +306,54 @@ pub fn NamespaceLimits(comptime config: Config) type {
             }
         };
 }
+
+/// Runtime resource limits exposed by the normal reader.
+pub const NormalLimits = struct {
+    /// Finite default limits for the normal reader.
+    pub const general: NormalLimits = .{};
+
+    /// Maximum simultaneously open element count.
+    max_depth: usize = 256,
+    /// Maximum cumulative raw-name bytes for open elements.
+    max_open_name_bytes: usize = 1024 * 1024,
+    /// Maximum bytes accepted in one unfinished token.
+    max_partial_token_bytes: usize = 64 * 1024,
+    /// Maximum source attributes accepted on one element.
+    max_attributes_per_element: usize = 256,
+    /// Maximum raw bytes accepted in one attribute name.
+    max_attribute_name_bytes: usize = 64 * 1024,
+    /// Maximum semantic bytes accepted in one attribute value.
+    max_attribute_value_bytes: usize = 1024 * 1024,
+    /// Maximum aggregate name and value bytes accepted on one element.
+    max_attribute_bytes_per_element: usize = 1024 * 1024,
+    /// Maximum source bytes accepted in one complete start tag.
+    max_start_tag_bytes: usize = 1024 * 1024,
+    /// Maximum bytes exposed by one fragmented semantic event.
+    max_fragment_bytes: usize = 64 * 1024,
+    /// Maximum UTF-8 bytes accepted in one processing-instruction target.
+    max_processing_instruction_target_bytes: usize = 64 * 1024,
+    /// Maximum namespace declarations accepted on one element.
+    max_namespace_declarations_per_element: usize = 64,
+    /// Maximum active namespace bindings, including shadowed bindings.
+    max_active_namespace_bindings: usize = 1024,
+    /// Maximum prefix and URI bytes retained by active namespace bindings.
+    max_namespace_binding_bytes: usize = 1024 * 1024,
+    /// Maximum UTF-8 bytes accepted in one qualified name.
+    max_qname_bytes: usize = 64 * 1024,
+    /// Maximum weighted namespace comparison work per start element.
+    max_namespace_comparison_work: usize = 1024 * 1024,
+    /// Maximum owned capacity retained across a retain reset.
+    max_retained_bytes: usize = 1024 * 1024,
+
+    fn validate(self: NormalLimits) bool {
+        return normalParserLimits(self).validate() and
+            self.max_namespace_declarations_per_element > 0 and
+            self.max_active_namespace_bindings > 0 and
+            self.max_namespace_binding_bytes > 0 and
+            self.max_qname_bytes > 0 and
+            self.max_namespace_comparison_work > 0;
+    }
+};
 
 /// Categories of memory owned by a reader.
 pub const MemoryUsage = struct {
@@ -1020,7 +1068,7 @@ pub const NormalDiagnosticSink = struct {
 /// Runtime options retain caller-owned pointers, slices, and callback contexts.
 /// Those borrows must remain valid until a successful reset or deinitialization.
 pub const NormalReaderOptions = struct {
-    limits: Limits = Limits.general,
+    limits: NormalLimits = NormalLimits.general,
     namespaces: NormalNamespacePolicy = .process,
     dtd: NormalDtdPolicy = .process,
     external: NormalExternalPolicy = .forbid,
@@ -11012,7 +11060,16 @@ fn normalEngineOptions(
     options: NormalReaderOptions,
 ) Options(config) {
     var result: Options(config) = .{};
-    result.limits = options.limits;
+    result.limits = normalParserLimits(options.limits);
+    if (comptime config.profile.hasNamespaces()) {
+        result.namespace_limits = .{
+            .max_declarations_per_element = options.limits.max_namespace_declarations_per_element,
+            .max_active_bindings = options.limits.max_active_namespace_bindings,
+            .max_binding_bytes = options.limits.max_namespace_binding_bytes,
+            .max_qname_bytes = options.limits.max_qname_bytes,
+            .max_comparison_work = options.limits.max_namespace_comparison_work,
+        };
+    }
     result.resolver.policy = if (options.external == .resolve) .resolve else .skip;
     result.resolver.resolver = options.resolver;
     result.resolver.document_base_id = options.document_base_id;
@@ -11028,6 +11085,22 @@ fn normalEngineOptions(
         }
     }
     return result;
+}
+
+fn normalParserLimits(limits: NormalLimits) Limits {
+    return .{
+        .max_depth = limits.max_depth,
+        .max_open_name_bytes = limits.max_open_name_bytes,
+        .max_partial_token_bytes = limits.max_partial_token_bytes,
+        .max_attributes_per_element = limits.max_attributes_per_element,
+        .max_attribute_name_bytes = limits.max_attribute_name_bytes,
+        .max_attribute_value_bytes = limits.max_attribute_value_bytes,
+        .max_attribute_bytes_per_element = limits.max_attribute_bytes_per_element,
+        .max_start_tag_bytes = limits.max_start_tag_bytes,
+        .max_fragment_bytes = limits.max_fragment_bytes,
+        .max_processing_instruction_target_bytes = limits.max_processing_instruction_target_bytes,
+        .max_retained_bytes = limits.max_retained_bytes,
+    };
 }
 
 fn normalName(comptime config: Config, name: Name(config)) NormalName {

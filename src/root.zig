@@ -31,8 +31,8 @@ pub const NormalizationIssueKind = reader.NormalizationIssueKind;
 pub const AttributeType = dtd_module.AttributeType;
 /// Observable lifecycle of a specialized reader.
 pub const ProfileLifecycle = reader.Lifecycle;
-/// Runtime resource limits.
-pub const Limits = reader.Limits;
+/// Runtime resource limits for the normal Reader.
+pub const Limits = reader.NormalLimits;
 /// Reader-owned memory categories.
 pub const MemoryUsage = reader.MemoryUsage;
 /// Stable diagnostic category.
