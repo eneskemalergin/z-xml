@@ -1103,7 +1103,7 @@ const Parser = struct {
                 if (top.cursor < top.len) break;
                 _ = self.sources.pop();
                 if (top.boundary_space) {
-                    logical.append(self.allocator, ' ') catch return error.OutOfMemory;
+                    try self.appendLogicalByte(&logical, ' ', offset);
                 }
             }
             if (self.sources.items.len == 0) break;
@@ -1115,7 +1115,7 @@ const Parser = struct {
                 parameterReferenceLength(bytes[cursor..]) != null and
                 quote == 0)
             {
-                if (quote == 0) logical.append(self.allocator, ' ') catch return error.OutOfMemory;
+                try self.appendLogicalByte(&logical, ' ', offset);
                 try self.pushParameterReference();
                 if (self.sources.items[self.sources.items.len - 1].base_id) |base_id| {
                     declaration_base_id = base_id;
@@ -1125,10 +1125,7 @@ const Parser = struct {
             }
             const byte = bytes[cursor];
             self.sources.items[index].cursor += 1;
-            logical.append(self.allocator, byte) catch return error.OutOfMemory;
-            if (logical.items.len > self.limits.max_declaration_bytes -| self.state.declaration_bytes) {
-                return self.limit(.declaration_bytes_limit, offset);
-            }
+            try self.appendLogicalByte(&logical, byte, offset);
             if (quote != 0) {
                 if (byte == quote and self.sources.items[index].entity_index == quote_entity_index) {
                     quote = 0;
@@ -1229,6 +1226,20 @@ const Parser = struct {
         if (cursor != logical.items.len) return self.invalid(.malformed_declaration, offset + cursor);
         _ = self.sources.pop();
         self.state.declaration_count += 1;
+    }
+
+    fn appendLogicalByte(
+        self: *Parser,
+        logical: *std.ArrayList(u8),
+        byte: u8,
+        offset: usize,
+    ) ParseError!void {
+        if (logical.items.len >= self.limits.max_declaration_bytes -|
+            self.state.declaration_bytes)
+        {
+            return self.limit(.declaration_bytes_limit, offset);
+        }
+        logical.append(self.allocator, byte) catch return error.OutOfMemory;
     }
 
     fn parameterReferenceLength(bytes: []const u8) ?usize {

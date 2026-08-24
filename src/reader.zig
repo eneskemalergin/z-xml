@@ -399,6 +399,14 @@ pub const NormalLimits = struct {
     max_validation_comparison_work: usize = 16 * 1024 * 1024,
     /// Maximum DTD validity findings reported for one document.
     max_validation_findings: usize = 1024,
+    /// Maximum external resources acquired for one document.
+    max_external_resources: usize = 256,
+    /// Maximum bytes read from one external resource.
+    max_external_source_bytes: usize = 8 * 1024 * 1024,
+    /// Maximum cumulative bytes read from external resources.
+    max_external_total_bytes: usize = 32 * 1024 * 1024,
+    /// Maximum bytes accepted in one external source identifier.
+    max_external_identifier_bytes: usize = 64 * 1024,
     /// Maximum owned capacity retained across a retain reset.
     max_retained_bytes: usize = 1024 * 1024,
 
@@ -410,7 +418,11 @@ pub const NormalLimits = struct {
             self.max_active_namespace_bindings > 0 and
             self.max_namespace_binding_bytes > 0 and
             self.max_qname_bytes > 0 and
-            self.max_namespace_comparison_work > 0;
+            self.max_namespace_comparison_work > 0 and
+            self.max_external_resources > 0 and
+            self.max_external_source_bytes > 0 and
+            self.max_external_total_bytes > 0 and
+            self.max_external_identifier_bytes > 0;
     }
 };
 
@@ -569,6 +581,7 @@ pub const DiagnosticCode = enum {
     entity_expansion_limit,
     external_resource_count_limit,
     external_resource_bytes_limit,
+    external_resource_identifier_limit,
     external_resource_depth_limit,
     resolver_not_found,
     resolver_forbidden,
@@ -576,6 +589,7 @@ pub const DiagnosticCode = enum {
     resolver_io_failure,
     resolver_resource_limit,
     resolver_cancelled,
+    resolver_invalid_result,
     transcoder_cancelled,
     dtd_finding_cancelled,
     read_failed,
@@ -652,10 +666,12 @@ fn ResolverOptions(comptime config: Config) type {
             max_source_bytes: usize = 8 * 1024 * 1024,
             /// Maximum cumulative bytes read from external resources.
             max_total_bytes: usize = 32 * 1024 * 1024,
+            /// Maximum bytes accepted in one external source identifier.
+            max_identifier_bytes: usize = 64 * 1024,
 
             fn validate(self: @This()) bool {
                 return self.max_resources > 0 and self.max_source_bytes > 0 and
-                    self.max_total_bytes > 0 and
+                    self.max_total_bytes > 0 and self.max_identifier_bytes > 0 and
                     (self.policy == .skip or self.resolver != null);
             }
         };
@@ -1530,6 +1546,8 @@ fn DtdState(comptime config: Config) type {
                 if (config.external_sources) 0 else {},
             external_resource_bytes: if (config.external_sources) usize else void =
                 if (config.external_sources) 0 else {},
+            external_source_ids: if (config.external_sources) std.ArrayList(u32) else void =
+                if (config.external_sources) .empty else {},
             source_id: u32 = 0,
             external_failure_code: if (config.external_sources) ?DiagnosticCode else void =
                 if (config.external_sources) null else {},
@@ -3498,7 +3516,8 @@ pub fn Reader(comptime config: Config) type {
                 self.dtd_state.attribute_sources.capacity *| @sizeOf(AttributeEntityFrame) +|
                 self.dtd_state.reference_name.capacity +|
                 if (comptime config.external_sources)
-                    self.dtd_state.external_buffers.capacity *| @sizeOf(ExternalBuffer) +|
+                    self.dtd_state.external_source_ids.capacity *| @sizeOf(u32) +|
+                        self.dtd_state.external_buffers.capacity *| @sizeOf(ExternalBuffer) +|
                         self.externalBufferCapacity() +|
                         self.diagnostic_inclusions.capacity *| @sizeOf(Location(config))
                 else
@@ -3547,6 +3566,7 @@ pub fn Reader(comptime config: Config) type {
                 self.dtd_state.attribute_sources.deinit(self.allocator);
                 self.dtd_state.reference_name.deinit(self.allocator);
                 if (comptime config.external_sources) {
+                    self.dtd_state.external_source_ids.deinit(self.allocator);
                     self.dtd_state.external_buffers.deinit(self.allocator);
                 }
             }
@@ -3643,6 +3663,7 @@ pub fn Reader(comptime config: Config) type {
                 if (comptime config.external_sources) {
                     self.dtd_state.external_resource_count = 0;
                     self.dtd_state.external_resource_bytes = 0;
+                    self.dtd_state.external_source_ids.clearRetainingCapacity();
                     self.dtd_state.external_failure_code = null;
                     self.dtd_state.external_failure_location = null;
                     self.dtd_state.active_external_inclusion = null;
@@ -4603,19 +4624,30 @@ pub fn Reader(comptime config: Config) type {
             }
             self.dtd_state.external_failure_code = null;
             self.dtd_state.external_failure_location = inclusion;
+            const base_id = requested_base_id orelse self.options.resolver.document_base_id;
+            if (system_id.len > self.options.resolver.max_identifier_bytes or
+                (public_id != null and
+                    public_id.?.len > self.options.resolver.max_identifier_bytes) or
+                (base_id != null and
+                    base_id.?.len > self.options.resolver.max_identifier_bytes))
+            {
+                return self.externalProviderFailure(
+                    .external_resource_identifier_limit,
+                    error.LimitExceeded,
+                );
+            }
+            if (self.dtd_state.external_resource_count == self.options.resolver.max_resources) {
+                return self.externalProviderFailure(.external_resource_count_limit, error.LimitExceeded);
+            }
             self.diagnostic_inclusions.ensureTotalCapacity(
                 self.allocator,
                 @min(
                     self.options.dtd_limits.max_active_entity_depth,
-                    self.dtd_state.external_resource_count +| 1,
+                    self.dtd_state.external_resource_count + 1,
                 ),
             ) catch return error.OutOfMemory;
-            if (self.dtd_state.external_resource_count == self.options.resolver.max_resources) {
-                return self.externalProviderFailure(.external_resource_count_limit, error.LimitExceeded);
-            }
             self.dtd_state.external_resource_count += 1;
             const callback = self.options.resolver.resolver.?;
-            const base_id = requested_base_id orelse self.options.resolver.document_base_id;
             const result = callback.resolve(.{
                 .kind = kind,
                 .name = name,
@@ -4635,6 +4667,36 @@ pub fn Reader(comptime config: Config) type {
                 .io_failure => return self.externalProviderFailure(.resolver_io_failure, error.ResolverFailed),
                 .resource_limit => return self.externalProviderFailure(.resolver_resource_limit, error.LimitExceeded),
                 .cancelled => return self.externalProviderFailure(.resolver_cancelled, error.Cancelled),
+            };
+            const reusable_source_used = if (comptime config.profile.dtdMode() == .validating)
+                if (self.options.validation.external_subset) |subset|
+                    subset.hasSource(source.source_id)
+                else
+                    false
+            else
+                false;
+            if (source.source_id == 0 or reusable_source_used or
+                std.mem.indexOfScalar(
+                    u32,
+                    self.dtd_state.external_source_ids.items,
+                    source.source_id,
+                ) != null)
+            {
+                source.close();
+                return self.externalProviderFailure(.resolver_invalid_result, error.ResolverFailed);
+            }
+            if (source.base_id != null and
+                source.base_id.?.len > self.options.resolver.max_identifier_bytes)
+            {
+                source.close();
+                return self.externalProviderFailure(
+                    .external_resource_identifier_limit,
+                    error.LimitExceeded,
+                );
+            }
+            self.dtd_state.external_source_ids.append(self.allocator, source.source_id) catch {
+                source.close();
+                return error.OutOfMemory;
             };
             return source;
         }
@@ -11355,6 +11417,10 @@ fn normalEngineOptions(
         result.resolver.policy = if (options.external == .resolve) .resolve else .skip;
         result.resolver.resolver = options.resolver;
         result.resolver.document_base_id = options.document_base_id;
+        result.resolver.max_resources = options.limits.max_external_resources;
+        result.resolver.max_source_bytes = options.limits.max_external_source_bytes;
+        result.resolver.max_total_bytes = options.limits.max_external_total_bytes;
+        result.resolver.max_identifier_bytes = options.limits.max_external_identifier_bytes;
     }
     result.normalization = switch (options.normalization) {
         .report => .report,

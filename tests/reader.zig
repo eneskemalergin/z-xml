@@ -3412,6 +3412,176 @@ test "[edge] - [Reader namespace limits]: each boundary accepts at limit and rej
     }
 }
 
+test "[edge] - [Reader core limits]: each boundary accepts at limit and rejects one over" {
+    inline for (.{
+        .{
+            .field = "max_depth",
+            .input = "<a><b/></a>",
+            .at_limit = 2,
+            .one_over = 1,
+            .code = xml.DiagnosticCode.depth_limit,
+            .primary = 4,
+        },
+        .{
+            .field = "max_open_name_bytes",
+            .input = "<abc><de/></abc>",
+            .at_limit = 5,
+            .one_over = 4,
+            .code = xml.DiagnosticCode.open_name_limit,
+            .primary = 7,
+        },
+        .{
+            .field = "max_partial_token_bytes",
+            .input = "<root/>",
+            .at_limit = 4,
+            .one_over = 3,
+            .code = xml.DiagnosticCode.partial_token_limit,
+            .primary = 4,
+        },
+        .{
+            .field = "max_attributes_per_element",
+            .input = "<r a='' b=''/>",
+            .at_limit = 2,
+            .one_over = 1,
+            .code = xml.DiagnosticCode.attribute_count_limit,
+            .primary = 8,
+        },
+        .{
+            .field = "max_attribute_name_bytes",
+            .input = "<r abc=''/>",
+            .at_limit = 3,
+            .one_over = 2,
+            .code = xml.DiagnosticCode.attribute_name_limit,
+            .primary = 5,
+        },
+        .{
+            .field = "max_attribute_value_bytes",
+            .input = "<r a='abc'/>",
+            .at_limit = 3,
+            .one_over = 2,
+            .code = xml.DiagnosticCode.attribute_value_limit,
+            .primary = 8,
+        },
+        .{
+            .field = "max_attribute_bytes_per_element",
+            .input = "<r a='123'/>",
+            .at_limit = 4,
+            .one_over = 3,
+            .code = xml.DiagnosticCode.attribute_bytes_limit,
+            .primary = 8,
+        },
+        .{
+            .field = "max_start_tag_bytes",
+            .input = "<r a='x'/>",
+            .at_limit = 10,
+            .one_over = 9,
+            .code = xml.DiagnosticCode.start_tag_limit,
+            .primary = 9,
+        },
+        .{
+            .field = "max_fragment_bytes",
+            .input = "<r>é</r>",
+            .at_limit = 2,
+            .one_over = 1,
+            .code = xml.DiagnosticCode.fragment_limit,
+            .primary = 3,
+        },
+        .{
+            .field = "max_processing_instruction_target_bytes",
+            .input = "<?ab?><r/>",
+            .at_limit = 2,
+            .one_over = 1,
+            .code = xml.DiagnosticCode.processing_instruction_target_limit,
+            .primary = 3,
+        },
+    }) |case| {
+        var options: xml.ReaderOptions = .{ .dtd = .reject };
+        @field(options.limits, case.field) = case.at_limit;
+        var expected = try summarizeNormalSourceWithOptions(.{ .slice = case.input }, options);
+        defer expected.deinit();
+        try expectNormalEncodingSchedulesWithOptions(
+            case.input,
+            options,
+            expected.events,
+            .utf8,
+            null,
+        );
+
+        @field(options.limits, case.field) = case.one_over;
+        try expectNormalFailureSchedulesWithOptions(
+            case.input,
+            options,
+            .{
+                .category = error.LimitExceeded,
+                .code = case.code,
+                .byte_offset = case.primary,
+                .related_byte_offset = null,
+                .line = 1,
+                .byte_column = case.primary + 1,
+            },
+        );
+    }
+}
+
+test "[failure] - [Reader limits]: every required zero limit is rejected without allocation" {
+    inline for (.{
+        "max_depth",
+        "max_open_name_bytes",
+        "max_partial_token_bytes",
+        "max_attributes_per_element",
+        "max_attribute_name_bytes",
+        "max_attribute_value_bytes",
+        "max_attribute_bytes_per_element",
+        "max_start_tag_bytes",
+        "max_fragment_bytes",
+        "max_processing_instruction_target_bytes",
+        "max_namespace_declarations_per_element",
+        "max_active_namespace_bindings",
+        "max_namespace_binding_bytes",
+        "max_qname_bytes",
+        "max_namespace_comparison_work",
+        "max_dtd_bytes",
+        "max_dtd_declarations",
+        "max_dtd_declaration_bytes",
+        "max_dtd_element_declarations",
+        "max_dtd_attribute_declarations",
+        "max_dtd_entity_declarations",
+        "max_dtd_notation_declarations",
+        "max_dtd_group_depth",
+        "max_dtd_grammar_nodes",
+        "max_dtd_entity_replacement_bytes",
+        "max_dtd_entity_depth",
+        "max_dtd_entity_references",
+        "max_dtd_expanded_bytes",
+        "max_dtd_expansion_ratio",
+        "max_dtd_comparison_work",
+        "max_validation_content_positions",
+        "max_validation_content_states",
+        "max_validation_content_transitions",
+        "max_validation_compilation_work",
+        "max_validation_ids",
+        "max_validation_idrefs",
+        "max_validation_identity_bytes",
+        "max_validation_comparison_work",
+        "max_validation_findings",
+        "max_external_resources",
+        "max_external_source_bytes",
+        "max_external_total_bytes",
+        "max_external_identifier_bytes",
+    }) |field_name| {
+        var options: xml.ReaderOptions = .{};
+        @field(options.limits, field_name) = 0;
+        try std.testing.expectError(
+            error.InvalidOptions,
+            xml.Reader.init(
+                std.testing.failing_allocator,
+                .{ .slice = "<unused/>" },
+                options,
+            ),
+        );
+    }
+}
+
 test "[integration] - [Reader]: event values borrow until the next read begins" {
     var reader = try xml.Reader.init(
         std.testing.allocator,
@@ -3753,6 +3923,51 @@ test "[edge] - [Reader DTD limits]: each boundary accepts at limit and rejects o
         "<!DOCTYPE r [<!ENTITY a 'x'>]><r>&a;&a;</r>",
         .dtd_comparison_work_limit,
     );
+
+    const external_resources = [_]TestExternalResource{
+        .{
+            .system_id = "schema.dtd",
+            .bytes = "<!ELEMENT%e;r%e;EMPTY>",
+            .source_id = 1,
+        },
+    };
+    const external_input =
+        "<!DOCTYPE r SYSTEM 'schema.dtd' [<!ENTITY % e ''>]><r/>";
+    var at_resolver = TestResolver{ .resources = &external_resources };
+    var external_options: xml.ReaderOptions = .{
+        .external = .resolve,
+        .resolver = at_resolver.resolver(),
+    };
+    external_options.limits.max_dtd_declaration_bytes = 36;
+    var at_reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = external_input },
+        external_options,
+    );
+    defer at_reader.deinit();
+    while (try at_reader.next()) |_| {}
+    try std.testing.expectEqual(@as(usize, 1), at_resolver.closes);
+
+    var over_resolver = TestResolver{ .resources = &external_resources };
+    external_options.limits.max_dtd_declaration_bytes = 35;
+    external_options.resolver = over_resolver.resolver();
+    var over_reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = external_input },
+        external_options,
+    );
+    defer over_reader.deinit();
+    while (true) {
+        _ = over_reader.next() catch |failure| {
+            try std.testing.expectEqual(error.LimitExceeded, failure);
+            break;
+        };
+    }
+    try std.testing.expectEqual(
+        xml.DiagnosticCode.dtd_declaration_bytes_limit,
+        over_reader.diagnostic().?.code,
+    );
+    try std.testing.expectEqual(@as(usize, 1), over_resolver.closes);
 }
 
 const NormalFindingLog = struct {
@@ -4343,6 +4558,41 @@ test "[integration] - [Reader lifecycle]: reset replaces every parser state" {
     try std.testing.expect(reader.diagnostic() == null);
 }
 
+test "[integration] - [Reader isolation]: failure and reset do not change another reader" {
+    var first = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "<!DOCTYPE first><first/>" },
+        .{ .dtd = .reject },
+    );
+    defer first.deinit();
+    var second = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "<p:second xmlns:p='urn:second'/>" },
+        .{},
+    );
+    defer second.deinit();
+
+    _ = try first.next();
+    _ = try second.next();
+    const second_start = (try second.next()).?.data.start_element;
+
+    try std.testing.expectError(error.DtdForbidden, first.next());
+    try first.reset(
+        .{ .slice = "<replacement/>" },
+        .{ .dtd = .reject },
+        .release_memory,
+    );
+    while (try first.next()) |_| {}
+
+    try std.testing.expectEqualStrings("p:second", second_start.name.raw);
+    try std.testing.expectEqualStrings(
+        "urn:second",
+        second_start.name.expanded.?.namespace_uri.?,
+    );
+    while (try second.next()) |_| {}
+    try std.testing.expect(second.diagnostic() == null);
+}
+
 test "[failure] - [Reader reset]: invalid options preserve active state and borrows" {
     var reader = try xml.Reader.init(
         std.testing.allocator,
@@ -4368,18 +4618,17 @@ test "[failure] - [Reader reset]: invalid options preserve active state and borr
 }
 
 test "[unit] - [Reader reset]: capacity policy is allocation free and exact" {
-    const input = "<root first='one' second='two'><child/></root>";
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var reader = try xml.Reader.init(
         failing.allocator(),
-        .{ .slice = input },
+        .{ .slice = MANY_ATTRIBUTES },
         .{ .dtd = .reject },
     );
     defer reader.deinit();
 
     while (try reader.next()) |_| {}
     try std.testing.expect(reader.memoryUsage().retained_capacity > 0);
-    try reader.reset(.{ .slice = input }, .{ .dtd = .reject }, .retain_capacity);
+    try reader.reset(.{ .slice = "<root/>" }, .{ .dtd = .reject }, .retain_capacity);
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
     while (try reader.next()) |_| {}
@@ -9462,6 +9711,19 @@ test "[failure] - [reader initialization]: zero required limits fail without all
             DtdReader.init(std.testing.allocator, dtd_options),
         );
     }
+    inline for (.{
+        "max_resources",
+        "max_source_bytes",
+        "max_total_bytes",
+        "max_identifier_bytes",
+    }) |field_name| {
+        dtd_options = .{};
+        @field(dtd_options.resolver, field_name) = 0;
+        try std.testing.expectError(
+            error.InvalidOptions,
+            DtdReader.init(std.testing.allocator, dtd_options),
+        );
+    }
 
     const ValidatingReader = xml.ReaderFor(xml.Configs.XML10_VALIDATING);
     var validating_options: xml.OptionsFor(xml.Configs.XML10_VALIDATING) = .{};
@@ -10269,6 +10531,7 @@ const TestExternalResource = struct {
     system_id: []const u8,
     bytes: []const u8,
     source_id: u32,
+    base_id: ?[]const u8 = null,
     encoding_hint: ?xml.SourceEncoding = null,
     transcoder: ?xml.Transcoder = null,
 };
@@ -10308,7 +10571,7 @@ const TestResolver = struct {
             return .{ .source = .{
                 .context = self,
                 .source_id = resource.source_id,
-                .base_id = resource.system_id,
+                .base_id = resource.base_id orelse resource.system_id,
                 .encoding_hint = resource.encoding_hint,
                 .transcoder = resource.transcoder,
                 .readFn = read,
@@ -10381,6 +10644,269 @@ test "[integration] - [Reader external sources]: success closes the source once"
     try std.testing.expectEqual(@as(usize, 1), resolver.closes);
     try std.testing.expect((try reader.next()) == null);
     try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+fn expectNormalExternalLimitBoundary(
+    comptime field_name: []const u8,
+    at_limit: usize,
+    one_over: usize,
+    input: []const u8,
+    resources: []const TestExternalResource,
+    code: xml.DiagnosticCode,
+    success_closes: usize,
+    failure_closes: usize,
+) !void {
+    var at_resolver = TestResolver{ .resources = resources, .max_read_len = 1 };
+    var at_options: xml.ReaderOptions = .{
+        .external = .resolve,
+        .resolver = at_resolver.resolver(),
+    };
+    @field(at_options.limits, field_name) = at_limit;
+    var at_reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = input },
+        at_options,
+    );
+    defer at_reader.deinit();
+    while (try at_reader.next()) |_| {}
+    try std.testing.expectEqual(success_closes, at_resolver.closes);
+
+    var over_resolver = TestResolver{ .resources = resources, .max_read_len = 1 };
+    var over_options = at_options;
+    over_options.resolver = over_resolver.resolver();
+    @field(over_options.limits, field_name) = one_over;
+    var over_reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = input },
+        over_options,
+    );
+    defer over_reader.deinit();
+    while (true) {
+        _ = over_reader.next() catch |failure| {
+            try std.testing.expectEqual(error.LimitExceeded, failure);
+            break;
+        };
+    }
+    try std.testing.expectEqual(code, over_reader.diagnostic().?.code);
+    try std.testing.expectEqual(failure_closes, over_resolver.closes);
+}
+
+test "[edge] - [Reader external limits]: each boundary accepts at limit and rejects one over" {
+    const two_resources = [_]TestExternalResource{
+        .{ .system_id = "a", .bytes = "x", .source_id = 1 },
+        .{ .system_id = "b", .bytes = "y", .source_id = 2 },
+    };
+    const two_source_input =
+        "<!DOCTYPE r [<!ENTITY a SYSTEM 'a'><!ENTITY b SYSTEM 'b'>]>" ++
+        "<r>&a;&b;</r>";
+    try expectNormalExternalLimitBoundary(
+        "max_external_resources",
+        2,
+        1,
+        two_source_input,
+        &two_resources,
+        .external_resource_count_limit,
+        2,
+        1,
+    );
+    try expectNormalExternalLimitBoundary(
+        "max_external_total_bytes",
+        2,
+        1,
+        two_source_input,
+        &two_resources,
+        .external_resource_bytes_limit,
+        2,
+        2,
+    );
+
+    const long_source = [_]TestExternalResource{
+        .{ .system_id = "a", .bytes = "xy", .source_id = 1 },
+    };
+    const one_source_input =
+        "<!DOCTYPE r [<!ENTITY a SYSTEM 'a'>]><r>&a;</r>";
+    try expectNormalExternalLimitBoundary(
+        "max_external_source_bytes",
+        2,
+        1,
+        one_source_input,
+        &long_source,
+        .external_resource_bytes_limit,
+        1,
+        1,
+    );
+
+    const long_identifier = [_]TestExternalResource{
+        .{ .system_id = "aa", .bytes = "x", .source_id = 1 },
+    };
+    const identifier_input =
+        "<!DOCTYPE r [<!ENTITY a SYSTEM 'aa'>]><r>&a;</r>";
+    try expectNormalExternalLimitBoundary(
+        "max_external_identifier_bytes",
+        2,
+        1,
+        identifier_input,
+        &long_identifier,
+        .external_resource_identifier_limit,
+        1,
+        0,
+    );
+}
+
+test "[failure] - [Reader resolver]: invalid source metadata closes before use" {
+    const input = "<!DOCTYPE r [<!ENTITY a SYSTEM 'a'>]><r>&a;</r>";
+    inline for (.{
+        .{
+            .input = "<!DOCTYPE r PUBLIC 'aa' 'a'><r/>",
+            .document_base_id = @as(?[]const u8, null),
+        },
+        .{
+            .input = "<!DOCTYPE r SYSTEM 'a'><r/>",
+            .document_base_id = @as(?[]const u8, "aa"),
+        },
+    }) |request_case| {
+        var resolver = TestResolver{ .resources = &.{} };
+        var limits: xml.Limits = .{};
+        limits.max_external_identifier_bytes = 1;
+        var reader = try xml.Reader.init(
+            std.testing.allocator,
+            .{ .slice = request_case.input },
+            .{
+                .limits = limits,
+                .external = .resolve,
+                .resolver = resolver.resolver(),
+                .document_base_id = request_case.document_base_id,
+            },
+        );
+        defer reader.deinit();
+        while (true) {
+            _ = reader.next() catch |failure| {
+                try std.testing.expectEqual(error.LimitExceeded, failure);
+                break;
+            };
+        }
+        try std.testing.expectEqual(
+            xml.DiagnosticCode.external_resource_identifier_limit,
+            reader.diagnostic().?.code,
+        );
+        try std.testing.expectEqual(@as(usize, 0), resolver.resolves);
+        try std.testing.expectEqual(@as(usize, 0), resolver.closes);
+    }
+
+    const cases = [_]struct {
+        resource: TestExternalResource,
+        limits: xml.Limits = .{},
+        category: xml.ReadError,
+        code: xml.DiagnosticCode,
+    }{
+        .{
+            .resource = .{ .system_id = "a", .bytes = "x", .source_id = 0 },
+            .category = error.ExternalResourceFailed,
+            .code = .resolver_invalid_result,
+        },
+        .{
+            .resource = .{
+                .system_id = "a",
+                .bytes = "x",
+                .source_id = 1,
+                .base_id = "too-long",
+            },
+            .limits = limits: {
+                var limits: xml.Limits = .{};
+                limits.max_external_identifier_bytes = 1;
+                break :limits limits;
+            },
+            .category = error.LimitExceeded,
+            .code = .external_resource_identifier_limit,
+        },
+    };
+    for (cases) |case| {
+        var resolver = TestResolver{ .resources = &.{case.resource} };
+        var reader = try xml.Reader.init(
+            std.testing.allocator,
+            .{ .slice = input },
+            .{
+                .limits = case.limits,
+                .external = .resolve,
+                .resolver = resolver.resolver(),
+            },
+        );
+        defer reader.deinit();
+        while (true) {
+            _ = reader.next() catch |failure| {
+                try std.testing.expectEqual(case.category, failure);
+                break;
+            };
+        }
+        try std.testing.expectEqual(case.code, reader.diagnostic().?.code);
+        try std.testing.expectEqual(@as(usize, 1), resolver.resolves);
+        try std.testing.expectEqual(@as(usize, 0), resolver.reads);
+        try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+    }
+
+    const duplicate_resources = [_]TestExternalResource{
+        .{ .system_id = "a", .bytes = "x", .source_id = 1 },
+        .{ .system_id = "b", .bytes = "y", .source_id = 1 },
+    };
+    var duplicate_resolver = TestResolver{
+        .resources = &duplicate_resources,
+        .max_read_len = 1,
+    };
+    var duplicate_reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{
+            .slice = "<!DOCTYPE r [<!ENTITY a SYSTEM 'a'><!ENTITY b SYSTEM 'b'>]>" ++
+                "<r>&a;&b;</r>",
+        },
+        .{ .external = .resolve, .resolver = duplicate_resolver.resolver() },
+    );
+    defer duplicate_reader.deinit();
+    while (true) {
+        _ = duplicate_reader.next() catch |failure| {
+            try std.testing.expectEqual(error.ExternalResourceFailed, failure);
+            break;
+        };
+    }
+    try std.testing.expectEqual(
+        xml.DiagnosticCode.resolver_invalid_result,
+        duplicate_reader.diagnostic().?.code,
+    );
+    try std.testing.expectEqual(@as(usize, 2), duplicate_resolver.resolves);
+    try std.testing.expectEqual(@as(usize, 2), duplicate_resolver.closes);
+
+    var subset = try xml.ExternalSubset.compileDecoded(
+        std.testing.allocator,
+        "schema.dtd",
+        "<!ELEMENT r (#PCDATA)><!ENTITY a SYSTEM 'a'>",
+        .{ .source_id = 1 },
+    );
+    defer subset.deinit();
+    const subset_resource = [_]TestExternalResource{
+        .{ .system_id = "a", .bytes = "x", .source_id = 1 },
+    };
+    var subset_resolver = TestResolver{ .resources = &subset_resource };
+    var subset_reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "<!DOCTYPE r SYSTEM 'schema.dtd'><r>&a;</r>" },
+        .{
+            .dtd = .{ .validate = .{ .external_subset = &subset } },
+            .external = .resolve,
+            .resolver = subset_resolver.resolver(),
+        },
+    );
+    defer subset_reader.deinit();
+    while (true) {
+        _ = subset_reader.next() catch |failure| {
+            try std.testing.expectEqual(error.ExternalResourceFailed, failure);
+            break;
+        };
+    }
+    try std.testing.expectEqual(
+        xml.DiagnosticCode.resolver_invalid_result,
+        subset_reader.diagnostic().?.code,
+    );
+    try std.testing.expectEqual(@as(usize, 1), subset_resolver.resolves);
+    try std.testing.expectEqual(@as(usize, 1), subset_resolver.closes);
 }
 
 test "[integration] - [Reader resolver]: callback failures keep exact public classes" {

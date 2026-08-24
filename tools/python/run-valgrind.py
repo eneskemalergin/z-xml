@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Valgrind Memcheck on correctness-qualified parser adapters."""
+"""Run Valgrind Memcheck on a qualified corpus pair or test executable."""
 
 from __future__ import annotations
 
@@ -20,14 +20,15 @@ MAX_WORKLOAD_BYTES = 1024 * 1024 * 1024
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--eligibility", type=Path, required=True)
-    parser.add_argument("--targets", type=Path, required=True)
-    parser.add_argument("--bin-dir", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--eligibility", type=Path)
+    parser.add_argument("--targets", type=Path)
+    parser.add_argument("--bin-dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--valgrind", default="valgrind")
-    parser.add_argument("--workload", action="append", required=True)
-    parser.add_argument("--target", action="append", required=True)
+    parser.add_argument("--workload", action="append", default=[])
+    parser.add_argument("--target", action="append", default=[])
+    parser.add_argument("--standalone", type=Path)
     parser.add_argument("--timeout", type=float, default=120.0)
     return parser.parse_args()
 
@@ -143,11 +144,122 @@ def safe_name(value: str) -> str:
     )
 
 
+def run_memcheck(
+    valgrind: str,
+    executable: Path,
+    arguments: list[str],
+    log: Path,
+    expected_status: int,
+    timeout: float,
+) -> tuple[str | int, int, int, int, str]:
+    command = [
+        valgrind,
+        "--tool=memcheck",
+        "--leak-check=full",
+        "--show-leak-kinds=definite,indirect,possible",
+        "--errors-for-leak-kinds=definite,indirect",
+        "--track-fds=yes",
+        "--error-exitcode=99",
+        f"--log-file={log}",
+        str(executable),
+        *arguments,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+        observed: str | int = completed.returncode
+        log_text = log.read_text(encoding="utf-8", errors="replace")
+        error_match = re.search(r"ERROR SUMMARY: ([0-9,]+) errors", log_text)
+        descriptor_match = re.search(
+            r"FILE DESCRIPTORS: ([0-9]+) open \(([0-9]+) (inherited|std)\)",
+            log_text,
+        )
+        memcheck_errors = (
+            int(error_match.group(1).replace(",", "")) if error_match else -1
+        )
+        open_fds = int(descriptor_match.group(1)) if descriptor_match else -1
+        baseline_fds = (
+            int(descriptor_match.group(2))
+            + (1 if descriptor_match.group(3) == "std" else 0)
+            if descriptor_match
+            else -1
+        )
+        status_matches = completed.returncode == expected_status
+        descriptors_clean = open_fds == baseline_fds and open_fds >= 0
+        verdict = (
+            "pass"
+            if status_matches and memcheck_errors == 0 and descriptors_clean
+            else "fail"
+        )
+        return observed, memcheck_errors, open_fds, baseline_fds, verdict
+    except subprocess.TimeoutExpired:
+        return "timeout", -1, -1, -1, "error"
+
+
 def main() -> int:
     args = parse_args()
     if args.timeout <= 0:
         print("timeout must be positive", file=sys.stderr)
         return 64
+    corpus_requested = any(
+        (
+            args.manifest is not None,
+            args.eligibility is not None,
+            args.targets is not None,
+            args.bin_dir is not None,
+            bool(args.workload),
+            bool(args.target),
+        )
+    )
+    corpus_complete = all(
+        (
+            args.manifest is not None,
+            args.eligibility is not None,
+            args.targets is not None,
+            args.bin_dir is not None,
+            bool(args.workload),
+            bool(args.target),
+        )
+    )
+    if args.standalone is not None and corpus_requested:
+        print("standalone and corpus modes are mutually exclusive", file=sys.stderr)
+        return 64
+    if args.standalone is None and not corpus_complete:
+        print(
+            "corpus mode requires manifest, eligibility, targets, bin-dir, "
+            "workload, and target",
+            file=sys.stderr,
+        )
+        return 64
+    if args.standalone is not None:
+        executable = args.standalone.resolve()
+        if not executable.is_file():
+            print(f"missing standalone executable: {executable}", file=sys.stderr)
+            return 1
+        valgrind = shutil.which(args.valgrind)
+        if valgrind is None:
+            print(f"Valgrind executable not found: {args.valgrind}", file=sys.stderr)
+            return 1
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        observed, errors, open_fds, baseline_fds, verdict = run_memcheck(
+            valgrind,
+            executable,
+            [],
+            args.output_dir / "standalone.log",
+            0,
+            args.timeout,
+        )
+        print(
+            f"standalone: {verdict}; status={observed}; errors={errors}; "
+            f"open_fds={open_fds}; baseline_fds={baseline_fds}"
+        )
+        return 0 if verdict == "pass" else 1
     try:
         workloads = read_manifest(args.manifest)
         targets = read_targets(args.targets, args.bin_dir.resolve())
@@ -251,57 +363,14 @@ def main() -> int:
             args.output_dir
             / f"{safe_name(target_name)}--{safe_name(workload_name)}.log"
         )
-        command = [
+        observed, memcheck_errors, open_fds, baseline_fds, verdict = run_memcheck(
             valgrind,
-            "--tool=memcheck",
-            "--leak-check=full",
-            "--show-leak-kinds=definite,indirect,possible",
-            "--errors-for-leak-kinds=definite,indirect",
-            "--track-fds=yes",
-            "--error-exitcode=99",
-            f"--log-file={log}",
-            str(target),
-            workload["resolved_path"],
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=args.timeout,
-                check=False,
-            )
-            observed: str | int = completed.returncode
-            log_text = log.read_text(encoding="utf-8", errors="replace")
-            error_match = re.search(r"ERROR SUMMARY: ([0-9,]+) errors", log_text)
-            descriptor_match = re.search(
-                r"FILE DESCRIPTORS: ([0-9]+) open \(([0-9]+) (inherited|std)\)",
-                log_text,
-            )
-            memcheck_errors = (
-                int(error_match.group(1).replace(",", "")) if error_match else -1
-            )
-            open_fds = int(descriptor_match.group(1)) if descriptor_match else -1
-            baseline_fds = (
-                int(descriptor_match.group(2))
-                + (1 if descriptor_match.group(3) == "std" else 0)
-                if descriptor_match
-                else -1
-            )
-            status_matches = completed.returncode == expected_status
-            descriptors_clean = open_fds == baseline_fds and open_fds >= 0
-            verdict = (
-                "pass"
-                if status_matches and memcheck_errors == 0 and descriptors_clean
-                else "fail"
-            )
-        except subprocess.TimeoutExpired:
-            observed = "timeout"
-            verdict = "error"
-            memcheck_errors = -1
-            open_fds = -1
-            baseline_fds = -1
+            target,
+            [workload["resolved_path"]],
+            log,
+            expected_status,
+            args.timeout,
+        )
         if verdict != "pass":
             had_error = True
         rows.append(

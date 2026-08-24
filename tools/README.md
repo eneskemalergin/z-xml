@@ -1,6 +1,6 @@
 # Tools
 
-Status: **Active** (last updated: 2026-08-23)
+Status: **Active** (last updated: 2026-08-24)
 
 `tools/` contains development commands and parser adapters. It is excluded from the Zig package.
 
@@ -41,7 +41,7 @@ Measurement:
 
 - `tools/python/run-zebrac-aa.py` runs the same command under two names to measure machine noise.
 - `tools/python/run-zebrac-matrix.py` measures parser and workload pairs that passed their required checks.
-- `tools/python/run-valgrind.py` checks selected correctness-passing generated or tracked fixture cases for memory errors. Tracked fixture cases keep companion external sources beside the selected XML file.
+- `tools/python/run-valgrind.py` checks correctness-passing corpus cases or an explicit standalone test executable for memory errors and leaked file descriptors. Tracked fixture cases keep companion external sources beside the selected XML file.
 
 `bench/` and `data/` are ignored. `bench/` contains local plans and small benchmark inputs. `data/` contains generated XML, downloaded test suites, and results. Benchmark results are local until the project has a stable way to reproduce and compare them.
 
@@ -61,9 +61,20 @@ zig build --build-file tools/build.zig corpus-adapters -Doptimize=ReleaseFast
 zig build --build-file tools/build.zig persistent-adapters -Doptimize=ReleaseFast
 zig build --build-file tools/build.zig tree-adapter -Doptimize=ReleaseFast
 zig build --build-file tools/build.zig validation-bench -Doptimize=ReleaseFast
+zig build --build-file tools/build.zig reader-audit -Doptimize=Debug
 ```
 
-The `tools` build step installs every adapter. The `experimental-adapters` step installs adapters that do not yet have a fully checked workload. The `test` step runs tests for the tool code.
+The `tools` build step installs every adapter. The `experimental-adapters` step installs adapters that do not yet have a fully checked workload. The `test` step runs tests for the tool code. The separate `reader-audit` step installs the Reader test executable used for Memcheck; it is not part of the adapter union.
+
+Run that executable under Memcheck with:
+
+```sh
+tools/python/run-valgrind.py \
+    --output-dir data/results/reader-audit \
+    --standalone tools/zig-out/bin/z-xml-reader-audit
+```
+
+Standalone mode writes `standalone.log`. Corpus mode keeps its existing metadata and result files.
 
 The development build installs adapters under `tools/zig-out/bin` by default.
 

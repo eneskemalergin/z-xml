@@ -26,6 +26,10 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run development tool tests");
+    const reader_audit_step = b.step(
+        "reader-audit",
+        "Build and install the Reader resource and failure tests",
+    );
     const tree_adapter_step = b.step("tree-adapter", "Build and install the owned-tree adapter");
     const corpus_adapters_step = b.step(
         "corpus-adapters",
@@ -44,6 +48,19 @@ pub fn build(b: *std.Build) void {
         "Build and install adapters outside the qualified lanes",
     );
     const tools_step = b.step("tools", "Build and install all adapter tools");
+
+    const reader_audit_module = b.createModule(.{
+        .root_source_file = b.path("../tests/reader.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    reader_audit_module.addImport("z_xml", z_xml);
+    const reader_audit = b.addTest(.{
+        .name = "z-xml-reader-audit",
+        .root_module = reader_audit_module,
+        .filters = &.{"[Reader"},
+    });
+    reader_audit_step.dependOn(&b.addInstallArtifact(reader_audit, .{}).step);
 
     const tree_module = b.createModule(.{
         .root_source_file = b.path("zig/tree.zig"),
