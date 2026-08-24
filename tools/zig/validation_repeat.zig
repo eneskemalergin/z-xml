@@ -4,7 +4,6 @@ const std = @import("std");
 const xml = @import("z_xml");
 const repeat_options = @import("repeat_options");
 
-const config = xml.Configs.XML10_VALIDATING;
 const input_buffer_size = 64 * 1024;
 
 const Stats = struct {
@@ -20,8 +19,8 @@ const Stats = struct {
         }
     }
 
-    fn observe(self: *Stats, event: xml.EventFor(config)) !void {
-        switch (event) {
+    fn observe(self: *Stats, event: xml.Event) !void {
+        switch (event.data) {
             .start_element => |start| {
                 self.elements += 1;
                 self.bytes(&.{1});
@@ -42,7 +41,7 @@ const Stats = struct {
                 self.text_bytes += text.bytes.len;
                 self.bytes(text.bytes);
             },
-            .document_end => |end| if (end.validation != .valid) return error.NotValid,
+            .document_end => |end| if (end.dtd_validity != .valid) return error.NotValid,
             else => {},
         }
     }
@@ -94,27 +93,29 @@ fn run(init: std.process.Init) !u8 {
     for (0..repetitions) |_| {
         const file = try std.Io.Dir.cwd().openFile(init.io, args[2], .{});
         defer file.close(init.io);
-        var options: xml.OptionsFor(config) = .{};
-        options.dtd_limits.max_comparison_work = 512 * 1024 * 1024;
-        options.validation.limits.max_ids = 8 * 1024 * 1024;
-        options.validation.limits.max_idrefs = 8 * 1024 * 1024;
-        options.validation.limits.max_id_bytes = 256 * 1024 * 1024;
-        options.validation.limits.max_comparison_work = 512 * 1024 * 1024;
-        options.resolver = .{
-            .policy = .resolve,
+        var options: xml.ReaderOptions = .{
+            .dtd = .{ .validate = .{} },
+            .external = .resolve,
             .resolver = filesystem_resolver.resolver(),
             .document_base_id = std.fs.path.basename(args[2]),
         };
-        if (comptime repeat_options.reuse) options.validation.external_subset = &subset.?;
+        options.limits.max_dtd_comparison_work = 512 * 1024 * 1024;
+        options.limits.max_validation_ids = 8 * 1024 * 1024;
+        options.limits.max_validation_idrefs = 8 * 1024 * 1024;
+        options.limits.max_validation_identity_bytes = 256 * 1024 * 1024;
+        options.limits.max_validation_comparison_work = 512 * 1024 * 1024;
+        if (comptime repeat_options.reuse) {
+            options.dtd.validate.external_subset = &subset.?;
+        }
         var input_buffer: [input_buffer_size]u8 = undefined;
         var file_reader = file.reader(init.io, &input_buffer);
-        var reader = try xml.ProfileIoReader(config).init(init.gpa, options, &file_reader.interface);
+        var reader = try xml.Reader.init(
+            init.gpa,
+            .{ .stream = &file_reader.interface },
+            options,
+        );
         defer reader.deinit();
-        while (true) switch (try reader.next()) {
-            .event => |event| try totals.observe(event),
-            .done => break,
-            .need_input => return error.InvalidState,
-        };
+        while (try reader.next()) |event| try totals.observe(event);
     }
 
     var output_buffer: [192]u8 = undefined;

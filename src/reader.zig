@@ -381,12 +381,31 @@ pub const NormalLimits = struct {
     dtd_expansion_ratio_minimum_bytes: usize = 4096,
     /// Maximum cumulative weighted DTD name-comparison work.
     max_dtd_comparison_work: usize = 8 * 1024 * 1024,
+    /// Maximum positions compiled for one DTD element content model.
+    max_validation_content_positions: usize = 4096,
+    /// Maximum states compiled across DTD element content models.
+    max_validation_content_states: usize = 16 * 1024,
+    /// Maximum transitions compiled across DTD element content models.
+    max_validation_content_transitions: usize = 64 * 1024,
+    /// Maximum cumulative DTD content-model compilation work.
+    max_validation_compilation_work: usize = 8 * 1024 * 1024,
+    /// Maximum IDs retained for DTD validity checks.
+    max_validation_ids: usize = 1024 * 1024,
+    /// Maximum IDREF values retained for DTD validity checks.
+    max_validation_idrefs: usize = 1024 * 1024,
+    /// Maximum cumulative bytes retained for IDs and IDREF values.
+    max_validation_identity_bytes: usize = 8 * 1024 * 1024,
+    /// Maximum cumulative DTD validity comparison work.
+    max_validation_comparison_work: usize = 16 * 1024 * 1024,
+    /// Maximum DTD validity findings reported for one document.
+    max_validation_findings: usize = 1024,
     /// Maximum owned capacity retained across a retain reset.
     max_retained_bytes: usize = 1024 * 1024,
 
     fn validate(self: NormalLimits) bool {
         return normalParserLimits(self).validate() and
             normalDtdLimits(self).validate() and
+            normalValidationLimits(self).validate() and
             self.max_namespace_declarations_per_element > 0 and
             self.max_active_namespace_bindings > 0 and
             self.max_namespace_binding_bytes > 0 and
@@ -558,6 +577,7 @@ pub const DiagnosticCode = enum {
     resolver_resource_limit,
     resolver_cancelled,
     transcoder_cancelled,
+    dtd_finding_cancelled,
     read_failed,
     validity_missing_doctype,
     validity_root_name_mismatch,
@@ -1028,11 +1048,12 @@ pub const NormalExternalPolicy = enum {
     resolve,
 };
 
-/// One DTD validity finding.
+/// One DTD validity finding whose inclusion trace borrows Reader storage.
 pub const NormalDtdFinding = struct {
     code: DiagnosticCode,
     primary: NormalLocation,
     related: ?NormalLocation = null,
+    inclusion_trace: []const NormalLocation,
 };
 
 /// Action returned by a DTD validity finding callback.
@@ -1826,6 +1847,14 @@ pub fn Reader(comptime config: Config) type {
             if (config.profile.dtdMode() == .validating) 0 else {},
         validation_incomplete: if (config.profile.dtdMode() == .validating) bool else void =
             if (config.profile.dtdMode() == .validating) false else {},
+        validation_declarations_incomplete: if (config.profile.dtdMode() == .validating)
+            bool
+        else
+            void = if (config.profile.dtdMode() == .validating) false else {},
+        validation_parameter_entity_skipped: if (config.profile.dtdMode() == .validating)
+            bool
+        else
+            void = if (config.profile.dtdMode() == .validating) false else {},
         final_idref_cursor: if (config.profile.dtdMode() == .validating) usize else void =
             if (config.profile.dtdMode() == .validating) 0 else {},
         token_start: Location(config) = .{},
@@ -2009,6 +2038,8 @@ pub fn Reader(comptime config: Config) type {
             if (comptime config.profile.dtdMode() == .validating) {
                 self.validity_errors = 0;
                 self.validation_incomplete = false;
+                self.validation_declarations_incomplete = false;
+                self.validation_parameter_entity_skipped = false;
                 self.final_idref_cursor = 0;
             }
             if (comptime config.profile.dtdMode() != .rejected) {
@@ -3204,6 +3235,14 @@ pub fn Reader(comptime config: Config) type {
                     },
                     .emit_skipped_entity => {
                         if (comptime config.profile.dtdMode() == .rejected) unreachable;
+                        if (comptime config.profile.dtdMode() == .validating) {
+                            self.validation_incomplete = true;
+                            if (self.open_elements.items.len != 0) {
+                                self.open_elements.items[
+                                    self.open_elements.items.len - 1
+                                ].validation.content_incomplete = true;
+                            }
+                        }
                         self.vertical_state = .content;
                         const entity_index = self.dtd_state.pending_skipped_entity_index;
                         self.dtd_state.pending_skipped_entity_index = null;
@@ -4303,7 +4342,17 @@ pub fn Reader(comptime config: Config) type {
                     self.options.dtd_limits.max_active_entity_depth,
                 ) catch return self.failOutOfMemory();
             }
-            if (reusable != null and appended.?.grammar_unchanged) {
+            for (self.dtd_state.declarations.skipped_external.items) |skipped| {
+                self.validation_incomplete = true;
+                self.validation_declarations_incomplete = true;
+                if (skipped.kind == .parameter_entity) {
+                    self.validation_parameter_entity_skipped = true;
+                }
+            }
+            if (reusable != null and appended.?.grammar_unchanged and
+                !self.validation_declarations_incomplete and
+                !reusable.?.compiledState().issues_truncated)
+            {
                 self.validation_state.copyCompiled(
                     self.allocator,
                     self.options.validation.limits,
@@ -4315,12 +4364,12 @@ pub fn Reader(comptime config: Config) type {
                     self.allocator,
                     self.options.validation.limits,
                     &self.dtd_state.declarations,
+                    !self.validation_declarations_incomplete,
                 ) catch |err| return self.mapValidationError(err);
             }
             for (self.validation_state.issues.items) |issue| {
-                try self.reportValidity(issue, self.token_start);
+                try self.emitValidity(issue, self.token_start);
             }
-            if (self.validation_state.issues_truncated) self.validation_incomplete = true;
         }
 
         fn mapValidationError(self: *Self, err: validation_module.Error) ReadError {
@@ -4373,12 +4422,12 @@ pub fn Reader(comptime config: Config) type {
 
         fn documentEnd(self: *const Self) DocumentEnd(config) {
             if (comptime config.profile.dtdMode() == .validating) {
-                return .{ .validation = if (self.validation_incomplete)
+                return .{ .validation = if (self.validity_errors != 0)
+                    .invalid
+                else if (self.validation_incomplete)
                     .incomplete
-                else if (self.validity_errors == 0)
-                    .valid
                 else
-                    .invalid };
+                    .valid };
             }
             return .{};
         }
@@ -4550,9 +4599,6 @@ pub fn Reader(comptime config: Config) type {
             inclusion: Location(config),
         ) dtd_module.ParseError!?resolver_module.Source {
             if (self.options.resolver.policy == .skip) {
-                if (comptime config.profile.dtdMode() == .validating) {
-                    return self.externalProviderFailure(.resolver_forbidden, error.ResolverFailed);
-                }
                 return null;
             }
             self.dtd_state.external_failure_code = null;
@@ -9247,8 +9293,27 @@ pub fn Reader(comptime config: Config) type {
             issue: validation_module.Issue,
             fallback: Location(config),
         ) ReadError!void {
+            if (self.validation_parameter_entity_skipped) switch (issue.code) {
+                .missing_doctype, .root_name_mismatch => {},
+                else => return,
+            } else if (self.validation_declarations_incomplete) switch (issue.code) {
+                .undeclared_element,
+                .undeclared_attribute,
+                .undeclared_entity,
+                .undeclared_notation,
+                => return,
+                else => {},
+            };
+            if (self.validation_incomplete and issue.code == .unresolved_idref) return;
+            return self.emitValidity(issue, fallback);
+        }
+
+        fn emitValidity(
+            self: *Self,
+            issue: validation_module.Issue,
+            fallback: Location(config),
+        ) ReadError!void {
             if (self.validity_errors == self.options.validation.limits.max_errors) {
-                self.validation_incomplete = true;
                 return;
             }
             const primary = if (issue.occurrence) |location|
@@ -10366,6 +10431,18 @@ const NormalDiagnosticCore = struct {
     related: ?NormalLocation,
 };
 
+const NormalDtdFindingCore = struct {
+    code: DiagnosticCode,
+    primary: NormalLocation,
+    related: ?NormalLocation,
+};
+
+const NormalDtdCancelTrace = enum {
+    none,
+    first_finding,
+    later_finding,
+};
+
 /// Normal reader with runtime namespace and DTD policy selection.
 pub const NormalReader = struct {
     const Self = @This();
@@ -10384,6 +10461,11 @@ pub const NormalReader = struct {
     failure: ?NormalReadError = null,
     first_diagnostic: ?NormalDiagnosticCore = null,
     diagnostic_inclusions: std.ArrayList(NormalLocation) = .empty,
+    first_dtd_finding: ?NormalDtdFindingCore = null,
+    dtd_finding_inclusions: std.ArrayList(NormalLocation) = .empty,
+    dtd_callback_inclusions: std.ArrayList(NormalLocation) = .empty,
+    dtd_finding_copy_failed: bool = false,
+    dtd_cancel_trace: NormalDtdCancelTrace = .none,
     event_attributes: std.ArrayList(NormalAttribute) = .empty,
     event_namespace_declarations: std.ArrayList(NormalNamespaceDeclaration) = .empty,
     effective_version: XmlVersion = .xml10,
@@ -10417,6 +10499,8 @@ pub const NormalReader = struct {
             inline else => |*parser| parser.deinit(),
         }
         self.diagnostic_inclusions.deinit(self.allocator);
+        self.dtd_finding_inclusions.deinit(self.allocator);
+        self.dtd_callback_inclusions.deinit(self.allocator);
         self.event_attributes.deinit(self.allocator);
         self.event_namespace_declarations.deinit(self.allocator);
         self.deinitialized = true;
@@ -10502,6 +10586,15 @@ pub const NormalReader = struct {
                 self.diagnostic_inclusions.deinit(self.allocator);
                 self.diagnostic_inclusions = .empty;
             }
+            if (normalOptionsUseValidationStorage(options)) {
+                self.dtd_finding_inclusions.clearRetainingCapacity();
+                self.dtd_callback_inclusions.clearRetainingCapacity();
+            } else {
+                self.dtd_finding_inclusions.deinit(self.allocator);
+                self.dtd_callback_inclusions.deinit(self.allocator);
+                self.dtd_finding_inclusions = .empty;
+                self.dtd_callback_inclusions = .empty;
+            }
             self.event_attributes.clearRetainingCapacity();
             if (options.namespaces == .raw) {
                 self.event_namespace_declarations.deinit(self.allocator);
@@ -10519,6 +10612,9 @@ pub const NormalReader = struct {
         self.complete = false;
         self.failure = null;
         self.first_diagnostic = null;
+        self.first_dtd_finding = null;
+        self.dtd_finding_copy_failed = false;
+        self.dtd_cancel_trace = .none;
         self.effective_version = .xml10;
         self.external_content_skipped = false;
         self.pending_event = null;
@@ -10566,11 +10662,30 @@ pub const NormalReader = struct {
     /// Returns the first fatal diagnostic, if one exists.
     pub fn diagnostic(self: *const Self) ?NormalDiagnostic {
         const value = self.first_diagnostic orelse return null;
+        const inclusions = if (value.code == .dtd_finding_cancelled)
+            switch (self.dtd_cancel_trace) {
+                .none => self.diagnostic_inclusions.items,
+                .first_finding => self.dtd_finding_inclusions.items,
+                .later_finding => self.dtd_callback_inclusions.items,
+            }
+        else
+            self.diagnostic_inclusions.items;
         return .{
             .code = value.code,
             .primary = value.primary,
             .related = value.related,
-            .inclusion_trace = self.diagnostic_inclusions.items,
+            .inclusion_trace = inclusions,
+        };
+    }
+
+    /// Returns the first DTD validity finding, retained until reset or deinitialization.
+    pub fn firstDtdFinding(self: *const Self) ?NormalDtdFinding {
+        const value = self.first_dtd_finding orelse return null;
+        return .{
+            .code = value.code,
+            .primary = value.primary,
+            .related = value.related,
+            .inclusion_trace = self.dtd_finding_inclusions.items,
         };
     }
 
@@ -10583,9 +10698,13 @@ pub const NormalReader = struct {
         const namespace_capacity = self.event_namespace_declarations.capacity *|
             @sizeOf(NormalNamespaceDeclaration);
         const diagnostic_capacity = self.diagnostic_inclusions.capacity *| @sizeOf(NormalLocation);
+        const finding_capacity = (self.dtd_finding_inclusions.capacity +|
+            self.dtd_callback_inclusions.capacity) *| @sizeOf(NormalLocation);
         usage.attribute_event_capacity +|= self.event_attributes.capacity;
         usage.namespace_capacity +|= namespace_capacity;
-        usage.retained_capacity +|= attribute_capacity +| namespace_capacity +| diagnostic_capacity;
+        usage.validation_capacity +|= finding_capacity;
+        usage.retained_capacity +|= attribute_capacity +| namespace_capacity +|
+            diagnostic_capacity +| finding_capacity;
         return usage;
     }
 
@@ -10616,10 +10735,10 @@ pub const NormalReader = struct {
     ) NormalReadError!?NormalEvent {
         while (true) {
             if (comptime config.profile.dtdMode() == .validating) {
-                parser.options.validation.sink = if (self.dtdFindingSink()) |_| .{
+                parser.options.validation.sink = .{
                     .context = self,
                     .reportFn = normalValidityReporter(config),
-                } else null;
+                };
             }
             if (parser.lifecycle == .ready or parser.lifecycle == .needs_input) {
                 self.refill(config, parser) catch |failure| {
@@ -10925,7 +11044,7 @@ pub const NormalReader = struct {
     ) NormalDocumentEnd {
         const validity: NormalDtdValidity = if (comptime config.profile.dtdMode() == .validating)
             switch (value.validation) {
-                .valid => .valid,
+                .valid => if (self.external_content_skipped) .incomplete else .valid,
                 .invalid => .invalid,
                 .incomplete => .incomplete,
             }
@@ -10977,6 +11096,23 @@ pub const NormalReader = struct {
         else
             null);
         if (mapped == error.InvalidState) return mapped;
+        if (self.dtd_finding_copy_failed) {
+            const location = self.first_diagnostic.?.primary;
+            self.recordGeneratedFailure(error.OutOfMemory, .out_of_memory, location);
+            return error.OutOfMemory;
+        }
+        if (mapped == error.Cancelled and self.dtd_cancel_trace != .none) {
+            const finding = self.first_dtd_finding.?;
+            self.failure = mapped;
+            self.diagnostic_inclusions.clearRetainingCapacity();
+            self.first_diagnostic = self.first_diagnostic orelse .{
+                .code = .dtd_finding_cancelled,
+                .primary = finding.primary,
+                .related = null,
+            };
+            self.reportFatalDiagnostic();
+            return mapped;
+        }
         if (internal_diagnostic) |value| {
             self.diagnostic_inclusions.clearRetainingCapacity();
             if (comptime config.external_sources) {
@@ -11048,9 +11184,13 @@ pub const NormalReader = struct {
 
     fn releaseFacadeStorage(self: *Self) void {
         self.diagnostic_inclusions.deinit(self.allocator);
+        self.dtd_finding_inclusions.deinit(self.allocator);
+        self.dtd_callback_inclusions.deinit(self.allocator);
         self.event_attributes.deinit(self.allocator);
         self.event_namespace_declarations.deinit(self.allocator);
         self.diagnostic_inclusions = .empty;
+        self.dtd_finding_inclusions = .empty;
+        self.dtd_callback_inclusions = .empty;
         self.event_attributes = .empty;
         self.event_namespace_declarations = .empty;
     }
@@ -11156,6 +11296,10 @@ fn normalOptionsUseExternalStorage(options: NormalReaderOptions) bool {
     };
 }
 
+fn normalOptionsUseValidationStorage(options: NormalReaderOptions) bool {
+    return options.dtd == .validate;
+}
+
 fn resetNormalParser(
     comptime config: Config,
     parser: *Reader(config),
@@ -11219,6 +11363,7 @@ fn normalEngineOptions(
     };
     if (comptime config.profile.dtdMode() == .validating) {
         result.validation.collect_validity_errors = true;
+        result.validation.limits = normalValidationLimits(options.limits);
         if (options.dtd == .validate) {
             result.validation.external_subset = options.dtd.validate.external_subset;
         }
@@ -11260,6 +11405,20 @@ fn normalDtdLimits(limits: NormalLimits) dtd_module.Limits {
         .max_expansion_ratio = limits.max_dtd_expansion_ratio,
         .expansion_ratio_minimum_bytes = limits.dtd_expansion_ratio_minimum_bytes,
         .max_comparison_work = limits.max_dtd_comparison_work,
+    };
+}
+
+fn normalValidationLimits(limits: NormalLimits) validation_module.Limits {
+    return .{
+        .max_content_positions = limits.max_validation_content_positions,
+        .max_content_states = limits.max_validation_content_states,
+        .max_content_transitions = limits.max_validation_content_transitions,
+        .max_compilation_work = limits.max_validation_compilation_work,
+        .max_ids = limits.max_validation_ids,
+        .max_idrefs = limits.max_validation_idrefs,
+        .max_id_bytes = limits.max_validation_identity_bytes,
+        .max_comparison_work = limits.max_validation_comparison_work,
+        .max_errors = limits.max_validation_findings,
     };
 }
 
@@ -11313,7 +11472,11 @@ fn mapNormalReadError(failure: ReadError, code: ?DiagnosticCode) NormalReadError
             }
         else
             error.InvalidXml,
-        error.InvalidDtd, error.NotValid => error.InvalidXml,
+        error.InvalidDtd => if (code == .external_subset_mismatch)
+            error.ExternalResourceFailed
+        else
+            error.InvalidXml,
+        error.NotValid => error.InvalidXml,
         error.UnsupportedFeature => if (code) |value|
             switch (value) {
                 .unsupported_version => error.UnsupportedVersion,
@@ -11347,15 +11510,54 @@ fn normalValidityReporter(
     return struct {
         fn report(context: ?*anyopaque, diagnostic: Diagnostic(config)) ValidityAction {
             const self: *NormalReader = @ptrCast(@alignCast(context.?));
-            const sink = self.dtdFindingSink() orelse return .continue_validation;
-            const action = sink.report(.{
+            const core: NormalDtdFindingCore = .{
                 .code = diagnostic.code,
                 .primary = normalLocation(self.options.track_lines, diagnostic.primary),
                 .related = if (diagnostic.related) |related|
                     normalLocation(self.options.track_lines, related)
                 else
                     null,
+            };
+            const first = self.first_dtd_finding == null;
+            const inclusions = if (first) &self.dtd_finding_inclusions else &self.dtd_callback_inclusions;
+            std.debug.assert(
+                diagnostic.inclusion_trace.len <= self.options.limits.max_dtd_entity_depth,
+            );
+            inclusions.ensureTotalCapacityPrecise(
+                self.allocator,
+                diagnostic.inclusion_trace.len,
+            ) catch {
+                self.dtd_finding_copy_failed = true;
+                self.first_diagnostic = .{
+                    .code = .out_of_memory,
+                    .primary = core.primary,
+                    .related = null,
+                };
+                return .cancel;
+            };
+            inclusions.clearRetainingCapacity();
+            for (diagnostic.inclusion_trace) |location| {
+                inclusions.appendAssumeCapacity(normalLocation(
+                    self.options.track_lines,
+                    location,
+                ));
+            }
+            if (first) self.first_dtd_finding = core;
+            const sink = self.dtdFindingSink() orelse return .continue_validation;
+            const action = sink.report(.{
+                .code = core.code,
+                .primary = core.primary,
+                .related = core.related,
+                .inclusion_trace = inclusions.items,
             });
+            if (action == .cancel) {
+                self.dtd_cancel_trace = if (first) .first_finding else .later_finding;
+                self.first_diagnostic = .{
+                    .code = .dtd_finding_cancelled,
+                    .primary = core.primary,
+                    .related = null,
+                };
+            }
             return switch (action) {
                 .continue_validation => .continue_validation,
                 .cancel => .cancel,

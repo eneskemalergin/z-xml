@@ -5,10 +5,8 @@ const std = @import("std");
 const CheckAdapter = struct {
     name: []const u8,
     namespaces: bool,
-    general_encodings: bool,
     dtd: bool,
     validating: bool,
-    xml11: bool = false,
 };
 
 const PersistentAdapter = struct {
@@ -64,74 +62,62 @@ pub fn build(b: *std.Build) void {
         .{
             .name = "z-xml-check",
             .namespaces = false,
-            .general_encodings = false,
             .dtd = false,
             .validating = false,
         },
         .{
             .name = "z-xml-ns-check",
             .namespaces = true,
-            .general_encodings = false,
             .dtd = false,
             .validating = false,
         },
         .{
             .name = "z-xml-general-check",
             .namespaces = false,
-            .general_encodings = true,
             .dtd = false,
             .validating = false,
         },
         .{
             .name = "z-xml-general-ns-check",
             .namespaces = true,
-            .general_encodings = true,
             .dtd = false,
             .validating = false,
         },
         .{
             .name = "z-xml-dtd-check",
             .namespaces = false,
-            .general_encodings = true,
             .dtd = true,
             .validating = false,
         },
         .{
             .name = "z-xml-dtd-ns-check",
             .namespaces = true,
-            .general_encodings = true,
             .dtd = true,
             .validating = false,
         },
         .{
             .name = "z-xml-validating-check",
             .namespaces = false,
-            .general_encodings = true,
             .dtd = true,
             .validating = true,
         },
         .{
             .name = "z-xml-validating-ns-check",
             .namespaces = true,
-            .general_encodings = true,
             .dtd = true,
             .validating = true,
         },
         .{
             .name = "z-xml11-validating-check",
             .namespaces = false,
-            .general_encodings = true,
             .dtd = true,
             .validating = true,
-            .xml11 = true,
         },
         .{
             .name = "z-xml11-validating-ns-check",
             .namespaces = true,
-            .general_encodings = true,
             .dtd = true,
             .validating = true,
-            .xml11 = true,
         },
     }) |adapter| {
         addCheckAdapter(
@@ -230,10 +216,8 @@ fn addCheckAdapter(
     module.addImport("z_xml", z_xml);
     const options = b.addOptions();
     options.addOption(bool, "namespaces", adapter.namespaces);
-    options.addOption(bool, "general_encodings", adapter.general_encodings);
     options.addOption(bool, "dtd", adapter.dtd);
     options.addOption(bool, "validating", adapter.validating);
-    if (adapter.xml11) options.addOption(bool, "xml11", true);
     module.addOptions("check_options", options);
 
     const executable = b.addExecutable(.{

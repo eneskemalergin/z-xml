@@ -23,6 +23,12 @@ pub const Options = struct {
     source_id: u32 = 1,
     dtd_limits: dtd.Limits = .{},
     validation_limits: validation.Limits = .{},
+    /// Maximum declaration sources retained by the compiled subset.
+    max_sources: usize = 256,
+    /// Maximum cumulative bytes retained from declaration sources.
+    max_source_bytes: usize = 32 * 1024 * 1024,
+    /// Maximum bytes accepted in one system, public, or base identifier.
+    max_identifier_bytes: usize = 64 * 1024,
     /// Optional synchronous provider for external parameter entities.
     provider: ?Provider = null,
 };
@@ -83,9 +89,20 @@ pub const ExternalSubset = struct {
         options: Options,
     ) CompileError!ExternalSubset {
         if (system_id.len == 0 or options.source_id == 0 or
-            !options.dtd_limits.validate() or !options.validation_limits.validate())
+            !options.dtd_limits.validate() or !options.validation_limits.validate() or
+            options.max_sources == 0 or options.max_source_bytes == 0 or
+            options.max_identifier_bytes == 0)
         {
             return error.InvalidOptions;
+        }
+        if (system_id.len > options.max_identifier_bytes or
+            (options.public_id != null and
+                options.public_id.?.len > options.max_identifier_bytes) or
+            (options.base_id != null and
+                options.base_id.?.len > options.max_identifier_bytes) or
+            declaration_bytes.len > options.max_source_bytes)
+        {
+            return error.LimitExceeded;
         }
         var result: ExternalSubset = .{
             .allocator = allocator,
@@ -109,6 +126,10 @@ pub const ExternalSubset = struct {
             .allocator = allocator,
             .owner = &result,
             .upstream = options.provider,
+            .max_sources = options.max_sources,
+            .max_source_bytes = options.max_source_bytes,
+            .max_identifier_bytes = options.max_identifier_bytes,
+            .source_bytes = declaration_bytes.len,
         };
         try result.declarations.parseExternalSubset(
             allocator,
@@ -122,6 +143,7 @@ pub const ExternalSubset = struct {
             allocator,
             options.validation_limits,
             &result.declarations,
+            true,
         ) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.LimitExceeded,
@@ -244,6 +266,10 @@ const ProviderCapture = struct {
     allocator: std.mem.Allocator,
     owner: *ExternalSubset,
     upstream: ?Provider,
+    max_sources: usize,
+    max_source_bytes: usize,
+    max_identifier_bytes: usize,
+    source_bytes: usize,
 
     fn provider(self: *@This()) Provider {
         return .{ .context = self, .resolveFn = resolve };
@@ -251,12 +277,27 @@ const ProviderCapture = struct {
 
     fn resolve(context: ?*anyopaque, request: Request) ProviderError!Result {
         const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.owner.sources.items.len == self.max_sources or
+            request.system_id.len > self.max_identifier_bytes or
+            (request.public_id != null and
+                request.public_id.?.len > self.max_identifier_bytes) or
+            (request.base_id != null and
+                request.base_id.?.len > self.max_identifier_bytes))
+        {
+            return error.LimitExceeded;
+        }
         const result = try self.upstream.?.resolve(request);
         return switch (result) {
             .skipped => error.UnsupportedFeature,
             .content => |content| blk: {
                 if (content.source_id == 0 or self.owner.findSource(content.source_id) != null) {
                     return error.InvalidDtd;
+                }
+                if (content.bytes.len > self.max_source_bytes -| self.source_bytes or
+                    (content.base_id != null and
+                        content.base_id.?.len > self.max_identifier_bytes))
+                {
+                    return error.LimitExceeded;
                 }
                 const bytes = try self.allocator.dupe(u8, content.bytes);
                 errdefer self.allocator.free(bytes);
@@ -268,6 +309,7 @@ const ProviderCapture = struct {
                         .offset = request.inclusion_offset,
                     },
                 });
+                self.source_bytes += content.bytes.len;
                 break :blk .{ .content = .{
                     .bytes = bytes,
                     .base_id = content.base_id,

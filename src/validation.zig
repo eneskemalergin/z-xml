@@ -144,6 +144,7 @@ pub const Frame = struct {
     model_index: ?u32 = null,
     state: u32 = 0,
     invalid_content: bool = false,
+    content_incomplete: bool = false,
     declared_external: bool = false,
 };
 
@@ -247,6 +248,7 @@ pub const State = struct {
         allocator: std.mem.Allocator,
         limits: Limits,
         declarations: *const dtd.State,
+        declarations_complete: bool,
     ) Error!void {
         if (declarations.elements.items.len > std.math.maxInt(u32)) {
             return error.ContentStateLimit;
@@ -309,7 +311,12 @@ pub const State = struct {
             }
             try self.models.append(allocator, model);
         }
-        try self.checkDeclarations(allocator, limits, declarations);
+        try self.checkDeclarations(
+            allocator,
+            limits,
+            declarations,
+            declarations_complete,
+        );
         for (declarations.nesting_violations.items) |location| {
             try self.addIssue(allocator, limits, .{
                 .code = .improper_parameter_entity_nesting,
@@ -400,7 +407,9 @@ pub const State = struct {
         child_name: []const u8,
         location: SourceLocation,
     ) Error!?Issue {
-        if (frame.invalid_content or frame.model_index == null) return null;
+        if (frame.invalid_content or frame.content_incomplete or frame.model_index == null) {
+            return null;
+        }
         const model = self.models.items[frame.model_index.?];
         switch (model.kind) {
             .any => return null,
@@ -445,7 +454,11 @@ pub const State = struct {
         allow_ignorable_whitespace: bool,
         location: SourceLocation,
     ) ?Issue {
-        if (frame.invalid_content or frame.model_index == null or bytes.len == 0) return null;
+        if (frame.invalid_content or frame.content_incomplete or
+            frame.model_index == null or bytes.len == 0)
+        {
+            return null;
+        }
         const model = self.models.items[frame.model_index.?];
         switch (model.kind) {
             .any, .mixed => return null,
@@ -463,7 +476,9 @@ pub const State = struct {
     }
 
     pub fn contentMarker(self: *const State, frame: *Frame, location: SourceLocation) ?Issue {
-        if (frame.invalid_content or frame.model_index == null) return null;
+        if (frame.invalid_content or frame.content_incomplete or frame.model_index == null) {
+            return null;
+        }
         if (self.models.items[frame.model_index.?].kind == .empty) {
             frame.invalid_content = true;
             return .{ .code = .invalid_element_content, .occurrence = location };
@@ -472,12 +487,18 @@ pub const State = struct {
     }
 
     pub fn isIgnorableWhitespace(self: *const State, frame: Frame, bytes: []const u8) bool {
-        if (frame.invalid_content or frame.model_index == null or !allXmlWhitespace(bytes)) return false;
+        if (frame.invalid_content or frame.content_incomplete or
+            frame.model_index == null or !allXmlWhitespace(bytes))
+        {
+            return false;
+        }
         return self.models.items[frame.model_index.?].kind == .children;
     }
 
     pub fn finishElement(self: *const State, frame: *Frame, location: SourceLocation) ?Issue {
-        if (frame.invalid_content or frame.model_index == null) return null;
+        if (frame.invalid_content or frame.content_incomplete or frame.model_index == null) {
+            return null;
+        }
         const model = self.models.items[frame.model_index.?];
         if (model.kind != .children) return null;
         if (!self.dfa_states.items[frame.state].accepting) {
@@ -641,6 +662,7 @@ pub const State = struct {
         allocator: std.mem.Allocator,
         limits: Limits,
         declarations: *const dtd.State,
+        declarations_complete: bool,
     ) Error!void {
         for (declarations.notations.items, 0..) |notation, index| {
             for (declarations.notations.items[0..index]) |prior| {
@@ -656,7 +678,9 @@ pub const State = struct {
         }
         for (declarations.entities.items) |entity| {
             if (!entity.unparsed) continue;
-            if (!notationDeclared(declarations, declarations.string(entity.notation_name.?))) {
+            if (declarations_complete and
+                !notationDeclared(declarations, declarations.string(entity.notation_name.?)))
+            {
                 try self.addIssue(allocator, limits, .{
                     .code = .undeclared_notation,
                     .declaration = entity.location,
@@ -711,7 +735,7 @@ pub const State = struct {
                 if (attribute.attribute_type == .notation) {
                     var iterator = GroupIterator.init(declarations.string(values));
                     while (iterator.next()) |value| {
-                        if (!notationDeclared(declarations, value)) {
+                        if (declarations_complete and !notationDeclared(declarations, value)) {
                             try self.addIssue(allocator, limits, .{
                                 .code = .undeclared_notation,
                                 .declaration = attribute.location,
