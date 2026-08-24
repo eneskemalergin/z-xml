@@ -7,8 +7,8 @@ fn parse(
     comptime config: xml.Config,
     allocator: std.mem.Allocator,
     input: []const u8,
-    tree_options: xml.TreeOptions,
-) !xml.Document(config) {
+    tree_options: xml.ProfileTreeOptions,
+) !xml.ProfileDocumentFor(config) {
     return parseWithReaderOptions(config, allocator, .{}, input, tree_options);
 }
 
@@ -17,11 +17,243 @@ fn parseWithReaderOptions(
     allocator: std.mem.Allocator,
     reader_options: xml.OptionsFor(config),
     input: []const u8,
-    tree_options: xml.TreeOptions,
-) !xml.Document(config) {
+    tree_options: xml.ProfileTreeOptions,
+) !xml.ProfileDocumentFor(config) {
     var pull = try xml.ProfileSliceReader(config).init(allocator, reader_options, input);
     defer pull.deinit();
-    return xml.buildTreeFromPull(config, allocator, tree_options, &pull);
+    return xml.buildProfileTreeFromPull(config, allocator, tree_options, &pull);
+}
+
+fn parseTemporaryDocument(allocator: std.mem.Allocator) !xml.Document {
+    var input =
+        ("<?xml version='1.0' standalone='yes'?>" ++
+            "<!--before--><?target data?>" ++
+            "<!DOCTYPE p:r [<!ELEMENT p:r (#PCDATA)><!ATTLIST p:r a CDATA #REQUIRED>]>" ++
+            "<p:r xmlns:p='urn:test' a='value'>text</p:r>").*;
+    const document = try xml.parseDocument(allocator, .{ .slice = &input }, .{});
+    @memset(&input, 0);
+    return document;
+}
+
+fn parseDocumentWithExternalFinding(allocator: std.mem.Allocator) !xml.Document {
+    var subset = try xml.ExternalSubset.compileDecoded(
+        allocator,
+        "schema.dtd",
+        "<!ELEMENT r EMPTY><!ELEMENT r EMPTY>",
+        .{ .source_id = 90 },
+    );
+    defer subset.deinit();
+    return xml.parseDocument(
+        allocator,
+        .{ .slice = "<!DOCTYPE r SYSTEM 'schema.dtd'><r/>" },
+        .{ .reader = .{ .dtd = .{ .validate = .{ .external_subset = &subset } } } },
+    );
+}
+
+test "[integration] - [document]: owns retained XML after the source expires" {
+    var document = try parseTemporaryDocument(std.testing.allocator);
+    defer document.deinit();
+
+    const invalid = std.math.maxInt(xml.Node);
+    try std.testing.expectEqual(@as(?xml.NodeKind, null), document.nodeKind(0));
+    try std.testing.expectEqual(@as(?xml.NodeKind, null), document.nodeKind(invalid));
+    try std.testing.expectEqual(@as(xml.Node, 0), document.parent(document.root()));
+    try std.testing.expectEqual(@as(xml.Node, 0), document.parent(invalid));
+    try std.testing.expectEqual(@as(?xml.Name, null), document.nodeName(invalid));
+    try std.testing.expectEqual(@as(?[]const u8, null), document.nodeValue(invalid));
+    try std.testing.expectEqual(@as(?xml.TextOrigin, null), document.textOrigin(invalid));
+    try std.testing.expect(document.processingInstruction(invalid) == null);
+    try std.testing.expectEqual(@as(?xml.Attribute, null), document.attribute(invalid, null, "a"));
+    try std.testing.expectEqual(@as(?xml.Attribute, null), document.attributeRaw(invalid, "a"));
+    var invalid_attributes = document.attributes(invalid);
+    try std.testing.expectEqual(@as(?xml.Attribute, null), invalid_attributes.next());
+    var invalid_declarations = document.namespaceDeclarations(invalid);
+    try std.testing.expectEqual(
+        @as(?xml.DocumentNamespaceDeclaration, null),
+        invalid_declarations.next(),
+    );
+    var invalid_children = document.children(invalid);
+    try std.testing.expectEqual(@as(?xml.Node, null), invalid_children.next());
+
+    const start = document.documentStart();
+    try std.testing.expectEqual(xml.XmlVersion.xml10, start.effective_version);
+    try std.testing.expectEqual(xml.XmlVersion.xml10, start.declaration.?.version);
+    try std.testing.expectEqual(@as(?[]const u8, null), start.declaration.?.encoding);
+    try std.testing.expectEqual(true, start.declaration.?.standalone.?);
+    try std.testing.expectEqualStrings("p:r", document.documentType().?.root_name);
+
+    const element = document.documentElement();
+    const name = document.nodeName(element).?;
+    try std.testing.expectEqualStrings("p:r", name.raw);
+    try std.testing.expectEqualStrings("urn:test", name.expanded.?.namespace_uri.?);
+    try std.testing.expectEqualStrings("value", document.attribute(element, null, "a").?.value);
+    var attributes = document.attributes(element);
+    try std.testing.expectEqualStrings("a", attributes.next().?.name.raw);
+    try std.testing.expectEqual(@as(?xml.Attribute, null), attributes.next());
+
+    var document_children = document.children(document.root());
+    const comment = document_children.next().?;
+    try std.testing.expectEqualStrings("before", document.nodeValue(comment).?);
+    const instruction = document.processingInstruction(document_children.next().?).?;
+    try std.testing.expectEqualStrings("target", instruction.target);
+    try std.testing.expectEqualStrings("data", instruction.data);
+    try std.testing.expectEqual(element, document_children.next().?);
+
+    var declarations = document.namespaceDeclarations(element);
+    const declaration = declarations.next().?;
+    try std.testing.expectEqualStrings("p", declaration.prefix.?);
+    try std.testing.expectEqualStrings("urn:test", declaration.namespace_uri);
+    try std.testing.expectEqual(@as(?xml.DocumentNamespaceDeclaration, null), declarations.next());
+
+    var children = document.children(element);
+    const text = children.next().?;
+    try std.testing.expectEqualStrings("text", document.nodeValue(text).?);
+    try std.testing.expectEqual(@as(?xml.TextOrigin, null), document.textOrigin(text));
+    try std.testing.expectEqual(@as(?xml.Node, null), children.next());
+    try std.testing.expectEqual(xml.DocumentContent.complete, document.documentEnd().content);
+    try std.testing.expect(document.memoryUsage().total_capacity_bytes > 0);
+}
+
+test "[integration] - [document]: joins fragments from caller-owned stream input" {
+    const input = "<r>ab<!--cd--><?p ef?></r>";
+    var input_buffer: [1]u8 = undefined;
+    var source: std.testing.Reader = .init(&input_buffer, &.{.{ .buffer = input }});
+    source.artificial_limit = .limited(1);
+    var document = try xml.parseDocument(
+        std.testing.allocator,
+        .{ .stream = &source.interface },
+        .{ .reader = .{ .limits = .{ .max_fragment_bytes = 1 } } },
+    );
+    defer document.deinit();
+
+    var children = document.children(document.documentElement());
+    try std.testing.expectEqualStrings("ab", document.nodeValue(children.next().?).?);
+    try std.testing.expectEqualStrings("cd", document.nodeValue(children.next().?).?);
+    const instruction = document.processingInstruction(children.next().?).?;
+    try std.testing.expectEqualStrings("p", instruction.target);
+    try std.testing.expectEqualStrings("ef", instruction.data);
+    try std.testing.expectEqual(@as(?xml.Node, null), children.next());
+}
+
+test "[integration] - [document]: keeps skipped external content as a text boundary" {
+    const input = "<!DOCTYPE r [<!ENTITY ext SYSTEM 'external.ent'>]><r>a&ext;b</r>";
+    var document = try xml.parseDocument(std.testing.allocator, .{ .slice = input }, .{
+        .reader = .{ .external = .skip },
+    });
+    defer document.deinit();
+
+    var children = document.children(document.documentElement());
+    try std.testing.expectEqualStrings("a", document.nodeValue(children.next().?).?);
+    try std.testing.expectEqualStrings("b", document.nodeValue(children.next().?).?);
+    try std.testing.expectEqual(@as(?xml.Node, null), children.next());
+    try std.testing.expectEqual(
+        xml.DocumentContent.external_content_skipped,
+        document.documentEnd().content,
+    );
+}
+
+test "[integration] - [document]: applies retention and raw-name options without changing type" {
+    const input = "<r xmlns='urn:test' a='value'>a<!--comment-->b<?target data?><![CDATA[c]]></r>";
+    var compact = try xml.parseDocument(std.testing.allocator, .{ .slice = input }, .{
+        .reader = .{ .namespaces = .raw, .dtd = .reject },
+        .retain_comments = false,
+        .retain_processing_instructions = false,
+    });
+    defer compact.deinit();
+
+    const element = compact.documentElement();
+    try std.testing.expectEqual(@as(?xml.ExpandedName, null), compact.nodeName(element).?.expanded);
+    try std.testing.expectEqualStrings(
+        "urn:test",
+        compact.attributeRaw(element, "xmlns").?.value,
+    );
+    try std.testing.expectEqualStrings("value", compact.attributeRaw(element, "a").?.value);
+    var declarations = compact.namespaceDeclarations(element);
+    try std.testing.expectEqual(@as(?xml.DocumentNamespaceDeclaration, null), declarations.next());
+    var children = compact.children(element);
+    const text = children.next().?;
+    try std.testing.expectEqualStrings("abc", compact.nodeValue(text).?);
+    try std.testing.expectEqual(@as(?xml.Node, null), children.next());
+    try std.testing.expectEqual(@as(?xml.Attribute, null), compact.attribute(element, null, "a"));
+
+    var origins = try xml.parseDocument(
+        std.testing.allocator,
+        .{ .slice = "<r>a<![CDATA[b]]></r>" },
+        .{ .retain_text_origin = true },
+    );
+    defer origins.deinit();
+    var origin_children = origins.children(origins.documentElement());
+    try std.testing.expectEqual(
+        xml.TextOrigin.character_data,
+        origins.textOrigin(origin_children.next().?).?,
+    );
+    try std.testing.expectEqual(xml.TextOrigin.cdata, origins.textOrigin(origin_children.next().?).?);
+}
+
+test "[integration] - [document]: retains validation and normalization findings" {
+    const input =
+        "<!DOCTYPE r [<!ELEMENT r EMPTY>" ++
+        "<!ATTLIST r required CDATA #REQUIRED mode (a|b) 'a'>]>" ++
+        "<r/>";
+    var document = try xml.parseDocument(std.testing.allocator, .{ .slice = input }, .{
+        .reader = .{ .dtd = .{ .validate = .{} } },
+    });
+    defer document.deinit();
+
+    try std.testing.expectEqual(xml.DtdValidity.invalid, document.documentEnd().dtd_validity);
+    try std.testing.expectEqual(
+        xml.DiagnosticCode.validity_required_attribute,
+        document.firstDtdFinding().?.code,
+    );
+    const defaulted = document.attribute(document.documentElement(), null, "mode").?;
+    try std.testing.expectEqualStrings("a", defaulted.value);
+    try std.testing.expect(!defaulted.specified);
+    try std.testing.expectEqual(xml.AttributeType.enumeration, defaulted.declared_type.?);
+
+    var external_finding = try parseDocumentWithExternalFinding(std.testing.allocator);
+    defer external_finding.deinit();
+    const retained_finding = external_finding.firstDtdFinding().?;
+    try std.testing.expectEqual(
+        xml.DiagnosticCode.validity_duplicate_element_declaration,
+        retained_finding.code,
+    );
+    try std.testing.expectEqual(@as(u32, 90), retained_finding.primary.source_id);
+    try std.testing.expectEqual(@as(usize, 1), retained_finding.inclusion_trace.len);
+    try std.testing.expectEqual(@as(u32, 0), retained_finding.inclusion_trace[0].source_id);
+
+    var normalization = try xml.parseDocument(
+        std.testing.allocator,
+        .{ .slice = "<?xml version='1.1'?><r>e\xcc\x81</r>" },
+        .{},
+    );
+    defer normalization.deinit();
+    try std.testing.expectEqual(
+        xml.DocumentNormalization.not_normalized,
+        normalization.documentEnd().normalization,
+    );
+    try std.testing.expectEqual(
+        xml.NormalizationIssueKind.not_nfc,
+        normalization.normalizationFinding().?.kind,
+    );
+}
+
+test "[failure] - [document]: reports option, XML, and document limit errors" {
+    try std.testing.expectError(
+        error.InvalidOptions,
+        xml.parseDocument(std.testing.allocator, .{ .slice = "<r/>" }, .{
+            .limits = .{ .max_nodes = 0 },
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidXml,
+        xml.parseDocument(std.testing.allocator, .{ .slice = "<r>" }, .{}),
+    );
+    try std.testing.expectError(
+        error.DocumentLimit,
+        xml.parseDocument(std.testing.allocator, .{ .slice = "<r/>" }, .{
+            .limits = .{ .max_nodes = 1 },
+        }),
+    );
 }
 
 test "[integration] - [owned tree]: preserves document order and semantic values" {
@@ -59,7 +291,7 @@ test "[integration] - [owned tree]: preserves document order and semantic values
     try std.testing.expectEqual(child, children.next().?);
     try std.testing.expectEqual(text, children.next().?);
     try std.testing.expectEqual(cdata, children.next().?);
-    try std.testing.expectEqual(@as(?xml.NodeIndex, null), children.next());
+    try std.testing.expectEqual(@as(?xml.Node, null), children.next());
 
     const declaration = document.xmlDeclaration();
     try std.testing.expectEqualStrings("1.0", declaration.declared_version.?);
@@ -125,7 +357,7 @@ test "[integration] - [owned tree]: retains detailed DTD reports in source order
     defer document.deinit();
 
     try std.testing.expectEqual(@as(usize, 7), document.dtdRecordCount());
-    const expected = [_]xml.TreeDtdRecordKind{
+    const expected = [_]xml.ProfileTreeDtdRecordKind{
         .element,
         .attribute_list,
         .parsed_entity,
@@ -136,8 +368,8 @@ test "[integration] - [owned tree]: retains detailed DTD reports in source order
         try std.testing.expectEqual(kind, document.dtdRecordAt(index).?.kind);
     }
     try std.testing.expectEqualStrings("n", document.dtdRecordAt(4).?.notation_name.?);
-    try std.testing.expectEqual(xml.TreeDtdRecordKind.entity_start, document.dtdRecordAt(5).?.kind);
-    try std.testing.expectEqual(xml.TreeDtdRecordKind.entity_end, document.dtdRecordAt(6).?.kind);
+    try std.testing.expectEqual(xml.ProfileTreeDtdRecordKind.entity_start, document.dtdRecordAt(5).?.kind);
+    try std.testing.expectEqual(xml.ProfileTreeDtdRecordKind.entity_end, document.dtdRecordAt(6).?.kind);
     try std.testing.expectEqualStrings(
         "value",
         document.nodeValue(document.firstChild(document.documentElement())).?,
@@ -161,7 +393,7 @@ test "[integration] - [owned tree]: preserves skipped external entity boundaries
     const second = document.nextSibling(first);
     try std.testing.expectEqualStrings("b", document.nodeValue(second).?);
     const skipped = document.dtdRecordAt(document.dtdRecordCount() - 1).?;
-    try std.testing.expectEqual(xml.TreeDtdRecordKind.skipped_entity, skipped.kind);
+    try std.testing.expectEqual(xml.ProfileTreeDtdRecordKind.skipped_entity, skipped.kind);
     try std.testing.expectEqual(xml.ProfileSkippedEntityKind.general_entity, skipped.skipped_entity_kind.?);
 }
 
@@ -250,7 +482,7 @@ test "[property] - [owned tree]: coalescing follows the configured text-origin b
     defer merged.deinit();
     const text = merged.firstChild(merged.documentElement());
     try std.testing.expectEqualStrings("abc&d", merged.nodeValue(text).?);
-    try std.testing.expectEqual(@as(xml.NodeIndex, 0), merged.nextSibling(text));
+    try std.testing.expectEqual(@as(xml.Node, 0), merged.nextSibling(text));
 
     var normalized = try parse(
         config,
@@ -307,7 +539,7 @@ test "[failure] - [owned tree]: reports independent count and memory limits" {
     );
     try std.testing.expectError(
         error.InvalidOptions,
-        xml.TreeBuilder(config).init(std.testing.allocator, .{
+        xml.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{
             .limits = .{ .max_nodes = 0 },
         }),
     );
@@ -363,7 +595,7 @@ test "[failure] - [owned tree]: releases every partial allocation" {
 
 test "[failure] - [owned tree]: rejects an inconsistent public event stream" {
     const config = xml.Configs.XML10_UTF8_NO_DTD;
-    var builder = try xml.TreeBuilder(config).init(std.testing.allocator, .{});
+    var builder = try xml.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
     defer builder.deinit();
     try builder.consume(.{ .document_start = .{} });
     try builder.consume(.{ .start_element = .{
@@ -379,7 +611,7 @@ test "[failure] - [owned tree]: rejects an inconsistent public event stream" {
 
 test "[failure] - [owned tree]: rejects interrupted fragments and remains failed" {
     const config = xml.Configs.XML10_UTF8_NO_DTD;
-    var builder = try xml.TreeBuilder(config).init(std.testing.allocator, .{});
+    var builder = try xml.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
     defer builder.deinit();
     try builder.consume(.{ .document_start = .{} });
     try builder.consume(.{ .comment = .{ .bytes = "part", .complete = false } });
@@ -400,7 +632,7 @@ test "[failure] - [owned tree]: rejects interrupted fragments and remains failed
 
 test "[failure] - [owned tree]: transfers document storage only once" {
     const config = xml.Configs.XML10_UTF8_NO_DTD;
-    var builder = try xml.TreeBuilder(config).init(std.testing.allocator, .{});
+    var builder = try xml.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
     defer builder.deinit();
     try builder.consume(.{ .document_start = .{} });
     try builder.consume(.{ .start_element = .{
@@ -418,7 +650,7 @@ test "[failure] - [owned tree]: transfers document storage only once" {
 
 test "[failure] - [owned tree]: rejects a second document element" {
     const config = xml.Configs.XML10_UTF8_NO_DTD;
-    var builder = try xml.TreeBuilder(config).init(std.testing.allocator, .{});
+    var builder = try xml.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
     defer builder.deinit();
     try builder.consume(.{ .document_start = .{} });
     try builder.consume(.{ .start_element = .{
@@ -496,7 +728,7 @@ fn eventSummary(comptime config: xml.Config, input: []const u8) !Summary {
 
 fn treeSummary(document: anytype) Summary {
     var result: Summary = .{};
-    var index: xml.NodeIndex = 1;
+    var index: xml.Node = 1;
     while (index <= document.memoryUsage().node_count) : (index += 1) {
         switch (document.nodeKind(index).?) {
             .document => {},

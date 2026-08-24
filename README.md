@@ -1,8 +1,8 @@
 # z-xml
 
-Status: **Active** (last updated: 2026-08-23)
+Status: **Active** (last updated: 2026-08-24)
 
-`z-xml` is an incremental XML parser for Zig. You can read an XML stream as events or build an immutable document tree from those events. Caller-set limits keep input-driven memory use bounded.
+`z-xml` is an XML parser for Zig. You can read XML as events or parse one complete source into an immutable owned document. Caller-set limits keep input-driven memory use bounded.
 
 ## XML support
 
@@ -15,6 +15,8 @@ Status: **Active** (last updated: 2026-08-23)
 - Optional XML 1.1 Unicode normalization checks
 
 Normal code calls `Reader.init(allocator, source, options)`. XML version and UTF-8 or UTF-16 decoding are automatic. Namespace, DTD, external-source, transcoding, normalization, line-tracking, diagnostic, and limit choices are runtime options on the same `Reader` and `Event` types.
+
+Code that needs retained XML calls `parseDocument(allocator, source, options)`. It returns one `Document` type regardless of Reader options. The Document owns its retained strings and releases them through `deinit`.
 
 Package tests and development tools that still need a compile-time parser shape use `ReaderFor(config)` and `Configs`.
 

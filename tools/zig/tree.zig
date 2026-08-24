@@ -48,7 +48,7 @@ fn run(init: std.process.Init) !u8 {
     var pull = try xml.ProfileIoReader(CONFIG).init(init.gpa, .{}, &file_reader.interface);
     defer pull.deinit();
     const build_start = std.Io.Clock.awake.now(init.io);
-    var document = xml.buildTreeFromPull(CONFIG, init.gpa, .{}, &pull) catch |err| {
+    var document = xml.buildProfileTreeFromPull(CONFIG, init.gpa, .{}, &pull) catch |err| {
         if (pull.diagnostic()) |diagnostic| {
             std.debug.print(
                 "z-xml-tree: {s} at source {d} byte {d}\n",
@@ -103,7 +103,7 @@ fn run(init: std.process.Init) !u8 {
     return 0;
 }
 
-fn traverse(document: *const xml.Document(CONFIG), stats: *Stats) void {
+fn traverse(document: *const xml.ProfileDocumentFor(CONFIG), stats: *Stats) void {
     var index = document.firstChild(document.root());
     while (index != 0) {
         enter(document, index, stats);
@@ -125,7 +125,7 @@ fn traverse(document: *const xml.Document(CONFIG), stats: *Stats) void {
     }
 }
 
-fn enter(document: *const xml.Document(CONFIG), index: xml.NodeIndex, stats: *Stats) void {
+fn enter(document: *const xml.ProfileDocumentFor(CONFIG), index: xml.Node, stats: *Stats) void {
     switch (document.nodeKind(index).?) {
         .element => {
             stats.elements += 1;
@@ -150,7 +150,7 @@ fn enter(document: *const xml.Document(CONFIG), index: xml.NodeIndex, stats: *St
     }
 }
 
-fn leave(document: *const xml.Document(CONFIG), index: xml.NodeIndex, stats: *Stats) void {
+fn leave(document: *const xml.ProfileDocumentFor(CONFIG), index: xml.Node, stats: *Stats) void {
     if (document.nodeKind(index).? != .element) return;
     stats.marker(4);
     stats.bytes(document.nodeName(index).?.raw);

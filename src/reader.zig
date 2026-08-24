@@ -1064,7 +1064,7 @@ pub const NormalExternalPolicy = enum {
     resolve,
 };
 
-/// One DTD validity finding whose inclusion trace borrows Reader storage.
+/// One DTD validity finding borrowed from the Reader or Document that returned it.
 pub const NormalDtdFinding = struct {
     code: DiagnosticCode,
     primary: NormalLocation,
@@ -1211,7 +1211,7 @@ pub const NormalName = struct {
     }
 };
 
-/// Attribute borrowed from one start-element event.
+/// Attribute borrowed from a start-element event or owned Document.
 pub const NormalAttribute = struct {
     name: NormalName,
     value: []const u8,
@@ -1235,14 +1235,14 @@ pub const NormalXmlDeclaration = struct {
     standalone: ?bool,
 };
 
-/// Document-start information.
+/// Document-start information returned by a Reader event or owned Document.
 pub const NormalDocumentStart = struct {
     effective_version: XmlVersion,
     source_encoding: SourceEncoding,
     declaration: ?NormalXmlDeclaration,
 };
 
-/// Document type header.
+/// Document type header returned by a Reader event or owned Document.
 pub const NormalDocumentType = struct {
     root_name: []const u8,
     public_id: ?[]const u8,

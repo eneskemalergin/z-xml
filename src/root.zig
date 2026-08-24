@@ -1,4 +1,4 @@
-//! A bounded XML reader for Zig.
+//! A bounded XML reader and owned document for Zig.
 //!
 //! Normal callers use `Reader`. Explicit `...For(config)` aliases expose the
 //! specialized reader shapes used by package tools.
@@ -132,7 +132,7 @@ pub const NormalizationFinding = reader.NormalNormalizationFinding;
 pub const Name = reader.NormalName;
 /// Resolved namespace identity.
 pub const ExpandedName = reader.NormalExpandedName;
-/// Attribute borrowed from one start-element event.
+/// Attribute borrowed from a start-element event or owned Document.
 pub const Attribute = reader.NormalAttribute;
 /// Namespace declaration borrowed from one start-element event.
 pub const NamespaceDeclaration = reader.NormalNamespaceDeclaration;
@@ -199,39 +199,32 @@ pub const ProfileDrainControl = io.DrainControl;
 pub const drainProfileSlice = io.drainSlice;
 /// Parses one buffered source through a specialized push callback.
 pub const drainProfileIo = io.drainIo;
-/// Immutable owned-tree node index with zero as the null sentinel.
-pub const NodeIndex = tree.NodeIndex;
-/// Immutable owned-tree node kind.
+/// Document-scoped node index with zero as the invalid sentinel.
+pub const Node = tree.NodeIndex;
+/// Immutable document node kind.
 pub const NodeKind = tree.NodeKind;
-/// Independent limits for owned-tree construction.
-pub const TreeLimits = tree.Limits;
-/// Optional initial owned-tree capacities.
-pub const TreeCapacityHints = tree.CapacityHints;
-/// Runtime owned-tree construction options.
-pub const TreeOptions = tree.Options;
-/// Errors specific to owned-tree construction.
-pub const TreeBuildError = tree.BuildError;
-/// Owned-tree capacity accounting.
-pub const TreeMemoryUsage = tree.MemoryUsage;
-/// Name whose slices borrow from an owned document.
-pub const TreeName = tree.Name;
-/// Attribute whose slices borrow from an owned document.
-pub const TreeAttribute = tree.Attribute;
-/// Namespace declaration whose slices borrow from an owned document.
-pub const TreeNamespaceDeclaration = tree.NamespaceDeclaration;
-/// XML declaration retained by an owned document.
-pub const TreeDeclaration = tree.Declaration;
-/// Document type header retained by an owned document.
-pub const TreeDocumentType = tree.DocumentType;
-/// Kind of source-ordered DTD report retained by an owned document.
-pub const TreeDtdRecordKind = tree.DtdRecordKind;
-/// Source-ordered DTD report retained by an owned document.
-pub const TreeDtdRecord = tree.DtdRecord;
-/// Returns the immutable owned document type for a reader configuration.
+/// Independent limits for normal document construction.
+pub const DocumentLimits = tree.DocumentLimits;
+/// Runtime options for normal document construction.
+pub const DocumentOptions = tree.DocumentOptions;
+/// Normal document-owned memory accounting.
+pub const DocumentMemoryUsage = tree.DocumentMemoryUsage;
+/// Namespace declaration borrowed from a normal document.
+pub const DocumentNamespaceDeclaration = tree.NamespaceDeclaration;
+/// Errors returned while parsing a normal owned document.
+pub const ParseDocumentError = tree.ParseDocumentError;
+/// Immutable document owned independently of its source and Reader.
 pub const Document = tree.Document;
-/// Returns the allocation-free child iterator for an owned document configuration.
-pub const TreeChildIterator = tree.ChildIterator;
-/// Returns the public-event tree builder for a reader configuration.
-pub const TreeBuilder = tree.Builder;
-/// Builds an owned document from a compatible public pull reader.
-pub const buildTreeFromPull = tree.buildFromPull;
+/// Parses one complete source into an owned document.
+pub const parseDocument = tree.parseDocument;
+
+/// Options for specialized document construction.
+pub const ProfileTreeOptions = tree.Options;
+/// DTD report kind retained by a specialized document.
+pub const ProfileTreeDtdRecordKind = tree.DtdRecordKind;
+/// Returns the immutable document type for a parser profile.
+pub const ProfileDocumentFor = tree.ProfileDocumentFor;
+/// Returns the document builder type for a parser profile.
+pub const ProfileTreeBuilderFor = tree.ProfileBuilderFor;
+/// Builds a specialized document from a compatible profile pull reader.
+pub const buildProfileTreeFromPull = tree.buildProfileFromPull;

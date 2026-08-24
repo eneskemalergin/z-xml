@@ -26,6 +26,9 @@ pub const NodeKind = enum(u8) {
 /// Node counts include the synthetic document node. `max_tree_bytes` covers
 /// dynamic capacity retained by the document, not temporary builder stacks.
 pub const Limits = struct {
+    /// Finite default limits for normal and specialized documents.
+    pub const general: Limits = .{};
+
     max_nodes: usize = 32 * 1024 * 1024,
     max_attributes: usize = 16 * 1024 * 1024,
     max_namespace_declarations: usize = 4 * 1024 * 1024,
@@ -42,6 +45,32 @@ pub const Limits = struct {
             self.max_children_per_element > 0 and
             self.max_coalesced_text_bytes > 0 and
             self.max_tree_bytes > 0;
+    }
+};
+
+/// Limits applied to normal Document construction and retained storage.
+pub const DocumentLimits = struct {
+    /// Finite default limits for normal documents.
+    pub const general: DocumentLimits = .{};
+
+    max_nodes: usize = 32 * 1024 * 1024,
+    max_attributes: usize = 16 * 1024 * 1024,
+    max_namespace_declarations: usize = 4 * 1024 * 1024,
+    max_string_bytes: usize = 1024 * 1024 * 1024,
+    max_children_per_element: usize = 16 * 1024 * 1024,
+    max_coalesced_text_bytes: usize = 64 * 1024 * 1024,
+    max_retained_bytes: usize = 2 * 1024 * 1024 * 1024,
+
+    fn profile(self: DocumentLimits) Limits {
+        return .{
+            .max_nodes = self.max_nodes,
+            .max_attributes = self.max_attributes,
+            .max_namespace_declarations = self.max_namespace_declarations,
+            .max_string_bytes = self.max_string_bytes,
+            .max_children_per_element = self.max_children_per_element,
+            .max_coalesced_text_bytes = self.max_coalesced_text_bytes,
+            .max_tree_bytes = self.max_retained_bytes,
+        };
     }
 };
 
@@ -84,6 +113,36 @@ pub const MemoryUsage = struct {
     location_capacity_bytes: usize,
     dtd_metadata_capacity_bytes: usize,
     total_capacity_bytes: usize,
+};
+
+/// Logical counts and retained allocation capacities owned by a normal document.
+pub const DocumentMemoryUsage = struct {
+    node_count: usize,
+    node_capacity_bytes: usize,
+    attribute_count: usize,
+    attribute_capacity_bytes: usize,
+    namespace_declaration_count: usize,
+    namespace_declaration_capacity_bytes: usize,
+    string_bytes: usize,
+    string_capacity_bytes: usize,
+    metadata_capacity_bytes: usize,
+    total_capacity_bytes: usize,
+};
+
+/// Runtime options for normal owned-document construction.
+pub const DocumentOptions = struct {
+    reader: reader.NormalReaderOptions = .{},
+    limits: DocumentLimits = DocumentLimits.general,
+    retain_comments: bool = true,
+    retain_processing_instructions: bool = true,
+    retain_text_origin: bool = false,
+};
+
+/// Errors returned while parsing a normal owned document.
+pub const ParseDocumentError = reader.NormalReadError || error{
+    InvalidOptions,
+    InvalidEventSequence,
+    DocumentLimit,
 };
 
 /// Name whose slices borrow from the document.
@@ -145,6 +204,274 @@ pub const DtdRecord = struct {
     system_id: ?[]const u8,
     notation_name: ?[]const u8,
     skipped_entity_kind: ?reader.SkippedEntityKind,
+};
+
+const document_storage_config: reader.Config = .{
+    .profile = .xml11_ns_nonvalidating,
+    .external_sources = true,
+};
+
+const StoredNormalDtdFinding = struct {
+    code: reader.DiagnosticCode,
+    primary: reader.NormalLocation,
+    related: ?reader.NormalLocation,
+};
+
+/// Immutable XML document owned independently of its source and Reader.
+///
+/// After assignment or return, only the destination may be used. Using or
+/// deinitializing both copies is not supported. Values returned by query methods
+/// borrow from the document and expire on `deinit`.
+pub const Document = struct {
+    const Self = @This();
+
+    storage: ProfileDocumentFor(document_storage_config),
+    end_result: reader.NormalDocumentEnd,
+    first_dtd_finding: ?StoredNormalDtdFinding,
+    dtd_finding_inclusions: []reader.NormalLocation,
+    normalization_finding: ?reader.NormalNormalizationFinding,
+    namespaces_processed: bool,
+    text_origin_retained: bool,
+
+    /// Releases all document-owned storage. Call exactly once for each owned value.
+    pub fn deinit(self: *Self) void {
+        const allocator = self.storage.allocator;
+        if (self.dtd_finding_inclusions.len != 0) {
+            allocator.free(self.dtd_finding_inclusions);
+        }
+        self.storage.deinit();
+        self.* = undefined;
+    }
+
+    /// Returns the synthetic document node.
+    pub fn root(self: *const Self) NodeIndex {
+        return self.storage.root();
+    }
+
+    /// Returns the document's single element node.
+    pub fn documentElement(self: *const Self) NodeIndex {
+        return self.storage.documentElement();
+    }
+
+    /// Returns a node kind, or null for an invalid index.
+    pub fn nodeKind(self: *const Self, node: NodeIndex) ?NodeKind {
+        return self.storage.nodeKind(node);
+    }
+
+    /// Returns a node's parent, or zero for an invalid node or the document node.
+    pub fn parent(self: *const Self, node: NodeIndex) NodeIndex {
+        return self.storage.parent(node);
+    }
+
+    /// Returns an allocation-free iterator over source-ordered child nodes.
+    pub fn children(self: *const Self, node: NodeIndex) ChildIterator {
+        return .{ .document = self, .next_node = self.storage.firstChild(node) };
+    }
+
+    /// Returns an element name, or null for another node kind or an invalid index.
+    pub fn nodeName(self: *const Self, node: NodeIndex) ?reader.NormalName {
+        const value = self.storage.nodeName(node) orelse return null;
+        return self.normalName(value);
+    }
+
+    /// Returns text or comment bytes, or null for another node kind or an invalid index.
+    pub fn nodeValue(self: *const Self, node: NodeIndex) ?[]const u8 {
+        return self.storage.nodeValue(node);
+    }
+
+    /// Returns retained text origin, or null when origin retention is disabled.
+    pub fn textOrigin(self: *const Self, node: NodeIndex) ?reader.TextOrigin {
+        if (!self.text_origin_retained) return null;
+        return self.storage.textOrigin(node);
+    }
+
+    /// Returns a processing instruction, or null for another node kind or an invalid index.
+    pub fn processingInstruction(
+        self: *const Self,
+        node: NodeIndex,
+    ) ?struct { target: []const u8, data: []const u8 } {
+        const value = self.storage.processingInstruction(node) orelse return null;
+        return .{ .target = value.target, .data = value.data };
+    }
+
+    /// Returns an allocation-free iterator over source-ordered attributes.
+    pub fn attributes(self: *const Self, element: NodeIndex) AttributeIterator {
+        return .{ .document = self, .element = element };
+    }
+
+    /// Finds an attribute by expanded identity, or returns null in raw-name mode.
+    pub fn attribute(
+        self: *const Self,
+        element: NodeIndex,
+        namespace_uri: ?[]const u8,
+        local: []const u8,
+    ) ?reader.NormalAttribute {
+        if (!self.namespaces_processed) return null;
+        var iterator = self.attributes(element);
+        while (iterator.next()) |value| {
+            if (value.name.eql(namespace_uri, local)) return value;
+        }
+        return null;
+    }
+
+    /// Finds an attribute by raw spelling.
+    pub fn attributeRaw(
+        self: *const Self,
+        element: NodeIndex,
+        raw: []const u8,
+    ) ?reader.NormalAttribute {
+        var iterator = self.attributes(element);
+        while (iterator.next()) |value| {
+            if (value.name.eqlRaw(raw)) return value;
+        }
+        return null;
+    }
+
+    /// Returns an allocation-free iterator over source-ordered namespace declarations.
+    pub fn namespaceDeclarations(
+        self: *const Self,
+        element: NodeIndex,
+    ) NamespaceDeclarationIterator {
+        const count = if (self.namespaces_processed)
+            self.storage.namespaceDeclarationCount(element)
+        else
+            0;
+        return .{ .document = self, .element = element, .count = count };
+    }
+
+    /// Returns the effective document-start information and optional XML declaration.
+    pub fn documentStart(self: *const Self) reader.NormalDocumentStart {
+        const value = self.storage.xmlDeclaration();
+        return .{
+            .effective_version = value.effective_version,
+            .source_encoding = value.source_encoding,
+            .declaration = if (value.declared_version != null) .{
+                .version = value.effective_version,
+                .encoding = value.declared_encoding,
+                .standalone = if (value.standalone_declared) value.standalone else null,
+            } else null,
+        };
+    }
+
+    /// Returns the optional document type header.
+    pub fn documentType(self: *const Self) ?reader.NormalDocumentType {
+        const value = self.storage.documentType() orelse return null;
+        return .{
+            .root_name = value.root_name,
+            .public_id = value.public_id,
+            .system_id = value.system_id,
+        };
+    }
+
+    /// Returns the final Reader result retained by the document.
+    pub fn documentEnd(self: *const Self) reader.NormalDocumentEnd {
+        return self.end_result;
+    }
+
+    /// Returns the first DTD validity finding retained by the document.
+    pub fn firstDtdFinding(self: *const Self) ?reader.NormalDtdFinding {
+        const value = self.first_dtd_finding orelse return null;
+        return .{
+            .code = value.code,
+            .primary = value.primary,
+            .related = value.related,
+            .inclusion_trace = self.dtd_finding_inclusions,
+        };
+    }
+
+    /// Returns the first XML 1.1 normalization finding retained by the document.
+    pub fn normalizationFinding(self: *const Self) ?reader.NormalNormalizationFinding {
+        return self.normalization_finding;
+    }
+
+    /// Reports document-owned allocation counts and capacities.
+    pub fn memoryUsage(self: *const Self) DocumentMemoryUsage {
+        const usage = self.storage.memoryUsage();
+        const finding_bytes = self.dtd_finding_inclusions.len *| @sizeOf(reader.NormalLocation);
+        const metadata_bytes = usage.location_capacity_bytes +|
+            usage.dtd_metadata_capacity_bytes +| finding_bytes;
+        return .{
+            .node_count = usage.node_count,
+            .node_capacity_bytes = usage.node_capacity_bytes,
+            .attribute_count = usage.attribute_count,
+            .attribute_capacity_bytes = usage.attribute_capacity_bytes,
+            .namespace_declaration_count = usage.namespace_declaration_count,
+            .namespace_declaration_capacity_bytes = usage.namespace_declaration_capacity_bytes,
+            .string_bytes = usage.string_bytes,
+            .string_capacity_bytes = usage.string_capacity_bytes,
+            .metadata_capacity_bytes = metadata_bytes,
+            .total_capacity_bytes = usage.total_capacity_bytes +| finding_bytes,
+        };
+    }
+
+    fn normalName(self: *const Self, value: Name) reader.NormalName {
+        return .{
+            .raw = value.raw,
+            .expanded = if (self.namespaces_processed) .{
+                .prefix = value.prefix,
+                .local = value.local,
+                .namespace_uri = value.namespace_uri,
+            } else null,
+        };
+    }
+
+    fn normalAttribute(self: *const Self, value: Attribute) reader.NormalAttribute {
+        return .{
+            .name = self.normalName(value.name),
+            .value = value.value,
+            .span = null,
+            .specified = value.specified,
+            .declared_type = value.declared_type,
+        };
+    }
+
+    /// Iterates source-ordered child nodes.
+    pub const ChildIterator = struct {
+        document: *const Self,
+        next_node: NodeIndex,
+
+        /// Returns the next node, or null after the final child.
+        pub fn next(self: *ChildIterator) ?NodeIndex {
+            if (self.next_node == 0) return null;
+            const current = self.next_node;
+            self.next_node = self.document.storage.nextSibling(current);
+            return current;
+        }
+    };
+
+    /// Iterates source-ordered attributes.
+    pub const AttributeIterator = struct {
+        document: *const Self,
+        element: NodeIndex,
+        offset: usize = 0,
+
+        /// Returns the next attribute, or null after the final attribute.
+        pub fn next(self: *AttributeIterator) ?reader.NormalAttribute {
+            const value = self.document.storage.attributeAt(self.element, self.offset) orelse
+                return null;
+            self.offset += 1;
+            return self.document.normalAttribute(value);
+        }
+    };
+
+    /// Iterates source-ordered namespace declarations.
+    pub const NamespaceDeclarationIterator = struct {
+        document: *const Self,
+        element: NodeIndex,
+        count: usize,
+        offset: usize = 0,
+
+        /// Returns the next declaration, or null after the final declaration.
+        pub fn next(self: *NamespaceDeclarationIterator) ?NamespaceDeclaration {
+            if (self.offset >= self.count) return null;
+            const value = self.document.storage.namespaceDeclarationAt(
+                self.element,
+                self.offset,
+            ) orelse return null;
+            self.offset += 1;
+            return .{ .prefix = value.prefix, .namespace_uri = value.namespace_uri };
+        }
+    };
 };
 
 const StringRef = struct {
@@ -245,8 +572,8 @@ const StoredDtdRecord = struct {
     skipped_entity_kind: ?reader.SkippedEntityKind = null,
 };
 
-/// Returns the immutable document type specialized to the reader configuration.
-pub fn Document(comptime config: reader.Config) type {
+/// Returns the immutable document type specialized to a parser profile.
+pub fn ProfileDocumentFor(comptime config: reader.Config) type {
     config.validate();
     return struct {
         const Self = @This();
@@ -318,7 +645,7 @@ pub fn Document(comptime config: reader.Config) type {
         }
 
         /// Iterates source-ordered children without allocation.
-        pub fn children(self: *const Self, index: NodeIndex) ChildIterator(config) {
+        pub fn children(self: *const Self, index: NodeIndex) ProfileChildIteratorFor(config) {
             return .{ .document = self, .next_index = self.firstChild(index) };
         }
 
@@ -574,10 +901,10 @@ pub fn Document(comptime config: reader.Config) type {
     };
 }
 
-/// Returns the allocation-free child iterator specialized to a document configuration.
-pub fn ChildIterator(comptime config: reader.Config) type {
+/// Returns the allocation-free child iterator specialized to a parser profile.
+pub fn ProfileChildIteratorFor(comptime config: reader.Config) type {
     return struct {
-        document: *const Document(config),
+        document: *const ProfileDocumentFor(config),
         next_index: NodeIndex,
 
         /// Returns the next child index, or null after the final child.
@@ -590,8 +917,8 @@ pub fn ChildIterator(comptime config: reader.Config) type {
     };
 }
 
-/// Returns an event consumer specialized to the reader configuration.
-pub fn Builder(comptime config: reader.Config) type {
+/// Returns an event consumer specialized to a parser profile.
+pub fn ProfileBuilderFor(comptime config: reader.Config) type {
     config.validate();
     return struct {
         const Self = @This();
@@ -720,11 +1047,11 @@ pub fn Builder(comptime config: reader.Config) type {
         /// Freezes a complete event stream and transfers the document storage.
         /// A successful transfer can occur only once.
         /// The caller must still deinitialize the builder to release construction scratch.
-        pub fn finish(self: *Self) BuildError!Document(config) {
+        pub fn finish(self: *Self) BuildError!ProfileDocumentFor(config) {
             if (self.failed or !self.document_ended or self.declaration == null or
                 self.document_element == 0 or self.open_elements.items.len != 0)
                 return error.InvalidEventSequence;
-            const result: Document(config) = .{
+            const result: ProfileDocumentFor(config) = .{
                 .allocator = self.allocator,
                 .nodes = self.nodes,
                 .elements = self.elements,
@@ -1176,6 +1503,236 @@ pub fn Builder(comptime config: reader.Config) type {
     };
 }
 
+/// Parses one complete source into an owned document.
+///
+/// The source, Reader option borrows, and callback contexts need to remain valid
+/// only until this call returns. The returned document owns its retained XML.
+/// That ownership transfers to the caller and must be released with `deinit`.
+pub fn parseDocument(
+    allocator: std.mem.Allocator,
+    source: reader.NormalSource,
+    options: DocumentOptions,
+) ParseDocumentError!Document {
+    var normal_reader = try reader.NormalReader.init(allocator, source, options.reader);
+    defer normal_reader.deinit();
+
+    var builder = DocumentBuilder.init(allocator, options) catch |err| {
+        return mapBuildError(err);
+    };
+    defer builder.deinit();
+
+    while (try normal_reader.next()) |event| {
+        builder.consume(event) catch |err| return mapBuildError(err);
+    }
+    return builder.finish(&normal_reader) catch |err| return mapBuildError(err);
+}
+
+const DocumentBuilder = struct {
+    const Self = @This();
+    const StorageBuilder = ProfileBuilderFor(document_storage_config);
+    const StorageAttribute = reader.Attribute(document_storage_config);
+
+    allocator: std.mem.Allocator,
+    options: DocumentOptions,
+    storage: StorageBuilder,
+    attributes: std.ArrayList(StorageAttribute) = .empty,
+    namespace_declarations: std.ArrayList(reader.NamespaceDeclaration) = .empty,
+    end_result: ?reader.NormalDocumentEnd = null,
+
+    fn init(allocator: std.mem.Allocator, options: DocumentOptions) BuildError!Self {
+        return .{
+            .allocator = allocator,
+            .options = options,
+            .storage = try StorageBuilder.init(allocator, .{
+                .limits = options.limits.profile(),
+                .preserve_cdata_origin = options.retain_text_origin,
+            }),
+        };
+    }
+
+    fn deinit(self: *Self) void {
+        self.storage.deinit();
+        self.attributes.deinit(self.allocator);
+        self.namespace_declarations.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn consume(self: *Self, event: reader.NormalEvent) BuildError!void {
+        switch (event.data) {
+            .document_start => |value| try self.storage.consume(.{ .document_start = .{
+                .effective_version = value.effective_version,
+                .declared_version = if (value.declaration) |declaration|
+                    xmlVersionBytes(declaration.version)
+                else
+                    null,
+                .source_encoding = value.source_encoding,
+                .declared_encoding = if (value.declaration) |declaration|
+                    declaration.encoding
+                else
+                    null,
+                .standalone = if (value.declaration) |declaration|
+                    declaration.standalone orelse false
+                else
+                    false,
+                .standalone_declared = if (value.declaration) |declaration|
+                    declaration.standalone != null
+                else
+                    false,
+            } }),
+            .document_type => |value| try self.storage.consume(.{ .document_type = .{
+                .root_name = value.root_name,
+                .public_id = value.public_id,
+                .system_id = value.system_id,
+            } }),
+            .start_element => |value| try self.startElement(value),
+            .end_element => |value| try self.storage.consume(.{ .end_element = .{
+                .name = storageName(value.name),
+            } }),
+            .text => |value| {
+                if (value.bytes.len == 0) return;
+                try self.storage.consume(.{ .text = .{
+                    .bytes = value.bytes,
+                    .origin = value.origin,
+                } });
+            },
+            .comment => |value| {
+                if (!self.options.retain_comments) return;
+                try self.storage.consume(.{ .comment = .{
+                    .bytes = value.bytes,
+                    .complete = value.final_fragment,
+                } });
+            },
+            .processing_instruction => |value| {
+                if (!self.options.retain_processing_instructions) return;
+                try self.storage.consume(.{ .processing_instruction = .{
+                    .target = value.target,
+                    .data = value.data,
+                    .complete = value.final_fragment,
+                } });
+            },
+            .skipped_external_source => self.storage.text_boundary = true,
+            .document_end => |value| {
+                try self.storage.consume(.{ .document_end = .{} });
+                self.end_result = value;
+            },
+        }
+    }
+
+    fn startElement(self: *Self, value: reader.NormalStartElement) BuildError!void {
+        const attribute_count = std.math.add(
+            usize,
+            self.storage.attributes.items.len,
+            value.attributes.len,
+        ) catch return error.TreeLimit;
+        if (attribute_count > self.options.limits.max_attributes) return error.TreeLimit;
+        const namespace_count = std.math.add(
+            usize,
+            self.storage.namespaces.items.len,
+            value.namespace_declarations.len,
+        ) catch return error.TreeLimit;
+        if (namespace_count > self.options.limits.max_namespace_declarations) {
+            return error.TreeLimit;
+        }
+
+        self.attributes.clearRetainingCapacity();
+        self.namespace_declarations.clearRetainingCapacity();
+        self.attributes.ensureTotalCapacity(self.allocator, value.attributes.len) catch
+            return error.OutOfMemory;
+        self.namespace_declarations.ensureTotalCapacity(
+            self.allocator,
+            value.namespace_declarations.len,
+        ) catch return error.OutOfMemory;
+
+        for (value.attributes) |attribute| self.attributes.appendAssumeCapacity(.{
+            .name = storageName(attribute.name),
+            .value = attribute.value,
+            .specified = attribute.specified,
+            .declared_type = attribute.declared_type,
+        });
+        for (value.namespace_declarations) |declaration| {
+            self.namespace_declarations.appendAssumeCapacity(.{
+                .prefix = declaration.prefix,
+                .namespace_uri = declaration.namespace_uri,
+            });
+        }
+        try self.storage.consume(.{ .start_element = .{
+            .name = storageName(value.name),
+            .attributes = self.attributes.items,
+            .namespace_declarations = self.namespace_declarations.items,
+            .empty_element_syntax = value.empty_syntax,
+        } });
+    }
+
+    fn finish(self: *Self, normal_reader: *const reader.NormalReader) BuildError!Document {
+        const end_result = self.end_result orelse return error.InvalidEventSequence;
+        var storage = try self.storage.finish();
+        errdefer storage.deinit();
+
+        const finding = normal_reader.firstDtdFinding();
+        var finding_inclusions: []reader.NormalLocation = &.{};
+        if (finding) |value| {
+            if (value.inclusion_trace.len != 0) {
+                const finding_bytes = std.math.mul(
+                    usize,
+                    value.inclusion_trace.len,
+                    @sizeOf(reader.NormalLocation),
+                ) catch return error.TreeLimit;
+                const retained_bytes = std.math.add(
+                    usize,
+                    storage.memoryUsage().total_capacity_bytes,
+                    finding_bytes,
+                ) catch return error.TreeLimit;
+                if (retained_bytes > self.options.limits.max_retained_bytes) {
+                    return error.TreeLimit;
+                }
+                finding_inclusions = self.allocator.dupe(
+                    reader.NormalLocation,
+                    value.inclusion_trace,
+                ) catch return error.OutOfMemory;
+            }
+        }
+        return .{
+            .storage = storage,
+            .end_result = end_result,
+            .first_dtd_finding = if (finding) |value| .{
+                .code = value.code,
+                .primary = value.primary,
+                .related = value.related,
+            } else null,
+            .dtd_finding_inclusions = finding_inclusions,
+            .normalization_finding = normal_reader.normalizationFinding(),
+            .namespaces_processed = self.options.reader.namespaces == .process,
+            .text_origin_retained = self.options.retain_text_origin,
+        };
+    }
+};
+
+fn storageName(value: reader.NormalName) reader.Name(document_storage_config) {
+    const expanded = value.expanded;
+    return .{
+        .raw = value.raw,
+        .prefix = if (expanded) |name| name.prefix else null,
+        .local = if (expanded) |name| name.local else value.raw,
+        .namespace_uri = if (expanded) |name| name.namespace_uri else null,
+    };
+}
+
+fn xmlVersionBytes(version: reader.XmlVersion) []const u8 {
+    return switch (version) {
+        .xml10 => "1.0",
+        .xml11 => "1.1",
+    };
+}
+
+fn mapBuildError(err: BuildError) ParseDocumentError {
+    return switch (err) {
+        error.TreeLimit => error.DocumentLimit,
+        error.InvalidOptions => error.InvalidOptions,
+        error.InvalidEventSequence => error.InvalidEventSequence,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
 fn capacityBytes(
     comptime config: reader.Config,
     nodes: usize,
@@ -1196,13 +1753,13 @@ fn addCapacity(total: *usize, count: usize, item_size: usize) !void {
 }
 
 /// Builds a document from any pull reader exposing `next()` with the matching event type.
-pub fn buildFromPull(
+pub fn buildProfileFromPull(
     comptime config: reader.Config,
     allocator: std.mem.Allocator,
     options: Options,
     pull: anytype,
-) (BuildError || reader.ReadError)!Document(config) {
-    var builder = try Builder(config).init(allocator, options);
+) (BuildError || reader.ReadError)!ProfileDocumentFor(config) {
+    var builder = try ProfileBuilderFor(config).init(allocator, options);
     defer builder.deinit();
     while (true) {
         switch (try pull.next()) {
