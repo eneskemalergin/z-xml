@@ -1475,7 +1475,14 @@ const NormalSummary = struct {
 };
 
 fn summarizeNormalSource(source: xml.Source) !NormalSummary {
-    var reader = try xml.Reader.init(std.testing.allocator, source, .{});
+    return summarizeNormalSourceWithOptions(source, .{});
+}
+
+fn summarizeNormalSourceWithOptions(
+    source: xml.Source,
+    options: xml.ReaderOptions,
+) !NormalSummary {
+    var reader = try xml.Reader.init(std.testing.allocator, source, options);
     defer reader.deinit();
     var output: std.ArrayList(u8) = .empty;
     errdefer output.deinit(std.testing.allocator);
@@ -1597,7 +1604,23 @@ fn expectNormalEncodingSchedules(
     expected_encoding: xml.SourceEncoding,
     expected_declaration: ?[]const u8,
 ) !void {
-    var slice = try summarizeNormalReader(input);
+    return expectNormalEncodingSchedulesWithOptions(
+        input,
+        .{},
+        expected_events,
+        expected_encoding,
+        expected_declaration,
+    );
+}
+
+fn expectNormalEncodingSchedulesWithOptions(
+    input: []const u8,
+    options: xml.ReaderOptions,
+    expected_events: []const u8,
+    expected_encoding: xml.SourceEncoding,
+    expected_declaration: ?[]const u8,
+) !void {
+    var slice = try summarizeNormalSourceWithOptions(.{ .slice = input }, options);
     defer slice.deinit();
     try expectNormalEncodingSummary(
         &slice,
@@ -1613,7 +1636,10 @@ fn expectNormalEncodingSchedules(
             &.{.{ .buffer = input }},
         );
         source.artificial_limit = .limited(chunk_size);
-        var streamed = try summarizeNormalSource(.{ .stream = &source.interface });
+        var streamed = try summarizeNormalSourceWithOptions(
+            .{ .stream = &source.interface },
+            options,
+        );
         defer streamed.deinit();
         try expectNormalEncodingSummary(
             &streamed,
@@ -1634,7 +1660,14 @@ const NormalFailure = struct {
 };
 
 fn normalFailure(source: xml.Source) !NormalFailure {
-    var reader = try xml.Reader.init(std.testing.allocator, source, .{});
+    return normalFailureWithOptions(source, .{});
+}
+
+fn normalFailureWithOptions(
+    source: xml.Source,
+    options: xml.ReaderOptions,
+) !NormalFailure {
+    var reader = try xml.Reader.init(std.testing.allocator, source, options);
     defer reader.deinit();
     while (true) {
         const event = reader.next() catch |failure| {
@@ -1656,7 +1689,18 @@ fn normalFailure(source: xml.Source) !NormalFailure {
 }
 
 fn expectNormalFailureSchedules(input: []const u8, expected: NormalFailure) !void {
-    try std.testing.expectEqual(expected, try normalFailure(.{ .slice = input }));
+    return expectNormalFailureSchedulesWithOptions(input, .{}, expected);
+}
+
+fn expectNormalFailureSchedulesWithOptions(
+    input: []const u8,
+    options: xml.ReaderOptions,
+    expected: NormalFailure,
+) !void {
+    try std.testing.expectEqual(
+        expected,
+        try normalFailureWithOptions(.{ .slice = input }, options),
+    );
     inline for (.{ 1, 2, 3, 5, 7 }) |chunk_size| {
         var input_buffer: [chunk_size]u8 = undefined;
         var source: std.testing.Reader = .init(
@@ -1666,9 +1710,272 @@ fn expectNormalFailureSchedules(input: []const u8, expected: NormalFailure) !voi
         source.artificial_limit = .limited(chunk_size);
         try std.testing.expectEqual(
             expected,
-            try normalFailure(.{ .stream = &source.interface }),
+            try normalFailureWithOptions(.{ .stream = &source.interface }, options),
         );
     }
+}
+
+fn pairEncode(output: []u8, input: []const u8) void {
+    std.debug.assert(output.len == input.len * 2);
+    for (input, 0..) |byte, index| {
+        output[index * 2] = 0;
+        output[index * 2 + 1] = byte;
+    }
+}
+
+fn pairTranscode(
+    _: ?*anyopaque,
+    input: []const u8,
+    final: bool,
+    output: []u8,
+    source_advances: []u8,
+) xml.TranscodeStep {
+    if (input.len < 2) {
+        if (final and input.len != 0) return .{ .malformed = 0 };
+        return .need_input;
+    }
+    if (input[0] != 0) return .{ .malformed = 0 };
+    if (output.len == 0) return .need_output;
+    output[0] = input[1];
+    source_advances[0] = 2;
+    return .{ .progress = .{ .consumed = 2, .produced = 1 } };
+}
+
+fn pairTranscoder() xml.Transcoder {
+    return .{ .context = null, .runFn = pairTranscode };
+}
+
+fn markedEncode(output: []u8, input: []const u8, marked: u8) []u8 {
+    var len: usize = 0;
+    for (input) |byte| {
+        if (byte == marked) {
+            output[len] = 0;
+            len += 1;
+        }
+        output[len] = byte;
+        len += 1;
+    }
+    return output[0..len];
+}
+
+fn markedTranscode(
+    _: ?*anyopaque,
+    input: []const u8,
+    final: bool,
+    output: []u8,
+    source_advances: []u8,
+) xml.TranscodeStep {
+    if (input.len == 0) return .need_input;
+    const consumed: usize = if (input[0] == 0) 2 else 1;
+    if (input.len < consumed) {
+        if (final) return .{ .malformed = 0 };
+        return .need_input;
+    }
+    if (output.len == 0) return .need_output;
+    output[0] = input[consumed - 1];
+    source_advances[0] = @intCast(consumed);
+    return .{ .progress = .{ .consumed = consumed, .produced = 1 } };
+}
+
+fn markedTranscoder() xml.Transcoder {
+    return .{ .context = null, .runFn = markedTranscode };
+}
+
+fn latin1Transcode(
+    _: ?*anyopaque,
+    input: []const u8,
+    _: bool,
+    output: []u8,
+    source_advances: []u8,
+) xml.TranscodeStep {
+    if (input.len == 0) return .need_input;
+    if (input[0] == 0xe9) {
+        if (output.len < 2) return .need_output;
+        output[0] = 0xc3;
+        output[1] = 0xa9;
+        source_advances[0] = 0;
+        source_advances[1] = 1;
+        return .{ .progress = .{ .consumed = 1, .produced = 2 } };
+    }
+    if (output.len == 0) return .need_output;
+    output[0] = input[0];
+    source_advances[0] = 1;
+    return .{ .progress = .{ .consumed = 1, .produced = 1 } };
+}
+
+fn latin1Transcoder() xml.Transcoder {
+    return .{ .context = null, .runFn = latin1Transcode };
+}
+
+const InvalidTranscodeResult = enum {
+    consumed_over_input,
+    produced_over_output,
+    zero_consumed,
+    zero_produced,
+    wrong_source_advance,
+    source_advance_over,
+    malformed_offset,
+    final_need_input,
+};
+
+fn invalidTranscode(
+    context: ?*anyopaque,
+    input: []const u8,
+    _: bool,
+    output: []u8,
+    source_advances: []u8,
+) xml.TranscodeStep {
+    const result: *const InvalidTranscodeResult = @ptrCast(@alignCast(context.?));
+    return switch (result.*) {
+        .consumed_over_input => .{ .progress = .{
+            .consumed = input.len + 1,
+            .produced = 1,
+        } },
+        .produced_over_output => .{ .progress = .{
+            .consumed = 1,
+            .produced = output.len + 1,
+        } },
+        .zero_consumed => .{ .progress = .{ .consumed = 0, .produced = 1 } },
+        .zero_produced => .{ .progress = .{ .consumed = 1, .produced = 0 } },
+        .wrong_source_advance => result: {
+            output[0] = 'x';
+            source_advances[0] = 0;
+            break :result .{ .progress = .{ .consumed = 1, .produced = 1 } };
+        },
+        .source_advance_over => result: {
+            output[0] = 'x';
+            source_advances[0] = 2;
+            break :result .{ .progress = .{ .consumed = 1, .produced = 1 } };
+        },
+        .malformed_offset => .{ .malformed = input.len + 1 },
+        .final_need_input => .need_input,
+    };
+}
+
+const FixedTranscodeResult = enum { need_output, unsupported, cancelled };
+
+fn fixedTranscodeResult(
+    context: ?*anyopaque,
+    _: []const u8,
+    _: bool,
+    _: []u8,
+    _: []u8,
+) xml.TranscodeStep {
+    const result: *const FixedTranscodeResult = @ptrCast(@alignCast(context.?));
+    return switch (result.*) {
+        .need_output => .need_output,
+        .unsupported => .unsupported,
+        .cancelled => .cancelled,
+    };
+}
+
+fn rootTranscoderAllocationAttempt(allocator: std.mem.Allocator) !void {
+    const logical = "<?xml version='1.0' encoding='PAIR'?><root>é</root>";
+    var encoded: [logical.len * 2]u8 = undefined;
+    pairEncode(&encoded, logical);
+    var input_buffer: [1]u8 = undefined;
+    var source: std.testing.Reader = .init(
+        &input_buffer,
+        &.{.{ .buffer = &encoded }},
+    );
+    source.artificial_limit = .limited(1);
+    var reader = try xml.Reader.init(
+        allocator,
+        .{ .stream = &source.interface },
+        .{ .transcoder = pairTranscoder() },
+    );
+    defer reader.deinit();
+    while (try reader.next()) |_| {}
+}
+
+const TranscodeCallCounter = struct {
+    calls: usize = 0,
+};
+
+fn cancellingTranscode(
+    context: ?*anyopaque,
+    _: []const u8,
+    _: bool,
+    _: []u8,
+    _: []u8,
+) xml.TranscodeStep {
+    const counter: *TranscodeCallCounter = @ptrCast(@alignCast(context.?));
+    counter.calls += 1;
+    return .cancelled;
+}
+
+fn invalidUtf8Transcode(
+    _: ?*anyopaque,
+    input: []const u8,
+    _: bool,
+    output: []u8,
+    source_advances: []u8,
+) xml.TranscodeStep {
+    if (input.len == 0) return .need_input;
+    if (output.len == 0) return .need_output;
+    output[0] = 0xff;
+    source_advances[0] = 1;
+    return .{ .progress = .{ .consumed = 1, .produced = 1 } };
+}
+
+fn finalIdentityTranscode(
+    _: ?*anyopaque,
+    input: []const u8,
+    final: bool,
+    output: []u8,
+    source_advances: []u8,
+) xml.TranscodeStep {
+    if (input.len == 0) return .need_input;
+    if (!final) return .need_input;
+    if (output.len == 0) return .need_output;
+    output[0] = input[0];
+    source_advances[0] = 1;
+    return .{ .progress = .{ .consumed = 1, .produced = 1 } };
+}
+
+fn prefixedIdentityTranscode(
+    _: ?*anyopaque,
+    input: []const u8,
+    final: bool,
+    output: []u8,
+    source_advances: []u8,
+) xml.TranscodeStep {
+    const prefix = "\xef\xbb\xbf";
+    if (input.len == 0) return .need_input;
+    if (std.mem.startsWith(u8, input, prefix)) {
+        if (input.len == prefix.len) {
+            return if (final) .{ .malformed = 0 } else .need_input;
+        }
+        if (output.len == 0) return .need_output;
+        output[0] = input[prefix.len];
+        source_advances[0] = prefix.len + 1;
+        return .{ .progress = .{ .consumed = prefix.len + 1, .produced = 1 } };
+    }
+    if (output.len == 0) return .need_output;
+    output[0] = input[0];
+    source_advances[0] = 1;
+    return .{ .progress = .{ .consumed = 1, .produced = 1 } };
+}
+
+const ProgressThenUnsupported = struct {
+    progressed: bool = false,
+};
+
+fn progressThenUnsupported(
+    context: ?*anyopaque,
+    input: []const u8,
+    _: bool,
+    output: []u8,
+    source_advances: []u8,
+) xml.TranscodeStep {
+    const state: *ProgressThenUnsupported = @ptrCast(@alignCast(context.?));
+    if (state.progressed) return .unsupported;
+    if (input.len == 0) return .need_input;
+    if (output.len == 0) return .need_output;
+    state.progressed = true;
+    output[0] = '<';
+    source_advances[0] = 1;
+    return .{ .progress = .{ .consumed = 1, .produced = 1 } };
 }
 
 fn summarizeSelectedEngine(input: []const u8) ![]u8 {
@@ -1905,6 +2212,358 @@ test "[property] - [Reader decoder]: built-in encodings preserve events across s
         .utf16_be,
         null,
     );
+}
+
+test "[unit] - [Transcoder]: validates bounded callback results" {
+    var output: [4]u8 = undefined;
+    var source_advances: [4]u8 = undefined;
+    const transcoder = pairTranscoder();
+
+    const progress = try transcoder.run("\x00x", true, &output, &source_advances);
+    try std.testing.expectEqual(@as(usize, 2), progress.progress.consumed);
+    try std.testing.expectEqual(@as(usize, 1), progress.progress.produced);
+    try std.testing.expectEqualStrings("x", output[0..1]);
+    try std.testing.expectEqual(@as(u8, 2), source_advances[0]);
+    try std.testing.expect((try transcoder.run("\x00", false, &output, &source_advances)) == .need_input);
+    try std.testing.expect((try transcoder.run("\x00x", false, output[0..0], source_advances[0..0])) == .need_output);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try transcoder.run("x", true, &output, &source_advances)).malformed,
+    );
+
+    const expanded = try latin1Transcoder().run("\xe9", true, &output, &source_advances);
+    try std.testing.expectEqual(@as(usize, 1), expanded.progress.consumed);
+    try std.testing.expectEqual(@as(usize, 2), expanded.progress.produced);
+    try std.testing.expectEqualStrings("é", output[0..2]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, source_advances[0..2]);
+
+    inline for (std.meta.tags(InvalidTranscodeResult)) |result| {
+        var invalid_result = result;
+        const invalid: xml.Transcoder = .{
+            .context = &invalid_result,
+            .runFn = invalidTranscode,
+        };
+        try std.testing.expectError(
+            error.InvalidResult,
+            invalid.run("x", true, &output, &source_advances),
+        );
+    }
+    try std.testing.expectError(
+        error.InvalidResult,
+        transcoder.run("\x00x", true, &output, source_advances[0..3]),
+    );
+
+    inline for (std.meta.tags(FixedTranscodeResult)) |result| {
+        var fixed = result;
+        const callback: xml.Transcoder = .{ .context = &fixed, .runFn = fixedTranscodeResult };
+        const observed = try callback.run("", true, &output, &source_advances);
+        try std.testing.expectEqualStrings(@tagName(result), @tagName(observed));
+    }
+}
+
+test "[property] - [Reader transcoder]: root bytes preserve events across source schedules" {
+    const content = "<根 属性='值'>one\r\ntwo🙂</根>";
+    const logical = "<?xml version='1.0' encoding='PAIR'?>" ++ content;
+    var encoded: [logical.len * 2]u8 = undefined;
+    pairEncode(&encoded, logical);
+    const options: xml.ReaderOptions = .{ .transcoder = pairTranscoder() };
+
+    var expected = try summarizeNormalReader(content);
+    defer expected.deinit();
+    var slice = try summarizeNormalSourceWithOptions(.{ .slice = &encoded }, options);
+    defer slice.deinit();
+    try expectNormalEncodingSummary(&slice, expected.events, .other, "PAIR");
+
+    inline for (.{ 1, 2, 3, 5, 7 }) |chunk_size| {
+        var input_buffer: [chunk_size]u8 = undefined;
+        var source: std.testing.Reader = .init(
+            &input_buffer,
+            &.{.{ .buffer = &encoded }},
+        );
+        source.artificial_limit = .limited(chunk_size);
+        var streamed = try summarizeNormalSourceWithOptions(
+            .{ .stream = &source.interface },
+            options,
+        );
+        defer streamed.deinit();
+        try expectNormalEncodingSummary(&streamed, expected.events, .other, "PAIR");
+    }
+
+    const latin1 = "<?xml version='1.0' encoding='ISO-8859-1'?><r>\xe9</r>";
+    var latin1_expected = try summarizeNormalReader("<r>é</r>");
+    defer latin1_expected.deinit();
+    var latin1_summary = try summarizeNormalSourceWithOptions(
+        .{ .slice = latin1 },
+        .{ .transcoder = latin1Transcoder() },
+    );
+    defer latin1_summary.deinit();
+    try expectNormalEncodingSummary(
+        &latin1_summary,
+        latin1_expected.events,
+        .other,
+        "ISO-8859-1",
+    );
+
+    const final_logical = "<r/>";
+    var final_expected = try summarizeNormalReader(final_logical);
+    defer final_expected.deinit();
+    const final_options: xml.ReaderOptions = .{ .transcoder = .{
+        .context = null,
+        .runFn = finalIdentityTranscode,
+    } };
+    var final_slice = try summarizeNormalSourceWithOptions(
+        .{ .slice = final_logical },
+        final_options,
+    );
+    defer final_slice.deinit();
+    try expectNormalEncodingSummary(&final_slice, final_expected.events, .other, null);
+
+    var final_buffer: [1]u8 = undefined;
+    var final_source: std.testing.Reader = .init(
+        &final_buffer,
+        &.{.{ .buffer = final_logical }},
+    );
+    final_source.artificial_limit = .limited(1);
+    var final_stream = try summarizeNormalSourceWithOptions(
+        .{ .stream = &final_source.interface },
+        final_options,
+    );
+    defer final_stream.deinit();
+    try expectNormalEncodingSummary(&final_stream, final_expected.events, .other, null);
+}
+
+test "[property] - [Reader transcoder]: XML 1.1 line endings survive source schedules" {
+    const logical =
+        "<?xml version='1.1' encoding='PAIR'?>\xc2\x85" ++
+        "<root a='A\xc2\x85B'>A\xc2\x85B\xe2\x80\xa8C\r\xc2\x85D</root>";
+    var encoded: [logical.len * 2]u8 = undefined;
+    pairEncode(&encoded, logical);
+
+    var expected = try summarizeNormalReader(
+        "<?xml version='1.1'?>\n<root a='A B'>A\nB\nC\nD</root>",
+    );
+    defer expected.deinit();
+    try expectNormalEncodingSchedulesWithOptions(
+        &encoded,
+        .{ .transcoder = pairTranscoder() },
+        expected.events,
+        .other,
+        "PAIR",
+    );
+}
+
+test "[integration] - [Reader transcoder]: event and failure locations use source bytes" {
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "<r>\xe9</r>" },
+        .{ .transcoder = latin1Transcoder() },
+    );
+    defer reader.deinit();
+
+    var start_seen = false;
+    var text_seen = false;
+    var end_seen = false;
+    while (try reader.next()) |event| switch (event.data) {
+        .start_element => {
+            try std.testing.expectEqual(@as(u64, 0), event.span.start);
+            try std.testing.expectEqual(@as(u64, 3), event.span.end);
+            start_seen = true;
+        },
+        .text => |text| {
+            try std.testing.expectEqualStrings("é", text.bytes);
+            try std.testing.expectEqual(@as(u64, 3), event.span.start);
+            try std.testing.expectEqual(@as(u64, 4), event.span.end);
+            text_seen = true;
+        },
+        .end_element => {
+            try std.testing.expectEqual(@as(u64, 4), event.span.start);
+            try std.testing.expectEqual(@as(u64, 8), event.span.end);
+            end_seen = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(start_seen and text_seen and end_seen);
+
+    const mismatch_source = "<r>\r\n<x></y></r>";
+    var mismatch_storage: [mismatch_source.len * 2]u8 = undefined;
+    const mismatch_input = markedEncode(&mismatch_storage, mismatch_source, 'y');
+    const mismatch = std.mem.indexOfScalar(u8, mismatch_source, 'y').?;
+    const related = std.mem.indexOf(u8, mismatch_source, "<x").?;
+    const line_start = std.mem.indexOfScalar(u8, mismatch_source, '\n').? + 1;
+    try expectNormalFailureSchedulesWithOptions(
+        mismatch_input,
+        .{ .transcoder = markedTranscoder() },
+        .{
+            .category = error.InvalidXml,
+            .code = .mismatched_end_tag,
+            .byte_offset = mismatch,
+            .related_byte_offset = related,
+            .line = 2,
+            .byte_column = mismatch - line_start + 1,
+        },
+    );
+
+    const declaration_source = "<?xml version='2.0'?><r/>";
+    var declaration_storage: [declaration_source.len * 2]u8 = undefined;
+    const declaration_input = markedEncode(&declaration_storage, declaration_source, 'v');
+    const version = std.mem.indexOfScalar(u8, declaration_source, '2').? + 1;
+    try expectNormalFailureSchedulesWithOptions(
+        declaration_input,
+        .{ .transcoder = markedTranscoder() },
+        .{
+            .category = error.UnsupportedVersion,
+            .code = .unsupported_version,
+            .byte_offset = version,
+            .related_byte_offset = null,
+            .line = 1,
+            .byte_column = version + 1,
+        },
+    );
+}
+
+test "[failure] - [Reader transcoder]: final and callback failures are exact" {
+    const invalid_result = NormalFailure{
+        .category = error.InvalidEncoding,
+        .code = .malformed_encoding,
+        .byte_offset = 0,
+        .related_byte_offset = null,
+        .line = 1,
+        .byte_column = 1,
+    };
+    inline for (std.meta.tags(InvalidTranscodeResult)) |result| {
+        var invalid = result;
+        try expectNormalFailureSchedulesWithOptions(
+            "x",
+            .{ .transcoder = .{ .context = &invalid, .runFn = invalidTranscode } },
+            invalid_result,
+        );
+    }
+
+    var need_output = FixedTranscodeResult.need_output;
+    try expectNormalFailureSchedulesWithOptions(
+        "x",
+        .{ .transcoder = .{ .context = &need_output, .runFn = fixedTranscodeResult } },
+        invalid_result,
+    );
+    var unsupported = FixedTranscodeResult.unsupported;
+    try expectNormalFailureSchedulesWithOptions(
+        "x",
+        .{ .transcoder = .{ .context = &unsupported, .runFn = fixedTranscodeResult } },
+        .{
+            .category = error.UnsupportedEncoding,
+            .code = .unsupported_encoding,
+            .byte_offset = 0,
+            .related_byte_offset = null,
+            .line = 1,
+            .byte_column = 1,
+        },
+    );
+    var progressed: ProgressThenUnsupported = .{};
+    try std.testing.expectEqual(
+        NormalFailure{
+            .category = error.UnsupportedEncoding,
+            .code = .unsupported_encoding,
+            .byte_offset = 1,
+            .related_byte_offset = null,
+            .line = 1,
+            .byte_column = 2,
+        },
+        try normalFailureWithOptions(
+            .{ .slice = "xx" },
+            .{ .transcoder = .{
+                .context = &progressed,
+                .runFn = progressThenUnsupported,
+            } },
+        ),
+    );
+    try expectNormalFailureSchedulesWithOptions(
+        "x",
+        .{ .transcoder = .{ .context = null, .runFn = invalidUtf8Transcode } },
+        .{
+            .category = error.InvalidEncoding,
+            .code = .malformed_utf8,
+            .byte_offset = 0,
+            .related_byte_offset = null,
+            .line = 1,
+            .byte_column = 1,
+        },
+    );
+
+    const logical = "<r/>";
+    var incomplete: [logical.len * 2 + 1]u8 = undefined;
+    pairEncode(incomplete[0 .. incomplete.len - 1], logical);
+    incomplete[incomplete.len - 1] = 0;
+    try expectNormalFailureSchedulesWithOptions(
+        &incomplete,
+        .{ .transcoder = pairTranscoder() },
+        .{
+            .category = error.InvalidEncoding,
+            .code = .malformed_encoding,
+            .byte_offset = incomplete.len - 1,
+            .related_byte_offset = null,
+            .line = 1,
+            .byte_column = incomplete.len,
+        },
+    );
+}
+
+test "[integration] - [Reader transcoder]: cancellation is sticky and reset replaces the callback" {
+    var counter: TranscodeCallCounter = .{};
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "x" },
+        .{ .transcoder = .{ .context = &counter, .runFn = cancellingTranscode } },
+    );
+    defer reader.deinit();
+
+    try std.testing.expectError(error.Cancelled, reader.next());
+    try std.testing.expectEqual(xml.DiagnosticCode.transcoder_cancelled, reader.diagnostic().?.code);
+    try std.testing.expectEqual(@as(u64, 0), reader.diagnostic().?.primary.byte_offset);
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
+    try std.testing.expectError(error.Cancelled, reader.next());
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
+
+    try reader.reset(.{ .slice = "<ok/>" }, .{}, .retain_capacity);
+    while (try reader.next()) |_| {}
+
+    const logical = "<again/>";
+    var encoded: [logical.len * 2]u8 = undefined;
+    pairEncode(&encoded, logical);
+    try reader.reset(
+        .{ .slice = &encoded },
+        .{ .transcoder = pairTranscoder() },
+        .retain_capacity,
+    );
+    var source_encoding: ?xml.SourceEncoding = null;
+    while (try reader.next()) |event| switch (event.data) {
+        .document_start => |document| source_encoding = document.source_encoding,
+        else => {},
+    };
+    try std.testing.expectEqual(xml.SourceEncoding.other, source_encoding.?);
+}
+
+test "[failure] - [Reader transcoder]: every allocation failure cleans up" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        rootTranscoderAllocationAttempt,
+        .{},
+    );
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    var reader = try xml.Reader.init(
+        failing.allocator(),
+        .{ .slice = "x" },
+        .{ .transcoder = pairTranscoder() },
+    );
+    defer reader.deinit();
+    try reader.reset(
+        .{ .slice = "x" },
+        .{ .transcoder = markedTranscoder() },
+        .release_memory,
+    );
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
 }
 
 test "[failure] - [Reader decoder]: malformed and incomplete input keeps physical locations" {
@@ -9034,6 +9693,139 @@ test "[integration] - [external encoding]: decodes UTF-16 general entity and tra
     try std.testing.expectEqual(@as(usize, 1), resolver.closes);
 }
 
+test "[integration] - [external encoding]: caller transcoder keeps short source input" {
+    const logical = "hi";
+    var encoded: [logical.len * 2]u8 = undefined;
+    pairEncode(&encoded, logical);
+    const resources = [_]TestExternalResource{
+        .{
+            .system_id = "message.ent",
+            .bytes = &encoded,
+            .source_id = 28,
+            .transcoder = pairTranscoder(),
+        },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed(
+        "<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>",
+        true,
+    );
+
+    var text: [logical.len]u8 = undefined;
+    var text_len: usize = 0;
+    while (true) switch (try reader.next()) {
+        .event => |event| switch (event) {
+            .text => |value| {
+                @memcpy(text[text_len..][0..value.bytes.len], value.bytes);
+                text_len += value.bytes.len;
+            },
+            else => {},
+        },
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqualStrings(logical, text[0..text_len]);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external encoding]: buffered source receives its final window" {
+    const resources = [_]TestExternalResource{
+        .{
+            .system_id = "external.dtd",
+            .bytes = "<!ELEMENT root EMPTY>",
+            .source_id = 29,
+            .transcoder = .{ .context = null, .runFn = finalIdentityTranscode },
+        },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+    while (true) switch (try reader.next()) {
+        .event => {},
+        .need_input => return error.UnexpectedNeedInput,
+        .done => break,
+    };
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [external encoding]: explicit transcoder owns byte zero and final input" {
+    const cases = [_]struct {
+        bytes: []const u8,
+        transcoder: xml.Transcoder,
+    }{
+        .{
+            .bytes = "",
+            .transcoder = .{ .context = null, .runFn = finalIdentityTranscode },
+        },
+        .{
+            .bytes = "\xef\xbb\xbf<!ELEMENT root EMPTY>",
+            .transcoder = .{ .context = null, .runFn = prefixedIdentityTranscode },
+        },
+    };
+    for (cases, 31..) |case, source_id| {
+        const resources = [_]TestExternalResource{.{
+            .system_id = "external.dtd",
+            .bytes = case.bytes,
+            .source_id = @intCast(source_id),
+            .transcoder = case.transcoder,
+        }};
+        var resolver = TestResolver{ .resources = &resources };
+        var options: xml.OptionsFor(DTD_CONFIG) = .{};
+        options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+        var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+        defer reader.deinit();
+        try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+        while (true) switch (try reader.next()) {
+            .event => {},
+            .need_input => return error.UnexpectedNeedInput,
+            .done => break,
+        };
+        try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+    }
+}
+
+test "[integration] - [external encoding]: transcoder cancellation keeps its source and closes once" {
+    var counter: TranscodeCallCounter = .{};
+    const resources = [_]TestExternalResource{
+        .{
+            .system_id = "external.dtd",
+            .bytes = "x",
+            .source_id = 30,
+            .transcoder = .{ .context = &counter, .runFn = cancellingTranscode },
+        },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
+    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    defer reader.deinit();
+    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
+
+    while (true) {
+        const step = reader.next() catch |failure| {
+            try std.testing.expectEqual(error.Cancelled, failure);
+            break;
+        };
+        if (step == .done) return error.ExpectedCancellation;
+    }
+    const diagnostic = reader.diagnostic().?;
+    try std.testing.expectEqual(xml.DiagnosticCode.transcoder_cancelled, diagnostic.code);
+    try std.testing.expectEqual(@as(u32, 30), diagnostic.primary.source_id);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.primary.byte_offset);
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+    try std.testing.expectError(error.Cancelled, reader.next());
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
 test "[integration] - [external cleanup]: read failure closes once and stays distinct" {
     const resources = [_]TestExternalResource{
         .{ .system_id = "external.dtd", .bytes = "<!ELEMENT root EMPTY>", .source_id = 4 },
@@ -9195,7 +9987,6 @@ test "[integration] - [external diagnostics]: caller transcoder supplies exact p
             .system_id = "external.dtd",
             .bytes = external,
             .source_id = 44,
-            .encoding_hint = .other,
             .transcoder = transcoder,
         },
     };
@@ -9226,7 +10017,6 @@ test "[integration] - [external diagnostics]: caller-transcoded general entity k
             .system_id = "message.ent",
             .bytes = "ab<",
             .source_id = 45,
-            .encoding_hint = .other,
             .transcoder = transcoder,
         },
     };

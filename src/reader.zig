@@ -468,6 +468,7 @@ pub const DiagnosticCode = enum {
     resolver_unsupported_scheme,
     resolver_io_failure,
     resolver_cancelled,
+    transcoder_cancelled,
     read_failed,
     validity_missing_doctype,
     validity_root_name_mismatch,
@@ -1025,6 +1026,7 @@ pub const NormalReaderOptions = struct {
     external: NormalExternalPolicy = .forbid,
     resolver: ?resolver_module.Resolver = null,
     document_base_id: ?[]const u8 = null,
+    /// Decodes the document entity from byte zero instead of using built-in detection.
     transcoder: ?encoding_module.Transcoder = null,
     track_lines: bool = true,
     normalization: NormalNormalizationPolicy = .report,
@@ -1569,6 +1571,7 @@ const Failure = enum {
 };
 
 const decoded_input_capacity = 16 * 1024;
+const transcoder_input_capacity = std.math.maxInt(u8);
 
 const EncodingFailure = struct {
     code: DiagnosticCode,
@@ -1594,6 +1597,8 @@ fn ExternalDecoderState(comptime config: Config) type {
         struct {
             raw: std.ArrayList(u8) = .empty,
             transcoder: ?encoding_module.Transcoder = null,
+            needs_input: bool = false,
+            finished: bool = false,
             eof: bool = false,
             at_start: bool = true,
         };
@@ -1664,6 +1669,8 @@ fn SourceState(comptime config: Config) type {
             input_is_direct_utf8: bool = false,
             line_pending: if (config.profile.isXml11()) [3]u8 else void =
                 if (config.profile.isXml11()) @splat(0) else {},
+            line_pending_advances: if (config.profile.isXml11()) [3]u8 else void =
+                if (config.profile.isXml11()) @splat(0) else {},
             line_pending_len: if (config.profile.isXml11()) u2 else void =
                 if (config.profile.isXml11()) 0 else {},
             pending_byte: ?u8 = null,
@@ -1710,6 +1717,7 @@ pub fn Reader(comptime config: Config) type {
         open_names: std.ArrayList(u8) = .empty,
         attribute_records: std.ArrayList(AttributeRecord(config)) = .empty,
         attribute_bytes: std.ArrayList(u8) = .empty,
+        declaration_source_advances: std.ArrayList(u8) = .empty,
         event_attributes: std.ArrayList(Attribute(config)) = .empty,
         namespace_state: NamespaceState(config) = .{},
         dtd_state: DtdState(config) = .{},
@@ -1726,11 +1734,13 @@ pub fn Reader(comptime config: Config) type {
         token_start: Location(config) = .{},
         token_name_len: usize = 0,
         end_mismatch_index: usize = no_end_mismatch,
+        end_mismatch_location: Location(config) = .{},
         attribute_quote: u8 = 0,
         utf8_bytes: [4]u8 = @splat(0),
         utf8_len: u3 = 0,
         utf8_expected_len: u3 = 0,
         utf8_start: Location(config) = .{},
+        utf8_source_advances: [4]u8 = @splat(0),
         text_inline: [4]u8 = @splat(0),
         text_fragment: []const u8 = &.{},
         text_from_reference: bool = false,
@@ -1775,6 +1785,7 @@ pub fn Reader(comptime config: Config) type {
         processing_instruction_initial: bool = false,
         processing_instruction_target_len: usize = 0,
         declaration_data_start: Location(config) = .{},
+        declaration_question_advance: u8 = 0,
 
         /// Initializes a reader without allocating.
         pub fn init(allocator: std.mem.Allocator, options: Options(config)) InitError!Self {
@@ -1846,11 +1857,13 @@ pub fn Reader(comptime config: Config) type {
             self.token_start = .{};
             self.token_name_len = 0;
             self.end_mismatch_index = no_end_mismatch;
+            self.end_mismatch_location = .{};
             self.attribute_quote = 0;
             self.utf8_bytes = @splat(0);
             self.utf8_len = 0;
             self.utf8_expected_len = 0;
             self.utf8_start = .{};
+            self.utf8_source_advances = @splat(0);
             self.text_inline = @splat(0);
             self.text_fragment = &.{};
             self.text_from_reference = false;
@@ -1895,6 +1908,7 @@ pub fn Reader(comptime config: Config) type {
             self.processing_instruction_initial = false;
             self.processing_instruction_target_len = 0;
             self.declaration_data_start = .{};
+            self.declaration_question_advance = 0;
             if (comptime config.profile.dtdMode() == .validating) {
                 self.validity_errors = 0;
                 self.validation_incomplete = false;
@@ -1931,6 +1945,48 @@ pub fn Reader(comptime config: Config) type {
                 self.cursor = 0;
                 self.final_input = false;
             }
+            self.final_was_seen = final;
+            self.lifecycle = .producing;
+        }
+
+        fn feedTranscodedRoot(self: *Self, input: []const u8, final: bool) ReadError!void {
+            if (comptime config.profile.isUtf8Only() or !config.external_sources) unreachable;
+            if (self.lifecycle != .ready and self.lifecycle != .needs_input) {
+                return error.InvalidState;
+            }
+            if (self.final_was_seen or (input.len == 0 and !final)) {
+                return error.InvalidState;
+            }
+
+            const source = &self.source_state;
+            const pending = source.raw_input[source.raw_cursor..];
+            if (pending.len > transcoder_input_capacity or
+                input.len > transcoder_input_capacity - pending.len)
+            {
+                return self.failAt(
+                    .malformed_encoding,
+                    .invalid_xml,
+                    self.locationAtCurrentLine(source.raw_offset),
+                );
+            }
+            if (pending.len != 0) {
+                std.mem.copyForwards(
+                    u8,
+                    source.external.raw.items[0..pending.len],
+                    pending,
+                );
+            }
+            source.external.raw.items.len = pending.len;
+            source.external.raw.ensureUnusedCapacity(self.allocator, input.len) catch
+                return self.failOutOfMemory();
+            source.external.raw.appendSliceAssumeCapacity(input);
+            source.raw_input = source.external.raw.items;
+            source.raw_cursor = 0;
+            source.raw_final = final;
+            source.external.needs_input = false;
+            self.input = &.{};
+            self.cursor = 0;
+            self.final_input = false;
             self.final_was_seen = final;
             self.lifecycle = .producing;
         }
@@ -2804,6 +2860,7 @@ pub fn Reader(comptime config: Config) type {
                         }
                         self.token_name_len = 0;
                         self.end_mismatch_index = no_end_mismatch;
+                        self.end_mismatch_location = .{};
                         self.vertical_state = .end_name;
                     },
                     .end_name => {
@@ -3183,8 +3240,10 @@ pub fn Reader(comptime config: Config) type {
                     0
                 else
                     self.attribute_bytes.items.len,
-                .scratch_bytes = self.attribute_bytes.items.len,
-                .scratch_capacity = self.attribute_bytes.capacity,
+                .scratch_bytes = self.attribute_bytes.items.len +|
+                    self.declaration_source_advances.items.len,
+                .scratch_capacity = self.attribute_bytes.capacity +|
+                    self.declaration_source_advances.capacity,
                 .decoder_capacity = self.decoderCapacity(),
                 .namespace_capacity = self.namespaceCapacity(),
                 .namespace_binding_count = self.namespaceBindingCount(),
@@ -3212,6 +3271,7 @@ pub fn Reader(comptime config: Config) type {
                 self.open_names.capacity +|
                 record_bytes +|
                 self.attribute_bytes.capacity +|
+                self.declaration_source_advances.capacity +|
                 event_bytes +|
                 self.namespaceCapacity() +|
                 self.dtdCapacity() +|
@@ -3335,6 +3395,7 @@ pub fn Reader(comptime config: Config) type {
             self.open_names.deinit(self.allocator);
             self.attribute_records.deinit(self.allocator);
             self.attribute_bytes.deinit(self.allocator);
+            self.declaration_source_advances.deinit(self.allocator);
             self.event_attributes.deinit(self.allocator);
             if (comptime config.profile.hasNamespaces()) {
                 self.namespace_state.bindings.deinit(self.allocator);
@@ -3368,6 +3429,7 @@ pub fn Reader(comptime config: Config) type {
             self.open_names = .empty;
             self.attribute_records = .empty;
             self.attribute_bytes = .empty;
+            self.declaration_source_advances = .empty;
             self.event_attributes = .empty;
             self.namespace_state = .{};
             self.source_state = .{};
@@ -3402,6 +3464,8 @@ pub fn Reader(comptime config: Config) type {
             if (comptime config.external_sources) {
                 self.source_state.external.raw.clearRetainingCapacity();
                 self.source_state.external.transcoder = null;
+                self.source_state.external.needs_input = false;
+                self.source_state.external.finished = false;
                 self.source_state.external.eof = false;
                 self.source_state.external.at_start = true;
             }
@@ -3410,8 +3474,10 @@ pub fn Reader(comptime config: Config) type {
         fn clearAttributesRetainingCapacity(self: *Self) void {
             self.attribute_records.clearRetainingCapacity();
             self.attribute_bytes.clearRetainingCapacity();
+            self.declaration_source_advances.clearRetainingCapacity();
             self.event_attributes.clearRetainingCapacity();
             self.attribute_quote = 0;
+            self.declaration_question_advance = 0;
             if (comptime config.profile.hasNamespaces()) {
                 self.namespace_state.event_declarations.clearRetainingCapacity();
                 self.namespace_state.expanded_indices.clearRetainingCapacity();
@@ -5655,9 +5721,19 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn appendDeclarationByte(self: *Self, byte: u8) ReadError!void {
-            try self.consumeDeclarationByte(byte);
-            self.attribute_bytes.append(self.allocator, byte) catch
+            self.attribute_bytes.ensureUnusedCapacity(self.allocator, 1) catch
                 return self.failOutOfMemory();
+            const source_advance = if (self.source_encoding == .other) advance: {
+                const value = self.sourceAdvanceAt(0);
+                self.declaration_source_advances.ensureUnusedCapacity(self.allocator, 1) catch
+                    return self.failOutOfMemory();
+                break :advance value;
+            } else 0;
+            try self.consumeDeclarationByte(byte);
+            self.attribute_bytes.appendAssumeCapacity(byte);
+            if (self.source_encoding == .other) {
+                self.declaration_source_advances.appendAssumeCapacity(source_advance);
+            }
         }
 
         fn readDeclaration(self: *Self) ReadError!bool {
@@ -5667,6 +5743,9 @@ pub fn Reader(comptime config: Config) type {
             }
             const byte = self.input[self.cursor];
             if (byte == '?') {
+                if (self.source_encoding == .other) {
+                    self.declaration_question_advance = self.sourceAdvanceAt(0);
+                }
                 try self.consumeDeclarationByte('?');
                 self.vertical_state = .declaration_question;
                 return false;
@@ -5701,8 +5780,19 @@ pub fn Reader(comptime config: Config) type {
                 return true;
             }
             if (self.input[self.cursor] != '>') {
-                self.attribute_bytes.append(self.allocator, '?') catch
+                self.attribute_bytes.ensureUnusedCapacity(self.allocator, 1) catch
                     return self.failOutOfMemory();
+                if (self.source_encoding == .other) {
+                    self.declaration_source_advances.ensureUnusedCapacity(self.allocator, 1) catch
+                        return self.failOutOfMemory();
+                }
+                self.attribute_bytes.appendAssumeCapacity('?');
+                if (self.source_encoding == .other) {
+                    self.declaration_source_advances.appendAssumeCapacity(
+                        self.declaration_question_advance,
+                    );
+                }
+                self.declaration_question_advance = 0;
                 self.vertical_state = .declaration;
                 return false;
             }
@@ -5762,8 +5852,13 @@ pub fn Reader(comptime config: Config) type {
         fn declarationLocation(self: *const Self, index: usize) Location(config) {
             var location = self.declaration_data_start;
             var pending_carriage_return = false;
-            for (self.attribute_bytes.items[0..@min(index, self.attribute_bytes.items.len)]) |byte| {
-                const source_width: u64 = if (self.source_encoding == .utf8) 1 else 2;
+            const end = @min(index, self.attribute_bytes.items.len);
+            for (self.attribute_bytes.items[0..end], 0..) |byte, source_index| {
+                const source_width: u64 = switch (self.source_encoding) {
+                    .utf8 => 1,
+                    .utf16_le, .utf16_be => 2,
+                    .other => self.declaration_source_advances.items[source_index],
+                };
                 location.byte_offset += source_width;
                 if (config.diagnostic_location == .line_column) {
                     if (pending_carriage_return and byte == '\n') {
@@ -5814,6 +5909,7 @@ pub fn Reader(comptime config: Config) type {
                 {
                     return self.fail(.malformed_utf8, .invalid_xml);
                 }
+                const source_advance = self.sourceAdvanceAt(0);
                 switch (source) {
                     .ordinary => self.consumeByte(byte),
                     .start_tag => {
@@ -5823,6 +5919,7 @@ pub fn Reader(comptime config: Config) type {
                     .reference => try self.consumeReferenceByte(byte),
                 }
                 self.utf8_bytes[index] = byte;
+                self.utf8_source_advances[index] = source_advance;
                 self.utf8_len += 1;
             }
 
@@ -6520,7 +6617,7 @@ pub fn Reader(comptime config: Config) type {
             self.dtd_state.active_external = source;
             self.dtd_state.active_external_inclusion = self.reference_start;
             self.source_state.external.transcoder = source.transcoder;
-            if (source.encoding_hint == .other) {
+            if (source.transcoder != null or source.encoding_hint == .other) {
                 self.source_state.encoding = .other;
                 self.source_encoding = .other;
             }
@@ -7829,6 +7926,7 @@ pub fn Reader(comptime config: Config) type {
                     const name_index = self.token_name_len + index;
                     if (name_index >= raw.len or raw[name_index] != byte) {
                         self.end_mismatch_index = name_index;
+                        self.end_mismatch_location = self.locationAfterInputPrefix(index);
                         break;
                     }
                 }
@@ -7857,6 +7955,10 @@ pub fn Reader(comptime config: Config) type {
                     const name_index = self.token_name_len + index;
                     if (name_index >= raw.len or raw[name_index] != byte) {
                         self.end_mismatch_index = name_index;
+                        self.end_mismatch_location = self.locationAfterSourceAdvances(
+                            self.utf8_start,
+                            self.utf8_source_advances[0..index],
+                        );
                         break;
                     }
                 }
@@ -7875,6 +7977,7 @@ pub fn Reader(comptime config: Config) type {
                 self.token_name_len != self.topFrame().name_len)
             {
                 self.end_mismatch_index = self.token_name_len;
+                self.end_mismatch_location = self.currentLocation();
             }
         }
 
@@ -8065,6 +8168,34 @@ pub fn Reader(comptime config: Config) type {
             return self.source_state.source_advances.items[self.cursor + index];
         }
 
+        fn locationAfterInputPrefix(self: *const Self, len: usize) Location(config) {
+            var location = self.currentLocation();
+            for (0..len) |index| {
+                const advance = self.sourceAdvanceAt(index);
+                location.byte_offset += advance;
+                if (config.diagnostic_location == .line_column) {
+                    location.byte_column += advance;
+                }
+            }
+            return location;
+        }
+
+        fn locationAfterSourceAdvances(
+            self: *const Self,
+            start: Location(config),
+            advances: []const u8,
+        ) Location(config) {
+            _ = self;
+            var location = start;
+            for (advances) |advance| {
+                location.byte_offset += advance;
+                if (config.diagnostic_location == .line_column) {
+                    location.byte_column += advance;
+                }
+            }
+            return location;
+        }
+
         fn validateTextFragment(self: *Self) ReadError!void {
             if (self.open_elements.items.len == 0 or self.text_fragment.len == 0) return;
             const frame = &self.open_elements.items[self.open_elements.items.len - 1].validation;
@@ -8143,18 +8274,7 @@ pub fn Reader(comptime config: Config) type {
 
         fn endMismatchLocation(self: *const Self) Location(config) {
             std.debug.assert(self.end_mismatch_index != no_end_mismatch);
-            var location = self.token_start;
-            const delta: u64 = if (self.source_encoding == .utf8)
-                @intCast(2 + self.end_mismatch_index)
-            else
-                4 + utf16SourceBytes(
-                    self.topRawName()[0..@min(self.end_mismatch_index, self.topRawName().len)],
-                );
-            location.byte_offset += delta;
-            if (config.diagnostic_location == .line_column) {
-                location.byte_column += delta;
-            }
-            return location;
+            return self.end_mismatch_location;
         }
 
         fn eventStep(
@@ -8255,8 +8375,19 @@ pub fn Reader(comptime config: Config) type {
             const decoder = &self.source_state;
             self.input = &.{};
             self.cursor = 0;
-            if (decoder.raw_cursor == decoder.raw_input.len and !decoder.raw_final) {
-                decoder.external.raw.clearRetainingCapacity();
+            if ((decoder.raw_cursor == decoder.raw_input.len or decoder.external.needs_input) and
+                !decoder.raw_final)
+            {
+                const pending = decoder.raw_input[decoder.raw_cursor..];
+                if (pending.len != 0) {
+                    std.mem.copyForwards(
+                        u8,
+                        decoder.external.raw.items[0..pending.len],
+                        pending,
+                    );
+                }
+                decoder.external.raw.items.len = pending.len;
+                decoder.external.needs_input = false;
                 while (true) {
                     const old_len = decoder.external.raw.items.len;
                     decoder.external.raw.ensureUnusedCapacity(self.allocator, 16 * 1024) catch
@@ -8273,7 +8404,8 @@ pub fn Reader(comptime config: Config) type {
                                 return self.failAt(.external_resource_bytes_limit, .limit_exceeded, self.currentLocation());
                             }
                             self.dtd_state.external_resource_bytes += len;
-                            if (!decoder.external.at_start or
+                            if (decoder.encoding == .other or
+                                !decoder.external.at_start or
                                 externalRawStartReady(
                                     decoder.external.raw.items,
                                     source.encoding_hint,
@@ -8360,11 +8492,20 @@ pub fn Reader(comptime config: Config) type {
                         try self.ensureDecoderCapacity();
                         try self.decodeUtf16SourceRun();
                     },
-                    .other => try self.decodeExternalOtherRun(),
+                    .other => {
+                        try self.decodeExternalOtherRun();
+                        if (comptime config.profile.isXml11()) {
+                            if (self.transcodedXml11LinesAreActive()) {
+                                try self.normalizeTranscodedXml11Lines(0);
+                            }
+                        }
+                        break;
+                    },
                 }
                 if (self.input.len != 0) return;
                 if ((source.encoding == .utf8 and source.decoded.items.len != 0) or
                     source.failure != null or
+                    (comptime config.external_sources) and source.external.needs_input or
                     source.raw_cursor == source.raw_input.len or
                     target_capacity - source.decoded.items.len < 4)
                 {
@@ -8530,6 +8671,12 @@ pub fn Reader(comptime config: Config) type {
             if (comptime !config.profile.isXml11()) unreachable;
             const source = &self.source_state;
             if (self.cursor == self.input.len) return;
+            if (self.source_encoding == .other) {
+                try self.normalizeTranscodedXml11Lines(self.cursor);
+                self.input = source.decoded.items;
+                self.cursor = 0;
+                return;
+            }
             if (self.source_encoding == .utf8 and source.input_is_direct_utf8) {
                 const remaining = self.input[self.cursor..];
                 source.raw_input = remaining;
@@ -8736,22 +8883,35 @@ pub fn Reader(comptime config: Config) type {
                 return self.failAt(.unsupported_encoding, .unsupported_feature, self.currentLocation());
             }
             const source = &self.source_state;
+            if (source.external.finished) return;
+            if (source.external.needs_input) return;
             const converter = source.external.transcoder orelse
                 return self.failAt(.unsupported_encoding, .unsupported_feature, self.currentLocation());
             try self.ensureDecoderCapacity();
-            while (source.decoded.items.len < self.decodedTargetCapacity()) {
-                const output = source.decoded.allocatedSlice()[source.decoded.items.len..];
-                const source_advances = source.source_advances.allocatedSlice()[source.source_advances.items.len..];
+            const pending_len = if (comptime config.profile.isXml11())
+                source.line_pending_len
+            else
+                0;
+            const output_limit = self.decodedTargetCapacity() - pending_len;
+            decode: while (source.decoded.items.len < output_limit) {
+                const output = source.decoded.allocatedSlice()[source.decoded.items.len..output_limit];
+                const source_advances = source.source_advances.allocatedSlice()[source.source_advances.items.len..output_limit];
                 const remaining = source.raw_input[source.raw_cursor..];
-                const bounded_input = remaining[0..@min(remaining.len, std.math.maxInt(u8))];
+                const bounded_input = remaining[0..@min(remaining.len, transcoder_input_capacity)];
+                const final = source.raw_final and bounded_input.len == remaining.len;
                 const step = converter.run(
                     bounded_input,
-                    source.raw_final and bounded_input.len == remaining.len,
+                    final,
                     output,
                     source_advances,
-                ) catch return self.failAt(.malformed_encoding, .invalid_xml, self.currentLocation());
+                ) catch return self.failAt(
+                    .malformed_encoding,
+                    .invalid_xml,
+                    self.locationAtCurrentLine(source.raw_offset),
+                );
                 switch (step) {
                     .progress => |progress| {
+                        source.external.needs_input = false;
                         const raw_start = source.raw_offset;
                         source.raw_cursor += progress.consumed;
                         source.raw_offset += progress.consumed;
@@ -8769,19 +8929,166 @@ pub fn Reader(comptime config: Config) type {
                             }
                         }
                     },
-                    .need_input => break,
-                    .need_output => break,
+                    .need_input => {
+                        if (final) {
+                            source.external.finished = true;
+                        } else if (bounded_input.len == transcoder_input_capacity) {
+                            return self.failAt(
+                                .malformed_encoding,
+                                .invalid_xml,
+                                self.locationAtCurrentLine(source.raw_offset),
+                            );
+                        } else {
+                            source.external.needs_input = true;
+                        }
+                        break :decode;
+                    },
+                    .need_output => {
+                        if (source.decoded.items.len == 0) {
+                            return self.failAt(
+                                .malformed_encoding,
+                                .invalid_xml,
+                                self.locationAtCurrentLine(source.raw_offset),
+                            );
+                        }
+                        break :decode;
+                    },
                     .malformed => |offset| return self.failAt(
                         .malformed_encoding,
                         .invalid_xml,
                         self.locationAtCurrentLine(source.raw_offset + offset),
                     ),
-                    .unsupported => return self.failAt(.unsupported_encoding, .unsupported_feature, self.currentLocation()),
+                    .unsupported => return self.failAt(
+                        .unsupported_encoding,
+                        .unsupported_feature,
+                        self.locationAtCurrentLine(source.raw_offset),
+                    ),
+                    .cancelled => return self.failAt(
+                        .transcoder_cancelled,
+                        .cancelled,
+                        self.locationAtCurrentLine(source.raw_offset),
+                    ),
                 }
                 if (source.raw_cursor == source.raw_input.len and !source.raw_final) break;
                 if (source.raw_final and source.raw_cursor == source.raw_input.len and
                     source.decoded.items.len == 0) break;
             }
+        }
+
+        fn transcodedXml11LinesAreActive(self: *const Self) bool {
+            if (comptime !config.profile.isXml11()) return false;
+            if (self.xmlVersion() != .xml11) return false;
+            if (comptime config.profile.dtdMode() == .rejected) return true;
+            if (self.dtd_state.current_is_replacement) return false;
+            return self.dtd_state.active_external == null or
+                !self.source_state.external.at_start;
+        }
+
+        fn normalizeTranscodedXml11Lines(self: *Self, start: usize) ReadError!void {
+            if (comptime !config.profile.isXml11() or !config.external_sources) unreachable;
+            const source = &self.source_state;
+            std.debug.assert(start <= source.decoded.items.len);
+            std.debug.assert(source.decoded.items.len == source.source_advances.items.len);
+
+            const remaining_len = source.decoded.items.len - start;
+            if (start != 0) {
+                std.mem.copyForwards(
+                    u8,
+                    source.decoded.items[0..remaining_len],
+                    source.decoded.items[start..],
+                );
+                std.mem.copyForwards(
+                    u8,
+                    source.source_advances.items[0..remaining_len],
+                    source.source_advances.items[start..],
+                );
+                source.decoded.items.len = remaining_len;
+                source.source_advances.items.len = remaining_len;
+            }
+
+            const pending_len: usize = source.line_pending_len;
+            if (pending_len != 0) {
+                const combined_len = pending_len + source.decoded.items.len;
+                std.debug.assert(combined_len <= source.decoded.capacity);
+                std.debug.assert(combined_len <= source.source_advances.capacity);
+                const decoded_len = source.decoded.items.len;
+                source.decoded.items.len = combined_len;
+                source.source_advances.items.len = combined_len;
+                std.mem.copyBackwards(
+                    u8,
+                    source.decoded.items[pending_len..],
+                    source.decoded.items[0..decoded_len],
+                );
+                std.mem.copyBackwards(
+                    u8,
+                    source.source_advances.items[pending_len..],
+                    source.source_advances.items[0..decoded_len],
+                );
+                @memcpy(
+                    source.decoded.items[0..pending_len],
+                    source.line_pending[0..pending_len],
+                );
+                @memcpy(
+                    source.source_advances.items[0..pending_len],
+                    source.line_pending_advances[0..pending_len],
+                );
+                source.line_pending_len = 0;
+            }
+
+            var read: usize = 0;
+            var write: usize = 0;
+            while (read < source.decoded.items.len) {
+                const bytes = source.decoded.items[read..];
+                const line_len: usize = if (std.mem.startsWith(u8, bytes, "\xc2\x85"))
+                    2
+                else if (std.mem.startsWith(u8, bytes, "\xe2\x80\xa8"))
+                    3
+                else
+                    0;
+                if (line_len != 0) {
+                    var source_advance: u8 = 0;
+                    for (source.source_advances.items[read..][0..line_len]) |advance| {
+                        source_advance = std.math.add(u8, source_advance, advance) catch
+                            return self.failAt(
+                                .malformed_encoding,
+                                .invalid_xml,
+                                self.locationAtCurrentLine(self.source_byte_offset),
+                            );
+                    }
+                    source.decoded.items[write] = '\n';
+                    source.source_advances.items[write] = source_advance;
+                    write += 1;
+                    read += line_len;
+                    continue;
+                }
+
+                const pending: usize = if (bytes.len == 1 and
+                    (bytes[0] == 0xc2 or bytes[0] == 0xe2))
+                    1
+                else if (bytes.len == 2 and bytes[0] == 0xe2 and bytes[1] == 0x80)
+                    2
+                else
+                    0;
+                if (pending != 0 and !source.external.finished) {
+                    @memcpy(
+                        source.line_pending[0..pending],
+                        source.decoded.items[read..][0..pending],
+                    );
+                    @memcpy(
+                        source.line_pending_advances[0..pending],
+                        source.source_advances.items[read..][0..pending],
+                    );
+                    source.line_pending_len = @intCast(pending);
+                    break;
+                }
+
+                source.decoded.items[write] = source.decoded.items[read];
+                source.source_advances.items[write] = source.source_advances.items[read];
+                write += 1;
+                read += 1;
+            }
+            source.decoded.items.len = write;
+            source.source_advances.items.len = write;
         }
 
         fn ensureDecoderCapacity(self: *Self) ReadError!void {
@@ -9113,38 +9420,30 @@ fn parseXmlDeclaration(
         const encoding = consumeQuoted(bytes, &index) orelse return .{ .malformed = index };
         const encoding_bytes = bytes[encoding.offset..][0..encoding.len];
         if (!isEncodingName(encoding_bytes)) return .{ .malformed = encoding.offset };
-        if (!supports_utf16 and !std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-8")) {
-            return .{ .unsupported_encoding = encoding.offset };
-        }
-        const declared_encoding: ?SourceEncoding = if (std.ascii.eqlIgnoreCase(
-            encoding_bytes,
-            "UTF-8",
-        ))
-            .utf8
-        else if (std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-16"))
-            switch (source_encoding) {
-                .utf16_le => .utf16_le,
-                .utf16_be => .utf16_be,
-                .utf8, .other => null,
+        if (source_encoding != .other) {
+            if (!supports_utf16 and !std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-8")) {
+                return .{ .unsupported_encoding = encoding.offset };
             }
-        else if (std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-16LE"))
-            .utf16_le
-        else if (std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-16BE"))
-            .utf16_be
-        else
-            return .{ .unsupported_encoding = encoding.offset };
-        if (declared_encoding == null or declared_encoding.? != source_encoding) {
-            return .{ .encoding_mismatch = encoding.offset };
-        }
-        if (source_encoding == .utf8 and
-            !std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-8"))
-        {
-            return .{ .encoding_mismatch = encoding.offset };
-        }
-        if (source_encoding != .utf8 and
-            std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-8"))
-        {
-            return .{ .encoding_mismatch = encoding.offset };
+            const declared_encoding: ?SourceEncoding = if (std.ascii.eqlIgnoreCase(
+                encoding_bytes,
+                "UTF-8",
+            ))
+                .utf8
+            else if (std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-16"))
+                switch (source_encoding) {
+                    .utf16_le => .utf16_le,
+                    .utf16_be => .utf16_be,
+                    .utf8, .other => null,
+                }
+            else if (std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-16LE"))
+                .utf16_le
+            else if (std.ascii.eqlIgnoreCase(encoding_bytes, "UTF-16BE"))
+                .utf16_be
+            else
+                return .{ .unsupported_encoding = encoding.offset };
+            if (declared_encoding == null or declared_encoding.? != source_encoding) {
+                return .{ .encoding_mismatch = encoding.offset };
+            }
         }
         parsed.encoding_offset = encoding.offset;
         parsed.encoding_len = encoding.len;
@@ -9485,7 +9784,9 @@ fn decodeExternalSource(
 ) dtd_module.ParseError!DecodedExternalSource {
     var encoding = hint orelse .utf8;
     var start: usize = 0;
-    if (raw.len >= 3 and std.mem.eql(u8, raw[0..3], "\xef\xbb\xbf")) {
+    if (transcoder != null or hint == .other) {
+        encoding = .other;
+    } else if (raw.len >= 3 and std.mem.eql(u8, raw[0..3], "\xef\xbb\xbf")) {
         if (hint != null and hint.? != .utf8) {
             setExternalDecodeFailure(failure, .encoding_mismatch, 0, &.{}, null, 0, 0);
             return error.InvalidDtd;
@@ -9608,13 +9909,13 @@ fn decodeExternalSource(
             var cursor = start;
             var output: [4096]u8 = undefined;
             var output_advances: [4096]u8 = undefined;
-            while (true) {
-                const final = cursor == raw.len;
+            decode: while (true) {
                 const remaining = raw[cursor..];
                 const bounded = remaining[0..@min(remaining.len, std.math.maxInt(u8))];
+                const final = bounded.len == remaining.len;
                 const step = converter.run(
                     bounded,
-                    final and bounded.len == remaining.len,
+                    final,
                     &output,
                     &output_advances,
                 ) catch {
@@ -9634,7 +9935,12 @@ fn decodeExternalSource(
                             advances.append(allocator, advance) catch return error.OutOfMemory;
                         }
                     },
-                    .need_input, .need_output => {
+                    .need_input => {
+                        if (final and bounded.len == 0) break :decode;
+                        setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
+                        return error.InvalidDtd;
+                    },
+                    .need_output => {
                         setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
                         return error.InvalidDtd;
                     },
@@ -9646,35 +9952,10 @@ fn decodeExternalSource(
                         setExternalDecodeFailure(failure, .unsupported_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
                         return error.UnsupportedFeature;
                     },
-                }
-                if (cursor == raw.len) {
-                    const final_step = converter.run("", true, &output, &output_advances) catch {
-                        setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
-                        return error.InvalidDtd;
-                    };
-                    switch (final_step) {
-                        .progress => |progress| {
-                            if (progress.consumed != 0 or progress.produced > max_bytes -| decoded.items.len) {
-                                setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
-                                return error.InvalidDtd;
-                            }
-                            decoded.appendSlice(allocator, output[0..progress.produced]) catch
-                                return error.OutOfMemory;
-                            for (output_advances[0..progress.produced]) |advance| {
-                                advances.append(allocator, advance) catch return error.OutOfMemory;
-                            }
-                            continue;
-                        },
-                        .need_input => break,
-                        .need_output, .malformed => {
-                            setExternalDecodeFailure(failure, .malformed_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
-                            return error.InvalidDtd;
-                        },
-                        .unsupported => {
-                            setExternalDecodeFailure(failure, .unsupported_encoding, start, decoded.items, advances.items, decoded.items.len, cursor);
-                            return error.UnsupportedFeature;
-                        },
-                    }
+                    .cancelled => {
+                        setExternalDecodeFailure(failure, .transcoder_cancelled, start, decoded.items, advances.items, decoded.items.len, cursor);
+                        return error.Cancelled;
+                    },
                 }
             }
             _ = std.unicode.Utf8View.init(decoded.items) catch {
@@ -10249,6 +10530,24 @@ pub const NormalReader = struct {
                 parser.feed(input, true) catch return error.InvalidState;
             },
             .stream => |input| {
+                if (self.options.transcoder != null) {
+                    if (self.source_finished) return error.InvalidState;
+                    const bytes = input.peekGreedy(1) catch |read_error| switch (read_error) {
+                        error.EndOfStream => {
+                            self.source_finished = true;
+                            return AdapterAccess(config).feedTranscodedRoot(parser, "", true);
+                        },
+                        error.ReadFailed => return AdapterAccess(config).recordReadFailure(parser),
+                    };
+                    const pending = AdapterAccess(config).transcoderPendingInput(parser);
+                    std.debug.assert(pending < transcoder_input_capacity);
+                    const len = @min(bytes.len, transcoder_input_capacity - pending);
+                    try AdapterAccess(config).feedTranscodedRoot(parser, bytes[0..len], false);
+                    input.toss(len);
+                    self.source_tossed += @intCast(len);
+                    self.source_started = true;
+                    return;
+                }
                 if (self.pending_toss != 0) {
                     input.toss(self.pending_toss);
                     self.source_tossed += @intCast(self.pending_toss);
@@ -10561,7 +10860,6 @@ pub const NormalReader = struct {
 
 fn validNormalOptions(options: NormalReaderOptions) bool {
     if (!options.limits.validate()) return false;
-    if (options.transcoder != null) return false;
     if (options.external == .resolve and options.resolver == null) return false;
     if (options.external != .resolve and options.resolver != null) return false;
     if (options.external != .resolve and options.document_base_id != null) return false;
@@ -10617,6 +10915,7 @@ fn normalOptionsDisableStorage(
     replacement: NormalReaderOptions,
 ) bool {
     if (previous.dtd != .reject and replacement.dtd == .reject) return true;
+    if (previous.transcoder != null and replacement.transcoder == null) return true;
     return previous.external == .resolve and replacement.external != .resolve;
 }
 
@@ -10636,7 +10935,7 @@ fn resetNormalParser(
 ) void {
     parser.options = normalEngineOptions(config, options);
     parser.reset(mode) catch unreachable;
-    parser.dtd_state.reject_doctype = options.dtd == .reject;
+    configureNormalParser(config, parser, options);
 }
 
 fn initNormalParser(
@@ -10645,8 +10944,21 @@ fn initNormalParser(
     options: NormalReaderOptions,
 ) NormalInitError!Reader(config) {
     var parser = try Reader(config).init(allocator, normalEngineOptions(config, options));
-    parser.dtd_state.reject_doctype = options.dtd == .reject;
+    configureNormalParser(config, &parser, options);
     return parser;
+}
+
+fn configureNormalParser(
+    comptime config: Config,
+    parser: *Reader(config),
+    options: NormalReaderOptions,
+) void {
+    parser.dtd_state.reject_doctype = options.dtd == .reject;
+    if (options.transcoder) |transcoder| {
+        parser.source_state.encoding = .other;
+        parser.source_state.external.transcoder = transcoder;
+        parser.source_encoding = .other;
+    }
 }
 
 fn normalEngineOptions(
@@ -10783,6 +11095,18 @@ pub fn AdapterAccess(comptime config: Config) type {
 
         pub fn currentLocation(reader: *const Reader(config)) Location(config) {
             return reader.currentLocation();
+        }
+
+        pub fn feedTranscodedRoot(
+            reader: *Reader(config),
+            input: []const u8,
+            final: bool,
+        ) ReadError!void {
+            return reader.feedTranscodedRoot(input, final);
+        }
+
+        pub fn transcoderPendingInput(reader: *const Reader(config)) usize {
+            return reader.source_state.raw_input.len - reader.source_state.raw_cursor;
         }
     };
 }

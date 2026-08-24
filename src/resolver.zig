@@ -45,6 +45,7 @@ pub const Source = struct {
     source_id: u32,
     base_id: ?[]const u8 = null,
     encoding_hint: ?encoding.SourceEncoding = null,
+    /// Decodes this source from byte zero and takes precedence over `encoding_hint`.
     transcoder: ?encoding.Transcoder = null,
     readFn: *const fn (?*anyopaque, []u8) ReadResult,
     closeFn: *const fn (?*anyopaque) void,
