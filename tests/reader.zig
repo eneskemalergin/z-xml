@@ -1467,12 +1467,27 @@ const NormalSummary = struct {
     source_encoding: xml.SourceEncoding,
     declared_encoding: [32]u8 = @splat(0),
     declared_encoding_len: usize = 0,
+    logical_events: [64]u8 = @splat(0),
+    logical_events_len: usize = 0,
+    text_runs: [512]u8 = @splat(0),
+    text_runs_len: usize = 0,
+    final_text_fragments: usize = 0,
+    final_text_span: ?xml.SourceSpan = null,
+    attributes: usize = 0,
+    attribute_values: [512]u8 = @splat(0),
+    attribute_values_len: usize = 0,
 
     fn deinit(self: *NormalSummary) void {
         std.testing.allocator.free(self.events);
         self.* = undefined;
     }
 };
+
+fn appendNormalLogicalEvent(events: *[64]u8, len: *usize, value: u8) !void {
+    if (len.* == events.len) return error.NormalEventSummaryTooLarge;
+    events[len.*] = value;
+    len.* += 1;
+}
 
 fn summarizeNormalSource(source: xml.Source) !NormalSummary {
     return summarizeNormalSourceWithOptions(source, .{});
@@ -1492,6 +1507,16 @@ fn summarizeNormalSourceWithOptions(
     var text_origin: ?xml.TextOrigin = null;
     var comment_active = false;
     var instruction_active = false;
+    var text_run_active = false;
+    var logical_events: [64]u8 = @splat(0);
+    var logical_events_len: usize = 0;
+    var text_runs: [512]u8 = @splat(0);
+    var text_runs_len: usize = 0;
+    var final_text_fragments: usize = 0;
+    var final_text_span: ?xml.SourceSpan = null;
+    var attributes: usize = 0;
+    var attribute_values: [512]u8 = @splat(0);
+    var attribute_values_len: usize = 0;
     while (try reader.next()) |event| switch (event.data) {
         .document_start => |document| {
             source_encoding = document.source_encoding;
@@ -1504,10 +1529,12 @@ fn summarizeNormalSourceWithOptions(
                     declared_encoding_len = value.len;
                 }
             }
+            try appendNormalLogicalEvent(&logical_events, &logical_events_len, 'D');
             try output.append(std.testing.allocator, 'D');
             try output.append(std.testing.allocator, @intFromEnum(document.effective_version));
         },
         .start_element => |element| {
+            try appendNormalLogicalEvent(&logical_events, &logical_events_len, 'S');
             try output.append(std.testing.allocator, 'S');
             try appendFocusedValue(&output, element.name.raw);
             try appendFocusedValue(
@@ -1515,6 +1542,19 @@ fn summarizeNormalSourceWithOptions(
                 element.name.expanded.?.namespace_uri orelse "",
             );
             for (element.attributes) |attribute| {
+                attributes = std.math.add(usize, attributes, 1) catch
+                    return error.NormalSummaryCountOverflow;
+                const value_end = std.math.add(
+                    usize,
+                    attribute_values_len,
+                    attribute.value.len,
+                ) catch return error.NormalAttributeSummaryTooLarge;
+                if (value_end >= attribute_values.len) {
+                    return error.NormalAttributeSummaryTooLarge;
+                }
+                @memcpy(attribute_values[attribute_values_len..value_end], attribute.value);
+                attribute_values[value_end] = 0;
+                attribute_values_len = value_end + 1;
                 try output.append(std.testing.allocator, 'A');
                 try appendFocusedValue(&output, attribute.name.raw);
                 try appendFocusedValue(&output, attribute.value);
@@ -1526,6 +1566,7 @@ fn summarizeNormalSourceWithOptions(
             }
         },
         .end_element => |element| {
+            try appendNormalLogicalEvent(&logical_events, &logical_events_len, 'E');
             try output.append(std.testing.allocator, 'E');
             try appendFocusedValue(&output, element.name.raw);
             try appendFocusedValue(
@@ -1534,15 +1575,35 @@ fn summarizeNormalSourceWithOptions(
             );
         },
         .text => |value| {
+            if (!text_run_active) {
+                try appendNormalLogicalEvent(&logical_events, &logical_events_len, 'T');
+                text_run_active = true;
+            }
             if (text_origin == null or text_origin.? != value.origin) {
                 try output.append(std.testing.allocator, 'T');
                 try output.append(std.testing.allocator, @intFromEnum(value.origin));
                 text_origin = value.origin;
             }
             try output.appendSlice(std.testing.allocator, value.bytes);
+            const text_end = std.math.add(usize, text_runs_len, value.bytes.len) catch
+                return error.TextRunSummaryTooLarge;
+            if (text_end > text_runs.len) return error.TextRunSummaryTooLarge;
+            @memcpy(text_runs[text_runs_len..text_end], value.bytes);
+            text_runs_len = text_end;
+            if (value.final_fragment) {
+                if (text_runs_len == text_runs.len) return error.TextRunSummaryTooLarge;
+                text_runs[text_runs_len] = 0;
+                text_runs_len += 1;
+                final_text_fragments = std.math.add(usize, final_text_fragments, 1) catch
+                    return error.NormalSummaryCountOverflow;
+                final_text_span = event.span;
+                text_run_active = false;
+                text_origin = null;
+            }
         },
         .comment => |value| {
             if (!comment_active) {
+                try appendNormalLogicalEvent(&logical_events, &logical_events_len, 'C');
                 try output.append(std.testing.allocator, 'C');
                 comment_active = true;
             }
@@ -1554,6 +1615,7 @@ fn summarizeNormalSourceWithOptions(
         },
         .processing_instruction => |value| {
             if (!instruction_active) {
+                try appendNormalLogicalEvent(&logical_events, &logical_events_len, 'P');
                 try output.append(std.testing.allocator, 'P');
                 try appendFocusedValue(&output, value.target);
                 instruction_active = true;
@@ -1564,15 +1626,28 @@ fn summarizeNormalSourceWithOptions(
                 instruction_active = false;
             }
         },
-        .document_end => try output.append(std.testing.allocator, 'Z'),
+        .document_end => {
+            try appendNormalLogicalEvent(&logical_events, &logical_events_len, 'Z');
+            try output.append(std.testing.allocator, 'Z');
+        },
         else => {},
     };
+    if (text_run_active) return error.MissingFinalTextFragment;
     const detected_encoding = source_encoding orelse return error.MissingDocumentStart;
     return .{
         .events = try output.toOwnedSlice(std.testing.allocator),
         .source_encoding = detected_encoding,
         .declared_encoding = declared_encoding,
         .declared_encoding_len = declared_encoding_len,
+        .logical_events = logical_events,
+        .logical_events_len = logical_events_len,
+        .text_runs = text_runs,
+        .text_runs_len = text_runs_len,
+        .final_text_fragments = final_text_fragments,
+        .final_text_span = final_text_span,
+        .attributes = attributes,
+        .attribute_values = attribute_values,
+        .attribute_values_len = attribute_values_len,
     };
 }
 
@@ -2085,10 +2160,31 @@ test "[integration] - [Reader]: matches selected engine output and first failure
 
 test "[property] - [Reader source]: slice and buffered schedules agree" {
     const input =
-        "<?setup ready?><root xmlns='urn:test' id='7'>" ++
-        "<!--note--><item/>text<![CDATA[more]]></root>";
+        " \n<?setup ready?><root xmlns='urn:test' id='7 &amp; 8'>" ++
+        "pre&amp;<![CDATA[mid]]><item child='ok &amp; ready'/>post<!--note-->" ++
+        "tail<?inside data?>done</root>\n";
     var expected = try summarizeNormalReader(input);
     defer expected.deinit();
+    try std.testing.expectEqualStrings(
+        "DPSTSETCTPTEZ",
+        expected.logical_events[0..expected.logical_events_len],
+    );
+    try std.testing.expectEqualStrings(
+        "pre&mid\x00post\x00tail\x00done\x00",
+        expected.text_runs[0..expected.text_runs_len],
+    );
+    try std.testing.expectEqual(@as(usize, 4), expected.final_text_fragments);
+    const text_end = std.mem.indexOf(u8, input, "</root>").?;
+    try std.testing.expectEqual(xml.SourceSpan{
+        .source_id = 0,
+        .start = text_end,
+        .end = text_end,
+    }, expected.final_text_span.?);
+    try std.testing.expectEqual(@as(usize, 2), expected.attributes);
+    try std.testing.expectEqualStrings(
+        "7 & 8\x00ok & ready\x00",
+        expected.attribute_values[0..expected.attribute_values_len],
+    );
 
     var one_byte_buffer: [1]u8 = undefined;
     var one_byte_source: std.testing.Reader = .init(
@@ -2100,20 +2196,56 @@ test "[property] - [Reader source]: slice and buffered schedules agree" {
     defer one_byte.deinit();
     try std.testing.expectEqualStrings(expected.events, one_byte.events);
     try std.testing.expectEqual(expected.source_encoding, one_byte.source_encoding);
+    try std.testing.expectEqualSlices(
+        u8,
+        expected.logical_events[0..expected.logical_events_len],
+        one_byte.logical_events[0..one_byte.logical_events_len],
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        expected.text_runs[0..expected.text_runs_len],
+        one_byte.text_runs[0..one_byte.text_runs_len],
+    );
+    try std.testing.expectEqual(expected.final_text_fragments, one_byte.final_text_fragments);
+    try std.testing.expectEqual(expected.final_text_span, one_byte.final_text_span);
+    try std.testing.expectEqual(expected.attributes, one_byte.attributes);
+    try std.testing.expectEqualSlices(
+        u8,
+        expected.attribute_values[0..expected.attribute_values_len],
+        one_byte.attribute_values[0..one_byte.attribute_values_len],
+    );
 
     var split_buffer: [7]u8 = undefined;
     var split_source: std.testing.Reader = .init(&split_buffer, &.{
         .{ .buffer = "" },
-        .{ .buffer = "<?setup ready?><ro" },
-        .{ .buffer = "ot xmlns='urn:test' id='7'><!--note--><it" },
-        .{ .buffer = "em/" },
-        .{ .buffer = ">text<![CDATA[more]]></root>" },
+        .{ .buffer = " \n<?setup ready?><ro" },
+        .{ .buffer = "ot xmlns='urn:test' id='7 &amp; 8'>pre&amp;<![CDATA[mi" },
+        .{ .buffer = "d]]><item child='ok &amp; ready'/>post<!--no" },
+        .{ .buffer = "te-->tail<?inside data?>done</root>\n" },
     });
     split_source.artificial_limit = .limited(3);
     var split = try summarizeNormalSource(.{ .stream = &split_source.interface });
     defer split.deinit();
     try std.testing.expectEqualStrings(expected.events, split.events);
     try std.testing.expectEqual(expected.source_encoding, split.source_encoding);
+    try std.testing.expectEqualSlices(
+        u8,
+        expected.logical_events[0..expected.logical_events_len],
+        split.logical_events[0..split.logical_events_len],
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        expected.text_runs[0..expected.text_runs_len],
+        split.text_runs[0..split.text_runs_len],
+    );
+    try std.testing.expectEqual(expected.final_text_fragments, split.final_text_fragments);
+    try std.testing.expectEqual(expected.final_text_span, split.final_text_span);
+    try std.testing.expectEqual(expected.attributes, split.attributes);
+    try std.testing.expectEqualSlices(
+        u8,
+        expected.attribute_values[0..expected.attribute_values_len],
+        split.attribute_values[0..split.attribute_values_len],
+    );
 
     const malformed = "<root><item></root>";
     const expected_failure = try normalFailure(.{ .slice = malformed });
@@ -2135,6 +2267,85 @@ test "[property] - [Reader source]: slice and buffered schedules agree" {
         expected_empty,
         try normalFailure(.{ .stream = &empty_source.interface }),
     );
+}
+
+test "[failure] - [Reader grammar]: first failures are exact across source schedules" {
+    const double_hyphen = "<root><!-- invalid -- comment --></root>\n";
+    const unclosed_cdata = "<root><![CDATA[never closed</root>";
+    const unsupported_version = "<?xml version=\"2.0\"?><root/>\n";
+    const cases = [_]struct {
+        input: []const u8,
+        category: xml.ReadError,
+        code: xml.DiagnosticCode,
+        offset: u64,
+        related: ?u64 = null,
+    }{
+        .{ .input = "", .category = error.InvalidXml, .code = .empty_document, .offset = 0 },
+        .{
+            .input = "<root><item></root>\n",
+            .category = error.InvalidXml,
+            .code = .mismatched_end_tag,
+            .offset = 14,
+            .related = 6,
+        },
+        .{
+            .input = "<root value=\"one\" value=\"two\"/>\n",
+            .category = error.InvalidXml,
+            .code = .duplicate_attribute,
+            .offset = 18,
+            .related = 6,
+        },
+        .{
+            .input = "<root>&#xZZ;</root>\n",
+            .category = error.InvalidXml,
+            .code = .malformed_reference,
+            .offset = 9,
+        },
+        .{
+            .input = double_hyphen,
+            .category = error.InvalidXml,
+            .code = .malformed_comment,
+            .offset = std.mem.indexOf(u8, double_hyphen, "-- comment").? + 2,
+        },
+        .{
+            .input = "<root><?XmL reserved?></root>\n",
+            .category = error.InvalidXml,
+            .code = .reserved_processing_instruction_target,
+            .offset = 6,
+        },
+        .{
+            .input = unclosed_cdata,
+            .category = error.InvalidXml,
+            .code = .unclosed_cdata,
+            .offset = unclosed_cdata.len,
+        },
+        .{
+            .input = unsupported_version,
+            .category = error.UnsupportedVersion,
+            .code = .unsupported_version,
+            .offset = std.mem.indexOf(u8, unsupported_version, "2.0").?,
+        },
+        .{
+            .input = "<1root/>",
+            .category = error.InvalidXml,
+            .code = .malformed_start_tag,
+            .offset = 1,
+        },
+    };
+    for (cases) |case| {
+        try expectNormalFailureSchedulesWithOptions(
+            case.input,
+            .{ .namespaces = .raw, .dtd = .reject },
+            .{
+                .category = case.category,
+                .code = case.code,
+                .byte_offset = case.offset,
+                .related_byte_offset = case.related,
+                .line = 1,
+                .byte_column = case.offset + 1,
+            },
+        );
+    }
 }
 
 test "[property] - [Reader decoder]: built-in encodings preserve events across source schedules" {
@@ -2362,6 +2573,7 @@ test "[integration] - [Reader transcoder]: event and failure locations use sourc
 
     var start_seen = false;
     var text_seen = false;
+    var text_complete = false;
     var end_seen = false;
     while (try reader.next()) |event| switch (event.data) {
         .start_element => {
@@ -2370,10 +2582,17 @@ test "[integration] - [Reader transcoder]: event and failure locations use sourc
             start_seen = true;
         },
         .text => |text| {
-            try std.testing.expectEqualStrings("é", text.bytes);
-            try std.testing.expectEqual(@as(u64, 3), event.span.start);
-            try std.testing.expectEqual(@as(u64, 4), event.span.end);
-            text_seen = true;
+            if (text.final_fragment) {
+                try std.testing.expectEqual(@as(usize, 0), text.bytes.len);
+                try std.testing.expectEqual(@as(u64, 4), event.span.start);
+                try std.testing.expectEqual(@as(u64, 4), event.span.end);
+                text_complete = true;
+            } else {
+                try std.testing.expectEqualStrings("é", text.bytes);
+                try std.testing.expectEqual(@as(u64, 3), event.span.start);
+                try std.testing.expectEqual(@as(u64, 4), event.span.end);
+                text_seen = true;
+            }
         },
         .end_element => {
             try std.testing.expectEqual(@as(u64, 4), event.span.start);
@@ -2382,7 +2601,7 @@ test "[integration] - [Reader transcoder]: event and failure locations use sourc
         },
         else => {},
     };
-    try std.testing.expect(start_seen and text_seen and end_seen);
+    try std.testing.expect(start_seen and text_seen and text_complete and end_seen);
 
     const mismatch_source = "<r>\r\n<x></y></r>";
     var mismatch_storage: [mismatch_source.len * 2]u8 = undefined;
@@ -2875,13 +3094,21 @@ test "[integration] - [Reader lifecycle]: reset replaces every parser state" {
     );
     defer reader.deinit();
 
-    try reader.reset(.{ .slice = "<ready/>" }, .{ .dtd = .reject }, .retain_capacity);
+    try reader.reset(.{ .slice = "<active>text</active>" }, .{}, .retain_capacity);
     _ = try reader.next();
+    _ = try reader.next();
+    _ = try reader.next();
+    try reader.reset(.{ .slice = "<pending>text</pending>" }, .{}, .retain_capacity);
+    try std.testing.expect((try reader.next()).?.data == .document_start);
+    _ = try reader.next();
+    _ = try reader.next();
+    try std.testing.expect((try reader.next()).?.data.text.final_fragment);
     try reader.reset(
         .{ .slice = "<p:active xmlns:p='urn:test'/>" },
         .{ .namespaces = .raw, .dtd = .reject },
         .retain_capacity,
     );
+    try std.testing.expect((try reader.next()).?.data == .document_start);
     while (try reader.next()) |_| {}
 
     try reader.reset(.{ .slice = "<complete/>" }, .{}, .retain_capacity);

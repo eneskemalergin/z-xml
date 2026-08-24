@@ -1156,7 +1156,8 @@ pub const NormalEndElement = struct {
     name: NormalName,
 };
 
-/// Text fragment payload.
+/// One fragment of a run of adjacent XML text.
+/// `final_fragment` ends the run and may be true on an empty fragment.
 pub const NormalText = struct {
     bytes: []const u8,
     origin: TextOrigin,
@@ -10284,6 +10285,10 @@ pub const NormalReader = struct {
     event_namespace_declarations: std.ArrayList(NormalNamespaceDeclaration) = .empty,
     effective_version: XmlVersion = .xml10,
     external_content_skipped: bool = false,
+    pending_event: ?NormalEvent = null,
+    text_run_source_id: ?u32 = null,
+    text_run_end: u64 = 0,
+    text_run_origin: TextOrigin = .character_data,
 
     /// Initializes the normal reader without reading or allocating.
     pub fn init(
@@ -10401,6 +10406,10 @@ pub const NormalReader = struct {
         self.first_diagnostic = null;
         self.effective_version = .xml10;
         self.external_content_skipped = false;
+        self.pending_event = null;
+        self.text_run_source_id = null;
+        self.text_run_end = 0;
+        self.text_run_origin = .character_data;
     }
 
     /// Produces the next stable event or returns null after the document ends.
@@ -10412,6 +10421,13 @@ pub const NormalReader = struct {
 
         self.in_call = true;
         defer self.in_call = false;
+
+        // A queued start event still borrows the facade arrays filled during conversion.
+        if (self.pending_event) |event| {
+            self.pending_event = null;
+            if (event.span.source_id == 0) self.commitRootStreamBytes(event.span.end);
+            return event;
+        }
 
         self.event_attributes.clearRetainingCapacity();
         self.event_namespace_declarations.clearRetainingCapacity();
@@ -10501,7 +10517,7 @@ pub const NormalReader = struct {
                     return null;
                 },
                 .event => |event| {
-                    const converted = self.convertEvent(config, parser, event) catch |failure| {
+                    const converted = self.convertEvent(config, event) catch |failure| {
                         if (self.failure == null) self.recordGeneratedFailure(
                             failure,
                             .out_of_memory,
@@ -10510,8 +10526,11 @@ pub const NormalReader = struct {
                         return failure;
                     };
                     if (converted) |value| {
-                        if (value.span.source_id == 0) self.commitRootStreamBytes(value.span.end);
-                        return value;
+                        const result = self.finishTextRunBefore(value);
+                        if (result.span.source_id == 0) {
+                            self.commitRootStreamBytes(result.span.end);
+                        }
+                        return result;
                     }
                 },
             }
@@ -10572,7 +10591,6 @@ pub const NormalReader = struct {
     fn convertEvent(
         self: *Self,
         comptime config: Config,
-        parser: *Reader(config),
         event: Event(config),
     ) NormalReadError!?NormalEvent {
         const span = normalSpan(config, event.span);
@@ -10620,7 +10638,7 @@ pub const NormalReader = struct {
                 .data = .{ .text = .{
                     .bytes = value.bytes,
                     .origin = value.origin,
-                    .final_fragment = AdapterAccess(config).fragmentComplete(parser),
+                    .final_fragment = false,
                 } },
             },
             .comment => |value| .{
@@ -10664,6 +10682,34 @@ pub const NormalReader = struct {
                 .data = .{ .document_end = self.normalDocumentEnd(config, value) },
             },
         };
+    }
+
+    fn finishTextRunBefore(self: *Self, event: NormalEvent) NormalEvent {
+        switch (event.data) {
+            .text => |text| {
+                self.text_run_source_id = event.span.source_id;
+                self.text_run_end = event.span.end;
+                self.text_run_origin = text.origin;
+                return event;
+            },
+            else => {
+                const source_id = self.text_run_source_id orelse return event;
+                const end = if (source_id == event.span.source_id)
+                    event.span.start
+                else
+                    self.text_run_end;
+                self.pending_event = event;
+                self.text_run_source_id = null;
+                return .{
+                    .span = .{ .source_id = source_id, .start = end, .end = end },
+                    .data = .{ .text = .{
+                        .bytes = "",
+                        .origin = self.text_run_origin,
+                        .final_fragment = true,
+                    } },
+                };
+            },
+        }
     }
 
     fn copyAttributes(
@@ -11087,10 +11133,6 @@ pub fn AdapterAccess(comptime config: Config) type {
     return struct {
         pub fn recordReadFailure(reader: *Reader(config)) ReadError {
             return reader.fail(.read_failed, .read_failed);
-        }
-
-        pub fn fragmentComplete(reader: *const Reader(config)) bool {
-            return reader.fragment_complete;
         }
 
         pub fn currentLocation(reader: *const Reader(config)) Location(config) {
