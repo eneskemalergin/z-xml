@@ -14,6 +14,8 @@ pub const Profile = enum {
     xml10_utf8_ns_no_dtd,
     xml10_no_dtd,
     xml10_ns_no_dtd,
+    xml11_no_dtd,
+    xml11_ns_no_dtd,
     xml10_nonvalidating,
     xml10_ns_nonvalidating,
     xml10_dtd_validating,
@@ -28,6 +30,7 @@ pub const Profile = enum {
         return switch (self) {
             .xml10_utf8_ns_no_dtd,
             .xml10_ns_no_dtd,
+            .xml11_ns_no_dtd,
             .xml10_ns_nonvalidating,
             .xml10_ns_dtd_validating,
             .xml11_ns_nonvalidating,
@@ -44,6 +47,8 @@ pub const Profile = enum {
             .xml10_utf8_ns_no_dtd,
             .xml10_no_dtd,
             .xml10_ns_no_dtd,
+            .xml11_no_dtd,
+            .xml11_ns_no_dtd,
             => .rejected,
             .xml10_nonvalidating,
             .xml10_ns_nonvalidating,
@@ -61,6 +66,8 @@ pub const Profile = enum {
     /// Returns whether the profile includes XML 1.1 behavior.
     pub fn isXml11(comptime self: Profile) bool {
         return switch (self) {
+            .xml11_no_dtd,
+            .xml11_ns_no_dtd,
             .xml11_nonvalidating,
             .xml11_ns_nonvalidating,
             .xml11_dtd_validating,
@@ -342,11 +349,44 @@ pub const NormalLimits = struct {
     max_qname_bytes: usize = 64 * 1024,
     /// Maximum weighted namespace comparison work per start element.
     max_namespace_comparison_work: usize = 1024 * 1024,
+    /// Maximum decoded bytes in one document type declaration.
+    max_dtd_bytes: usize = 1024 * 1024,
+    /// Maximum markup declarations processed from DTD subsets and parameter entities.
+    max_dtd_declarations: usize = 4096,
+    /// Maximum cumulative decoded bytes in DTD markup declarations.
+    max_dtd_declaration_bytes: usize = 1024 * 1024,
+    /// Maximum retained DTD element declarations.
+    max_dtd_element_declarations: usize = 1024,
+    /// Maximum retained DTD attribute declarations.
+    max_dtd_attribute_declarations: usize = 4096,
+    /// Maximum retained general and parameter entity declarations.
+    max_dtd_entity_declarations: usize = 1024,
+    /// Maximum retained DTD notation declarations.
+    max_dtd_notation_declarations: usize = 1024,
+    /// Maximum nested DTD content-model group depth.
+    max_dtd_group_depth: usize = 256,
+    /// Maximum cumulative DTD content-model and attribute-type grammar nodes.
+    max_dtd_grammar_nodes: usize = 64 * 1024,
+    /// Maximum cumulative normalized DTD replacement and default bytes.
+    max_dtd_entity_replacement_bytes: usize = 1024 * 1024,
+    /// Maximum active parameter or general entity depth.
+    max_dtd_entity_depth: usize = 64,
+    /// Maximum cumulative parameter and general entity reference count.
+    max_dtd_entity_references: usize = 1024 * 1024,
+    /// Maximum cumulative bytes included from entity replacement text.
+    max_dtd_expanded_bytes: usize = 8 * 1024 * 1024,
+    /// Maximum expanded bytes per entity-reference source byte after the minimum threshold.
+    max_dtd_expansion_ratio: usize = 100,
+    /// Expanded-byte count at or below which ratio enforcement remains disabled.
+    dtd_expansion_ratio_minimum_bytes: usize = 4096,
+    /// Maximum cumulative weighted DTD name-comparison work.
+    max_dtd_comparison_work: usize = 8 * 1024 * 1024,
     /// Maximum owned capacity retained across a retain reset.
     max_retained_bytes: usize = 1024 * 1024,
 
     fn validate(self: NormalLimits) bool {
         return normalParserLimits(self).validate() and
+            normalDtdLimits(self).validate() and
             self.max_namespace_declarations_per_element > 0 and
             self.max_active_namespace_bindings > 0 and
             self.max_namespace_binding_bytes > 0 and
@@ -1459,7 +1499,6 @@ fn DtdState(comptime config: Config) type {
         struct {}
     else
         struct {
-            reject_doctype: bool = false,
             declarations: dtd_module.State = .{},
             entity_sources: std.ArrayList(EntitySourceFrame(config)) = .empty,
             attribute_sources: std.ArrayList(AttributeEntityFrame) = .empty,
@@ -1640,8 +1679,16 @@ fn isUnsupportedFourByteSignature(bytes: [4]u8) bool {
         std.mem.eql(u8, &bytes, "\x00\x3c\x00\x00");
 }
 
+fn hasTranscoderState(comptime config: Config) bool {
+    if (config.external_sources) return true;
+    return switch (config.profile) {
+        .xml11_no_dtd, .xml11_ns_no_dtd => true,
+        else => false,
+    };
+}
+
 fn ExternalDecoderState(comptime config: Config) type {
-    return if (!config.external_sources)
+    return if (!hasTranscoderState(config))
         struct {}
     else
         struct {
@@ -2000,7 +2047,7 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn feedTranscodedRoot(self: *Self, input: []const u8, final: bool) ReadError!void {
-            if (comptime config.profile.isUtf8Only() or !config.external_sources) unreachable;
+            if (comptime config.profile.isUtf8Only() or !hasTranscoderState(config)) unreachable;
             if (self.lifecycle != .ready and self.lifecycle != .needs_input) {
                 return error.InvalidState;
             }
@@ -3101,13 +3148,6 @@ pub fn Reader(comptime config: Config) type {
                                     self.token_start,
                                 );
                             } else {
-                                if (self.dtd_state.reject_doctype) {
-                                    return self.failAt(
-                                        .dtd_forbidden,
-                                        .unsupported_feature,
-                                        self.token_start,
-                                    );
-                                }
                                 if (self.dtd_state.seen_doctype) {
                                     return self.failAt(.malformed_doctype, .invalid_dtd, self.token_start);
                                 }
@@ -3383,8 +3423,10 @@ pub fn Reader(comptime config: Config) type {
             if (comptime config.profile.isUtf8Only()) return 0;
             var total = self.source_state.decoded.capacity +|
                 self.source_state.source_advances.capacity;
-            if (comptime config.external_sources) {
+            if (comptime hasTranscoderState(config)) {
                 total +|= self.source_state.external.raw.capacity;
+            }
+            if (comptime config.external_sources) {
                 for (self.dtd_state.entity_sources.items) |frame| {
                     if (!frame.external) continue;
                     total +|= frame.source_state.decoded.capacity +|
@@ -3511,7 +3553,7 @@ pub fn Reader(comptime config: Config) type {
             if (comptime config.profile.isXml11()) {
                 self.source_state.normalization.reset();
             }
-            if (comptime config.external_sources) {
+            if (comptime hasTranscoderState(config)) {
                 self.source_state.external.raw.clearRetainingCapacity();
                 self.source_state.external.transcoder = null;
                 self.source_state.external.needs_input = false;
@@ -3589,7 +3631,7 @@ pub fn Reader(comptime config: Config) type {
             if (comptime config.profile.isUtf8Only()) return;
             source.decoded.deinit(self.allocator);
             source.source_advances.deinit(self.allocator);
-            if (comptime config.external_sources) {
+            if (comptime hasTranscoderState(config)) {
                 source.external.raw.deinit(self.allocator);
             }
             source.* = .{};
@@ -6635,7 +6677,7 @@ pub fn Reader(comptime config: Config) type {
                 self.options.dtd_limits.max_active_entity_depth)
             {
                 source.close();
-                return self.failAt(.entity_expansion_limit, .limit_exceeded, self.reference_start);
+                return self.failAt(.entity_depth_limit, .limit_exceeded, self.reference_start);
             }
             self.chargeEntity(self.dtd_state.reference_name.items.len +| 2, 0) catch |err| {
                 source.close();
@@ -6700,7 +6742,7 @@ pub fn Reader(comptime config: Config) type {
             if (self.dtd_state.entity_sources.items.len ==
                 self.options.dtd_limits.max_active_entity_depth)
             {
-                return self.failAt(.entity_expansion_limit, .limit_exceeded, self.reference_start);
+                return self.failAt(.entity_depth_limit, .limit_exceeded, self.reference_start);
             }
             try self.chargeEntity(self.dtd_state.reference_name.items.len +| 2, value.len);
             self.dtd_state.entity_sources.append(self.allocator, .{
@@ -6781,7 +6823,7 @@ pub fn Reader(comptime config: Config) type {
                 if (self.dtd_state.attribute_sources.items.len ==
                     self.options.dtd_limits.max_active_entity_depth)
                 {
-                    return self.failAt(.entity_expansion_limit, .limit_exceeded, self.reference_start);
+                    return self.failAt(.entity_depth_limit, .limit_exceeded, self.reference_start);
                 }
                 const entity = declarations.entities.items[nested];
                 if (entity.unparsed) return self.failAt(.malformed_reference, .invalid_xml, self.reference_start);
@@ -8555,7 +8597,7 @@ pub fn Reader(comptime config: Config) type {
                 if (self.input.len != 0) return;
                 if ((source.encoding == .utf8 and source.decoded.items.len != 0) or
                     source.failure != null or
-                    (comptime config.external_sources) and source.external.needs_input or
+                    (comptime hasTranscoderState(config)) and source.external.needs_input or
                     source.raw_cursor == source.raw_input.len or
                     target_capacity - source.decoded.items.len < 4)
                 {
@@ -8929,7 +8971,7 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn decodeExternalOtherRun(self: *Self) ReadError!void {
-            if (comptime !config.external_sources) {
+            if (comptime !hasTranscoderState(config)) {
                 return self.failAt(.unsupported_encoding, .unsupported_feature, self.currentLocation());
             }
             const source = &self.source_state;
@@ -9035,7 +9077,7 @@ pub fn Reader(comptime config: Config) type {
         }
 
         fn normalizeTranscodedXml11Lines(self: *Self, start: usize) ReadError!void {
-            if (comptime !config.profile.isXml11() or !config.external_sources) unreachable;
+            if (comptime !config.profile.isXml11() or !hasTranscoderState(config)) unreachable;
             const source = &self.source_state;
             std.debug.assert(start <= source.decoded.items.len);
             std.debug.assert(source.decoded.items.len == source.source_advances.items.len);
@@ -10281,10 +10323,20 @@ const normal_raw_config: Config = .{
     .external_sources = true,
 };
 
+const normal_raw_no_dtd_config: Config = .{
+    .profile = .xml11_no_dtd,
+    .event_locations = true,
+};
+
 const normal_namespace_config: Config = .{
     .profile = .xml11_ns_nonvalidating,
     .event_locations = true,
     .external_sources = true,
+};
+
+const normal_namespace_no_dtd_config: Config = .{
+    .profile = .xml11_ns_no_dtd,
+    .event_locations = true,
 };
 
 const normal_raw_validating_config: Config = .{
@@ -10300,6 +10352,8 @@ const normal_namespace_validating_config: Config = .{
 };
 
 const NormalEngine = union(enum) {
+    raw_no_dtd: Reader(normal_raw_no_dtd_config),
+    namespaces_no_dtd: Reader(normal_namespace_no_dtd_config),
     raw: Reader(normal_raw_config),
     namespaces: Reader(normal_namespace_config),
     raw_validating: Reader(normal_raw_validating_config),
@@ -10393,6 +10447,18 @@ pub const NormalReader = struct {
         const selected = normalEngineKind(options);
         if (std.meta.activeTag(self.engine) == selected) {
             switch (self.engine) {
+                .raw_no_dtd => |*parser| resetNormalParser(
+                    normal_raw_no_dtd_config,
+                    parser,
+                    options,
+                    engine_mode,
+                ),
+                .namespaces_no_dtd => |*parser| resetNormalParser(
+                    normal_namespace_no_dtd_config,
+                    parser,
+                    options,
+                    engine_mode,
+                ),
                 .raw => |*parser| resetNormalParser(
                     normal_raw_config,
                     parser,
@@ -10482,6 +10548,11 @@ pub const NormalReader = struct {
         self.event_namespace_declarations.clearRetainingCapacity();
 
         return switch (self.engine) {
+            .raw_no_dtd => |*parser| self.nextFrom(normal_raw_no_dtd_config, parser),
+            .namespaces_no_dtd => |*parser| self.nextFrom(
+                normal_namespace_no_dtd_config,
+                parser,
+            ),
             .raw => |*parser| self.nextFrom(normal_raw_config, parser),
             .namespaces => |*parser| self.nextFrom(normal_namespace_config, parser),
             .raw_validating => |*parser| self.nextFrom(normal_raw_validating_config, parser),
@@ -10645,6 +10716,76 @@ pub const NormalReader = struct {
     ) NormalReadError!?NormalEvent {
         const span = normalSpan(config, event.span);
         const payload = event.payload;
+        if (comptime config.profile.dtdMode() == .rejected) {
+            return self.convertCommonEvent(config, span, payload);
+        }
+        return switch (payload) {
+            .document_type => |document_type| .{
+                .span = span,
+                .data = .{ .document_type = .{
+                    .root_name = document_type.root_name,
+                    .public_id = document_type.public_id,
+                    .system_id = document_type.system_id,
+                } },
+            },
+            .notation_declaration, .unparsed_entity_declaration => null,
+            .skipped_entity => |value| result: {
+                if (self.options.external == .forbid) {
+                    self.recordGeneratedFailure(
+                        error.ExternalResourceForbidden,
+                        .external_resource_forbidden,
+                        normalLocation(self.options.track_lines, event.span.start),
+                    );
+                    return error.ExternalResourceForbidden;
+                }
+                self.external_content_skipped = true;
+                break :result .{ .span = span, .data = .{ .skipped_external_source = .{
+                    .kind = switch (value.kind) {
+                        .external_subset => .external_subset,
+                        .parameter_entity => .parameter_entity,
+                        .general_entity => .general_entity,
+                    },
+                    .name = value.name,
+                    .public_id = value.public_id,
+                    .system_id = value.system_id,
+                } } };
+            },
+            .document_start => |value| self.convertCommonEvent(
+                config,
+                span,
+                .{ .document_start = value },
+            ),
+            .start_element => |value| self.convertCommonEvent(
+                config,
+                span,
+                .{ .start_element = value },
+            ),
+            .end_element => |value| self.convertCommonEvent(
+                config,
+                span,
+                .{ .end_element = value },
+            ),
+            .text => |value| self.convertCommonEvent(config, span, .{ .text = value }),
+            .comment => |value| self.convertCommonEvent(config, span, .{ .comment = value }),
+            .processing_instruction => |value| self.convertCommonEvent(
+                config,
+                span,
+                .{ .processing_instruction = value },
+            ),
+            .document_end => |value| self.convertCommonEvent(
+                config,
+                span,
+                .{ .document_end = value },
+            ),
+        };
+    }
+
+    fn convertCommonEvent(
+        self: *Self,
+        comptime config: Config,
+        span: NormalSourceSpan,
+        payload: NoDtdEventPayload(config),
+    ) NormalReadError!?NormalEvent {
         return switch (payload) {
             .document_start => |document| result: {
                 self.effective_version = document.effective_version;
@@ -10661,12 +10802,6 @@ pub const NormalReader = struct {
                     } else null,
                 } } };
             },
-            .document_type => |document_type| .{ .span = span, .data = .{ .document_type = .{
-                .root_name = document_type.root_name,
-                .public_id = document_type.public_id,
-                .system_id = document_type.system_id,
-            } } },
-            .notation_declaration, .unparsed_entity_declaration => null,
             .start_element => |element| result: {
                 try self.copyAttributes(config, element.attributes);
                 if (comptime config.profile.hasNamespaces()) {
@@ -10705,27 +10840,6 @@ pub const NormalReader = struct {
                     .data = value.data,
                     .final_fragment = value.complete,
                 } },
-            },
-            .skipped_entity => |value| result: {
-                if (self.options.external == .forbid) {
-                    self.recordGeneratedFailure(
-                        error.ExternalResourceForbidden,
-                        .external_resource_forbidden,
-                        normalLocation(self.options.track_lines, event.span.start),
-                    );
-                    return error.ExternalResourceForbidden;
-                }
-                self.external_content_skipped = true;
-                break :result .{ .span = span, .data = .{ .skipped_external_source = .{
-                    .kind = switch (value.kind) {
-                        .external_subset => .external_subset,
-                        .parameter_entity => .parameter_entity,
-                        .general_entity => .general_entity,
-                    },
-                    .name = value.name,
-                    .public_id = value.public_id,
-                    .system_id = value.system_id,
-                } } };
             },
             .document_end => |value| .{
                 .span = span,
@@ -10865,24 +10979,26 @@ pub const NormalReader = struct {
         if (mapped == error.InvalidState) return mapped;
         if (internal_diagnostic) |value| {
             self.diagnostic_inclusions.clearRetainingCapacity();
-            self.diagnostic_inclusions.ensureTotalCapacity(
-                self.allocator,
-                value.inclusion_trace.len,
-            ) catch {
-                self.recordGeneratedFailure(
-                    error.OutOfMemory,
-                    .out_of_memory,
-                    normalLocation(
-                        self.options.track_lines,
-                        AdapterAccess(config).currentLocation(parser),
-                    ),
-                );
-                return error.OutOfMemory;
-            };
-            for (value.inclusion_trace) |source| {
-                self.diagnostic_inclusions.appendAssumeCapacity(
-                    normalLocation(self.options.track_lines, source),
-                );
+            if (comptime config.external_sources) {
+                self.diagnostic_inclusions.ensureTotalCapacity(
+                    self.allocator,
+                    value.inclusion_trace.len,
+                ) catch {
+                    self.recordGeneratedFailure(
+                        error.OutOfMemory,
+                        .out_of_memory,
+                        normalLocation(
+                            self.options.track_lines,
+                            AdapterAccess(config).currentLocation(parser),
+                        ),
+                    );
+                    return error.OutOfMemory;
+                };
+                for (value.inclusion_trace) |source| {
+                    self.diagnostic_inclusions.appendAssumeCapacity(
+                        normalLocation(self.options.track_lines, source),
+                    );
+                }
             }
             self.failure = mapped;
             self.first_diagnostic = .{
@@ -10967,6 +11083,20 @@ fn initNormalEngine(
     allocator: std.mem.Allocator,
     options: NormalReaderOptions,
 ) NormalInitError!NormalEngine {
+    if (options.dtd == .reject) {
+        if (options.namespaces == .process) {
+            return .{ .namespaces_no_dtd = try initNormalParser(
+                normal_namespace_no_dtd_config,
+                allocator,
+                options,
+            ) };
+        }
+        return .{ .raw_no_dtd = try initNormalParser(
+            normal_raw_no_dtd_config,
+            allocator,
+            options,
+        ) };
+    }
     const validating = options.dtd == .validate;
     if (validating) {
         if (options.namespaces == .process) {
@@ -10997,6 +11127,9 @@ fn initNormalEngine(
 }
 
 fn normalEngineKind(options: NormalReaderOptions) std.meta.Tag(NormalEngine) {
+    if (options.dtd == .reject) {
+        return if (options.namespaces == .process) .namespaces_no_dtd else .raw_no_dtd;
+    }
     if (options.dtd == .validate) {
         return if (options.namespaces == .process)
             .namespaces_validating
@@ -11049,7 +11182,6 @@ fn configureNormalParser(
     parser: *Reader(config),
     options: NormalReaderOptions,
 ) void {
-    parser.dtd_state.reject_doctype = options.dtd == .reject;
     if (options.transcoder) |transcoder| {
         parser.source_state.encoding = .other;
         parser.source_state.external.transcoder = transcoder;
@@ -11072,9 +11204,14 @@ fn normalEngineOptions(
             .max_comparison_work = options.limits.max_namespace_comparison_work,
         };
     }
-    result.resolver.policy = if (options.external == .resolve) .resolve else .skip;
-    result.resolver.resolver = options.resolver;
-    result.resolver.document_base_id = options.document_base_id;
+    if (comptime config.profile.dtdMode() != .rejected) {
+        result.dtd_limits = normalDtdLimits(options.limits);
+    }
+    if (comptime config.external_sources) {
+        result.resolver.policy = if (options.external == .resolve) .resolve else .skip;
+        result.resolver.resolver = options.resolver;
+        result.resolver.document_base_id = options.document_base_id;
+    }
     result.normalization = switch (options.normalization) {
         .report => .report,
         .require => .require,
@@ -11102,6 +11239,27 @@ fn normalParserLimits(limits: NormalLimits) Limits {
         .max_fragment_bytes = limits.max_fragment_bytes,
         .max_processing_instruction_target_bytes = limits.max_processing_instruction_target_bytes,
         .max_retained_bytes = limits.max_retained_bytes,
+    };
+}
+
+fn normalDtdLimits(limits: NormalLimits) dtd_module.Limits {
+    return .{
+        .max_dtd_bytes = limits.max_dtd_bytes,
+        .max_declarations = limits.max_dtd_declarations,
+        .max_declaration_bytes = limits.max_dtd_declaration_bytes,
+        .max_element_declarations = limits.max_dtd_element_declarations,
+        .max_attribute_declarations = limits.max_dtd_attribute_declarations,
+        .max_entity_declarations = limits.max_dtd_entity_declarations,
+        .max_notation_declarations = limits.max_dtd_notation_declarations,
+        .max_group_depth = limits.max_dtd_group_depth,
+        .max_grammar_nodes = limits.max_dtd_grammar_nodes,
+        .max_entity_replacement_bytes = limits.max_dtd_entity_replacement_bytes,
+        .max_active_entity_depth = limits.max_dtd_entity_depth,
+        .max_entity_references = limits.max_dtd_entity_references,
+        .max_expanded_bytes = limits.max_dtd_expanded_bytes,
+        .max_expansion_ratio = limits.max_dtd_expansion_ratio,
+        .expansion_ratio_minimum_bytes = limits.dtd_expansion_ratio_minimum_bytes,
+        .max_comparison_work = limits.max_dtd_comparison_work,
     };
 }
 
@@ -11456,6 +11614,52 @@ fn isUtf8FourByteLeader(byte: u8) bool {
 }
 
 // --- Tests ---
+
+test "[unit] - [normal Reader DTD policy]: rejection selects no-DTD engines" {
+    var namespace_rejecting = try NormalReader.init(
+        std.testing.allocator,
+        .{ .slice = "<root/>" },
+        .{ .dtd = .reject },
+    );
+    defer namespace_rejecting.deinit();
+    try std.testing.expectEqual(
+        std.meta.Tag(NormalEngine).namespaces_no_dtd,
+        std.meta.activeTag(namespace_rejecting.engine),
+    );
+
+    var raw_rejecting = try NormalReader.init(
+        std.testing.allocator,
+        .{ .slice = "<root/>" },
+        .{ .namespaces = .raw, .dtd = .reject },
+    );
+    defer raw_rejecting.deinit();
+    try std.testing.expectEqual(
+        std.meta.Tag(NormalEngine).raw_no_dtd,
+        std.meta.activeTag(raw_rejecting.engine),
+    );
+
+    var namespace_processing = try NormalReader.init(
+        std.testing.allocator,
+        .{ .slice = "<root/>" },
+        .{},
+    );
+    defer namespace_processing.deinit();
+    try std.testing.expectEqual(
+        std.meta.Tag(NormalEngine).namespaces,
+        std.meta.activeTag(namespace_processing.engine),
+    );
+
+    var raw_processing = try NormalReader.init(
+        std.testing.allocator,
+        .{ .slice = "<root/>" },
+        .{ .namespaces = .raw },
+    );
+    defer raw_processing.deinit();
+    try std.testing.expectEqual(
+        std.meta.Tag(NormalEngine).raw,
+        std.meta.activeTag(raw_processing.engine),
+    );
+}
 
 test "[unit] - [content SIMD]: forbidden-control scan matches scalar boundaries" {
     const vector_len = std.simd.suggestVectorLength(u8) orelse 16;

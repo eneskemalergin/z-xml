@@ -3476,6 +3476,285 @@ test "[integration] - [Reader]: DTD rejection is sticky and reports once" {
     try std.testing.expectEqual(xml.DiagnosticCode.dtd_forbidden, reader.diagnostic().?.code);
 }
 
+test "[integration] - [Reader DTD rejection]: keeps XML 1.1 and root transcoding" {
+    const logical = "<?xml version='1.1'?><root/>";
+    var encoded: [logical.len * 2]u8 = undefined;
+    pairEncode(&encoded, logical);
+
+    var expected = try summarizeNormalReader(logical);
+    defer expected.deinit();
+    try expectNormalEncodingSchedulesWithOptions(
+        &encoded,
+        .{ .dtd = .reject, .transcoder = pairTranscoder() },
+        expected.events,
+        .other,
+        null,
+    );
+
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = &encoded },
+        .{ .dtd = .reject, .transcoder = pairTranscoder() },
+    );
+    defer reader.deinit();
+
+    var version: ?xml.XmlVersion = null;
+    while (try reader.next()) |event| switch (event.data) {
+        .document_start => |start| version = start.effective_version,
+        else => {},
+    };
+    try std.testing.expectEqual(xml.XmlVersion.xml11, version.?);
+    try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().dtd_capacity);
+}
+
+test "[integration] - [Reader DTD processing]: applies declarations without validity" {
+    const input =
+        "<?xml version='1.0' standalone='yes'?>" ++
+        "<!DOCTYPE root [" ++
+        "<!ELEMENT root (#PCDATA)>" ++
+        "<!ATTLIST root explicit CDATA #IMPLIED mode NMTOKENS ' one  two '>" ++
+        "<!ENTITY text 'entity'>" ++
+        "<!NOTATION media SYSTEM 'media/type'>" ++
+        "<!ENTITY image SYSTEM 'image.bin' NDATA media>" ++
+        "]><root explicit='source'>&text;</root>";
+    var reader = try xml.Reader.init(std.testing.allocator, .{ .slice = input }, .{});
+    defer reader.deinit();
+
+    var event_count: usize = 0;
+    var saw_document_type = false;
+    var saw_start = false;
+    var text: [6]u8 = undefined;
+    var text_len: usize = 0;
+    var document_end: ?xml.DocumentEnd = null;
+    while (try reader.next()) |event| {
+        event_count += 1;
+        switch (event.data) {
+            .document_start => |start| {
+                try std.testing.expectEqual(@as(?bool, true), start.declaration.?.standalone);
+            },
+            .document_type => |document_type| {
+                saw_document_type = true;
+                try std.testing.expectEqualStrings("root", document_type.root_name);
+                try std.testing.expect(document_type.public_id == null);
+                try std.testing.expect(document_type.system_id == null);
+            },
+            .start_element => |start| {
+                saw_start = true;
+                try std.testing.expectEqual(@as(usize, 2), start.attributes.len);
+                const explicit = start.attributeRaw("explicit").?;
+                try std.testing.expectEqualStrings("source", explicit.value);
+                try std.testing.expect(explicit.specified);
+                try std.testing.expectEqual(xml.dtd.AttributeType.cdata, explicit.declared_type.?);
+                const mode = start.attributeRaw("mode").?;
+                try std.testing.expectEqualStrings("one two", mode.value);
+                try std.testing.expect(!mode.specified);
+                try std.testing.expectEqual(xml.dtd.AttributeType.nmtokens, mode.declared_type.?);
+            },
+            .text => |value| {
+                if (text_len + value.bytes.len > text.len) return error.UnexpectedText;
+                @memcpy(text[text_len..][0..value.bytes.len], value.bytes);
+                text_len += value.bytes.len;
+            },
+            .document_end => |result| document_end = result,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_document_type);
+    try std.testing.expect(saw_start);
+    try std.testing.expectEqualStrings("entity", text[0..text_len]);
+    try std.testing.expectEqual(xml.DocumentContent.complete, document_end.?.content);
+    try std.testing.expectEqual(xml.DtdValidity.not_requested, document_end.?.dtd_validity);
+    try std.testing.expectEqual(@as(usize, 7), event_count);
+    try std.testing.expect(reader.memoryUsage().dtd_capacity > 0);
+}
+
+test "[integration] - [Reader DTD processing]: standalone ignores external declarations" {
+    const resources = [_]TestExternalResource{
+        .{
+            .system_id = "schema.dtd",
+            .bytes = "<!ELEMENT root (#PCDATA)><!ENTITY message 'external'>",
+            .source_id = 72,
+        },
+    };
+    var resolver = TestResolver{ .resources = &resources };
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{
+            .slice = "<?xml version='1.0' standalone='yes'?>" ++
+                "<!DOCTYPE root SYSTEM 'schema.dtd'><root>&message;</root>",
+        },
+        .{ .external = .resolve, .resolver = resolver.resolver() },
+    );
+    defer reader.deinit();
+
+    while (true) {
+        const event = reader.next() catch |failure| {
+            try std.testing.expectEqual(error.InvalidXml, failure);
+            break;
+        };
+        if (event == null) return error.ExpectedFailure;
+    }
+    try std.testing.expectEqual(xml.DiagnosticCode.undeclared_entity, reader.diagnostic().?.code);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+fn expectNormalDtdLimit(
+    options: xml.ReaderOptions,
+    at_input: []const u8,
+    over_input: []const u8,
+    code: xml.DiagnosticCode,
+) !void {
+    var at_reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = at_input },
+        options,
+    );
+    defer at_reader.deinit();
+    while (try at_reader.next()) |_| {}
+
+    var over_reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = over_input },
+        options,
+    );
+    defer over_reader.deinit();
+    while (true) {
+        const event = over_reader.next() catch |failure| {
+            try std.testing.expectEqual(error.LimitExceeded, failure);
+            break;
+        };
+        if (event == null) return error.ExpectedLimitFailure;
+    }
+    try std.testing.expectEqual(code, over_reader.diagnostic().?.code);
+}
+
+fn expectNormalDtdLimitBoundary(
+    comptime field_name: []const u8,
+    limit: usize,
+    at_input: []const u8,
+    over_input: []const u8,
+    code: xml.DiagnosticCode,
+) !void {
+    var options: xml.ReaderOptions = .{};
+    @field(options.limits, field_name) = limit;
+    try expectNormalDtdLimit(options, at_input, over_input, code);
+}
+
+test "[edge] - [Reader DTD limits]: each boundary accepts at limit and rejects one over" {
+    const element = "<!ELEMENT r EMPTY>";
+    const expanded_element = "<!ELEMENT rr EMPTY>";
+    const parameter_declaration = "<!ELEMENT r EMPTY>";
+
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_bytes",
+        " r>".len,
+        "<!DOCTYPE r><r/>",
+        "<!DOCTYPE rr><r/>",
+        .dtd_bytes_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_declarations",
+        1,
+        "<!DOCTYPE r [<!ELEMENT r EMPTY>]><r/>",
+        "<!DOCTYPE r [<!ELEMENT r EMPTY><!ELEMENT a EMPTY>]><r/>",
+        .dtd_declaration_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_declaration_bytes",
+        element.len,
+        "<!DOCTYPE r [" ++ element ++ "]><r/>",
+        "<!DOCTYPE r [" ++ expanded_element ++ "]><r/>",
+        .dtd_declaration_bytes_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_element_declarations",
+        1,
+        "<!DOCTYPE r [<!ELEMENT r EMPTY>]><r/>",
+        "<!DOCTYPE r [<!ELEMENT r EMPTY><!ELEMENT a EMPTY>]><r/>",
+        .dtd_element_declaration_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_attribute_declarations",
+        1,
+        "<!DOCTYPE r [<!ATTLIST r a CDATA #IMPLIED>]><r/>",
+        "<!DOCTYPE r [<!ATTLIST r a CDATA #IMPLIED b CDATA #IMPLIED>]><r/>",
+        .dtd_attribute_declaration_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_entity_declarations",
+        1,
+        "<!DOCTYPE r [<!ENTITY a 'a'>]><r/>",
+        "<!DOCTYPE r [<!ENTITY a 'a'><!ENTITY b 'b'>]><r/>",
+        .dtd_entity_declaration_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_notation_declarations",
+        1,
+        "<!DOCTYPE r [<!NOTATION a SYSTEM 'a'>]><r/>",
+        "<!DOCTYPE r [<!NOTATION a SYSTEM 'a'><!NOTATION b SYSTEM 'b'>]><r/>",
+        .dtd_notation_declaration_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_group_depth",
+        1,
+        "<!DOCTYPE r [<!ELEMENT r (a)>]><r/>",
+        "<!DOCTYPE r [<!ELEMENT r (a,(b))>]><r/>",
+        .dtd_grammar_depth_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_grammar_nodes",
+        1,
+        "<!DOCTYPE r [<!ELEMENT r (a)>]><r/>",
+        "<!DOCTYPE r [<!ELEMENT r (a,b)>]><r/>",
+        .dtd_grammar_node_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_entity_replacement_bytes",
+        1,
+        "<!DOCTYPE r [<!ENTITY a 'a'>]><r/>",
+        "<!DOCTYPE r [<!ENTITY a 'ab'>]><r/>",
+        .dtd_replacement_bytes_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_entity_depth",
+        2,
+        "<!DOCTYPE r [<!ENTITY a '&b;'><!ENTITY b 'x'>]><r>&a;</r>",
+        "<!DOCTYPE r [<!ENTITY a '&b;'><!ENTITY b '&c;'><!ENTITY c 'x'>]><r>&a;</r>",
+        .entity_depth_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_entity_references",
+        1,
+        "<!DOCTYPE r [<!ENTITY a 'x'>]><r>&a;</r>",
+        "<!DOCTYPE r [<!ENTITY a 'x'>]><r>&a;&a;</r>",
+        .entity_reference_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_expanded_bytes",
+        parameter_declaration.len,
+        "<!DOCTYPE r [<!ENTITY % a '&#60;!ELEMENT r EMPTY>'>%a;]><r/>",
+        "<!DOCTYPE r [<!ENTITY % a '&#60;!ELEMENT r EMPTY>'>%a;%a;]><r/>",
+        .entity_expansion_limit,
+    );
+
+    var ratio_options: xml.ReaderOptions = .{};
+    ratio_options.limits.max_dtd_expansion_ratio = 3;
+    ratio_options.limits.dtd_expansion_ratio_minimum_bytes = 0;
+    try expectNormalDtdLimit(
+        ratio_options,
+        "<!DOCTYPE r [<!ENTITY a '123456789'>]><r>&a;</r>",
+        "<!DOCTYPE r [<!ENTITY a '1234567890'>]><r>&a;</r>",
+        .entity_expansion_ratio_limit,
+    );
+    try expectNormalDtdLimitBoundary(
+        "max_dtd_comparison_work",
+        3,
+        "<!DOCTYPE r [<!ENTITY a 'x'>]><r>&a;</r>",
+        "<!DOCTYPE r [<!ENTITY a 'x'>]><r>&a;&a;</r>",
+        .dtd_comparison_work_limit,
+    );
+}
+
 const NormalFindingLog = struct {
     calls: usize = 0,
     code: ?xml.DiagnosticCode = null,
@@ -3806,6 +4085,21 @@ test "[unit] - [Reader]: initialization validates options without allocating" {
         "max_namespace_binding_bytes",
         "max_qname_bytes",
         "max_namespace_comparison_work",
+        "max_dtd_bytes",
+        "max_dtd_declarations",
+        "max_dtd_declaration_bytes",
+        "max_dtd_element_declarations",
+        "max_dtd_attribute_declarations",
+        "max_dtd_entity_declarations",
+        "max_dtd_notation_declarations",
+        "max_dtd_group_depth",
+        "max_dtd_grammar_nodes",
+        "max_dtd_entity_replacement_bytes",
+        "max_dtd_entity_depth",
+        "max_dtd_entity_references",
+        "max_dtd_expanded_bytes",
+        "max_dtd_expansion_ratio",
+        "max_dtd_comparison_work",
     }) |field_name| {
         var options: xml.ReaderOptions = .{};
         @field(options.limits, field_name) = 0;
