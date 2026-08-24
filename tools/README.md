@@ -41,7 +41,7 @@ Measurement:
 
 - `tools/python/run-zebrac-aa.py` runs the same command under two names to measure machine noise.
 - `tools/python/run-zebrac-matrix.py` measures parser and workload pairs that passed their required checks.
-- `tools/python/run-valgrind.py` checks selected passing cases for memory errors.
+- `tools/python/run-valgrind.py` checks selected correctness-passing generated or tracked fixture cases for memory errors. Tracked fixture cases keep companion external sources beside the selected XML file.
 
 `bench/` and `data/` are ignored. `bench/` contains local plans and small benchmark inputs. `data/` contains generated XML, downloaded test suites, and results. Benchmark results are local until the project has a stable way to reproduce and compare them.
 

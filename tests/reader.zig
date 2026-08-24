@@ -3784,6 +3784,22 @@ test "[unit] - [Reader]: initialization validates options without allocating" {
         ),
     );
 
+    var resolver = TestResolver{ .resources = &.{} };
+    inline for (.{
+        xml.ExternalPolicy.forbid,
+        xml.ExternalPolicy.skip,
+    }) |external| {
+        try std.testing.expectError(
+            error.InvalidOptions,
+            xml.Reader.init(
+                std.testing.allocator,
+                .{ .slice = "<root/>" },
+                .{ .external = external, .resolver = resolver.resolver() },
+            ),
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 0), resolver.resolves);
+
     inline for (.{
         "max_namespace_declarations_per_element",
         "max_active_namespace_bindings",
@@ -9485,6 +9501,7 @@ const TestResolver = struct {
     parameter_inclusion_offset: ?u64 = null,
     reader: ?*xml.Reader = null,
     close_reset_error: ?xml.ResetError = null,
+    resolve_result: ?xml.ResolverResult = null,
 
     fn resolver(self: *@This()) xml.Resolver {
         return .{ .context = self, .resolveFn = resolve };
@@ -9497,6 +9514,7 @@ const TestResolver = struct {
             self.parameter_inclusion_source_id = request.inclusion.source_id;
             self.parameter_inclusion_offset = request.inclusion.byte_offset;
         }
+        if (self.resolve_result) |result| return result;
         for (self.resources) |*resource| {
             if (!std.mem.eql(u8, resource.system_id, request.system_id)) continue;
             self.active = resource;
@@ -9538,6 +9556,80 @@ const TestResolver = struct {
         }
     }
 };
+
+test "[integration] - [Reader external sources]: success closes the source once" {
+    const document =
+        "<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]>" ++
+        "<root>&message;</root>";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "message.ent", .bytes = "external text", .source_id = 6 },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = document },
+        .{ .external = .resolve, .resolver = resolver.resolver() },
+    );
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(usize, 0), resolver.resolves);
+
+    var text: [32]u8 = undefined;
+    var text_len: usize = 0;
+    var source_id: ?u32 = null;
+    while (try reader.next()) |event| switch (event.data) {
+        .text => |value| if (value.bytes.len != 0) {
+            try std.testing.expect(event.span.source_id != 0);
+            if (source_id) |expected| {
+                try std.testing.expectEqual(expected, event.span.source_id);
+            } else {
+                source_id = event.span.source_id;
+            }
+            @memcpy(text[text_len..][0..value.bytes.len], value.bytes);
+            text_len += value.bytes.len;
+        },
+        else => {},
+    };
+    try std.testing.expectEqualStrings("external text", text[0..text_len]);
+    try std.testing.expectEqual(@as(usize, 1), resolver.resolves);
+    try std.testing.expect(resolver.reads > 0);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+    try std.testing.expect((try reader.next()) == null);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [Reader resolver]: callback failures keep exact public classes" {
+    const cases = .{
+        .{ @as(xml.ResolverResult, .not_found), error.ExternalResourceUnavailable, xml.DiagnosticCode.resolver_not_found },
+        .{ @as(xml.ResolverResult, .forbidden), error.ExternalResourceForbidden, xml.DiagnosticCode.resolver_forbidden },
+        .{ @as(xml.ResolverResult, .unsupported_scheme), error.ExternalResourceUnavailable, xml.DiagnosticCode.resolver_unsupported_scheme },
+        .{ @as(xml.ResolverResult, .resource_limit), error.LimitExceeded, xml.DiagnosticCode.resolver_resource_limit },
+        .{ @as(xml.ResolverResult, .cancelled), error.Cancelled, xml.DiagnosticCode.resolver_cancelled },
+        .{ @as(xml.ResolverResult, .io_failure), error.ExternalResourceFailed, xml.DiagnosticCode.resolver_io_failure },
+    };
+    inline for (cases) |case| {
+        var resolver = TestResolver{
+            .resources = &.{},
+            .resolve_result = case[0],
+        };
+        var reader = try xml.Reader.init(
+            std.testing.allocator,
+            .{ .slice = "<!DOCTYPE root SYSTEM 'external.dtd'><root/>" },
+            .{ .external = .resolve, .resolver = resolver.resolver() },
+        );
+        defer reader.deinit();
+
+        while (true) {
+            _ = reader.next() catch |failure| {
+                try std.testing.expectEqual(case[1], failure);
+                break;
+            };
+        }
+        try std.testing.expectEqual(case[2], reader.diagnostic().?.code);
+        try std.testing.expectEqual(@as(usize, 1), resolver.resolves);
+        try std.testing.expectEqual(@as(usize, 0), resolver.closes);
+        try std.testing.expectError(case[1], reader.next());
+    }
+}
 
 const TestSubsetProvider = struct {
     resources: []const TestExternalResource,
@@ -9592,6 +9684,15 @@ test "[integration] - [Reader lifecycle]: reset and deinit close active external
     };
     try std.testing.expect(saw_first_text);
     try std.testing.expectEqual(@as(usize, 0), resolver.closes);
+    try std.testing.expectError(
+        error.InvalidOptions,
+        reader.reset(
+            .{ .slice = "<replacement/>" },
+            .{ .external = .resolve },
+            .release_memory,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), resolver.closes);
     try reader.reset(.{ .slice = document }, options, .retain_capacity);
     try std.testing.expectEqual(@as(usize, 1), resolver.closes);
 
@@ -9611,7 +9712,7 @@ test "[integration] - [Reader lifecycle]: reset and deinit close active external
     try std.testing.expectEqual(error.InvalidState, resolver.close_reset_error.?);
 }
 
-test "[unit] - [Reader reset]: disabling external sources releases inclusion storage" {
+test "[integration] - [Reader reset]: disabling external sources releases inclusion storage" {
     const resources = [_]TestExternalResource{
         .{ .system_id = "broken.ent", .bytes = "<broken", .source_id = 7 },
     };
@@ -9633,6 +9734,7 @@ test "[unit] - [Reader reset]: disabling external sources releases inclusion sto
         };
         if (event == null) return error.ExpectedFailure;
     }
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
     try std.testing.expectEqual(@as(usize, 1), reader.diagnostic().?.inclusion_trace.len);
     try std.testing.expect(reader.memoryUsage().retained_capacity > 0);
 
@@ -10542,19 +10644,21 @@ test "[integration] - [external cleanup]: read failure closes once and stays dis
         .{ .system_id = "external.dtd", .bytes = "<!ELEMENT root EMPTY>", .source_id = 4 },
     };
     var resolver = TestResolver{ .resources = &resources, .fail_read_after = 1 };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
-    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "<!DOCTYPE root SYSTEM 'external.dtd'><root/>" },
+        .{ .external = .resolve, .resolver = resolver.resolver() },
+    );
     defer reader.deinit();
-    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
     while (true) {
         _ = reader.next() catch |err| {
-            try std.testing.expectEqual(error.ReadFailed, err);
+            try std.testing.expectEqual(error.ExternalResourceFailed, err);
             break;
         };
     }
+    try std.testing.expectEqual(xml.DiagnosticCode.resolver_io_failure, reader.diagnostic().?.code);
     try std.testing.expectEqual(@as(usize, 1), resolver.closes);
-    try std.testing.expectError(error.ReadFailed, reader.next());
+    try std.testing.expectError(error.ExternalResourceFailed, reader.next());
     try std.testing.expectEqual(@as(usize, 1), resolver.closes);
 }
 
@@ -10789,14 +10893,15 @@ test "[integration] - [external diagnostics]: nested resolver failure points to 
         .{ .system_id = "external.dtd", .bytes = external, .source_id = 103 },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
-    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "<!DOCTYPE root SYSTEM 'external.dtd'><root/>" },
+        .{ .external = .resolve, .resolver = resolver.resolver() },
+    );
     defer reader.deinit();
-    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
     while (true) {
         _ = reader.next() catch |err| {
-            try std.testing.expectEqual(error.ResolverFailed, err);
+            try std.testing.expectEqual(error.ExternalResourceUnavailable, err);
             const diagnostic = reader.diagnostic().?;
             try std.testing.expectEqual(xml.DiagnosticCode.resolver_not_found, diagnostic.code);
             try std.testing.expectEqual(@as(u32, 103), diagnostic.primary.source_id);
@@ -10915,11 +11020,17 @@ test "[integration] - [external cleanup]: cancellation and reset close active so
         .{ .system_id = "message.ent", .bytes = "long external text", .source_id = 6 },
     };
     var resolver = TestResolver{ .resources = &resources, .cancel_read_after = 0 };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
-    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    const document = "<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>";
+    const options: xml.ReaderOptions = .{
+        .external = .resolve,
+        .resolver = resolver.resolver(),
+    };
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = document },
+        options,
+    );
     defer reader.deinit();
-    try reader.feed("<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>", true);
     while (true) {
         _ = reader.next() catch |err| {
             try std.testing.expectEqual(error.Cancelled, err);
@@ -10929,41 +11040,15 @@ test "[integration] - [external cleanup]: cancellation and reset close active so
     }
     try std.testing.expectEqual(@as(usize, 1), resolver.closes);
 
-    try reader.reset(.retain_capacity);
     resolver.cancel_read_after = null;
     resolver.reads = 0;
-    try reader.feed("<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>", true);
-    parse: while (true) switch (try reader.next()) {
-        .event => |event| switch (event) {
-            .text => break :parse,
-            else => {},
-        },
-        .need_input => return error.UnexpectedNeedInput,
-        .done => return error.UnexpectedDone,
+    try reader.reset(.{ .slice = document }, options, .retain_capacity);
+    parse: while (try reader.next()) |event| switch (event.data) {
+        .text => break :parse,
+        else => {},
     };
-    try reader.reset(.retain_capacity);
+    try reader.reset(.{ .slice = "<root/>" }, .{ .dtd = .reject }, .retain_capacity);
     try std.testing.expectEqual(@as(usize, 2), resolver.closes);
-}
-
-test "[integration] - [external cleanup]: deinit closes an active source once" {
-    const resources = [_]TestExternalResource{
-        .{ .system_id = "message.ent", .bytes = "long external text", .source_id = 7 },
-    };
-    var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
-    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
-    try reader.feed("<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>", true);
-    parse: while (true) switch (try reader.next()) {
-        .event => |event| switch (event) {
-            .text => break :parse,
-            else => {},
-        },
-        .need_input => return error.UnexpectedNeedInput,
-        .done => return error.UnexpectedDone,
-    };
-    reader.deinit();
-    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
 }
 
 test "[integration] - [external memory]: large generated entity keeps reader storage flat" {
@@ -11034,24 +11119,38 @@ test "[integration] - [external memory]: large generated entity keeps reader sto
 
 fn externalAllocationAttempt(allocator: std.mem.Allocator) !void {
     const resources = [_]TestExternalResource{
-        .{ .system_id = "external.dtd", .bytes = "<!ENTITY message SYSTEM 'message.ent'>", .source_id = 51 },
-        .{ .system_id = "message.ent", .bytes = "external", .source_id = 52 },
+        .{ .system_id = "message.ent", .bytes = "<child id='7'/>", .source_id = 51 },
     };
     var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
-    options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(allocator, options);
-    defer reader.deinit();
-    try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root>&message;</root>", true);
-    while (true) switch (try reader.next()) {
-        .event => {},
-        .need_input => return error.UnexpectedNeedInput,
-        .done => break,
-    };
-    try std.testing.expectEqual(@as(usize, 2), resolver.closes);
+    var reader = try xml.Reader.init(
+        allocator,
+        .{
+            .slice = "<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]>" ++
+                "<root>&message;</root>",
+        },
+        .{ .external = .resolve, .resolver = resolver.resolver() },
+    );
+    var reader_live = true;
+    defer if (reader_live) reader.deinit();
+    while (true) {
+        const event = reader.next() catch |failure| {
+            try std.testing.expectEqual(resolver.resolves, resolver.closes);
+            const closes = resolver.closes;
+            reader.deinit();
+            reader_live = false;
+            try std.testing.expectEqual(closes, resolver.closes);
+            return failure;
+        };
+        if (event == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolver.resolves);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+    reader.deinit();
+    reader_live = false;
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
 }
 
-test "[integration] - [external allocation]: every parser allocation failure closes sources" {
+test "[integration] - [Reader external allocation]: every failure closes acquired sources" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         externalAllocationAttempt,
@@ -11059,7 +11158,7 @@ test "[integration] - [external allocation]: every parser allocation failure clo
     );
 }
 
-test "[integration] - [rooted resolver]: reads beneath root and rejects escape and symlink paths" {
+test "[integration] - [rooted resolver]: normal Reader rejects escapes and symlinks" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const io = std.testing.io;
@@ -11073,40 +11172,39 @@ test "[integration] - [rooted resolver]: reads beneath root and rejects escape a
         .data = "<!ELEMENT root ANY>",
     });
     try temporary.dir.symLink(io, "../outside.dtd", "schemas/link.dtd", .{});
+    try temporary.dir.symLink(io, "schemas", "schema-link", .{ .is_directory = true });
 
     var rooted = xml.RootedFilesystemResolver.init(std.testing.allocator, io, temporary.dir);
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
-    options.resolver = .{
-        .policy = .resolve,
+    const options: xml.ReaderOptions = .{
+        .external = .resolve,
         .resolver = rooted.resolver(),
         .document_base_id = "document.xml",
     };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = "<!DOCTYPE root SYSTEM 'schemas/document.dtd'><root/>" },
+        options,
+    );
     defer reader.deinit();
-    try reader.feed("<!DOCTYPE root SYSTEM 'schemas/document.dtd'><root/>", true);
-    while (true) switch (try reader.next()) {
-        .event => {},
-        .need_input => return error.UnexpectedNeedInput,
-        .done => break,
-    };
+    while (try reader.next()) |_| {}
 
-    try reader.reset(.retain_capacity);
-    try reader.feed("<!DOCTYPE root SYSTEM '../outside.dtd'><root/>", true);
-    while (true) {
-        _ = reader.next() catch |err| {
-            try std.testing.expectEqual(error.ResolverFailed, err);
-            try std.testing.expectEqual(xml.DiagnosticCode.resolver_forbidden, reader.diagnostic().?.code);
-            break;
-        };
-    }
-
-    try reader.reset(.retain_capacity);
-    try reader.feed("<!DOCTYPE root SYSTEM 'schemas/link.dtd'><root/>", true);
-    while (true) {
-        _ = reader.next() catch |err| {
-            try std.testing.expectEqual(error.ResolverFailed, err);
-            try std.testing.expectEqual(xml.DiagnosticCode.resolver_forbidden, reader.diagnostic().?.code);
-            break;
-        };
+    inline for (.{
+        "<!DOCTYPE root SYSTEM '../outside.dtd'><root/>",
+        "<!DOCTYPE root SYSTEM 'https://example.test/root.dtd'><root/>",
+        "<!DOCTYPE root SYSTEM 'schemas/document.dtd#part'><root/>",
+        "<!DOCTYPE root SYSTEM 'schemas/link.dtd'><root/>",
+        "<!DOCTYPE root SYSTEM 'schema-link/document.dtd'><root/>",
+    }) |document| {
+        try reader.reset(.{ .slice = document }, options, .retain_capacity);
+        while (true) {
+            _ = reader.next() catch |err| {
+                try std.testing.expectEqual(error.ExternalResourceForbidden, err);
+                try std.testing.expectEqual(
+                    xml.DiagnosticCode.resolver_forbidden,
+                    reader.diagnostic().?.code,
+                );
+                break;
+            };
+        }
     }
 }

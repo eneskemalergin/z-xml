@@ -515,6 +515,7 @@ pub const DiagnosticCode = enum {
     resolver_forbidden,
     resolver_unsupported_scheme,
     resolver_io_failure,
+    resolver_resource_limit,
     resolver_cancelled,
     transcoder_cancelled,
     read_failed,
@@ -4544,7 +4545,7 @@ pub fn Reader(comptime config: Config) type {
                 .forbidden => return self.externalProviderFailure(.resolver_forbidden, error.ResolverFailed),
                 .unsupported_scheme => return self.externalProviderFailure(.resolver_unsupported_scheme, error.ResolverFailed),
                 .io_failure => return self.externalProviderFailure(.resolver_io_failure, error.ResolverFailed),
-                .resource_limit => return self.externalProviderFailure(.external_resource_bytes_limit, error.LimitExceeded),
+                .resource_limit => return self.externalProviderFailure(.resolver_resource_limit, error.LimitExceeded),
                 .cancelled => return self.externalProviderFailure(.resolver_cancelled, error.Cancelled),
             };
             return source;
@@ -10566,6 +10567,7 @@ pub const NormalReader = struct {
                 },
                 .event => |event| {
                     const converted = self.convertEvent(config, event) catch |failure| {
+                        parser.closeExternalSources();
                         if (self.failure == null) self.recordGeneratedFailure(
                             failure,
                             .out_of_memory,
@@ -11170,7 +11172,10 @@ fn mapNormalReadError(failure: ReadError, code: ?DiagnosticCode) NormalReadError
             .resolver_not_found, .resolver_unsupported_scheme => error.ExternalResourceUnavailable,
             else => error.ExternalResourceFailed,
         },
-        error.ReadFailed => error.ReadFailed,
+        error.ReadFailed => if (code == .resolver_io_failure)
+            error.ExternalResourceFailed
+        else
+            error.ReadFailed,
         error.Cancelled => error.Cancelled,
         error.NotNormalized => error.NotNormalized,
         error.OutOfMemory => error.OutOfMemory,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Valgrind Memcheck on correctness-qualified reference adapters."""
+"""Run Valgrind Memcheck on correctness-qualified parser adapters."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMAS = {"z-xml-generated-v2", "z-xml-generated-v3"}
+GENERATED_SCHEMAS = {"z-xml-generated-v2", "z-xml-generated-v3"}
+FIXTURE_SCHEMA = "z-xml-fixtures-v2"
 MAX_WORKLOAD_BYTES = 1024 * 1024 * 1024
 
 
@@ -36,27 +37,47 @@ def read_manifest(path: Path) -> dict[str, dict[str, str]]:
     with path.open(encoding="utf-8", newline="") as stream:
         lines = list(stream)
     comments = {line[1:].strip() for line in lines if line.startswith("#")}
-    if not SCHEMAS.intersection(comments):
-        raise ValueError(f"{path}: unsupported generated-corpus schema")
-    if f"size ceiling: {MAX_WORKLOAD_BYTES} bytes" not in comments:
+    generated = bool(GENERATED_SCHEMAS.intersection(comments))
+    fixtures = FIXTURE_SCHEMA in comments
+    if generated == fixtures:
+        raise ValueError(f"{path}: unsupported manifest schema")
+    if generated and f"size ceiling: {MAX_WORKLOAD_BYTES} bytes" not in comments:
         raise ValueError(f"{path}: unexpected workload ceiling")
-    required = {
-        "id",
-        "path",
-        "target_bytes",
-        "actual_bytes",
-        "classification",
-    }
-    reader = csv.DictReader(
-        (line for line in lines if not line.startswith("#")), delimiter="\t"
-    )
+    required = {"id", "path", "classification"}
+    if generated:
+        required.update({"target_bytes", "actual_bytes"})
+    data_lines = (line for line in lines if not line.startswith("#"))
+    if fixtures:
+        header = next(
+            (line[2:].rstrip("\n") for line in lines if line.startswith("# id\t")),
+            None,
+        )
+        if header is None:
+            raise ValueError(f"{path}: missing fixture manifest header")
+        reader = csv.DictReader(
+            data_lines, fieldnames=header.split("\t"), delimiter="\t"
+        )
+    else:
+        reader = csv.DictReader(data_lines, delimiter="\t")
     if reader.fieldnames is None or required.difference(reader.fieldnames):
-        raise ValueError(f"{path}: incomplete generated manifest")
+        raise ValueError(f"{path}: incomplete manifest")
+    valid_classifications = (
+        {"benchmark-valid", "not-well-formed"}
+        if generated
+        else {
+            "well-formed",
+            "namespace-valid",
+            "namespace-invalid",
+            "dtd-valid",
+            "dtd-invalid",
+            "not-well-formed",
+        }
+    )
     result: dict[str, dict[str, str]] = {}
     for row in reader:
         if row["id"] in result:
-            raise ValueError(f"duplicate workload ID {row['id']}")
-        if row["classification"] not in {"benchmark-valid", "not-well-formed"}:
+            raise ValueError(f"duplicate manifest ID {row['id']}")
+        if row["classification"] not in valid_classifications:
             raise ValueError(f"unsupported classification {row['classification']}")
         result[row["id"]] = row
     seen_paths: set[Path] = set()
@@ -66,7 +87,7 @@ def read_manifest(path: Path) -> dict[str, dict[str, str]]:
             resolved.relative_to(root)
         except ValueError as error:
             raise ValueError(f"{row['id']}: path escapes corpus") from error
-        if resolved in seen_paths:
+        if generated and resolved in seen_paths:
             raise ValueError(f"{row['id']}: duplicate workload path")
         seen_paths.add(resolved)
         row["resolved_path"] = str(resolved)
@@ -88,13 +109,31 @@ def read_targets(path: Path, bin_dir: Path) -> dict[str, Path]:
     return result
 
 
-def read_passing(path: Path) -> set[tuple[str, str]]:
+def read_passing(path: Path) -> dict[tuple[str, str], int]:
     with path.open(encoding="utf-8", newline="") as stream:
-        return {
-            (row["target"], row["workload"])
-            for row in csv.DictReader(stream, delimiter="\t")
-            if row["verdict"] == "pass"
-        }
+        reader = csv.DictReader(stream, delimiter="\t")
+        if reader.fieldnames is None:
+            raise ValueError(f"{path}: missing eligibility header")
+        item_fields = {"workload", "fixture"}.intersection(reader.fieldnames)
+        if not item_fields:
+            raise ValueError(f"{path}: missing eligibility item column")
+        if len(item_fields) != 1:
+            raise ValueError(f"{path}: ambiguous eligibility item column")
+        item_field = item_fields.pop()
+        required = {"target", item_field, "expected", "verdict"}
+        if required.difference(reader.fieldnames):
+            raise ValueError(f"{path}: incomplete eligibility results")
+        result: dict[tuple[str, str], int] = {}
+        for row in reader:
+            if row["verdict"] != "pass":
+                continue
+            expected = {"accept": 0, "reject": 2}.get(row["expected"])
+            if expected is None:
+                raise ValueError(
+                    f"{path}: passing row has unsupported expectation {row['expected']}"
+                )
+            result[(row["target"], row[item_field])] = expected
+        return result
 
 
 def safe_name(value: str) -> str:
@@ -126,7 +165,7 @@ def main() -> int:
         )
         return 64
     pairs = [
-        (target, workload)
+        (target, workload, passing[(target, workload)])
         for target in args.target
         for workload in args.workload
         if (target, workload) in passing
@@ -134,13 +173,13 @@ def main() -> int:
     if not pairs:
         print("no selected pairs passed the correctness gate", file=sys.stderr)
         return 1
-    for workload_name in dict.fromkeys(workload for _target, workload in pairs):
+    for workload_name in dict.fromkeys(workload for _target, workload, _status in pairs):
         workload = workloads[workload_name]
         path = Path(workload["resolved_path"])
         try:
             actual_size = path.stat().st_size
-            manifest_size = int(workload["actual_bytes"])
-            target_size = int(workload["target_bytes"])
+            manifest_size = int(workload.get("actual_bytes", actual_size))
+            target_size = int(workload.get("target_bytes", 0))
         except (OSError, ValueError) as error:
             print(f"{workload_name}: {error}", file=sys.stderr)
             return 1
@@ -150,7 +189,7 @@ def main() -> int:
             or actual_size > MAX_WORKLOAD_BYTES
         ):
             print(
-                f"{workload_name}: generated bytes differ from manifest",
+                f"{workload_name}: selected input size is invalid",
                 file=sys.stderr,
             )
             return 1
@@ -168,7 +207,7 @@ def main() -> int:
     ).stdout.strip()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "schema": "z-xml-valgrind-v2",
+        "schema": "z-xml-valgrind-v3",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "valgrind": str(Path(valgrind).resolve()),
         "valgrind_version": version,
@@ -184,7 +223,9 @@ def main() -> int:
                 "path": str(targets[target_name]),
                 "size": targets[target_name].stat().st_size,
             }
-            for target_name in dict.fromkeys(target for target, _workload in pairs)
+            for target_name in dict.fromkeys(
+                target for target, _workload, _status in pairs
+            )
         },
         "memcheck_options": [
             "--leak-check=full",
@@ -200,7 +241,7 @@ def main() -> int:
     results_path = args.output_dir / "results.tsv"
     rows: list[dict[str, str | int]] = []
     had_error = False
-    for target_name, workload_name in pairs:
+    for target_name, workload_name, expected_status in pairs:
         target = targets[target_name]
         workload = workloads[workload_name]
         if not target.is_file() or not Path(workload["resolved_path"]).is_file():
@@ -222,7 +263,6 @@ def main() -> int:
             str(target),
             workload["resolved_path"],
         ]
-        expected_status = 0 if workload["classification"] == "benchmark-valid" else 2
         try:
             completed = subprocess.run(
                 command,
@@ -235,13 +275,22 @@ def main() -> int:
             observed: str | int = completed.returncode
             log_text = log.read_text(encoding="utf-8", errors="replace")
             error_match = re.search(r"ERROR SUMMARY: ([0-9,]+) errors", log_text)
-            descriptor_match = re.search(r"FILE DESCRIPTORS: ([0-9]+) open", log_text)
+            descriptor_match = re.search(
+                r"FILE DESCRIPTORS: ([0-9]+) open \(([0-9]+) (inherited|std)\)",
+                log_text,
+            )
             memcheck_errors = (
                 int(error_match.group(1).replace(",", "")) if error_match else -1
             )
             open_fds = int(descriptor_match.group(1)) if descriptor_match else -1
+            baseline_fds = (
+                int(descriptor_match.group(2))
+                + (1 if descriptor_match.group(3) == "std" else 0)
+                if descriptor_match
+                else -1
+            )
             status_matches = completed.returncode == expected_status
-            descriptors_clean = open_fds == 4
+            descriptors_clean = open_fds == baseline_fds and open_fds >= 0
             verdict = (
                 "pass"
                 if status_matches and memcheck_errors == 0 and descriptors_clean
@@ -252,6 +301,7 @@ def main() -> int:
             verdict = "error"
             memcheck_errors = -1
             open_fds = -1
+            baseline_fds = -1
         if verdict != "pass":
             had_error = True
         rows.append(
@@ -262,7 +312,8 @@ def main() -> int:
                 "expected_status": expected_status,
                 "observed_status": observed,
                 "memcheck_errors": memcheck_errors,
-                "open_fds_including_log": open_fds,
+                "open_fds_at_exit": open_fds,
+                "baseline_fds": baseline_fds,
                 "verdict": verdict,
                 "log": log.name,
             }

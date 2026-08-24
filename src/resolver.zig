@@ -278,20 +278,26 @@ test "[unit] - [resolver source]: validates bounded reads and closes explicitly"
 
 test "[unit] - [resolver source]: rejects invalid callback byte counts" {
     const InvalidReader = struct {
-        fn read(_: ?*anyopaque, output: []u8) ReadResult {
-            return .{ .bytes = output.len + 1 };
+        count: usize,
+
+        fn read(context: ?*anyopaque, _: []u8) ReadResult {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return .{ .bytes = self.count };
         }
 
         fn close(_: ?*anyopaque) void {}
     };
-    const source: Source = .{
-        .context = null,
-        .source_id = 1,
-        .readFn = InvalidReader.read,
-        .closeFn = InvalidReader.close,
-    };
     var buffer: [4]u8 = undefined;
-    try std.testing.expectEqual(ReadResult.io_failure, source.read(&buffer));
+    inline for (.{ 0, buffer.len + 1 }) |count| {
+        var context = InvalidReader{ .count = count };
+        const source: Source = .{
+            .context = &context,
+            .source_id = 1,
+            .readFn = InvalidReader.read,
+            .closeFn = InvalidReader.close,
+        };
+        try std.testing.expectEqual(ReadResult.io_failure, source.read(&buffer));
+    }
 }
 
 test "[unit] - [rooted resolver]: rejects absolute, escaping, scheme, and fragment paths" {
