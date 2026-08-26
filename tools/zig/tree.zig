@@ -28,17 +28,33 @@ const Stats = struct {
     comments: u64 = 0,
     processing_instructions: u64 = 0,
     max_depth: u64 = 0,
-    checksum: u64 = 14695981039346656037,
+    common_checksum: u64 = 14695981039346656037,
+    traversal_checksum: u64 = 14695981039346656037,
 
-    fn bytes(self: *Stats, value: []const u8) void {
+    fn sharedBytes(self: *Stats, comptime include_common: bool, value: []const u8) void {
         for (value) |byte| {
-            self.checksum ^= byte;
-            self.checksum *%= 1099511628211;
+            if (include_common) {
+                self.common_checksum ^= byte;
+                self.common_checksum *%= 1099511628211;
+            }
+            self.traversal_checksum ^= byte;
+            self.traversal_checksum *%= 1099511628211;
         }
     }
 
-    fn marker(self: *Stats, value: u8) void {
-        self.bytes(&.{value});
+    fn sharedMarker(self: *Stats, comptime include_common: bool, value: u8) void {
+        self.sharedBytes(include_common, &.{value});
+    }
+
+    fn traversalBytes(self: *Stats, value: []const u8) void {
+        for (value) |byte| {
+            self.traversal_checksum ^= byte;
+            self.traversal_checksum *%= 1099511628211;
+        }
+    }
+
+    fn traversalMarker(self: *Stats, value: u8) void {
+        self.traversalBytes(&.{value});
     }
 };
 
@@ -111,13 +127,15 @@ fn run(init: std.process.Init) !u8 {
     var traversal_allocator_operations: u64 = 0;
     if (report_memory) {
         var traversal_tracking: TrackingAllocator = .{ .child = init.gpa };
-        try traverse(traversal_tracking.allocator(), &document, &stats);
+        try traverse(false, traversal_tracking.allocator(), &document, &stats);
         if (traversal_tracking.live_bytes != 0) return error.TraversalMemoryLeak;
         traversal_peak = traversal_tracking.peak_live_bytes;
         traversal_allocator_operations = traversal_tracking.allocs +
             traversal_tracking.resizes + traversal_tracking.remaps;
+    } else if (report_timing) {
+        try traverse(false, init.gpa, &document, &stats);
     } else {
-        try traverse(init.gpa, &document, &stats);
+        try traverse(true, init.gpa, &document, &stats);
     }
     const traversal_end = std.Io.Clock.awake.now(init.io);
     var output_buffer: [256]u8 = undefined;
@@ -150,13 +168,14 @@ fn run(init: std.process.Init) !u8 {
                 build_start.durationTo(build_end).nanoseconds,
                 build_end.durationTo(traversal_end).nanoseconds,
                 stats.elements,
-                stats.checksum,
+                stats.traversal_checksum,
             },
         );
     } else try output.print(
         "{{\"nodes\":{d},\"elements\":{d},\"attributes\":{d}," ++
             "\"text_nodes\":{d},\"text_bytes\":{d},\"comments\":{d}," ++
             "\"processing_instructions\":{d},\"max_depth\":{d}," ++
+            "\"common_checksum\":\"{x:0>16}\"," ++
             "\"traversal_checksum\":\"{x:0>16}\"}}\n",
         .{
             stats.nodes,
@@ -167,7 +186,8 @@ fn run(init: std.process.Init) !u8 {
             stats.comments,
             stats.processing_instructions,
             stats.max_depth,
-            stats.checksum,
+            stats.common_checksum,
+            stats.traversal_checksum,
         },
     );
     try output.flush();
@@ -180,7 +200,12 @@ const Frame = struct {
     depth: u64,
 };
 
-fn traverse(allocator: std.mem.Allocator, document: *const xml.Document, stats: *Stats) !void {
+fn traverse(
+    comptime include_common: bool,
+    allocator: std.mem.Allocator,
+    document: *const xml.Document,
+    stats: *Stats,
+) !void {
     var stack: std.ArrayList(Frame) = .empty;
     defer stack.deinit(allocator);
     try stack.append(allocator, .{
@@ -192,7 +217,7 @@ fn traverse(allocator: std.mem.Allocator, document: *const xml.Document, stats: 
         const frame = &stack.items[stack.items.len - 1];
         if (frame.children.next()) |child| {
             const depth = frame.depth + 1;
-            enter(document, child, depth, stats);
+            enter(include_common, document, child, depth, stats);
             if (document.nodeKind(child).? == .element) {
                 try stack.append(allocator, .{
                     .node = child,
@@ -202,49 +227,73 @@ fn traverse(allocator: std.mem.Allocator, document: *const xml.Document, stats: 
             }
         } else {
             const node = stack.pop().?.node;
-            if (node != document.root()) leave(document, node, stats);
+            if (node != document.root()) leave(include_common, document, node, stats);
         }
     }
 }
 
-fn enter(document: *const xml.Document, index: xml.Node, depth: u64, stats: *Stats) void {
+fn enter(
+    comptime include_common: bool,
+    document: *const xml.Document,
+    index: xml.Node,
+    depth: u64,
+    stats: *Stats,
+) void {
     stats.nodes += 1;
     switch (document.nodeKind(index).?) {
         .element => {
             stats.elements += 1;
             stats.max_depth = @max(stats.max_depth, depth);
-            stats.marker(1);
-            stats.bytes(document.nodeName(index).?.raw);
+            stats.sharedMarker(include_common, 1);
+            stats.sharedBytes(include_common, document.nodeName(index).?.raw);
             var attributes = document.attributes(index);
             while (attributes.next()) |attribute| {
                 stats.attributes += 1;
-                stats.marker(2);
-                stats.bytes(attribute.name.raw);
-                stats.marker(3);
-                stats.bytes(attribute.value);
+                stats.sharedMarker(include_common, 2);
+                stats.sharedBytes(include_common, attribute.name.raw);
+                stats.sharedMarker(include_common, 3);
+                stats.sharedBytes(include_common, attribute.value);
             }
         },
         .text => {
             const value = document.nodeValue(index).?;
             stats.text_nodes += 1;
             stats.text_bytes += value.len;
-            stats.bytes(value);
+            stats.sharedBytes(include_common, value);
         },
-        .comment => stats.comments += 1,
-        .processing_instruction => stats.processing_instructions += 1,
+        .comment => {
+            stats.comments += 1;
+            stats.traversalMarker(5);
+            stats.traversalBytes(document.nodeValue(index).?);
+            stats.traversalMarker(6);
+        },
+        .processing_instruction => {
+            stats.processing_instructions += 1;
+            const value = document.processingInstruction(index).?;
+            stats.traversalMarker(7);
+            stats.traversalBytes(value.target);
+            stats.traversalMarker(8);
+            stats.traversalBytes(value.data);
+            stats.traversalMarker(9);
+        },
         .document => unreachable,
     }
 }
 
-fn leave(document: *const xml.Document, index: xml.Node, stats: *Stats) void {
+fn leave(
+    comptime include_common: bool,
+    document: *const xml.Document,
+    index: xml.Node,
+    stats: *Stats,
+) void {
     if (document.nodeKind(index).? != .element) return;
-    stats.marker(4);
-    stats.bytes(document.nodeName(index).?.raw);
+    stats.sharedMarker(include_common, 4);
+    stats.sharedBytes(include_common, document.nodeName(index).?.raw);
 }
 
 // --- Tests ---
 
-test "[unit] - [document adapter]: reports complete traversal work" {
+test "[unit] - [document adapter]: reports retained node kinds and values" {
     var document = try xml.parseDocument(
         std.testing.allocator,
         .{ .slice = "<r a='1'>x<!--c--><?p d?><n/></r>" },
@@ -252,7 +301,7 @@ test "[unit] - [document adapter]: reports complete traversal work" {
     );
     defer document.deinit();
     var stats: Stats = .{};
-    try traverse(std.testing.allocator, &document, &stats);
+    try traverse(true, std.testing.allocator, &document, &stats);
     try std.testing.expectEqual(@as(u64, 6), stats.nodes);
     try std.testing.expectEqual(@as(u64, 2), stats.elements);
     try std.testing.expectEqual(@as(u64, 1), stats.attributes);
@@ -261,5 +310,17 @@ test "[unit] - [document adapter]: reports complete traversal work" {
     try std.testing.expectEqual(@as(u64, 1), stats.comments);
     try std.testing.expectEqual(@as(u64, 1), stats.processing_instructions);
     try std.testing.expectEqual(@as(u64, 2), stats.max_depth);
-    try std.testing.expectEqual(@as(u64, 0x804252a17ef54766), stats.checksum);
+    try std.testing.expectEqual(@as(u64, 0x804252a17ef54766), stats.common_checksum);
+    try std.testing.expectEqual(@as(u64, 0x7b0ab72bea31905e), stats.traversal_checksum);
+
+    var changed = try xml.parseDocument(
+        std.testing.allocator,
+        .{ .slice = "<r a='1'>x<!--d--><?p e?><n/></r>" },
+        .{ .reader = .{ .namespaces = .raw, .dtd = .reject } },
+    );
+    defer changed.deinit();
+    var changed_stats: Stats = .{};
+    try traverse(true, std.testing.allocator, &changed, &changed_stats);
+    try std.testing.expectEqual(stats.common_checksum, changed_stats.common_checksum);
+    try std.testing.expect(stats.traversal_checksum != changed_stats.traversal_checksum);
 }
