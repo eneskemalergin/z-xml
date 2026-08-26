@@ -1,7 +1,7 @@
 //! A bounded XML reader and owned document for Zig.
 //!
 //! Normal callers use `Reader`. Explicit `...For(config)` aliases expose the
-//! specialized reader shapes used by package tools.
+//! specialized reader shapes used by package tests and layout reporting.
 
 const reader = @import("reader.zig");
 const dtd_module = @import("dtd.zig");

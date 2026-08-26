@@ -1,6 +1,6 @@
 # Tools
 
-Status: **Active** (last updated: 2026-08-24)
+Status: **Active** (last updated: 2026-08-25)
 
 `tools/` contains development commands and parser adapters. It is excluded from the Zig package.
 
@@ -51,7 +51,7 @@ Measurement:
 
 - `tools/zig/check.zig` reads XML and prints event counts and a checksum.
 - `tools/zig/persistent.zig` measures repeated parsing from memory or a stream. The `z-xml-default-persistent` build uses `Reader.init` defaults.
-- `tools/zig/tree.zig` builds and walks an owned document tree.
+- `tools/zig/tree.zig` builds and walks the public owned `Document`. Its memory mode reports final owned capacity, peak construction bytes, and allocator operations separately.
 - `tools/zig/validation_repeat.zig` compares validation with a new or reused external DTD subset.
 
 The persistent adapter gives resident input to `Reader` as one slice. `--chunk-bytes` sizes the buffered file reader only for stream input. The resident result keeps the requested value in its protocol metadata, so resident rows with different chunk values are not different source schedules.

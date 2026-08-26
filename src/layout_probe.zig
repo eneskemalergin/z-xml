@@ -19,6 +19,29 @@ pub fn main() void {
     printPrivate("dtd-process-raw", xml.Configs.XML11_NONVALIDATING);
     printPrivate("dtd-process-namespaces", xml.Configs.XML11_NAMESPACES_NONVALIDATING);
     printPrivate("dtd-validate-namespaces", xml.Configs.XML11_NAMESPACES_VALIDATING);
+    std.debug.print(
+        "document\tdocument={d}\tnode_index={d}\tnode={d}\telement={d}\t" ++
+            "attribute={d}\tnamespace={d}\ttext={d}\ttext_origin={d}\t" ++
+            "comment={d}\tpi={d}\tlocation={d}\n",
+        .{
+            @sizeOf(xml.Document),
+            @sizeOf(xml.Node),
+            @sizeOf(documentListItem("nodes")),
+            @sizeOf(documentListItem("elements")),
+            @sizeOf(documentListItem("attributes_storage")),
+            @sizeOf(documentListItem("namespace_storage")),
+            @sizeOf(documentListItem("texts")),
+            @sizeOf(documentListItem("text_origins")),
+            @sizeOf(documentListItem("comments")),
+            @sizeOf(documentListItem("processing_instructions")),
+            @sizeOf(xml.Location),
+        },
+    );
+}
+
+fn documentListItem(comptime field_name: []const u8) type {
+    const List = @FieldType(xml.Document, field_name);
+    return std.meta.Elem(@FieldType(List, "items"));
 }
 
 fn printPrivate(comptime name: []const u8, comptime config: xml.Config) void {

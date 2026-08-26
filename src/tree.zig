@@ -61,16 +61,14 @@ pub const DocumentLimits = struct {
     max_coalesced_text_bytes: usize = 64 * 1024 * 1024,
     max_retained_bytes: usize = 2 * 1024 * 1024 * 1024,
 
-    fn profile(self: DocumentLimits) Limits {
-        return .{
-            .max_nodes = self.max_nodes,
-            .max_attributes = self.max_attributes,
-            .max_namespace_declarations = self.max_namespace_declarations,
-            .max_string_bytes = self.max_string_bytes,
-            .max_children_per_element = self.max_children_per_element,
-            .max_coalesced_text_bytes = self.max_coalesced_text_bytes,
-            .max_tree_bytes = self.max_retained_bytes,
-        };
+    fn valid(self: DocumentLimits) bool {
+        return self.max_nodes > 0 and
+            self.max_attributes > 0 and
+            self.max_namespace_declarations > 0 and
+            self.max_string_bytes > 0 and
+            self.max_children_per_element > 0 and
+            self.max_coalesced_text_bytes > 0 and
+            self.max_retained_bytes > 0;
     }
 };
 
@@ -206,15 +204,72 @@ pub const DtdRecord = struct {
     skipped_entity_kind: ?reader.SkippedEntityKind,
 };
 
-const document_storage_config: reader.Config = .{
-    .profile = .xml11_ns_nonvalidating,
-    .external_sources = true,
-};
-
 const StoredNormalDtdFinding = struct {
     code: reader.DiagnosticCode,
     primary: reader.NormalLocation,
     related: ?reader.NormalLocation,
+};
+
+const StringRef = struct {
+    offset: u32 = std.math.maxInt(u32),
+    len: u32 = 0,
+};
+
+const Node = struct {
+    parent: NodeIndex = 0,
+    first_child: NodeIndex = 0,
+    next_sibling: NodeIndex = 0,
+    payload: u32 = 0,
+    kind: NodeKind,
+};
+
+const DocumentNameRecord = struct {
+    raw: StringRef,
+    prefix: StringRef = .{},
+    local: StringRef = .{},
+    namespace_uri: StringRef = .{},
+};
+
+const DocumentElementRecord = struct {
+    name: DocumentNameRecord,
+    attribute_start: u32,
+    attribute_count: u32,
+    namespace_start: u32,
+    namespace_count: u32,
+};
+
+const DocumentAttributeRecord = struct {
+    name: DocumentNameRecord,
+    value: StringRef,
+    declared_type: u8 = 0,
+    specified: bool = true,
+    has_declared_type: bool = false,
+};
+
+const NamespaceRecord = struct {
+    prefix: StringRef,
+    namespace_uri: StringRef,
+};
+
+const PiRecord = struct {
+    target: StringRef,
+    data: StringRef,
+};
+
+const StoredDocumentStart = struct {
+    effective_version: reader.XmlVersion,
+    source_encoding: reader.SourceEncoding,
+    declaration_present: bool,
+    declared_version: reader.XmlVersion,
+    declared_encoding: StringRef,
+    standalone: bool,
+    standalone_declared: bool,
+};
+
+const StoredDocumentType = struct {
+    root_name: StringRef,
+    public_id: StringRef,
+    system_id: StringRef,
 };
 
 /// Immutable XML document owned independently of its source and Reader.
@@ -225,64 +280,93 @@ const StoredNormalDtdFinding = struct {
 pub const Document = struct {
     const Self = @This();
 
-    storage: ProfileDocumentFor(document_storage_config),
+    allocator: std.mem.Allocator,
+    nodes: std.ArrayList(Node),
+    elements: std.ArrayList(DocumentElementRecord),
+    attributes_storage: std.ArrayList(DocumentAttributeRecord),
+    namespace_storage: std.ArrayList(NamespaceRecord),
+    texts: std.ArrayList(StringRef),
+    text_origins: std.ArrayList(reader.TextOrigin),
+    comments: std.ArrayList(StringRef),
+    processing_instructions: std.ArrayList(PiRecord),
+    strings: std.ArrayList(u8),
+    dtd_finding_inclusions: std.ArrayList(reader.NormalLocation),
+    start_result: StoredDocumentStart,
+    document_type: ?StoredDocumentType,
+    document_element: NodeIndex,
     end_result: reader.NormalDocumentEnd,
     first_dtd_finding: ?StoredNormalDtdFinding,
-    dtd_finding_inclusions: []reader.NormalLocation,
     normalization_finding: ?reader.NormalNormalizationFinding,
     namespaces_processed: bool,
     text_origin_retained: bool,
 
     /// Releases all document-owned storage. Call exactly once for each owned value.
     pub fn deinit(self: *Self) void {
-        const allocator = self.storage.allocator;
-        if (self.dtd_finding_inclusions.len != 0) {
-            allocator.free(self.dtd_finding_inclusions);
-        }
-        self.storage.deinit();
+        self.nodes.deinit(self.allocator);
+        self.elements.deinit(self.allocator);
+        self.attributes_storage.deinit(self.allocator);
+        self.namespace_storage.deinit(self.allocator);
+        self.texts.deinit(self.allocator);
+        self.text_origins.deinit(self.allocator);
+        self.comments.deinit(self.allocator);
+        self.processing_instructions.deinit(self.allocator);
+        self.strings.deinit(self.allocator);
+        self.dtd_finding_inclusions.deinit(self.allocator);
         self.* = undefined;
     }
 
     /// Returns the synthetic document node.
     pub fn root(self: *const Self) NodeIndex {
-        return self.storage.root();
+        _ = self;
+        return 1;
     }
 
     /// Returns the document's single element node.
     pub fn documentElement(self: *const Self) NodeIndex {
-        return self.storage.documentElement();
+        return self.document_element;
     }
 
     /// Returns a node kind, or null for an invalid index.
     pub fn nodeKind(self: *const Self, node: NodeIndex) ?NodeKind {
-        return self.storage.nodeKind(node);
+        const value = self.getNode(node) orelse return null;
+        return value.kind;
     }
 
     /// Returns a node's parent, or zero for an invalid node or the document node.
     pub fn parent(self: *const Self, node: NodeIndex) NodeIndex {
-        return self.storage.parent(node);
+        const value = self.getNode(node) orelse return 0;
+        return value.parent;
     }
 
     /// Returns an allocation-free iterator over source-ordered child nodes.
     pub fn children(self: *const Self, node: NodeIndex) ChildIterator {
-        return .{ .document = self, .next_node = self.storage.firstChild(node) };
+        const value = self.getNode(node) orelse return .{ .document = self, .next_node = 0 };
+        return .{ .document = self, .next_node = value.first_child };
     }
 
     /// Returns an element name, or null for another node kind or an invalid index.
     pub fn nodeName(self: *const Self, node: NodeIndex) ?reader.NormalName {
-        const value = self.storage.nodeName(node) orelse return null;
-        return self.normalName(value);
+        const value = self.getNode(node) orelse return null;
+        if (value.kind != .element) return null;
+        return self.normalName(self.elements.items[value.payload].name);
     }
 
     /// Returns text or comment bytes, or null for another node kind or an invalid index.
     pub fn nodeValue(self: *const Self, node: NodeIndex) ?[]const u8 {
-        return self.storage.nodeValue(node);
+        const value = self.getNode(node) orelse return null;
+        return switch (value.kind) {
+            .text => self.bytes(self.texts.items[value.payload]),
+            .comment => self.bytes(self.comments.items[value.payload]),
+            else => null,
+        };
     }
 
     /// Returns retained text origin, or null when origin retention is disabled.
     pub fn textOrigin(self: *const Self, node: NodeIndex) ?reader.TextOrigin {
         if (!self.text_origin_retained) return null;
-        return self.storage.textOrigin(node);
+        const value = self.getNode(node) orelse return null;
+        if (value.kind != .text) return null;
+        return self.text_origins.items[value.payload];
     }
 
     /// Returns a processing instruction, or null for another node kind or an invalid index.
@@ -290,8 +374,10 @@ pub const Document = struct {
         self: *const Self,
         node: NodeIndex,
     ) ?struct { target: []const u8, data: []const u8 } {
-        const value = self.storage.processingInstruction(node) orelse return null;
-        return .{ .target = value.target, .data = value.data };
+        const value = self.getNode(node) orelse return null;
+        if (value.kind != .processing_instruction) return null;
+        const instruction = self.processing_instructions.items[value.payload];
+        return .{ .target = self.bytes(instruction.target), .data = self.bytes(instruction.data) };
     }
 
     /// Returns an allocation-free iterator over source-ordered attributes.
@@ -332,22 +418,20 @@ pub const Document = struct {
         self: *const Self,
         element: NodeIndex,
     ) NamespaceDeclarationIterator {
-        const count = if (self.namespaces_processed)
-            self.storage.namespaceDeclarationCount(element)
-        else
-            0;
+        const record = if (self.namespaces_processed) self.getElement(element) else null;
+        const count = if (record) |value| value.namespace_count else 0;
         return .{ .document = self, .element = element, .count = count };
     }
 
     /// Returns the effective document-start information and optional XML declaration.
     pub fn documentStart(self: *const Self) reader.NormalDocumentStart {
-        const value = self.storage.xmlDeclaration();
+        const value = self.start_result;
         return .{
             .effective_version = value.effective_version,
             .source_encoding = value.source_encoding,
-            .declaration = if (value.declared_version != null) .{
-                .version = value.effective_version,
-                .encoding = value.declared_encoding,
+            .declaration = if (value.declaration_present) .{
+                .version = value.declared_version,
+                .encoding = self.optionalBytes(value.declared_encoding),
                 .standalone = if (value.standalone_declared) value.standalone else null,
             } else null,
         };
@@ -355,11 +439,11 @@ pub const Document = struct {
 
     /// Returns the optional document type header.
     pub fn documentType(self: *const Self) ?reader.NormalDocumentType {
-        const value = self.storage.documentType() orelse return null;
+        const value = self.document_type orelse return null;
         return .{
-            .root_name = value.root_name,
-            .public_id = value.public_id,
-            .system_id = value.system_id,
+            .root_name = self.bytes(value.root_name),
+            .public_id = self.optionalBytes(value.public_id),
+            .system_id = self.optionalBytes(value.system_id),
         };
     }
 
@@ -375,7 +459,7 @@ pub const Document = struct {
             .code = value.code,
             .primary = value.primary,
             .related = value.related,
-            .inclusion_trace = self.dtd_finding_inclusions,
+            .inclusion_trace = self.dtd_finding_inclusions.items,
         };
     }
 
@@ -386,43 +470,81 @@ pub const Document = struct {
 
     /// Reports document-owned allocation counts and capacities.
     pub fn memoryUsage(self: *const Self) DocumentMemoryUsage {
-        const usage = self.storage.memoryUsage();
-        const finding_bytes = self.dtd_finding_inclusions.len *| @sizeOf(reader.NormalLocation);
-        const metadata_bytes = usage.location_capacity_bytes +|
-            usage.dtd_metadata_capacity_bytes +| finding_bytes;
+        const node_bytes = self.nodes.capacity *| @sizeOf(Node) +|
+            self.elements.capacity *| @sizeOf(DocumentElementRecord) +|
+            self.texts.capacity *| @sizeOf(StringRef) +|
+            self.text_origins.capacity *| @sizeOf(reader.TextOrigin) +|
+            self.comments.capacity *| @sizeOf(StringRef) +|
+            self.processing_instructions.capacity *| @sizeOf(PiRecord);
+        const attribute_bytes = self.attributes_storage.capacity *|
+            @sizeOf(DocumentAttributeRecord);
+        const namespace_bytes = self.namespace_storage.capacity *| @sizeOf(NamespaceRecord);
+        const metadata_bytes = self.dtd_finding_inclusions.capacity *|
+            @sizeOf(reader.NormalLocation);
         return .{
-            .node_count = usage.node_count,
-            .node_capacity_bytes = usage.node_capacity_bytes,
-            .attribute_count = usage.attribute_count,
-            .attribute_capacity_bytes = usage.attribute_capacity_bytes,
-            .namespace_declaration_count = usage.namespace_declaration_count,
-            .namespace_declaration_capacity_bytes = usage.namespace_declaration_capacity_bytes,
-            .string_bytes = usage.string_bytes,
-            .string_capacity_bytes = usage.string_capacity_bytes,
+            .node_count = self.nodes.items.len,
+            .node_capacity_bytes = node_bytes,
+            .attribute_count = self.attributes_storage.items.len,
+            .attribute_capacity_bytes = attribute_bytes,
+            .namespace_declaration_count = self.namespace_storage.items.len,
+            .namespace_declaration_capacity_bytes = namespace_bytes,
+            .string_bytes = self.strings.items.len,
+            .string_capacity_bytes = self.strings.capacity,
             .metadata_capacity_bytes = metadata_bytes,
-            .total_capacity_bytes = usage.total_capacity_bytes +| finding_bytes,
+            .total_capacity_bytes = node_bytes +| attribute_bytes +| namespace_bytes +|
+                self.strings.capacity +| metadata_bytes,
         };
     }
 
-    fn normalName(self: *const Self, value: Name) reader.NormalName {
+    fn normalName(self: *const Self, value: DocumentNameRecord) reader.NormalName {
         return .{
-            .raw = value.raw,
+            .raw = self.bytes(value.raw),
             .expanded = if (self.namespaces_processed) .{
-                .prefix = value.prefix,
-                .local = value.local,
-                .namespace_uri = value.namespace_uri,
+                .prefix = self.optionalBytes(value.prefix),
+                .local = self.bytes(value.local),
+                .namespace_uri = self.optionalBytes(value.namespace_uri),
             } else null,
         };
     }
 
-    fn normalAttribute(self: *const Self, value: Attribute) reader.NormalAttribute {
+    fn normalAttribute(self: *const Self, value: DocumentAttributeRecord) reader.NormalAttribute {
         return .{
             .name = self.normalName(value.name),
-            .value = value.value,
+            .value = self.bytes(value.value),
             .span = null,
             .specified = value.specified,
-            .declared_type = value.declared_type,
+            .declared_type = if (value.has_declared_type)
+                @enumFromInt(value.declared_type)
+            else
+                null,
         };
+    }
+
+    fn nodeSlot(self: *const Self, index: NodeIndex) ?usize {
+        if (index == 0) return null;
+        const slot: usize = index - 1;
+        if (slot >= self.nodes.items.len) return null;
+        return slot;
+    }
+
+    fn getNode(self: *const Self, index: NodeIndex) ?Node {
+        const slot = self.nodeSlot(index) orelse return null;
+        return self.nodes.items[slot];
+    }
+
+    fn getElement(self: *const Self, index: NodeIndex) ?DocumentElementRecord {
+        const value = self.getNode(index) orelse return null;
+        if (value.kind != .element) return null;
+        return self.elements.items[value.payload];
+    }
+
+    fn bytes(self: *const Self, value: StringRef) []const u8 {
+        return self.strings.items[value.offset..][0..value.len];
+    }
+
+    fn optionalBytes(self: *const Self, value: StringRef) ?[]const u8 {
+        if (value.offset == std.math.maxInt(u32)) return null;
+        return self.bytes(value);
     }
 
     /// Iterates source-ordered child nodes.
@@ -434,7 +556,7 @@ pub const Document = struct {
         pub fn next(self: *ChildIterator) ?NodeIndex {
             if (self.next_node == 0) return null;
             const current = self.next_node;
-            self.next_node = self.document.storage.nextSibling(current);
+            self.next_node = self.document.getNode(current).?.next_sibling;
             return current;
         }
     };
@@ -447,8 +569,9 @@ pub const Document = struct {
 
         /// Returns the next attribute, or null after the final attribute.
         pub fn next(self: *AttributeIterator) ?reader.NormalAttribute {
-            const value = self.document.storage.attributeAt(self.element, self.offset) orelse
-                return null;
+            const element = self.document.getElement(self.element) orelse return null;
+            if (self.offset >= element.attribute_count) return null;
+            const value = self.document.attributes_storage.items[element.attribute_start + self.offset];
             self.offset += 1;
             return self.document.normalAttribute(value);
         }
@@ -464,19 +587,15 @@ pub const Document = struct {
         /// Returns the next declaration, or null after the final declaration.
         pub fn next(self: *NamespaceDeclarationIterator) ?NamespaceDeclaration {
             if (self.offset >= self.count) return null;
-            const value = self.document.storage.namespaceDeclarationAt(
-                self.element,
-                self.offset,
-            ) orelse return null;
+            const element = self.document.getElement(self.element) orelse return null;
+            const value = self.document.namespace_storage.items[element.namespace_start + self.offset];
             self.offset += 1;
-            return .{ .prefix = value.prefix, .namespace_uri = value.namespace_uri };
+            return .{
+                .prefix = self.document.optionalBytes(value.prefix),
+                .namespace_uri = self.document.bytes(value.namespace_uri),
+            };
         }
     };
-};
-
-const StringRef = struct {
-    offset: u32 = std.math.maxInt(u32),
-    len: u32 = 0,
 };
 
 fn StoredName(comptime config: reader.Config) type {
@@ -490,14 +609,6 @@ fn StoredName(comptime config: reader.Config) type {
     else
         struct { raw: StringRef };
 }
-
-const Node = struct {
-    parent: NodeIndex = 0,
-    first_child: NodeIndex = 0,
-    next_sibling: NodeIndex = 0,
-    payload: u32 = 0,
-    kind: NodeKind,
-};
 
 fn ElementRecord(comptime config: reader.Config) type {
     return if (config.profile.hasNamespaces())
@@ -532,20 +643,10 @@ fn AttributeRecord(comptime config: reader.Config) type {
         };
 }
 
-const NamespaceRecord = struct {
-    prefix: StringRef,
-    namespace_uri: StringRef,
-};
-
 const TextRecord = struct {
     value: StringRef,
     origin: reader.TextOrigin,
     ignorable_whitespace: bool,
-};
-
-const PiRecord = struct {
-    target: StringRef,
-    data: StringRef,
 };
 
 const StoredDeclaration = struct {
@@ -555,12 +656,6 @@ const StoredDeclaration = struct {
     declared_encoding: StringRef,
     standalone: bool,
     standalone_declared: bool,
-};
-
-const StoredDocumentType = struct {
-    root_name: StringRef,
-    public_id: StringRef,
-    system_id: StringRef,
 };
 
 const StoredDtdRecord = struct {
@@ -1529,200 +1624,448 @@ pub fn parseDocument(
 
 const DocumentBuilder = struct {
     const Self = @This();
-    const StorageBuilder = ProfileBuilderFor(document_storage_config);
-    const StorageAttribute = reader.Attribute(document_storage_config);
 
     allocator: std.mem.Allocator,
     options: DocumentOptions,
-    storage: StorageBuilder,
-    attributes: std.ArrayList(StorageAttribute) = .empty,
-    namespace_declarations: std.ArrayList(reader.NamespaceDeclaration) = .empty,
+    nodes: std.ArrayList(Node) = .empty,
+    elements: std.ArrayList(DocumentElementRecord) = .empty,
+    attributes: std.ArrayList(DocumentAttributeRecord) = .empty,
+    namespaces: std.ArrayList(NamespaceRecord) = .empty,
+    texts: std.ArrayList(StringRef) = .empty,
+    text_origins: std.ArrayList(reader.TextOrigin) = .empty,
+    comments: std.ArrayList(StringRef) = .empty,
+    processing_instructions: std.ArrayList(PiRecord) = .empty,
+    strings: std.ArrayList(u8) = .empty,
+    dtd_finding_inclusions: std.ArrayList(reader.NormalLocation) = .empty,
+    open_elements: std.ArrayList(NodeIndex) = .empty,
+    last_children: std.ArrayList(NodeIndex) = .empty,
+    open_child_counts: std.ArrayList(u32) = .empty,
+    start_result: ?StoredDocumentStart = null,
+    document_type: ?StoredDocumentType = null,
+    document_element: NodeIndex = 0,
     end_result: ?reader.NormalDocumentEnd = null,
+    document_ended: bool = false,
+    failed: bool = false,
+    fragment_node: NodeIndex = 0,
+    fragment_complete: bool = true,
+    text_boundary: bool = false,
 
     fn init(allocator: std.mem.Allocator, options: DocumentOptions) BuildError!Self {
-        return .{
-            .allocator = allocator,
-            .options = options,
-            .storage = try StorageBuilder.init(allocator, .{
-                .limits = options.limits.profile(),
-                .preserve_cdata_origin = options.retain_text_origin,
-            }),
-        };
+        if (!options.limits.valid()) return error.InvalidOptions;
+        return .{ .allocator = allocator, .options = options };
     }
 
     fn deinit(self: *Self) void {
-        self.storage.deinit();
+        self.nodes.deinit(self.allocator);
+        self.elements.deinit(self.allocator);
         self.attributes.deinit(self.allocator);
-        self.namespace_declarations.deinit(self.allocator);
+        self.namespaces.deinit(self.allocator);
+        self.texts.deinit(self.allocator);
+        self.text_origins.deinit(self.allocator);
+        self.comments.deinit(self.allocator);
+        self.processing_instructions.deinit(self.allocator);
+        self.strings.deinit(self.allocator);
+        self.dtd_finding_inclusions.deinit(self.allocator);
+        self.open_elements.deinit(self.allocator);
+        self.last_children.deinit(self.allocator);
+        self.open_child_counts.deinit(self.allocator);
         self.* = undefined;
     }
 
     fn consume(self: *Self, event: reader.NormalEvent) BuildError!void {
+        if (self.document_ended or self.failed) return error.InvalidEventSequence;
+        self.consumeEvent(event) catch |err| {
+            self.failed = true;
+            return err;
+        };
+    }
+
+    fn consumeEvent(self: *Self, event: reader.NormalEvent) BuildError!void {
+        if (!self.fragment_complete) switch (event.data) {
+            .comment, .processing_instruction => {},
+            else => return error.InvalidEventSequence,
+        };
         switch (event.data) {
-            .document_start => |value| try self.storage.consume(.{ .document_start = .{
-                .effective_version = value.effective_version,
-                .declared_version = if (value.declaration) |declaration|
-                    xmlVersionBytes(declaration.version)
-                else
-                    null,
-                .source_encoding = value.source_encoding,
-                .declared_encoding = if (value.declaration) |declaration|
-                    declaration.encoding
-                else
-                    null,
-                .standalone = if (value.declaration) |declaration|
-                    declaration.standalone orelse false
-                else
-                    false,
-                .standalone_declared = if (value.declaration) |declaration|
-                    declaration.standalone != null
-                else
-                    false,
-            } }),
-            .document_type => |value| try self.storage.consume(.{ .document_type = .{
-                .root_name = value.root_name,
-                .public_id = value.public_id,
-                .system_id = value.system_id,
-            } }),
+            .document_start => |value| try self.startDocument(value),
+            .document_type => |value| try self.setDocumentType(value),
             .start_element => |value| try self.startElement(value),
-            .end_element => |value| try self.storage.consume(.{ .end_element = .{
-                .name = storageName(value.name),
-            } }),
-            .text => |value| {
-                if (value.bytes.len == 0) return;
-                try self.storage.consume(.{ .text = .{
-                    .bytes = value.bytes,
-                    .origin = value.origin,
-                } });
-            },
+            .end_element => |value| try self.endElement(value),
+            .text => |value| try self.appendText(value),
             .comment => |value| {
                 if (!self.options.retain_comments) return;
-                try self.storage.consume(.{ .comment = .{
-                    .bytes = value.bytes,
-                    .complete = value.final_fragment,
-                } });
+                try self.appendComment(value);
             },
             .processing_instruction => |value| {
                 if (!self.options.retain_processing_instructions) return;
-                try self.storage.consume(.{ .processing_instruction = .{
-                    .target = value.target,
-                    .data = value.data,
-                    .complete = value.final_fragment,
-                } });
+                try self.appendPi(value);
             },
-            .skipped_external_source => self.storage.text_boundary = true,
-            .document_end => |value| {
-                try self.storage.consume(.{ .document_end = .{} });
-                self.end_result = value;
-            },
+            .skipped_external_source => self.text_boundary = true,
+            .document_end => |value| try self.endDocument(value),
         }
+    }
+
+    fn startDocument(self: *Self, value: reader.NormalDocumentStart) BuildError!void {
+        if (self.start_result != null or self.nodes.items.len != 0)
+            return error.InvalidEventSequence;
+        const declaration = value.declaration;
+        self.start_result = .{
+            .effective_version = value.effective_version,
+            .source_encoding = value.source_encoding,
+            .declaration_present = declaration != null,
+            .declared_version = if (declaration) |item| item.version else value.effective_version,
+            .declared_encoding = try self.copyOptional(if (declaration) |item|
+                item.encoding
+            else
+                null),
+            .standalone = if (declaration) |item| item.standalone orelse false else false,
+            .standalone_declared = if (declaration) |item| item.standalone != null else false,
+        };
+        _ = try self.appendNode(.document, 0);
+        try self.open_elements.append(self.allocator, 1);
+        try self.last_children.append(self.allocator, 0);
+        try self.open_child_counts.append(self.allocator, 0);
+    }
+
+    fn setDocumentType(self: *Self, value: reader.NormalDocumentType) BuildError!void {
+        if (self.start_result == null or self.document_type != null or self.document_element != 0)
+            return error.InvalidEventSequence;
+        self.document_type = .{
+            .root_name = try self.copy(value.root_name),
+            .public_id = try self.copyOptional(value.public_id),
+            .system_id = try self.copyOptional(value.system_id),
+        };
     }
 
     fn startElement(self: *Self, value: reader.NormalStartElement) BuildError!void {
-        const attribute_count = std.math.add(
-            usize,
-            self.storage.attributes.items.len,
+        if (self.start_result == null or self.open_elements.items.len == 0)
+            return error.InvalidEventSequence;
+        if (self.open_elements.items.len == 1 and self.document_element != 0)
+            return error.InvalidEventSequence;
+        try self.requireCount(
+            self.attributes.items.len,
             value.attributes.len,
-        ) catch return error.TreeLimit;
-        if (attribute_count > self.options.limits.max_attributes) return error.TreeLimit;
-        const namespace_count = std.math.add(
-            usize,
-            self.storage.namespaces.items.len,
+            self.options.limits.max_attributes,
+        );
+        try self.requireCount(
+            self.namespaces.items.len,
             value.namespace_declarations.len,
-        ) catch return error.TreeLimit;
-        if (namespace_count > self.options.limits.max_namespace_declarations) {
-            return error.TreeLimit;
-        }
+            self.options.limits.max_namespace_declarations,
+        );
 
-        self.attributes.clearRetainingCapacity();
-        self.namespace_declarations.clearRetainingCapacity();
-        self.attributes.ensureTotalCapacity(self.allocator, value.attributes.len) catch
-            return error.OutOfMemory;
-        self.namespace_declarations.ensureTotalCapacity(
-            self.allocator,
-            value.namespace_declarations.len,
-        ) catch return error.OutOfMemory;
-
-        for (value.attributes) |attribute| self.attributes.appendAssumeCapacity(.{
-            .name = storageName(attribute.name),
-            .value = attribute.value,
-            .specified = attribute.specified,
-            .declared_type = attribute.declared_type,
-        });
+        const element_index = self.elements.items.len;
+        if (element_index > std.math.maxInt(u32)) return error.TreeLimit;
+        const attribute_start = self.attributes.items.len;
+        const namespace_start = self.namespaces.items.len;
+        const name = try self.copyName(value.name);
+        try self.reserveOwned(&self.attributes, value.attributes.len);
+        try self.reserveOwned(&self.namespaces, value.namespace_declarations.len);
+        for (value.attributes) |attribute| try self.appendAttribute(attribute);
         for (value.namespace_declarations) |declaration| {
-            self.namespace_declarations.appendAssumeCapacity(.{
-                .prefix = declaration.prefix,
-                .namespace_uri = declaration.namespace_uri,
+            try self.appendOwned(&self.namespaces, .{
+                .prefix = try self.copyOptional(declaration.prefix),
+                .namespace_uri = try self.copy(declaration.namespace_uri),
             });
         }
-        try self.storage.consume(.{ .start_element = .{
-            .name = storageName(value.name),
-            .attributes = self.attributes.items,
-            .namespace_declarations = self.namespace_declarations.items,
-            .empty_element_syntax = value.empty_syntax,
-        } });
+        try self.appendOwned(&self.elements, .{
+            .name = name,
+            .attribute_start = @intCast(attribute_start),
+            .attribute_count = @intCast(value.attributes.len),
+            .namespace_start = @intCast(namespace_start),
+            .namespace_count = @intCast(value.namespace_declarations.len),
+        });
+        const node_index = try self.appendNode(.element, @intCast(element_index));
+        if (self.document_element == 0) self.document_element = node_index;
+        try self.open_elements.append(self.allocator, node_index);
+        try self.last_children.append(self.allocator, 0);
+        try self.open_child_counts.append(self.allocator, 0);
+        self.clearFragment();
+    }
+
+    fn endElement(self: *Self, value: reader.NormalEndElement) BuildError!void {
+        if (self.open_elements.items.len <= 1) return error.InvalidEventSequence;
+        const open = self.open_elements.getLast();
+        const node = self.nodes.items[open - 1];
+        if (node.kind != .element or !std.mem.eql(
+            u8,
+            self.poolBytes(self.elements.items[node.payload].name.raw),
+            value.name.raw,
+        )) return error.InvalidEventSequence;
+        _ = self.open_elements.pop().?;
+        _ = self.last_children.pop().?;
+        _ = self.open_child_counts.pop().?;
+        self.clearFragment();
+    }
+
+    fn appendText(self: *Self, value: reader.NormalText) BuildError!void {
+        if (self.open_elements.items.len <= 1) return error.InvalidEventSequence;
+        if (value.bytes.len == 0) return;
+        if (value.bytes.len > self.options.limits.max_coalesced_text_bytes)
+            return error.TreeLimit;
+        const last = self.last_children.getLast();
+        if (!self.text_boundary and last != 0) {
+            const node = &self.nodes.items[last - 1];
+            if (node.kind == .text) {
+                const compatible_origin = !self.options.retain_text_origin or
+                    self.text_origins.items[node.payload] == value.origin;
+                if (compatible_origin) {
+                    const record = &self.texts.items[node.payload];
+                    const next_len = std.math.add(usize, record.len, value.bytes.len) catch
+                        return error.TreeLimit;
+                    if (next_len > self.options.limits.max_coalesced_text_bytes or
+                        next_len > std.math.maxInt(u32)) return error.TreeLimit;
+                    try self.appendToString(record, value.bytes);
+                    self.clearFragment();
+                    return;
+                }
+            }
+        }
+        const payload = self.texts.items.len;
+        if (payload > std.math.maxInt(u32)) return error.TreeLimit;
+        try self.appendOwned(&self.texts, try self.copy(value.bytes));
+        if (self.options.retain_text_origin) {
+            try self.appendOwned(&self.text_origins, value.origin);
+        }
+        _ = try self.appendNode(.text, @intCast(payload));
+        self.clearFragment();
+    }
+
+    fn appendComment(self: *Self, value: reader.NormalComment) BuildError!void {
+        if (!self.fragment_complete) {
+            const node = &self.nodes.items[self.fragment_node - 1];
+            if (node.kind != .comment) return error.InvalidEventSequence;
+            try self.appendToString(&self.comments.items[node.payload], value.bytes);
+            self.fragment_complete = value.final_fragment;
+            if (value.final_fragment) self.fragment_node = 0;
+            return;
+        }
+        const payload = self.comments.items.len;
+        if (payload > std.math.maxInt(u32)) return error.TreeLimit;
+        try self.appendOwned(&self.comments, try self.copy(value.bytes));
+        const node_index = try self.appendNode(.comment, @intCast(payload));
+        self.fragment_complete = value.final_fragment;
+        self.fragment_node = if (value.final_fragment) 0 else node_index;
+        self.text_boundary = true;
+    }
+
+    fn appendPi(self: *Self, value: reader.NormalProcessingInstruction) BuildError!void {
+        if (!self.fragment_complete) {
+            const node = &self.nodes.items[self.fragment_node - 1];
+            if (node.kind != .processing_instruction) return error.InvalidEventSequence;
+            const record = &self.processing_instructions.items[node.payload];
+            if (!std.mem.eql(u8, self.poolBytes(record.target), value.target))
+                return error.InvalidEventSequence;
+            try self.appendToString(&record.data, value.data);
+            self.fragment_complete = value.final_fragment;
+            if (value.final_fragment) self.fragment_node = 0;
+            return;
+        }
+        const payload = self.processing_instructions.items.len;
+        if (payload > std.math.maxInt(u32)) return error.TreeLimit;
+        const target = try self.copy(value.target);
+        const data = try self.copy(value.data);
+        try self.appendOwned(&self.processing_instructions, .{ .target = target, .data = data });
+        const node_index = try self.appendNode(.processing_instruction, @intCast(payload));
+        self.fragment_complete = value.final_fragment;
+        self.fragment_node = if (value.final_fragment) 0 else node_index;
+        self.text_boundary = true;
+    }
+
+    fn endDocument(self: *Self, value: reader.NormalDocumentEnd) BuildError!void {
+        if (self.start_result == null or self.open_elements.items.len != 1 or
+            !self.fragment_complete or self.document_element == 0)
+            return error.InvalidEventSequence;
+        _ = self.open_elements.pop().?;
+        _ = self.last_children.pop().?;
+        _ = self.open_child_counts.pop().?;
+        self.end_result = value;
+        self.document_ended = true;
     }
 
     fn finish(self: *Self, normal_reader: *const reader.NormalReader) BuildError!Document {
-        const end_result = self.end_result orelse return error.InvalidEventSequence;
-        var storage = try self.storage.finish();
-        errdefer storage.deinit();
-
+        if (self.failed or !self.document_ended or self.start_result == null or
+            self.document_element == 0 or self.open_elements.items.len != 0)
+            return error.InvalidEventSequence;
         const finding = normal_reader.firstDtdFinding();
-        var finding_inclusions: []reader.NormalLocation = &.{};
         if (finding) |value| {
             if (value.inclusion_trace.len != 0) {
-                const finding_bytes = std.math.mul(
-                    usize,
-                    value.inclusion_trace.len,
-                    @sizeOf(reader.NormalLocation),
-                ) catch return error.TreeLimit;
-                const retained_bytes = std.math.add(
-                    usize,
-                    storage.memoryUsage().total_capacity_bytes,
-                    finding_bytes,
-                ) catch return error.TreeLimit;
-                if (retained_bytes > self.options.limits.max_retained_bytes) {
-                    return error.TreeLimit;
-                }
-                finding_inclusions = self.allocator.dupe(
-                    reader.NormalLocation,
-                    value.inclusion_trace,
-                ) catch return error.OutOfMemory;
+                try self.reserveOwned(&self.dtd_finding_inclusions, value.inclusion_trace.len);
+                self.dtd_finding_inclusions.appendSliceAssumeCapacity(value.inclusion_trace);
             }
         }
-        return .{
-            .storage = storage,
-            .end_result = end_result,
+        const result: Document = .{
+            .allocator = self.allocator,
+            .nodes = self.nodes,
+            .elements = self.elements,
+            .attributes_storage = self.attributes,
+            .namespace_storage = self.namespaces,
+            .texts = self.texts,
+            .text_origins = self.text_origins,
+            .comments = self.comments,
+            .processing_instructions = self.processing_instructions,
+            .strings = self.strings,
+            .dtd_finding_inclusions = self.dtd_finding_inclusions,
+            .start_result = self.start_result.?,
+            .document_type = self.document_type,
+            .document_element = self.document_element,
+            .end_result = self.end_result.?,
             .first_dtd_finding = if (finding) |value| .{
                 .code = value.code,
                 .primary = value.primary,
                 .related = value.related,
             } else null,
-            .dtd_finding_inclusions = finding_inclusions,
             .normalization_finding = normal_reader.normalizationFinding(),
             .namespaces_processed = self.options.reader.namespaces == .process,
             .text_origin_retained = self.options.retain_text_origin,
         };
+        self.nodes = .empty;
+        self.elements = .empty;
+        self.attributes = .empty;
+        self.namespaces = .empty;
+        self.texts = .empty;
+        self.text_origins = .empty;
+        self.comments = .empty;
+        self.processing_instructions = .empty;
+        self.strings = .empty;
+        self.dtd_finding_inclusions = .empty;
+        self.document_element = 0;
+        return result;
+    }
+
+    fn appendAttribute(self: *Self, value: reader.NormalAttribute) BuildError!void {
+        try self.appendOwned(&self.attributes, .{
+            .name = try self.copyName(value.name),
+            .value = try self.copy(value.value),
+            .specified = value.specified,
+            .declared_type = if (value.declared_type) |kind| @intFromEnum(kind) else 0,
+            .has_declared_type = value.declared_type != null,
+        });
+    }
+
+    fn appendNode(self: *Self, kind: NodeKind, payload: u32) BuildError!NodeIndex {
+        if (self.nodes.items.len >= self.options.limits.max_nodes or
+            self.nodes.items.len >= std.math.maxInt(u32)) return error.TreeLimit;
+        const parent = if (self.open_elements.items.len == 0)
+            0
+        else
+            self.open_elements.getLast();
+        if (parent != 0) {
+            const child_count = self.open_child_counts.getLast();
+            if (self.nodes.items[parent - 1].kind == .element and
+                (child_count >= self.options.limits.max_children_per_element or
+                    child_count == std.math.maxInt(u32))) return error.TreeLimit;
+        }
+        try self.appendOwned(&self.nodes, .{ .kind = kind, .payload = payload, .parent = parent });
+        const index: NodeIndex = @intCast(self.nodes.items.len);
+        if (parent != 0) {
+            const parent_node = &self.nodes.items[parent - 1];
+            const last = self.last_children.getLast();
+            if (last == 0) {
+                parent_node.first_child = index;
+            } else {
+                self.nodes.items[last - 1].next_sibling = index;
+            }
+            self.open_child_counts.items[self.open_child_counts.items.len - 1] += 1;
+            self.last_children.items[self.last_children.items.len - 1] = index;
+        }
+        self.text_boundary = false;
+        return index;
+    }
+
+    fn copyName(self: *Self, value: reader.NormalName) BuildError!DocumentNameRecord {
+        var result: DocumentNameRecord = .{ .raw = try self.copy(value.raw) };
+        if (value.expanded) |expanded| {
+            result.prefix = try self.copyOptional(expanded.prefix);
+            result.local = try self.copy(expanded.local);
+            result.namespace_uri = try self.copyOptional(expanded.namespace_uri);
+        }
+        return result;
+    }
+
+    fn copy(self: *Self, bytes: []const u8) BuildError!StringRef {
+        const end = std.math.add(usize, self.strings.items.len, bytes.len) catch
+            return error.TreeLimit;
+        if (end > self.options.limits.max_string_bytes or end >= std.math.maxInt(u32))
+            return error.TreeLimit;
+        const offset = self.strings.items.len;
+        try self.reserveOwned(&self.strings, bytes.len);
+        self.strings.appendSliceAssumeCapacity(bytes);
+        return .{ .offset = @intCast(offset), .len = @intCast(bytes.len) };
+    }
+
+    fn copyOptional(self: *Self, value: ?[]const u8) BuildError!StringRef {
+        return if (value) |bytes| try self.copy(bytes) else .{};
+    }
+
+    fn appendToString(self: *Self, value: *StringRef, bytes: []const u8) BuildError!void {
+        if (value.offset + value.len != self.strings.items.len)
+            return error.InvalidEventSequence;
+        const next_len = std.math.add(usize, value.len, bytes.len) catch return error.TreeLimit;
+        if (next_len > std.math.maxInt(u32)) return error.TreeLimit;
+        _ = try self.copy(bytes);
+        value.len = @intCast(next_len);
+    }
+
+    fn poolBytes(self: *const Self, value: StringRef) []const u8 {
+        return self.strings.items[value.offset..][0..value.len];
+    }
+
+    fn requireCount(self: *Self, current: usize, added: usize, maximum: usize) BuildError!void {
+        _ = self;
+        const total = std.math.add(usize, current, added) catch return error.TreeLimit;
+        if (total > maximum or total > std.math.maxInt(u32)) return error.TreeLimit;
+    }
+
+    fn appendOwned(
+        self: *Self,
+        list: anytype,
+        value: std.meta.Elem(@TypeOf(list.items)),
+    ) BuildError!void {
+        try self.reserveOwned(list, 1);
+        list.appendAssumeCapacity(value);
+    }
+
+    fn reserveOwned(self: *Self, list: anytype, additional: usize) BuildError!void {
+        const required = std.math.add(usize, list.items.len, additional) catch
+            return error.TreeLimit;
+        if (required <= list.capacity) return;
+        var capacity = list.capacity;
+        while (capacity < required) {
+            const increment = capacity / 2 + 8;
+            capacity = std.math.add(usize, capacity, increment) catch return error.TreeLimit;
+        }
+        const item_size = @sizeOf(std.meta.Elem(@TypeOf(list.items)));
+        var projected = self.ownedCapacity() catch return error.TreeLimit;
+        const old_bytes = std.math.mul(usize, list.capacity, item_size) catch
+            return error.TreeLimit;
+        const new_bytes = std.math.mul(usize, capacity, item_size) catch
+            return error.TreeLimit;
+        projected -= old_bytes;
+        projected = std.math.add(usize, projected, new_bytes) catch return error.TreeLimit;
+        if (projected > self.options.limits.max_retained_bytes) return error.TreeLimit;
+        list.ensureTotalCapacityPrecise(self.allocator, capacity) catch return error.OutOfMemory;
+    }
+
+    fn ownedCapacity(self: *const Self) !usize {
+        var total = self.strings.capacity;
+        inline for (.{
+            .{ self.nodes.capacity, @sizeOf(Node) },
+            .{ self.elements.capacity, @sizeOf(DocumentElementRecord) },
+            .{ self.attributes.capacity, @sizeOf(DocumentAttributeRecord) },
+            .{ self.namespaces.capacity, @sizeOf(NamespaceRecord) },
+            .{ self.texts.capacity, @sizeOf(StringRef) },
+            .{ self.text_origins.capacity, @sizeOf(reader.TextOrigin) },
+            .{ self.comments.capacity, @sizeOf(StringRef) },
+            .{ self.processing_instructions.capacity, @sizeOf(PiRecord) },
+            .{ self.dtd_finding_inclusions.capacity, @sizeOf(reader.NormalLocation) },
+        }) |entry| try addCapacity(&total, entry[0], entry[1]);
+        return total;
+    }
+
+    fn clearFragment(self: *Self) void {
+        self.fragment_node = 0;
+        self.fragment_complete = true;
     }
 };
-
-fn storageName(value: reader.NormalName) reader.Name(document_storage_config) {
-    const expanded = value.expanded;
-    return .{
-        .raw = value.raw,
-        .prefix = if (expanded) |name| name.prefix else null,
-        .local = if (expanded) |name| name.local else value.raw,
-        .namespace_uri = if (expanded) |name| name.namespace_uri else null,
-    };
-}
-
-fn xmlVersionBytes(version: reader.XmlVersion) []const u8 {
-    return switch (version) {
-        .xml10 => "1.0",
-        .xml11 => "1.1",
-    };
-}
 
 fn mapBuildError(err: BuildError) ParseDocumentError {
     return switch (err) {

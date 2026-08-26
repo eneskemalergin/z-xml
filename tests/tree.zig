@@ -111,7 +111,16 @@ test "[integration] - [document]: owns retained XML after the source expires" {
     try std.testing.expectEqual(@as(?xml.TextOrigin, null), document.textOrigin(text));
     try std.testing.expectEqual(@as(?xml.Node, null), children.next());
     try std.testing.expectEqual(xml.DocumentContent.complete, document.documentEnd().content);
-    try std.testing.expect(document.memoryUsage().total_capacity_bytes > 0);
+    const memory = document.memoryUsage();
+    try std.testing.expectEqual(@as(usize, 5), memory.node_count);
+    try std.testing.expectEqual(@as(usize, 1), memory.attribute_count);
+    try std.testing.expectEqual(@as(usize, 1), memory.namespace_declaration_count);
+    try std.testing.expectEqual(
+        memory.node_capacity_bytes + memory.attribute_capacity_bytes +
+            memory.namespace_declaration_capacity_bytes + memory.string_capacity_bytes +
+            memory.metadata_capacity_bytes,
+        memory.total_capacity_bytes,
+    );
 }
 
 test "[integration] - [document]: joins fragments from caller-owned stream input" {
@@ -220,6 +229,7 @@ test "[integration] - [document]: retains validation and normalization findings"
     try std.testing.expectEqual(@as(u32, 90), retained_finding.primary.source_id);
     try std.testing.expectEqual(@as(usize, 1), retained_finding.inclusion_trace.len);
     try std.testing.expectEqual(@as(u32, 0), retained_finding.inclusion_trace[0].source_id);
+    try std.testing.expect(external_finding.memoryUsage().metadata_capacity_bytes > 0);
 
     var normalization = try xml.parseDocument(
         std.testing.allocator,
@@ -227,6 +237,14 @@ test "[integration] - [document]: retains validation and normalization findings"
         .{},
     );
     defer normalization.deinit();
+    try std.testing.expectEqual(
+        xml.XmlVersion.xml11,
+        normalization.documentStart().effective_version,
+    );
+    try std.testing.expectEqual(
+        xml.XmlVersion.xml11,
+        normalization.documentStart().declaration.?.version,
+    );
     try std.testing.expectEqual(
         xml.DocumentNormalization.not_normalized,
         normalization.documentEnd().normalization,
@@ -254,6 +272,251 @@ test "[failure] - [document]: reports option, XML, and document limit errors" {
             .limits = .{ .max_nodes = 1 },
         }),
     );
+
+    const partial = "<r><!--unfinished";
+    var input_buffer: [1]u8 = undefined;
+    var source: std.testing.Reader = .init(&input_buffer, &.{.{ .buffer = partial }});
+    source.artificial_limit = .limited(1);
+    try std.testing.expectError(
+        error.InvalidXml,
+        xml.parseDocument(
+            std.testing.allocator,
+            .{ .stream = &source.interface },
+            .{ .reader = .{ .limits = .{ .max_fragment_bytes = 1 } } },
+        ),
+    );
+}
+
+fn documentAllocationFailureCase(allocator: std.mem.Allocator) !void {
+    const input =
+        "<?xml version='1.1'?>" ++
+        "<!DOCTYPE p:r [" ++
+        "<!ELEMENT p:r (#PCDATA|x)*>" ++
+        "<!ELEMENT x EMPTY>" ++
+        "<!ATTLIST p:r mode (a|b) 'a'>" ++
+        "]>" ++
+        "<!--before--><?p data?>" ++
+        "<p:r xmlns:p='urn:test'>a<![CDATA[b]]><x/>c</p:r>";
+    var document = try xml.parseDocument(allocator, .{ .slice = input }, .{
+        .reader = .{
+            .dtd = .{ .validate = .{} },
+            .limits = .{ .max_fragment_bytes = 2 },
+        },
+        .retain_text_origin = true,
+    });
+    document.deinit();
+}
+
+fn documentFindingAllocationFailureCase(
+    allocator: std.mem.Allocator,
+    subset: *const xml.ExternalSubset,
+) !void {
+    var document = try xml.parseDocument(
+        allocator,
+        .{ .slice = "<!DOCTYPE r SYSTEM 'schema.dtd'><r/>" },
+        .{ .reader = .{ .dtd = .{ .validate = .{ .external_subset = subset } } } },
+    );
+    document.deinit();
+}
+
+test "[failure] - [document]: releases every construction allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        documentAllocationFailureCase,
+        .{},
+    );
+    var subset = try xml.ExternalSubset.compileDecoded(
+        std.testing.allocator,
+        "schema.dtd",
+        "<!ELEMENT r EMPTY><!ELEMENT r EMPTY>",
+        .{ .source_id = 90 },
+    );
+    defer subset.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        documentFindingAllocationFailureCase,
+        .{&subset},
+    );
+}
+
+const PublicSummary = struct {
+    elements: usize = 0,
+    attributes: usize = 0,
+    namespace_declarations: usize = 0,
+    text_bytes: usize = 0,
+    comments: usize = 0,
+    processing_instructions: usize = 0,
+    checksum: u64 = 14695981039346656037,
+
+    fn marker(self: *PublicSummary, value: u8) void {
+        self.checksum ^= value;
+        self.checksum *%= 1099511628211;
+    }
+
+    fn rawBytes(self: *PublicSummary, value: []const u8) void {
+        for (value) |byte| self.marker(byte);
+    }
+
+    fn bytes(self: *PublicSummary, value: []const u8) void {
+        var length = value.len;
+        for (0..@sizeOf(usize)) |_| {
+            self.marker(@truncate(length));
+            length >>= 8;
+        }
+        self.rawBytes(value);
+    }
+
+    fn optionalBytes(self: *PublicSummary, value: ?[]const u8) void {
+        if (value) |bytes_value| {
+            self.marker(1);
+            self.bytes(bytes_value);
+        } else {
+            self.marker(0);
+        }
+    }
+
+    fn name(self: *PublicSummary, value: xml.Name) void {
+        self.bytes(value.raw);
+        if (value.expanded) |expanded| {
+            self.marker(1);
+            self.optionalBytes(expanded.prefix);
+            self.bytes(expanded.local);
+            self.optionalBytes(expanded.namespace_uri);
+        } else {
+            self.marker(0);
+        }
+    }
+};
+
+fn publicReaderSummary(input: []const u8, options: xml.ReaderOptions) !PublicSummary {
+    var parser = try xml.Reader.init(std.testing.allocator, .{ .slice = input }, options);
+    defer parser.deinit();
+    var result: PublicSummary = .{};
+    var comment_open = false;
+    var pi_open = false;
+    while (try parser.next()) |event| switch (event.data) {
+        .start_element => |value| {
+            result.marker(1);
+            result.name(value.name);
+            result.elements += 1;
+            for (value.attributes) |attribute| {
+                result.marker(2);
+                result.name(attribute.name);
+                result.bytes(attribute.value);
+                result.attributes += 1;
+            }
+            for (value.namespace_declarations) |declaration| {
+                result.marker(3);
+                result.optionalBytes(declaration.prefix);
+                result.bytes(declaration.namespace_uri);
+                result.namespace_declarations += 1;
+            }
+        },
+        .end_element => |value| {
+            result.marker(4);
+            result.name(value.name);
+        },
+        .text => |value| {
+            result.rawBytes(value.bytes);
+            result.text_bytes += value.bytes.len;
+        },
+        .comment => |value| {
+            if (!comment_open) result.marker(5);
+            result.rawBytes(value.bytes);
+            comment_open = !value.final_fragment;
+            if (value.final_fragment) {
+                result.marker(6);
+                result.comments += 1;
+            }
+        },
+        .processing_instruction => |value| {
+            if (!pi_open) {
+                result.marker(7);
+                result.bytes(value.target);
+            }
+            result.rawBytes(value.data);
+            pi_open = !value.final_fragment;
+            if (value.final_fragment) {
+                result.marker(8);
+                result.processing_instructions += 1;
+            }
+        },
+        else => {},
+    };
+    return result;
+}
+
+fn addDocumentNode(document: *const xml.Document, node: xml.Node, result: *PublicSummary) void {
+    switch (document.nodeKind(node).?) {
+        .document => {},
+        .element => {
+            result.marker(1);
+            result.name(document.nodeName(node).?);
+            result.elements += 1;
+            var attributes = document.attributes(node);
+            while (attributes.next()) |attribute| {
+                result.marker(2);
+                result.name(attribute.name);
+                result.bytes(attribute.value);
+                result.attributes += 1;
+            }
+            var declarations = document.namespaceDeclarations(node);
+            while (declarations.next()) |declaration| {
+                result.marker(3);
+                result.optionalBytes(declaration.prefix);
+                result.bytes(declaration.namespace_uri);
+                result.namespace_declarations += 1;
+            }
+            var children = document.children(node);
+            while (children.next()) |child| addDocumentNode(document, child, result);
+            result.marker(4);
+            result.name(document.nodeName(node).?);
+        },
+        .text => {
+            const value = document.nodeValue(node).?;
+            result.rawBytes(value);
+            result.text_bytes += value.len;
+        },
+        .comment => {
+            result.marker(5);
+            result.rawBytes(document.nodeValue(node).?);
+            result.marker(6);
+            result.comments += 1;
+        },
+        .processing_instruction => {
+            const value = document.processingInstruction(node).?;
+            result.marker(7);
+            result.bytes(value.target);
+            result.rawBytes(value.data);
+            result.marker(8);
+            result.processing_instructions += 1;
+        },
+    }
+}
+
+fn publicDocumentSummary(document: *const xml.Document) PublicSummary {
+    var result: PublicSummary = .{};
+    var children = document.children(document.root());
+    while (children.next()) |child| addDocumentNode(document, child, &result);
+    return result;
+}
+
+test "[property] - [document]: matches the public Reader event order and values" {
+    const input =
+        "<!--before--><?p data?>" ++
+        "<r xmlns='urn:r' xmlns:q='urn:q' a='1'>" ++
+        "x<![CDATA[y]]><q:n q:b='2'/>z" ++
+        "</r><!--after-->";
+    const reader_options: xml.ReaderOptions = .{
+        .dtd = .reject,
+        .limits = .{ .max_fragment_bytes = 2 },
+    };
+    const expected = try publicReaderSummary(input, reader_options);
+    var document = try xml.parseDocument(std.testing.allocator, .{ .slice = input }, .{
+        .reader = reader_options,
+    });
+    defer document.deinit();
+    try std.testing.expectEqual(expected, publicDocumentSummary(&document));
 }
 
 test "[integration] - [owned tree]: preserves document order and semantic values" {

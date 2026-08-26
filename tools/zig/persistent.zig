@@ -3,6 +3,7 @@
 const std = @import("std");
 const xml = @import("z_xml");
 const persistent_options = @import("persistent_options");
+const TrackingAllocator = @import("tracking_allocator.zig").TrackingAllocator;
 
 const ENGINE = if (persistent_options.default_options)
     "z-xml-default"
@@ -35,98 +36,6 @@ const Options = struct {
     report_memory: bool = false,
     parser_storage: ParserStorage = .dynamic,
     path: []const u8,
-};
-
-const TrackingAllocator = struct {
-    child: std.mem.Allocator,
-    allocs: u64 = 0,
-    resizes: u64 = 0,
-    remaps: u64 = 0,
-    requested_bytes: u64 = 0,
-    live_bytes: usize = 0,
-    peak_live_bytes: usize = 0,
-
-    fn allocator(self: *TrackingAllocator) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    fn addLive(self: *TrackingAllocator, amount: usize) void {
-        self.live_bytes += amount;
-        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
-        self.requested_bytes += amount;
-    }
-
-    fn alloc(
-        context: *anyopaque,
-        len: usize,
-        alignment: std.mem.Alignment,
-        return_address: usize,
-    ) ?[*]u8 {
-        const self: *TrackingAllocator = @ptrCast(@alignCast(context));
-        const result = self.child.rawAlloc(len, alignment, return_address) orelse return null;
-        self.allocs += 1;
-        self.addLive(len);
-        return result;
-    }
-
-    fn resize(
-        context: *anyopaque,
-        memory: []u8,
-        alignment: std.mem.Alignment,
-        new_len: usize,
-        return_address: usize,
-    ) bool {
-        const self: *TrackingAllocator = @ptrCast(@alignCast(context));
-        if (!self.child.rawResize(memory, alignment, new_len, return_address)) return false;
-        self.resizes += 1;
-        if (new_len > memory.len) {
-            self.addLive(new_len - memory.len);
-        } else {
-            self.live_bytes -= memory.len - new_len;
-        }
-        return true;
-    }
-
-    fn remap(
-        context: *anyopaque,
-        memory: []u8,
-        alignment: std.mem.Alignment,
-        new_len: usize,
-        return_address: usize,
-    ) ?[*]u8 {
-        const self: *TrackingAllocator = @ptrCast(@alignCast(context));
-        const result = self.child.rawRemap(
-            memory,
-            alignment,
-            new_len,
-            return_address,
-        ) orelse return null;
-        self.remaps += 1;
-        if (new_len > memory.len) {
-            self.addLive(new_len - memory.len);
-        } else {
-            self.live_bytes -= memory.len - new_len;
-        }
-        return result;
-    }
-
-    fn free(
-        context: *anyopaque,
-        memory: []u8,
-        alignment: std.mem.Alignment,
-        return_address: usize,
-    ) void {
-        const self: *TrackingAllocator = @ptrCast(@alignCast(context));
-        self.child.rawFree(memory, alignment, return_address);
-        self.live_bytes -= memory.len;
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{
-        .alloc = alloc,
-        .resize = resize,
-        .remap = remap,
-        .free = free,
-    };
 };
 
 const MemoryStats = struct {
@@ -507,7 +416,7 @@ test "[unit] - [persistent adapter options]: parses the shared controls exactly"
     try std.testing.expect(parseOptions(&.{ "z-xml-persistent", "x", "y" }) == null);
 }
 
-test "[unit] - [persistent adapter memory]: tracks owned bytes and cleanup" {
+test "[unit] - [tracking allocator]: tracks owned bytes and cleanup" {
     var tracking: TrackingAllocator = .{ .child = std.testing.allocator };
     const allocator = tracking.allocator();
     const first = try allocator.alloc(u8, 4);
