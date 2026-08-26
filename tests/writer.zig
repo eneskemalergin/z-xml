@@ -28,6 +28,28 @@ const FlushSink = struct {
     }
 };
 
+fn expectExpandedName(
+    name: xml.Name,
+    raw: []const u8,
+    prefix: ?[]const u8,
+    local: []const u8,
+    namespace_uri: ?[]const u8,
+) !void {
+    try std.testing.expectEqualStrings(raw, name.raw);
+    const expanded = name.expanded orelse return error.MissingExpandedName;
+    if (prefix) |expected| {
+        try std.testing.expectEqualStrings(expected, expanded.prefix.?);
+    } else {
+        try std.testing.expect(expanded.prefix == null);
+    }
+    try std.testing.expectEqualStrings(local, expanded.local);
+    if (namespace_uri) |expected| {
+        try std.testing.expectEqualStrings(expected, expanded.namespace_uri.?);
+    } else {
+        try std.testing.expect(expanded.namespace_uri == null);
+    }
+}
+
 test "[integration] - [writer output]: writes compact XML in call order" {
     const declaration = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
     const prolog = "<!--before--><?prepare root?>";
@@ -65,6 +87,124 @@ test "[integration] - [writer output]: writes compact XML in call order" {
 
     try std.testing.expectEqualStrings(expected, output.buffered());
     try std.testing.expectEqual(@as(?u64, expected.len), writer.byteOffset());
+}
+
+test "[integration] - [writer namespaces]: writes scoped names that Reader resolves exactly" {
+    const outer_namespace = "urn:outer&one";
+    const expected =
+        "<?xml version=\"1.1\" encoding=\"UTF-8\"?>" ++
+        "<root xmlns=\"urn:outer&amp;one\" value=\"0\" xmlns:p=\"urn:p\" " ++
+        "xmlns:xml=\"http://www.w3.org/XML/1998/namespace\" " ++
+        "p:value=\"1\" xml:lang=\"en\">" ++
+        "<p:child xmlns=\"urn:inner\" xmlns:p=\"urn:inner-p\" p:value=\"2\">" ++
+        "<leaf xmlns=\"\"/><plain xmlns:p=\"\"/></p:child><p:child/></root>";
+    var output_buffer: [2048]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+        .version = .xml11,
+    });
+    defer writer.deinit();
+
+    try writer.startDocument();
+    try writer.startElement("root");
+    try writer.namespace(null, outer_namespace);
+    try writer.attribute("value", "0");
+    try writer.namespace("p", "urn:p");
+    try writer.namespace("xml", "http://www.w3.org/XML/1998/namespace");
+    try writer.attribute("p:value", "1");
+    try writer.attribute("xml:lang", "en");
+    try writer.startElement("p:child");
+    try writer.namespace(null, "urn:inner");
+    try writer.namespace("p", "urn:inner-p");
+    try writer.attribute("p:value", "2");
+    try writer.startElement("leaf");
+    try writer.namespace(null, "");
+    try writer.endElement();
+    try writer.startElement("plain");
+    try writer.namespace("p", "");
+    try writer.endElement();
+    try writer.endElement();
+    try writer.startElement("p:child");
+    try writer.endElement();
+    try writer.endElement();
+    try writer.endDocument();
+
+    try std.testing.expectEqualStrings(expected, output.buffered());
+    try std.testing.expectEqual(@as(usize, 0), writer.memoryUsage().namespace_binding_count);
+    try std.testing.expectEqual(@as(usize, 0), writer.memoryUsage().namespace_bytes);
+
+    const ExpectedElement = struct {
+        raw: []const u8,
+        prefix: ?[]const u8 = null,
+        local: []const u8,
+        namespace_uri: ?[]const u8 = null,
+    };
+    const expected_elements = [_]ExpectedElement{
+        .{ .raw = "root", .local = "root", .namespace_uri = outer_namespace },
+        .{
+            .raw = "p:child",
+            .prefix = "p",
+            .local = "child",
+            .namespace_uri = "urn:inner-p",
+        },
+        .{ .raw = "leaf", .local = "leaf" },
+        .{ .raw = "plain", .local = "plain", .namespace_uri = "urn:inner" },
+        .{
+            .raw = "p:child",
+            .prefix = "p",
+            .local = "child",
+            .namespace_uri = "urn:p",
+        },
+    };
+    var parser = try xml.Reader.init(std.testing.allocator, .{ .slice = output.buffered() }, .{});
+    defer parser.deinit();
+    var start_index: usize = 0;
+    while (try parser.next()) |event| switch (event.data) {
+        .start_element => |element| {
+            const expected_element = expected_elements[start_index];
+            try expectExpandedName(
+                element.name,
+                expected_element.raw,
+                expected_element.prefix,
+                expected_element.local,
+                expected_element.namespace_uri,
+            );
+            switch (start_index) {
+                0 => {
+                    try std.testing.expectEqual(@as(usize, 3), element.attributes.len);
+                    try expectExpandedName(element.attributes[0].name, "value", null, "value", null);
+                    try expectExpandedName(
+                        element.attributes[1].name,
+                        "p:value",
+                        "p",
+                        "value",
+                        "urn:p",
+                    );
+                    try expectExpandedName(
+                        element.attributes[2].name,
+                        "xml:lang",
+                        "xml",
+                        "lang",
+                        "http://www.w3.org/XML/1998/namespace",
+                    );
+                },
+                1 => {
+                    try std.testing.expectEqual(@as(usize, 1), element.attributes.len);
+                    try expectExpandedName(
+                        element.attributes[0].name,
+                        "p:value",
+                        "p",
+                        "value",
+                        "urn:inner-p",
+                    );
+                },
+                else => try std.testing.expectEqual(@as(usize, 0), element.attributes.len),
+            }
+            start_index += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(expected_elements.len, start_index);
 }
 
 test "[property] - [writer declaration]: emits each configured declaration" {
@@ -212,13 +352,16 @@ test "[property] - [writer names]: accepts XML names and rejects malformed names
         try writer.startDocument();
         try writer.startElement("π:r");
         try writer.attribute("a:β", "value");
+        try writer.attribute("xmlns", "urn:default");
+        try writer.attribute("xmlns:p", "urn:p");
         try writer.startElement("a\xf3\xaf\xbf\xbf");
         try writer.endElement();
         try writer.endElement();
         try writer.endDocument();
 
         try std.testing.expectEqualStrings(
-            "<π:r a:β=\"value\"><a\xf3\xaf\xbf\xbf/></π:r>",
+            "<π:r a:β=\"value\" xmlns=\"urn:default\" " ++
+                "xmlns:p=\"urn:p\"><a\xf3\xaf\xbf\xbf/></π:r>",
             output.buffered(),
         );
     }
@@ -424,6 +567,137 @@ test "[failure] - [writer attributes]: rejects duplicate raw names" {
     try std.testing.expectEqualStrings("", output.buffered());
 }
 
+test "[failure] - [writer namespaces]: rejects illegal declarations before output" {
+    const Case = struct {
+        prefix: ?[]const u8,
+        namespace_uri: []const u8,
+        expected: xml.WriterError,
+    };
+    const cases = [_]Case{
+        .{ .prefix = "", .namespace_uri = "urn:test", .expected = error.InvalidName },
+        .{ .prefix = "a:b", .namespace_uri = "urn:test", .expected = error.InvalidName },
+        .{ .prefix = "xmlns", .namespace_uri = "urn:test", .expected = error.InvalidNamespace },
+        .{ .prefix = "xml", .namespace_uri = "urn:test", .expected = error.InvalidNamespace },
+        .{
+            .prefix = "p",
+            .namespace_uri = "http://www.w3.org/XML/1998/namespace",
+            .expected = error.InvalidNamespace,
+        },
+        .{
+            .prefix = "p",
+            .namespace_uri = "http://www.w3.org/2000/xmlns/",
+            .expected = error.InvalidNamespace,
+        },
+        .{ .prefix = "p", .namespace_uri = "", .expected = error.InvalidNamespace },
+        .{
+            .prefix = null,
+            .namespace_uri = "http://www.w3.org/XML/1998/namespace",
+            .expected = error.InvalidNamespace,
+        },
+        .{ .prefix = "p", .namespace_uri = "\x00", .expected = error.InvalidCharacter },
+    };
+
+    for (cases) |case| {
+        var output_buffer: [256]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("root");
+        try std.testing.expectError(
+            case.expected,
+            writer.namespace(case.prefix, case.namespace_uri),
+        );
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
+}
+
+test "[failure] - [writer namespaces]: rejects malformed reserved and unbound names" {
+    const Case = struct {
+        name: []const u8,
+        attribute: bool = false,
+        release: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .name = "a:b:c" },
+        .{ .name = "xmlns:root" },
+        .{ .name = "p:root", .release = true },
+        .{ .name = "a:b:c", .attribute = true },
+        .{ .name = "xmlns", .attribute = true },
+        .{ .name = "xmlns:value", .attribute = true },
+        .{ .name = "p:value", .attribute = true, .release = true },
+    };
+
+    for (cases) |case| {
+        var output_buffer: [256]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        if (case.attribute) {
+            try writer.startElement("root");
+            if (case.release) {
+                try writer.attribute(case.name, "value");
+                try std.testing.expectError(error.InvalidNamespace, writer.endElement());
+            } else {
+                try std.testing.expectError(
+                    error.InvalidNamespace,
+                    writer.attribute(case.name, "value"),
+                );
+            }
+        } else if (case.release) {
+            try writer.startElement(case.name);
+            try std.testing.expectError(error.InvalidNamespace, writer.endElement());
+        } else {
+            try std.testing.expectError(error.InvalidNamespace, writer.startElement(case.name));
+        }
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
+}
+
+test "[failure] - [writer namespaces]: rejects duplicate declarations and expanded attributes" {
+    {
+        var output_buffer: [256]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("root");
+        try writer.namespace("p", "urn:one");
+        try std.testing.expectError(
+            error.InvalidNamespace,
+            writer.namespace("p", "urn:two"),
+        );
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
+    {
+        var output_buffer: [256]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("root");
+        try writer.namespace("a", "urn:same");
+        try writer.namespace("b", "urn:same");
+        try writer.attribute("a:value", "one");
+        try writer.attribute("b:value", "two");
+        try std.testing.expectError(error.DuplicateAttribute, writer.endElement());
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
+}
+
 test "[failure] - [writer raw names]: rejects namespace declarations" {
     var output_buffer: [256]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
@@ -457,7 +731,7 @@ test "[failure] - [writer document]: rejects unfinished output without publishin
     try std.testing.expectEqualStrings("", output.buffered());
 }
 
-test "[integration] - [writer argument lifetime]: copies retained names and attributes" {
+test "[integration] - [writer argument lifetime]: copies names attributes and namespaces" {
     var output_buffer: [256]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
     var writer = try xml.Writer.init(std.testing.allocator, &output, .{
@@ -465,19 +739,27 @@ test "[integration] - [writer argument lifetime]: copies retained names and attr
     });
     defer writer.deinit();
 
-    var element_name = [_]u8{ 'r', 'o', 'o', 't' };
-    var attribute_name = [_]u8{'a'};
+    var element_name = [_]u8{ 'p', ':', 'r', 'o', 'o', 't' };
+    var attribute_name = [_]u8{ 'p', ':', 'a' };
     var attribute_value = [_]u8{ 'v', 'a', 'l', 'u', 'e' };
+    var prefix = [_]u8{'p'};
+    var namespace_uri = [_]u8{ 'u', 'r', 'n', ':', 't', 'e', 's', 't' };
     try writer.startDocument();
     try writer.startElement(&element_name);
     try writer.attribute(&attribute_name, &attribute_value);
+    try writer.namespace(&prefix, &namespace_uri);
     @memset(&element_name, 'x');
     @memset(&attribute_name, 'x');
     @memset(&attribute_value, 'x');
+    @memset(&prefix, 'x');
+    @memset(&namespace_uri, 'x');
     try writer.endElement();
     try writer.endDocument();
 
-    try std.testing.expectEqualStrings("<root a=\"value\"/>", output.buffered());
+    try std.testing.expectEqualStrings(
+        "<p:root p:a=\"value\" xmlns:p=\"urn:test\"/>",
+        output.buffered(),
+    );
 }
 
 test "[integration] - [writer round trip]: Reader preserves core output values" {
@@ -630,6 +912,105 @@ test "[failure] - [writer limits]: rejects invalid options and excess depth" {
     try std.testing.expectEqual(@as(usize, 1), writer.memoryUsage().open_element_count);
     try std.testing.expectError(error.WriterLimit, writer.endElement());
     try std.testing.expectEqual(@as(usize, 1), writer.memoryUsage().open_element_count);
+}
+
+test "[edge] - [writer namespace limits]: bounds declarations and binding bytes" {
+    {
+        var output_buffer: [256]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_namespace_declarations_per_element = 1 },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("root");
+        try writer.namespace("p", "urn:p");
+        try std.testing.expectError(error.WriterLimit, writer.namespace("q", "urn:q"));
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
+    {
+        var output_buffer: [256]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_namespace_binding_bytes = 6 },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("p:r");
+        try writer.namespace("p", "urn:p");
+        try std.testing.expectEqual(@as(usize, 6), writer.memoryUsage().namespace_bytes);
+        try writer.endElement();
+        try writer.endDocument();
+        try std.testing.expectEqualStrings("<p:r xmlns:p=\"urn:p\"/>", output.buffered());
+    }
+    {
+        var output_buffer: [256]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_namespace_binding_bytes = 5 },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("root");
+        try std.testing.expectError(error.WriterLimit, writer.namespace("p", "urn:p"));
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
+    {
+        var output_buffer: [256]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_active_namespace_bindings = 1 },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("root");
+        try writer.namespace("p", "urn:p");
+        try writer.startElement("child");
+        try std.testing.expectError(error.WriterLimit, writer.namespace("q", "urn:q"));
+        try std.testing.expectEqualStrings("<root xmlns:p=\"urn:p\">", output.buffered());
+    }
+}
+
+test "[property] - [writer namespace memory]: sibling declarations roll back with scope" {
+    var output_buffer: [8192]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+        .emit_declaration = false,
+    });
+    defer writer.deinit();
+
+    try writer.startDocument();
+    try writer.startElement("root");
+    try writer.namespace("p", "urn:outer");
+    const root_bytes = writer.memoryUsage().namespace_bytes;
+    var scoped_capacity: ?usize = null;
+    for (0..32) |_| {
+        try writer.startElement("p:child");
+        try writer.namespace("p", "urn:child");
+        const scoped_usage = writer.memoryUsage();
+        try std.testing.expectEqual(@as(usize, 2), scoped_usage.namespace_binding_count);
+        try std.testing.expect(scoped_usage.namespace_bytes > root_bytes);
+        if (scoped_capacity) |expected| {
+            try std.testing.expectEqual(expected, scoped_usage.retained_capacity_bytes);
+        } else {
+            scoped_capacity = scoped_usage.retained_capacity_bytes;
+        }
+        try writer.endElement();
+        try std.testing.expectEqual(@as(usize, 1), writer.memoryUsage().namespace_binding_count);
+        try std.testing.expectEqual(root_bytes, writer.memoryUsage().namespace_bytes);
+    }
+    try writer.endElement();
+    try writer.endDocument();
+    try std.testing.expectEqual(@as(usize, 0), writer.memoryUsage().namespace_binding_count);
+    try std.testing.expectEqual(@as(usize, 0), writer.memoryUsage().namespace_bytes);
 }
 
 test "[integration] - [writer ownership]: leaves sink flushing to the caller" {

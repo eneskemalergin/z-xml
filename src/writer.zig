@@ -106,12 +106,37 @@ const Lifecycle = enum {
 
 const Element = struct {
     name_start: usize,
+    namespace_binding_start: usize,
+    namespace_byte_start: usize,
 };
 
 const PendingAttribute = struct {
     name_start: usize,
     name_len: usize,
+    local_start: usize,
+    namespace: NamespaceReference = .none,
 };
+
+const NamespaceBinding = struct {
+    prefix_start: usize,
+    prefix_len: usize,
+    uri_start: usize,
+    uri_len: usize,
+};
+
+const NamespaceReference = union(enum) {
+    none,
+    predefined_xml,
+    binding: usize,
+};
+
+const QNameParts = struct {
+    prefix: ?[]const u8,
+    local: []const u8,
+};
+
+const XML_NAMESPACE_URI = "http://www.w3.org/XML/1998/namespace";
+const XMLNS_NAMESPACE_URI = "http://www.w3.org/2000/xmlns/";
 
 const Escape = union(enum) {
     bytes: []const u8,
@@ -146,6 +171,8 @@ pub const Writer = struct {
     text_trailing_brackets: u2 = 0,
     open_names: std.ArrayList(u8) = .empty,
     elements: std.ArrayList(Element) = .empty,
+    namespace_bytes: std.ArrayList(u8) = .empty,
+    namespace_bindings: std.ArrayList(NamespaceBinding) = .empty,
     pending_start_tag: std.ArrayList(u8) = .empty,
     pending_attributes: std.ArrayList(PendingAttribute) = .empty,
 
@@ -168,6 +195,8 @@ pub const Writer = struct {
     pub fn deinit(self: *Writer) void {
         self.pending_attributes.deinit(self.allocator);
         self.pending_start_tag.deinit(self.allocator);
+        self.namespace_bindings.deinit(self.allocator);
+        self.namespace_bytes.deinit(self.allocator);
         self.elements.deinit(self.allocator);
         self.open_names.deinit(self.allocator);
         self.* = undefined;
@@ -209,9 +238,16 @@ pub const Writer = struct {
             return self.fail(error.WriterLimit);
         }
         if (!isXmlName(name)) return self.fail(error.InvalidName);
-        if (self.options.namespaces == .process and std.mem.indexOfScalar(u8, name, ':') != null) {
-            return self.fail(error.InvalidNamespace);
+        if (self.options.namespaces == .process) {
+            const parts = qnameParts(name) orelse return self.fail(error.InvalidNamespace);
+            if (parts.prefix) |prefix| {
+                if (std.mem.eql(u8, prefix, "xmlns")) {
+                    return self.fail(error.InvalidNamespace);
+                }
+            }
         }
+
+        if (self.lifecycle == .start_tag) try self.validatePendingStartTag();
 
         const parent_output_len = if (self.lifecycle == .start_tag)
             std.math.add(usize, self.pending_start_tag.items.len, 1) catch
@@ -226,6 +262,8 @@ pub const Writer = struct {
             element_count,
             required_pending_len,
             self.pending_attributes.items.len,
+            self.namespace_bytes.items.len,
+            self.namespace_bindings.items.len,
         );
         try self.ensureOutputFits(parent_output_len);
 
@@ -233,7 +271,11 @@ pub const Writer = struct {
 
         const name_start = self.open_names.items.len;
         self.open_names.appendSliceAssumeCapacity(name);
-        self.elements.appendAssumeCapacity(.{ .name_start = name_start });
+        self.elements.appendAssumeCapacity(.{
+            .name_start = name_start,
+            .namespace_binding_start = self.namespace_bindings.items.len,
+            .namespace_byte_start = self.namespace_bytes.items.len,
+        });
         self.pending_start_tag.appendAssumeCapacity('<');
         self.pending_start_tag.appendSliceAssumeCapacity(name);
         self.pending_attributes.clearRetainingCapacity();
@@ -241,20 +283,140 @@ pub const Writer = struct {
         self.lifecycle = .start_tag;
     }
 
-    /// Returns `InvalidNamespace` because namespace output is not supported.
+    /// Adds one default or prefixed namespace declaration to the pending start tag.
     pub fn namespace(
         self: *Writer,
         prefix: ?[]const u8,
         namespace_uri: []const u8,
     ) WriterError!void {
         try self.checkFailure();
-        _ = prefix;
-        _ = namespace_uri;
         if (self.lifecycle != .start_tag) return self.fail(error.InvalidState);
-        return self.fail(error.InvalidNamespace);
+        if (self.options.namespaces == .raw) return self.fail(error.InvalidNamespace);
+
+        const element = self.elements.items[self.elements.items.len - 1];
+        const declaration_count = self.namespace_bindings.items.len -
+            element.namespace_binding_start;
+        if (declaration_count ==
+            self.options.limits.max_namespace_declarations_per_element)
+        {
+            return self.fail(error.WriterLimit);
+        }
+        if (self.namespace_bindings.items.len ==
+            self.options.limits.max_active_namespace_bindings)
+        {
+            return self.fail(error.WriterLimit);
+        }
+
+        const declared_prefix = prefix orelse "";
+        if (declared_prefix.len > self.options.limits.max_name_bytes) {
+            return self.fail(error.WriterLimit);
+        }
+        const added_namespace_bytes = std.math.add(
+            usize,
+            declared_prefix.len,
+            namespace_uri.len,
+        ) catch return self.fail(error.WriterLimit);
+        const namespace_byte_len = std.math.add(
+            usize,
+            self.namespace_bytes.items.len,
+            added_namespace_bytes,
+        ) catch return self.fail(error.WriterLimit);
+        if (namespace_byte_len > self.options.limits.max_namespace_binding_bytes) {
+            return self.fail(error.WriterLimit);
+        }
+
+        const minimum_syntax_len = if (prefix) |value|
+            checkedSum(&.{ value.len, namespace_uri.len, 10 }) orelse
+                return self.fail(error.WriterLimit)
+        else
+            checkedSum(&.{ namespace_uri.len, 9 }) orelse
+                return self.fail(error.WriterLimit);
+        const minimum_pending_len = std.math.add(
+            usize,
+            self.pending_start_tag.items.len,
+            minimum_syntax_len,
+        ) catch return self.fail(error.WriterLimit);
+        if (minimum_pending_len > self.options.limits.max_pending_start_tag_bytes) {
+            return self.fail(error.WriterLimit);
+        }
+
+        if (prefix) |value| {
+            if (!isNcName(value)) return self.fail(error.InvalidName);
+        }
+        const escaped_len = attributeOutputLen(
+            namespace_uri,
+            self.options.version,
+        ) catch |failure| return self.fail(failure);
+        const exact_syntax_len = if (prefix) |value|
+            checkedSum(&.{ value.len, escaped_len, 10 }) orelse
+                return self.fail(error.WriterLimit)
+        else
+            checkedSum(&.{ escaped_len, 9 }) orelse
+                return self.fail(error.WriterLimit);
+        const pending_len = std.math.add(
+            usize,
+            self.pending_start_tag.items.len,
+            exact_syntax_len,
+        ) catch return self.fail(error.WriterLimit);
+        if (pending_len > self.options.limits.max_pending_start_tag_bytes) {
+            return self.fail(error.WriterLimit);
+        }
+
+        if (std.mem.eql(u8, declared_prefix, "xmlns") or
+            std.mem.eql(u8, namespace_uri, XMLNS_NAMESPACE_URI) or
+            (std.mem.eql(u8, declared_prefix, "xml") !=
+                std.mem.eql(u8, namespace_uri, XML_NAMESPACE_URI)) or
+            (prefix != null and namespace_uri.len == 0 and
+                self.options.version == .xml10))
+        {
+            return self.fail(error.InvalidNamespace);
+        }
+        for (self.namespace_bindings.items[element.namespace_binding_start..]) |binding| {
+            if (std.mem.eql(u8, self.bindingPrefix(binding), declared_prefix)) {
+                return self.fail(error.InvalidNamespace);
+            }
+        }
+
+        const binding_count = std.math.add(
+            usize,
+            self.namespace_bindings.items.len,
+            1,
+        ) catch return self.fail(error.WriterLimit);
+        try self.ensureStorage(
+            self.open_names.items.len,
+            self.elements.items.len,
+            pending_len,
+            self.pending_attributes.items.len,
+            namespace_byte_len,
+            binding_count,
+        );
+
+        self.pending_start_tag.appendSliceAssumeCapacity(" xmlns");
+        if (prefix) |value| {
+            self.pending_start_tag.appendAssumeCapacity(':');
+            self.pending_start_tag.appendSliceAssumeCapacity(value);
+        }
+        self.pending_start_tag.appendSliceAssumeCapacity("=\"");
+        appendEscapedAttribute(
+            &self.pending_start_tag,
+            namespace_uri,
+            self.options.version,
+        );
+        self.pending_start_tag.appendAssumeCapacity('"');
+
+        const prefix_start = self.namespace_bytes.items.len;
+        self.namespace_bytes.appendSliceAssumeCapacity(declared_prefix);
+        const uri_start = self.namespace_bytes.items.len;
+        self.namespace_bytes.appendSliceAssumeCapacity(namespace_uri);
+        self.namespace_bindings.appendAssumeCapacity(.{
+            .prefix_start = prefix_start,
+            .prefix_len = declared_prefix.len,
+            .uri_start = uri_start,
+            .uri_len = namespace_uri.len,
+        });
     }
 
-    /// Adds one unqualified attribute to the pending start tag.
+    /// Adds one attribute to the pending start tag.
     pub fn attribute(self: *Writer, name: []const u8, value: []const u8) WriterError!void {
         try self.checkFailure();
         if (self.lifecycle != .start_tag) return self.fail(error.InvalidState);
@@ -291,15 +453,22 @@ pub const Writer = struct {
         if (pending_len > self.options.limits.max_pending_start_tag_bytes) {
             return self.fail(error.WriterLimit);
         }
-        if (self.options.namespaces == .process and
-            (std.mem.indexOfScalar(u8, name, ':') != null or std.mem.eql(u8, name, "xmlns")))
-        {
-            return self.fail(error.InvalidNamespace);
-        }
-        for (self.pending_attributes.items) |attribute_record| {
-            const previous_name = self.pending_start_tag.items[attribute_record.name_start..][0..attribute_record.name_len];
-            if (std.mem.eql(u8, previous_name, name)) {
-                return self.fail(error.DuplicateAttribute);
+        const local_offset = if (self.options.namespaces == .process) offset: {
+            const parts = qnameParts(name) orelse return self.fail(error.InvalidNamespace);
+            if (std.mem.eql(u8, name, "xmlns")) return self.fail(error.InvalidNamespace);
+            if (parts.prefix) |prefix| {
+                if (std.mem.eql(u8, prefix, "xmlns")) {
+                    return self.fail(error.InvalidNamespace);
+                }
+            }
+            break :offset name.len - parts.local.len;
+        } else 0;
+        if (self.options.namespaces == .raw) {
+            for (self.pending_attributes.items) |attribute_record| {
+                const previous_name = self.pending_start_tag.items[attribute_record.name_start..][0..attribute_record.name_len];
+                if (std.mem.eql(u8, previous_name, name)) {
+                    return self.fail(error.DuplicateAttribute);
+                }
             }
         }
 
@@ -313,6 +482,8 @@ pub const Writer = struct {
             self.elements.items.len,
             pending_len,
             attribute_count,
+            self.namespace_bytes.items.len,
+            self.namespace_bindings.items.len,
         );
 
         self.pending_start_tag.appendAssumeCapacity(' ');
@@ -324,6 +495,7 @@ pub const Writer = struct {
         self.pending_attributes.appendAssumeCapacity(.{
             .name_start = name_start,
             .name_len = name.len,
+            .local_start = name_start + local_offset,
         });
     }
 
@@ -447,6 +619,7 @@ pub const Writer = struct {
         std.debug.assert(self.elements.items.len != 0);
 
         const element = self.elements.items[self.elements.items.len - 1];
+        if (self.lifecycle == .start_tag) try self.validatePendingStartTag();
         const name = self.open_names.items[element.name_start..];
         const output_len = if (self.lifecycle == .start_tag)
             checkedSum(&.{ self.pending_start_tag.items.len, 2 }) orelse
@@ -465,6 +638,8 @@ pub const Writer = struct {
 
         _ = self.elements.pop();
         self.open_names.shrinkRetainingCapacity(element.name_start);
+        self.namespace_bindings.shrinkRetainingCapacity(element.namespace_binding_start);
+        self.namespace_bytes.shrinkRetainingCapacity(element.namespace_byte_start);
         self.text_trailing_brackets = 0;
         self.lifecycle = if (self.elements.items.len == 0) .epilog else .content;
     }
@@ -486,8 +661,8 @@ pub const Writer = struct {
         return .{
             .open_element_count = self.elements.items.len,
             .open_name_bytes = self.open_names.items.len,
-            .namespace_binding_count = 0,
-            .namespace_bytes = 0,
+            .namespace_binding_count = self.namespace_bindings.items.len,
+            .namespace_bytes = self.namespace_bytes.items.len,
             .pending_attribute_count = self.pending_attributes.items.len,
             .pending_start_tag_bytes = self.pending_start_tag.items.len,
             .retained_capacity_bytes = self.retainedCapacity(),
@@ -496,8 +671,94 @@ pub const Writer = struct {
 
     fn pendingContentOutputLen(self: *Writer) WriterError!usize {
         if (self.lifecycle != .start_tag) return 0;
+        try self.validatePendingStartTag();
         return std.math.add(usize, self.pending_start_tag.items.len, 1) catch
             return self.fail(error.WriterLimit);
+    }
+
+    fn validatePendingStartTag(self: *Writer) WriterError!void {
+        if (self.options.namespaces == .raw) return;
+
+        const element = self.elements.items[self.elements.items.len - 1];
+        const element_name = self.open_names.items[element.name_start..];
+        const element_parts = qnameParts(element_name).?;
+        _ = try self.resolveNamespace(element_parts.prefix orelse "");
+
+        for (self.pending_attributes.items) |*attribute_record| {
+            const name = self.pending_start_tag.items[attribute_record.name_start..][0..attribute_record.name_len];
+            const parts = qnameParts(name).?;
+            attribute_record.namespace = if (parts.prefix) |prefix|
+                try self.resolveNamespace(prefix)
+            else
+                .none;
+        }
+
+        for (self.pending_attributes.items, 0..) |attribute_record, index| {
+            const local_end = attribute_record.name_start + attribute_record.name_len;
+            const local = self.pending_start_tag.items[attribute_record.local_start..local_end];
+            for (self.pending_attributes.items[0..index]) |previous_record| {
+                const previous_end = previous_record.name_start + previous_record.name_len;
+                const previous_local = self.pending_start_tag.items[previous_record.local_start..previous_end];
+                if (self.namespaceReferencesEqual(
+                    attribute_record.namespace,
+                    previous_record.namespace,
+                ) and std.mem.eql(u8, local, previous_local)) {
+                    return self.fail(error.DuplicateAttribute);
+                }
+            }
+        }
+    }
+
+    fn resolveNamespace(
+        self: *Writer,
+        prefix: []const u8,
+    ) WriterError!NamespaceReference {
+        if (std.mem.eql(u8, prefix, "xml")) return .predefined_xml;
+
+        var index = self.namespace_bindings.items.len;
+        while (index != 0) {
+            index -= 1;
+            const binding = self.namespace_bindings.items[index];
+            if (!std.mem.eql(u8, self.bindingPrefix(binding), prefix)) continue;
+            if (binding.uri_len != 0) return .{ .binding = index };
+            if (prefix.len == 0) return .none;
+            return self.fail(error.InvalidNamespace);
+        }
+        if (prefix.len == 0) return .none;
+        return self.fail(error.InvalidNamespace);
+    }
+
+    fn bindingPrefix(self: *const Writer, binding: NamespaceBinding) []const u8 {
+        return self.namespace_bytes.items[binding.prefix_start..][0..binding.prefix_len];
+    }
+
+    fn bindingUri(self: *const Writer, binding: NamespaceBinding) []const u8 {
+        return self.namespace_bytes.items[binding.uri_start..][0..binding.uri_len];
+    }
+
+    fn namespaceReferencesEqual(
+        self: *const Writer,
+        left: NamespaceReference,
+        right: NamespaceReference,
+    ) bool {
+        const left_uri = self.namespaceUri(left);
+        const right_uri = self.namespaceUri(right);
+        if (left_uri) |left_bytes| {
+            const right_bytes = right_uri orelse return false;
+            return std.mem.eql(u8, left_bytes, right_bytes);
+        }
+        return right_uri == null;
+    }
+
+    fn namespaceUri(
+        self: *const Writer,
+        reference: NamespaceReference,
+    ) ?[]const u8 {
+        return switch (reference) {
+            .none => null,
+            .predefined_xml => XML_NAMESPACE_URI,
+            .binding => |index| self.bindingUri(self.namespace_bindings.items[index]),
+        };
     }
 
     fn ensureStorage(
@@ -506,6 +767,8 @@ pub const Writer = struct {
         element_count: usize,
         pending_len: usize,
         attribute_count: usize,
+        namespace_byte_len: usize,
+        namespace_binding_count: usize,
     ) WriterError!void {
         var open_name_capacity = targetCapacity(
             u8,
@@ -527,22 +790,44 @@ pub const Writer = struct {
             self.pending_attributes.capacity,
             attribute_count,
         );
+        var namespace_byte_capacity = targetCapacity(
+            u8,
+            self.namespace_bytes.capacity,
+            namespace_byte_len,
+        );
+        var namespace_binding_capacity = targetCapacity(
+            NamespaceBinding,
+            self.namespace_bindings.capacity,
+            namespace_binding_count,
+        );
         const grown_total = capacityTotal(
             open_name_capacity,
             element_capacity,
             pending_capacity,
             attribute_capacity,
+            namespace_byte_capacity,
+            namespace_binding_capacity,
         );
         if (grown_total == null or grown_total.? > self.options.limits.max_retained_bytes) {
             open_name_capacity = @max(self.open_names.capacity, open_name_len);
             element_capacity = @max(self.elements.capacity, element_count);
             pending_capacity = @max(self.pending_start_tag.capacity, pending_len);
             attribute_capacity = @max(self.pending_attributes.capacity, attribute_count);
+            namespace_byte_capacity = @max(
+                self.namespace_bytes.capacity,
+                namespace_byte_len,
+            );
+            namespace_binding_capacity = @max(
+                self.namespace_bindings.capacity,
+                namespace_binding_count,
+            );
             const precise_total = capacityTotal(
                 open_name_capacity,
                 element_capacity,
                 pending_capacity,
                 attribute_capacity,
+                namespace_byte_capacity,
+                namespace_binding_capacity,
             ) orelse return self.fail(error.WriterLimit);
             if (precise_total > self.options.limits.max_retained_bytes) {
                 return self.fail(error.WriterLimit);
@@ -564,6 +849,14 @@ pub const Writer = struct {
         self.pending_attributes.ensureTotalCapacityPrecise(
             self.allocator,
             attribute_capacity,
+        ) catch return self.fail(error.OutOfMemory);
+        self.namespace_bytes.ensureTotalCapacityPrecise(
+            self.allocator,
+            namespace_byte_capacity,
+        ) catch return self.fail(error.OutOfMemory);
+        self.namespace_bindings.ensureTotalCapacityPrecise(
+            self.allocator,
+            namespace_binding_capacity,
         ) catch return self.fail(error.OutOfMemory);
     }
 
@@ -653,6 +946,8 @@ pub const Writer = struct {
             self.elements.capacity,
             self.pending_start_tag.capacity,
             self.pending_attributes.capacity,
+            self.namespace_bytes.capacity,
+            self.namespace_bindings.capacity,
         ).?;
     }
 
@@ -864,6 +1159,22 @@ fn isXmlName(bytes: []const u8) bool {
     return true;
 }
 
+fn qnameParts(raw: []const u8) ?QNameParts {
+    const colon = std.mem.indexOfScalar(u8, raw, ':') orelse
+        return .{ .prefix = null, .local = raw };
+    if (colon == 0 or colon + 1 == raw.len) return null;
+    if (std.mem.indexOfScalarPos(u8, raw, colon + 1, ':') != null) return null;
+    if (!isNcName(raw[colon + 1 ..])) return null;
+    return .{
+        .prefix = raw[0..colon],
+        .local = raw[colon + 1 ..],
+    };
+}
+
+fn isNcName(bytes: []const u8) bool {
+    return isXmlName(bytes) and std.mem.indexOfScalar(u8, bytes, ':') == null;
+}
+
 fn decodeCodepoint(bytes: []const u8, index: *usize) error{InvalidCharacter}!u21 {
     const length = std.unicode.utf8ByteSequenceLength(bytes[index.*]) catch
         return error.InvalidCharacter;
@@ -1001,6 +1312,8 @@ fn capacityTotal(
     element_capacity: usize,
     pending_capacity: usize,
     attribute_capacity: usize,
+    namespace_byte_capacity: usize,
+    namespace_binding_capacity: usize,
 ) ?usize {
     const element_bytes = std.math.mul(usize, element_capacity, @sizeOf(Element)) catch
         return null;
@@ -1009,10 +1322,17 @@ fn capacityTotal(
         attribute_capacity,
         @sizeOf(PendingAttribute),
     ) catch return null;
+    const namespace_binding_bytes = std.math.mul(
+        usize,
+        namespace_binding_capacity,
+        @sizeOf(NamespaceBinding),
+    ) catch return null;
     return checkedSum(&.{
         open_name_capacity,
         element_bytes,
         pending_capacity,
         attribute_bytes,
+        namespace_byte_capacity,
+        namespace_binding_bytes,
     });
 }
