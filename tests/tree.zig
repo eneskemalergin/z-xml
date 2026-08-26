@@ -83,6 +83,7 @@ test "[integration] - [document]: owns retained XML after the source expires" {
     try std.testing.expectEqualStrings("p:r", document.documentType().?.root_name);
 
     const element = document.documentElement();
+    try std.testing.expectEqual(document.root(), document.parent(element));
     const name = document.nodeName(element).?;
     try std.testing.expectEqualStrings("p:r", name.raw);
     try std.testing.expectEqualStrings("urn:test", name.expanded.?.namespace_uri.?);
@@ -107,9 +108,15 @@ test "[integration] - [document]: owns retained XML after the source expires" {
 
     var children = document.children(element);
     const text = children.next().?;
+    try std.testing.expectEqual(element, document.parent(text));
     try std.testing.expectEqualStrings("text", document.nodeValue(text).?);
     try std.testing.expectEqual(@as(?xml.TextOrigin, null), document.textOrigin(text));
     try std.testing.expectEqual(@as(?xml.Node, null), children.next());
+    try std.testing.expectEqual(@as(?xml.Name, null), document.nodeName(text));
+    var text_children = document.children(text);
+    try std.testing.expectEqual(@as(?xml.Node, null), text_children.next());
+    var text_attributes = document.attributes(text);
+    try std.testing.expectEqual(@as(?xml.Attribute, null), text_attributes.next());
     try std.testing.expectEqual(xml.DocumentContent.complete, document.documentEnd().content);
     const memory = document.memoryUsage();
     try std.testing.expectEqual(@as(usize, 5), memory.node_count);
@@ -340,12 +347,15 @@ test "[failure] - [document]: releases every construction allocation" {
 }
 
 const PublicSummary = struct {
+    nodes: usize = 1,
     elements: usize = 0,
     attributes: usize = 0,
     namespace_declarations: usize = 0,
+    text_nodes: usize = 0,
     text_bytes: usize = 0,
     comments: usize = 0,
     processing_instructions: usize = 0,
+    max_depth: usize = 0,
     checksum: u64 = 14695981039346656037,
 
     fn marker(self: *PublicSummary, value: u8) void {
@@ -394,8 +404,14 @@ fn publicReaderSummary(input: []const u8, options: xml.ReaderOptions) !PublicSum
     var result: PublicSummary = .{};
     var comment_open = false;
     var pi_open = false;
+    var text_open = false;
+    var depth: usize = 0;
     while (try parser.next()) |event| switch (event.data) {
         .start_element => |value| {
+            text_open = false;
+            depth += 1;
+            result.max_depth = @max(result.max_depth, depth);
+            result.nodes += 1;
             result.marker(1);
             result.name(value.name);
             result.elements += 1;
@@ -413,15 +429,27 @@ fn publicReaderSummary(input: []const u8, options: xml.ReaderOptions) !PublicSum
             }
         },
         .end_element => |value| {
+            text_open = false;
             result.marker(4);
             result.name(value.name);
+            depth -= 1;
         },
         .text => |value| {
+            if (value.bytes.len == 0) continue;
+            if (!text_open) {
+                result.nodes += 1;
+                result.text_nodes += 1;
+                text_open = true;
+            }
             result.rawBytes(value.bytes);
             result.text_bytes += value.bytes.len;
         },
         .comment => |value| {
-            if (!comment_open) result.marker(5);
+            text_open = false;
+            if (!comment_open) {
+                result.nodes += 1;
+                result.marker(5);
+            }
             result.rawBytes(value.bytes);
             comment_open = !value.final_fragment;
             if (value.final_fragment) {
@@ -430,7 +458,9 @@ fn publicReaderSummary(input: []const u8, options: xml.ReaderOptions) !PublicSum
             }
         },
         .processing_instruction => |value| {
+            text_open = false;
             if (!pi_open) {
+                result.nodes += 1;
                 result.marker(7);
                 result.bytes(value.target);
             }
@@ -441,15 +471,23 @@ fn publicReaderSummary(input: []const u8, options: xml.ReaderOptions) !PublicSum
                 result.processing_instructions += 1;
             }
         },
-        else => {},
+        .skipped_external_source => text_open = false,
+        else => text_open = false,
     };
     return result;
 }
 
-fn addDocumentNode(document: *const xml.Document, node: xml.Node, result: *PublicSummary) void {
+fn enterDocumentNode(
+    document: *const xml.Document,
+    node: xml.Node,
+    depth: usize,
+    result: *PublicSummary,
+) void {
+    result.nodes += 1;
     switch (document.nodeKind(node).?) {
         .document => {},
         .element => {
+            result.max_depth = @max(result.max_depth, depth);
             result.marker(1);
             result.name(document.nodeName(node).?);
             result.elements += 1;
@@ -467,13 +505,10 @@ fn addDocumentNode(document: *const xml.Document, node: xml.Node, result: *Publi
                 result.bytes(declaration.namespace_uri);
                 result.namespace_declarations += 1;
             }
-            var children = document.children(node);
-            while (children.next()) |child| addDocumentNode(document, child, result);
-            result.marker(4);
-            result.name(document.nodeName(node).?);
         },
         .text => {
             const value = document.nodeValue(node).?;
+            result.text_nodes += 1;
             result.rawBytes(value);
             result.text_bytes += value.len;
         },
@@ -494,10 +529,51 @@ fn addDocumentNode(document: *const xml.Document, node: xml.Node, result: *Publi
     }
 }
 
-fn publicDocumentSummary(document: *const xml.Document) PublicSummary {
+fn leaveDocumentNode(
+    document: *const xml.Document,
+    node: xml.Node,
+    result: *PublicSummary,
+) void {
+    if (document.nodeKind(node).? != .element) return;
+    result.marker(4);
+    result.name(document.nodeName(node).?);
+}
+
+const PublicDocumentFrame = struct {
+    node: xml.Node,
+    children: xml.Document.ChildIterator,
+    depth: usize,
+};
+
+fn publicDocumentSummary(
+    allocator: std.mem.Allocator,
+    document: *const xml.Document,
+) !PublicSummary {
     var result: PublicSummary = .{};
-    var children = document.children(document.root());
-    while (children.next()) |child| addDocumentNode(document, child, &result);
+    var stack: std.ArrayList(PublicDocumentFrame) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{
+        .node = document.root(),
+        .children = document.children(document.root()),
+        .depth = 0,
+    });
+    while (stack.items.len != 0) {
+        const frame = &stack.items[stack.items.len - 1];
+        if (frame.children.next()) |child| {
+            const depth = frame.depth + 1;
+            enterDocumentNode(document, child, depth, &result);
+            if (document.nodeKind(child).? == .element) {
+                try stack.append(allocator, .{
+                    .node = child,
+                    .children = document.children(child),
+                    .depth = depth,
+                });
+            }
+        } else {
+            const node = stack.pop().?.node;
+            if (node != document.root()) leaveDocumentNode(document, node, &result);
+        }
+    }
     return result;
 }
 
@@ -516,7 +592,187 @@ test "[property] - [document]: matches the public Reader event order and values"
         .reader = reader_options,
     });
     defer document.deinit();
-    try std.testing.expectEqual(expected, publicDocumentSummary(&document));
+    try std.testing.expectEqual(
+        expected,
+        try publicDocumentSummary(std.testing.allocator, &document),
+    );
+}
+
+fn expectPublicDocumentMatchesReader(
+    input: []const u8,
+    reader_options: xml.ReaderOptions,
+) !PublicSummary {
+    const expected = try publicReaderSummary(input, reader_options);
+    var document = try xml.parseDocument(std.testing.allocator, .{ .slice = input }, .{
+        .reader = reader_options,
+    });
+    defer document.deinit();
+    const actual = try publicDocumentSummary(std.testing.allocator, &document);
+    try std.testing.expectEqual(expected, actual);
+    try std.testing.expectEqual(actual.nodes, document.memoryUsage().node_count);
+    return actual;
+}
+
+test "[property] - [document]: matches Reader summaries on representative shapes" {
+    const raw_options: xml.ReaderOptions = .{
+        .namespaces = .raw,
+        .dtd = .reject,
+    };
+    const shallow = try expectPublicDocumentMatchesReader(
+        "<r a='1'><a/><b>text</b><c/></r>",
+        raw_options,
+    );
+    try std.testing.expectEqual(@as(usize, 4), shallow.elements);
+    try std.testing.expectEqual(@as(usize, 2), shallow.max_depth);
+
+    const mixed = try expectPublicDocumentMatchesReader(
+        "<!--before--><r>a<![CDATA[b]]><x q='v'/>c<!--d--><?p e?></r>",
+        raw_options,
+    );
+    try std.testing.expectEqual(@as(usize, 2), mixed.elements);
+    try std.testing.expectEqual(@as(usize, 2), mixed.text_nodes);
+    try std.testing.expectEqual(@as(usize, 2), mixed.comments);
+    try std.testing.expectEqual(@as(usize, 1), mixed.processing_instructions);
+
+    var wide_input: std.ArrayList(u8) = .empty;
+    defer wide_input.deinit(std.testing.allocator);
+    try wide_input.ensureTotalCapacity(std.testing.allocator, 10_000 * 10 + 7);
+    try wide_input.appendSlice(std.testing.allocator, "<r>");
+    for (0..10_000) |_| {
+        try wide_input.appendSlice(std.testing.allocator, "<n a='v'/>");
+    }
+    try wide_input.appendSlice(std.testing.allocator, "</r>");
+    const wide = try expectPublicDocumentMatchesReader(wide_input.items, raw_options);
+    try std.testing.expectEqual(@as(usize, 10_001), wide.elements);
+    try std.testing.expectEqual(@as(usize, 10_000), wide.attributes);
+    try std.testing.expectEqual(@as(usize, 2), wide.max_depth);
+
+    var deep_input: std.ArrayList(u8) = .empty;
+    defer deep_input.deinit(std.testing.allocator);
+    try deep_input.ensureTotalCapacity(std.testing.allocator, 2_048 * 7 + 1);
+    for (0..2_048) |_| try deep_input.appendSlice(std.testing.allocator, "<n>");
+    try deep_input.append(std.testing.allocator, 'x');
+    for (0..2_048) |_| try deep_input.appendSlice(std.testing.allocator, "</n>");
+    const deep = try expectPublicDocumentMatchesReader(deep_input.items, .{
+        .namespaces = .raw,
+        .dtd = .reject,
+        .limits = .{ .max_depth = 2_048 },
+    });
+    try std.testing.expectEqual(@as(usize, 2_048), deep.elements);
+    try std.testing.expectEqual(@as(usize, 2_048), deep.max_depth);
+
+    var namespace_storage: [8 * 1024]u8 = undefined;
+    var namespace_writer = std.Io.Writer.fixed(&namespace_storage);
+    try namespace_writer.writeAll("<r");
+    for (0..64) |index| {
+        try namespace_writer.print(" xmlns:p{d}='urn:{d}'", .{ index, index });
+    }
+    try namespace_writer.writeAll("/>");
+    const namespace_heavy = try expectPublicDocumentMatchesReader(
+        namespace_writer.buffered(),
+        .{ .dtd = .reject },
+    );
+    try std.testing.expectEqual(@as(usize, 64), namespace_heavy.namespace_declarations);
+
+    var text_input: std.ArrayList(u8) = .empty;
+    defer text_input.deinit(std.testing.allocator);
+    try text_input.ensureTotalCapacity(std.testing.allocator, 512 * 1024 + 7);
+    try text_input.appendSlice(std.testing.allocator, "<r>");
+    try text_input.appendNTimes(std.testing.allocator, 'x', 512 * 1024);
+    try text_input.appendSlice(std.testing.allocator, "</r>");
+    const large_text = try expectPublicDocumentMatchesReader(text_input.items, .{
+        .namespaces = .raw,
+        .dtd = .reject,
+        .limits = .{ .max_fragment_bytes = 1_024 },
+    });
+    try std.testing.expectEqual(@as(usize, 1), large_text.text_nodes);
+    try std.testing.expectEqual(@as(usize, 512 * 1024), large_text.text_bytes);
+}
+
+test "[failure] - [document]: accepts each limit boundary and rejects one over" {
+    const cases = [_]struct {
+        at: []const u8,
+        over: []const u8,
+        options: xml.DocumentOptions,
+    }{
+        .{ .at = "<r/>", .over = "<r><x/></r>", .options = .{
+            .limits = .{ .max_nodes = 2 },
+        } },
+        .{ .at = "<r a='1'/>", .over = "<r a='1' b='2'/>", .options = .{
+            .limits = .{ .max_attributes = 1 },
+        } },
+        .{
+            .at = "<r xmlns:a='u'/>",
+            .over = "<r xmlns:a='u' xmlns:b='v'/>",
+            .options = .{ .limits = .{ .max_namespace_declarations = 1 } },
+        },
+        .{ .at = "<r/>", .over = "<rr/>", .options = .{
+            .reader = .{ .namespaces = .raw, .dtd = .reject },
+            .limits = .{ .max_string_bytes = 1 },
+        } },
+        .{ .at = "<r><x/></r>", .over = "<r><x/><y/></r>", .options = .{
+            .limits = .{ .max_children_per_element = 1 },
+        } },
+        .{ .at = "<r>a</r>", .over = "<r>ab</r>", .options = .{
+            .reader = .{ .limits = .{ .max_fragment_bytes = 1 } },
+            .limits = .{ .max_coalesced_text_bytes = 1 },
+        } },
+    };
+    for (cases) |case| {
+        var at = try xml.parseDocument(
+            std.testing.allocator,
+            .{ .slice = case.at },
+            case.options,
+        );
+        at.deinit();
+        try std.testing.expectError(
+            error.DocumentLimit,
+            xml.parseDocument(
+                std.testing.allocator,
+                .{ .slice = case.over },
+                case.options,
+            ),
+        );
+    }
+
+    const raw_options: xml.ReaderOptions = .{ .namespaces = .raw, .dtd = .reject };
+    var probe = try xml.parseDocument(std.testing.allocator, .{ .slice = "<r/>" }, .{
+        .reader = raw_options,
+    });
+    const retained = probe.memoryUsage().total_capacity_bytes;
+    probe.deinit();
+    try std.testing.expect(retained > 1);
+    var at_retained = try xml.parseDocument(std.testing.allocator, .{ .slice = "<r/>" }, .{
+        .reader = raw_options,
+        .limits = .{ .max_retained_bytes = retained },
+    });
+    try std.testing.expectEqual(retained, at_retained.memoryUsage().total_capacity_bytes);
+    at_retained.deinit();
+    try std.testing.expectError(
+        error.DocumentLimit,
+        xml.parseDocument(std.testing.allocator, .{ .slice = "<r/>" }, .{
+            .reader = raw_options,
+            .limits = .{ .max_retained_bytes = retained - 1 },
+        }),
+    );
+}
+
+test "[integration] - [document]: does not carry capacity from a large document" {
+    var large_input: std.ArrayList(u8) = .empty;
+    defer large_input.deinit(std.testing.allocator);
+    try large_input.ensureTotalCapacity(std.testing.allocator, 4_096 * 4 + 7);
+    try large_input.appendSlice(std.testing.allocator, "<r>");
+    for (0..4_096) |_| try large_input.appendSlice(std.testing.allocator, "<n/>");
+    try large_input.appendSlice(std.testing.allocator, "</r>");
+
+    var large = try xml.parseDocument(std.testing.allocator, .{ .slice = large_input.items }, .{});
+    const large_capacity = large.memoryUsage().total_capacity_bytes;
+    large.deinit();
+
+    var small = try xml.parseDocument(std.testing.allocator, .{ .slice = "<r/>" }, .{});
+    defer small.deinit();
+    try std.testing.expectEqual(@as(usize, 2), small.memoryUsage().node_count);
+    try std.testing.expect(small.memoryUsage().total_capacity_bytes < large_capacity);
 }
 
 test "[integration] - [owned tree]: preserves document order and semantic values" {

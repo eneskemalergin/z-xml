@@ -71,6 +71,7 @@ pub fn build(b: *std.Build) void {
         .root_module = tree_module,
     });
     tree_adapter_step.dependOn(&b.addInstallArtifact(tree_adapter, .{}).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = tree_module })).step);
 
     inline for ([_]CheckAdapter{
         .{
