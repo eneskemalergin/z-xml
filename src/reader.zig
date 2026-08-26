@@ -810,28 +810,34 @@ pub fn Attribute(comptime config: Config) type {
         struct {
             name: Name(config),
             value: []const u8,
+            span: if (config.event_locations) ?NormalSourceSpan else void,
         }
     else
         struct {
             name: Name(config),
             value: []const u8,
+            span: if (config.event_locations) ?NormalSourceSpan else void,
             specified: bool,
             declared_type: ?dtd_module.AttributeType,
         };
 }
 
 /// One source-ordered namespace declaration whose slices follow the event lifetime.
-pub const NamespaceDeclaration = struct {
-    prefix: ?[]const u8,
-    namespace_uri: []const u8,
-};
+pub fn NamespaceDeclaration(comptime config: Config) type {
+    return struct {
+        prefix: ?[]const u8,
+        namespace_uri: []const u8,
+        span: if (config.event_locations) ?NormalSourceSpan else void,
+        specified: if (config.profile.dtdMode() == .rejected) void else bool,
+    };
+}
 
 fn StartElement(comptime config: Config) type {
     return if (config.profile.hasNamespaces())
         struct {
             name: Name(config),
             attributes: []const Attribute(config),
-            namespace_declarations: []const NamespaceDeclaration,
+            namespace_declarations: []const NamespaceDeclaration(config),
             empty_element_syntax: bool,
         }
     else
@@ -1604,7 +1610,7 @@ fn NamespaceState(comptime config: Config) type {
             bindings: std.ArrayList(NamespaceBinding) = .empty,
             active_prefixes: std.ArrayList(usize) = .empty,
             bytes: std.ArrayList(u8) = .empty,
-            event_declarations: std.ArrayList(NamespaceDeclaration) = .empty,
+            event_declarations: std.ArrayList(NamespaceDeclaration(config)) = .empty,
             expanded_indices: std.ArrayList(usize) = .empty,
             event_attribute_locations: std.ArrayList(Location(config)) = .empty,
             comparison_work: usize = 0,
@@ -1651,6 +1657,7 @@ fn AttributeRecord(comptime config: Config) type {
             name_len: usize,
             value_len: usize,
             start: Location(config),
+            end_byte_offset: if (config.event_locations) u64 else void,
             specified: bool = true,
             declared_type: ?dtd_module.AttributeType = null,
             declaration_index: ?usize = null,
@@ -1663,6 +1670,7 @@ fn AttributeRecord(comptime config: Config) type {
             name_len: usize,
             value_len: usize,
             start: Location(config),
+            end_byte_offset: if (config.event_locations) u64 else void,
             namespace_shape: usize = 0,
         }
     else if (config.profile.dtdMode() != .rejected)
@@ -1671,6 +1679,7 @@ fn AttributeRecord(comptime config: Config) type {
             name_len: usize,
             value_len: usize,
             start: Location(config),
+            end_byte_offset: if (config.event_locations) u64 else void,
             specified: bool = true,
             declared_type: ?dtd_module.AttributeType = null,
             declaration_index: ?usize = null,
@@ -1682,6 +1691,7 @@ fn AttributeRecord(comptime config: Config) type {
             name_len: usize,
             value_len: usize,
             start: Location(config),
+            end_byte_offset: if (config.event_locations) u64 else void,
         };
 }
 
@@ -3499,7 +3509,8 @@ pub fn Reader(comptime config: Config) type {
             return self.namespace_state.bindings.capacity *| @sizeOf(NamespaceBinding) +|
                 self.namespace_state.active_prefixes.capacity *| @sizeOf(usize) +|
                 self.namespace_state.bytes.capacity +|
-                self.namespace_state.event_declarations.capacity *| @sizeOf(NamespaceDeclaration) +|
+                self.namespace_state.event_declarations.capacity *|
+                    @sizeOf(NamespaceDeclaration(config)) +|
                 self.namespace_state.expanded_indices.capacity *| @sizeOf(usize) +|
                 self.namespace_state.event_attribute_locations.capacity *| @sizeOf(Location(config));
         }
@@ -7327,6 +7338,7 @@ pub fn Reader(comptime config: Config) type {
                 .name_len = 0,
                 .value_len = 0,
                 .start = self.currentLocation(),
+                .end_byte_offset = if (config.event_locations) 0 else {},
             }) catch return self.failOutOfMemory();
             self.vertical_state = .attribute_name;
         }
@@ -7473,6 +7485,32 @@ pub fn Reader(comptime config: Config) type {
             const record = &self.attribute_records.items[self.attribute_records.items.len - 1];
             const value_offset = record.name_offset + record.name_len;
             record.value_len = self.attribute_bytes.items.len - value_offset;
+            if (comptime config.event_locations) {
+                const end = self.currentLocation();
+                std.debug.assert(record.start.source_id == end.source_id);
+                record.end_byte_offset = end.byte_offset;
+            }
+        }
+
+        fn sourceAttributeSpan(
+            record: AttributeRecord(config),
+        ) if (config.event_locations) ?NormalSourceSpan else void {
+            if (comptime !config.event_locations) return {};
+            if (comptime config.profile.dtdMode() != .rejected) {
+                if (!record.specified) return null;
+            }
+            return .{
+                .source_id = record.start.source_id,
+                .start = record.start.byte_offset,
+                .end = record.end_byte_offset,
+            };
+        }
+
+        fn sourceAttributeSpecified(
+            record: AttributeRecord(config),
+        ) if (config.profile.dtdMode() == .rejected) void else bool {
+            if (comptime config.profile.dtdMode() == .rejected) return {};
+            return record.specified;
         }
 
         fn prepareNamespaceStartElement(self: *Self) ReadError!NamespaceReference {
@@ -7571,11 +7609,13 @@ pub fn Reader(comptime config: Config) type {
                     self.event_attributes.appendAssumeCapacity(.{
                         .name = self.expandedName(raw, parts, reference),
                         .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
+                        .span = sourceAttributeSpan(record),
                     });
                 } else {
                     self.event_attributes.appendAssumeCapacity(.{
                         .name = self.expandedName(raw, parts, reference),
                         .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
+                        .span = sourceAttributeSpan(record),
                         .specified = record.specified,
                         .declared_type = record.declared_type,
                     });
@@ -7654,6 +7694,8 @@ pub fn Reader(comptime config: Config) type {
                 self.namespace_state.event_declarations.append(self.allocator, .{
                     .prefix = declared_prefix,
                     .namespace_uri = uri,
+                    .span = sourceAttributeSpan(record),
+                    .specified = sourceAttributeSpecified(record),
                 }) catch return self.failOutOfMemory();
                 return;
             }
@@ -7705,6 +7747,8 @@ pub fn Reader(comptime config: Config) type {
             self.namespace_state.event_declarations.append(self.allocator, .{
                 .prefix = if (is_default) null else raw["xmlns:".len..],
                 .namespace_uri = uri,
+                .span = sourceAttributeSpan(record),
+                .specified = sourceAttributeSpecified(record),
             }) catch return self.failOutOfMemory();
         }
 
@@ -7904,11 +7948,13 @@ pub fn Reader(comptime config: Config) type {
                     self.event_attributes.appendAssumeCapacity(.{
                         .name = nameFromRaw(config, raw_name),
                         .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
+                        .span = sourceAttributeSpan(record),
                     });
                 } else {
                     self.event_attributes.appendAssumeCapacity(.{
                         .name = nameFromRaw(config, raw_name),
                         .value = self.attribute_bytes.items[value_offset..][0..record.value_len],
+                        .span = sourceAttributeSpan(record),
                         .specified = record.specified,
                         .declared_type = record.declared_type,
                     });
@@ -8024,6 +8070,7 @@ pub fn Reader(comptime config: Config) type {
                 .name_len = name.len,
                 .value_len = value.len,
                 .start = self.token_start,
+                .end_byte_offset = if (config.event_locations) 0 else {},
                 .specified = false,
                 .declared_type = self.dtd_state.declarations.attributes.items[declaration_index].attribute_type,
                 .declaration_index = declaration_index,
@@ -10533,6 +10580,7 @@ pub const NormalReader = struct {
     effective_version: XmlVersion = .xml10,
     external_content_skipped: bool = false,
     pending_event: ?NormalEvent = null,
+    skippable_start: ?NormalSourceSpan = null,
     text_run_source_id: ?u32 = null,
     text_run_end: u64 = 0,
     text_run_origin: TextOrigin = .character_data,
@@ -10680,6 +10728,7 @@ pub const NormalReader = struct {
         self.effective_version = .xml10;
         self.external_content_skipped = false;
         self.pending_event = null;
+        self.skippable_start = null;
         self.text_run_source_id = null;
         self.text_run_end = 0;
         self.text_run_origin = .character_data;
@@ -10692,6 +10741,7 @@ pub const NormalReader = struct {
         if (self.failure) |failure| return failure;
         if (self.complete) return null;
 
+        self.skippable_start = null;
         self.in_call = true;
         defer self.in_call = false;
 
@@ -10699,13 +10749,14 @@ pub const NormalReader = struct {
         if (self.pending_event) |event| {
             self.pending_event = null;
             if (event.span.source_id == 0) self.commitRootStreamBytes(event.span.end);
+            self.rememberStart(event);
             return event;
         }
 
         self.event_attributes.clearRetainingCapacity();
         self.event_namespace_declarations.clearRetainingCapacity();
 
-        return switch (self.engine) {
+        const event = try switch (self.engine) {
             .raw_no_dtd => |*parser| self.nextFrom(normal_raw_no_dtd_config, parser),
             .namespaces_no_dtd => |*parser| self.nextFrom(
                 normal_namespace_no_dtd_config,
@@ -10719,6 +10770,45 @@ pub const NormalReader = struct {
                 parser,
             ),
         };
+        if (event) |value| self.rememberStart(value);
+        return event;
+    }
+
+    /// Consumes the most recently returned start element through its matching end.
+    /// Other states return `error.InvalidState` without changing the Reader.
+    pub fn skipElement(self: *Self) NormalReadError!NormalSourceSpan {
+        if (self.deinitialized or self.in_call) return error.InvalidState;
+        const start = self.skippable_start orelse return error.InvalidState;
+
+        var depth: usize = 1;
+        while (try self.next()) |event| {
+            switch (event.data) {
+                .start_element => depth += 1,
+                .end_element => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        std.debug.assert(start.source_id == event.span.source_id);
+                        return .{
+                            .source_id = start.source_id,
+                            .start = start.start,
+                            .end = event.span.end,
+                        };
+                    }
+                },
+                else => {},
+            }
+        }
+
+        self.in_call = true;
+        defer self.in_call = false;
+        const location = switch (self.engine) {
+            inline else => |*parser| normalLocation(
+                self.options.track_lines,
+                parser.currentLocation(),
+            ),
+        };
+        self.recordGeneratedFailure(error.InvalidXml, .incomplete_input, location);
+        return error.InvalidXml;
     }
 
     /// Returns the first fatal diagnostic, if one exists.
@@ -10836,6 +10926,13 @@ pub const NormalReader = struct {
                     }
                 },
             }
+        }
+    }
+
+    fn rememberStart(self: *Self, event: NormalEvent) void {
+        switch (event.data) {
+            .start_element => self.skippable_start = event.span,
+            else => {},
         }
     }
 
@@ -10986,7 +11083,7 @@ pub const NormalReader = struct {
             .start_element => |element| result: {
                 try self.copyAttributes(config, element.attributes);
                 if (comptime config.profile.hasNamespaces()) {
-                    try self.copyNamespaceDeclarations(element.namespace_declarations);
+                    try self.copyNamespaceDeclarations(config, element.namespace_declarations);
                 }
                 break :result .{ .span = span, .data = .{ .start_element = .{
                     .name = normalName(config, element.name),
@@ -11068,7 +11165,7 @@ pub const NormalReader = struct {
             self.event_attributes.appendAssumeCapacity(.{
                 .name = normalName(config, attribute.name),
                 .value = attribute.value,
-                .span = null,
+                .span = attribute.span,
                 .specified = if (@hasField(@TypeOf(attribute), "specified"))
                     attribute.specified
                 else
@@ -11083,7 +11180,8 @@ pub const NormalReader = struct {
 
     fn copyNamespaceDeclarations(
         self: *Self,
-        declarations: []const NamespaceDeclaration,
+        comptime config: Config,
+        declarations: []const NamespaceDeclaration(config),
     ) NormalReadError!void {
         self.event_namespace_declarations.ensureTotalCapacity(
             self.allocator,
@@ -11093,8 +11191,11 @@ pub const NormalReader = struct {
             self.event_namespace_declarations.appendAssumeCapacity(.{
                 .prefix = declaration.prefix,
                 .namespace_uri = declaration.namespace_uri,
-                .span = null,
-                .specified = true,
+                .span = declaration.span,
+                .specified = if (comptime config.profile.dtdMode() == .rejected)
+                    true
+                else
+                    declaration.specified,
             });
         }
     }

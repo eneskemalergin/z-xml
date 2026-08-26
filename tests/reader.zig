@@ -1861,6 +1861,590 @@ fn pairTranscoder() xml.Transcoder {
     return .{ .context = null, .runFn = pairTranscode };
 }
 
+fn physicalSpan(start: usize, end: usize, prefix: u64, scale: u64) xml.SourceSpan {
+    return .{
+        .source_id = 0,
+        .start = prefix + scale * @as(u64, @intCast(start)),
+        .end = prefix + scale * @as(u64, @intCast(end)),
+    };
+}
+
+fn expectReaderSourceSpans(
+    source: xml.Source,
+    options: xml.ReaderOptions,
+    logical: []const u8,
+    prefix: u64,
+    scale: u64,
+) !void {
+    const start_offset = std.mem.indexOf(u8, logical, "<r ") orelse
+        return error.MissingStartMarkup;
+    const start_end = (std.mem.indexOfPos(u8, logical, start_offset, ">") orelse
+        return error.MissingStartMarkup) + 1;
+    const first_offset = std.mem.indexOf(u8, logical, "a='1'") orelse
+        return error.MissingAttribute;
+    const second_offset = std.mem.indexOf(u8, logical, "p:b = \"2\"") orelse
+        return error.MissingAttribute;
+    const default_namespace_offset = std.mem.indexOf(u8, logical, "xmlns='u'") orelse
+        return error.MissingNamespaceDeclaration;
+    const prefixed_namespace_offset = std.mem.indexOf(u8, logical, "xmlns:p=\"v\"") orelse
+        return error.MissingNamespaceDeclaration;
+    const text_offset = std.mem.indexOfPos(u8, logical, start_end, "x") orelse
+        return error.MissingText;
+    const end_offset = std.mem.indexOfPos(u8, logical, text_offset + 1, "</r>") orelse
+        return error.MissingEndMarkup;
+
+    var reader = try xml.Reader.init(std.testing.allocator, source, options);
+    defer reader.deinit();
+    var saw_start = false;
+    var saw_text = false;
+    var saw_end = false;
+    while (try reader.next()) |event| switch (event.data) {
+        .start_element => |element| {
+            saw_start = true;
+            try std.testing.expectEqual(
+                physicalSpan(start_offset, start_end, prefix, scale),
+                event.span,
+            );
+
+            const first = element.attributeRaw("a") orelse return error.MissingAttribute;
+            try std.testing.expect(first.specified);
+            try std.testing.expectEqual(
+                physicalSpan(
+                    first_offset,
+                    first_offset + "a='1'".len,
+                    prefix,
+                    scale,
+                ),
+                first.span.?,
+            );
+            const second = element.attributeRaw("p:b") orelse return error.MissingAttribute;
+            try std.testing.expect(second.specified);
+            try std.testing.expectEqual(
+                physicalSpan(
+                    second_offset,
+                    second_offset + "p:b = \"2\"".len,
+                    prefix,
+                    scale,
+                ),
+                second.span.?,
+            );
+
+            try std.testing.expectEqual(@as(usize, 2), element.namespace_declarations.len);
+            for (element.namespace_declarations) |declaration| {
+                try std.testing.expect(declaration.specified);
+                if (declaration.prefix) |declared_prefix| {
+                    try std.testing.expectEqualStrings("p", declared_prefix);
+                    try std.testing.expectEqual(
+                        physicalSpan(
+                            prefixed_namespace_offset,
+                            prefixed_namespace_offset + "xmlns:p=\"v\"".len,
+                            prefix,
+                            scale,
+                        ),
+                        declaration.span.?,
+                    );
+                } else {
+                    try std.testing.expectEqual(
+                        physicalSpan(
+                            default_namespace_offset,
+                            default_namespace_offset + "xmlns='u'".len,
+                            prefix,
+                            scale,
+                        ),
+                        declaration.span.?,
+                    );
+                }
+            }
+        },
+        .text => |text| {
+            if (text.bytes.len == 0) continue;
+            saw_text = true;
+            try std.testing.expectEqualStrings("x", text.bytes);
+            try std.testing.expectEqual(
+                physicalSpan(text_offset, text_offset + 1, prefix, scale),
+                event.span,
+            );
+        },
+        .end_element => {
+            saw_end = true;
+            try std.testing.expectEqual(
+                physicalSpan(end_offset, end_offset + "</r>".len, prefix, scale),
+                event.span,
+            );
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_start and saw_text and saw_end);
+}
+
+test "[integration] - [Reader spans]: source locations survive adapters and entities" {
+    const logical = "<r a='1' xmlns='u' xmlns:p=\"v\" p:b = \"2\">x</r>";
+    try expectReaderSourceSpans(.{ .slice = logical }, .{}, logical, 0, 1);
+    try expectReaderSourceSpans(
+        .{ .slice = logical },
+        .{ .dtd = .reject },
+        logical,
+        0,
+        1,
+    );
+
+    const raw_input = "<r a = '1'/>";
+    var raw_reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = raw_input },
+        .{ .namespaces = .raw, .dtd = .reject },
+    );
+    defer raw_reader.deinit();
+    var saw_raw_start = false;
+    while (try raw_reader.next()) |event| switch (event.data) {
+        .start_element => |element| {
+            saw_raw_start = true;
+            try std.testing.expectEqual(@as(usize, 0), element.namespace_declarations.len);
+            const attribute = element.attributeRaw("a") orelse return error.MissingAttribute;
+            try std.testing.expect(attribute.specified);
+            try std.testing.expectEqual(
+                physicalSpan(3, 10, 0, 1),
+                attribute.span.?,
+            );
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_raw_start);
+
+    var one_byte_buffer: [1]u8 = undefined;
+    var one_byte_source: std.testing.Reader = .init(
+        &one_byte_buffer,
+        &.{.{ .buffer = logical }},
+    );
+    one_byte_source.artificial_limit = .limited(1);
+    try expectReaderSourceSpans(
+        .{ .stream = &one_byte_source.interface },
+        .{},
+        logical,
+        0,
+        1,
+    );
+
+    const utf16 = try encodeUtf16(std.testing.allocator, logical, .little, true);
+    defer std.testing.allocator.free(utf16);
+    try expectReaderSourceSpans(.{ .slice = utf16 }, .{}, logical, 2, 2);
+
+    var encoded: [logical.len * 2]u8 = undefined;
+    pairEncode(&encoded, logical);
+    try expectReaderSourceSpans(
+        .{ .slice = &encoded },
+        .{ .transcoder = pairTranscoder() },
+        logical,
+        0,
+        2,
+    );
+
+    const external = "<p:item xmlns:p='urn:p' p:a='v'/>";
+    const document = "<!DOCTYPE root [<!ENTITY item SYSTEM 'item.ent'>]>" ++
+        "<root>&item;</root>";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "item.ent", .bytes = external, .source_id = 73 },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = document },
+        .{ .external = .resolve, .resolver = resolver.resolver() },
+    );
+    defer reader.deinit();
+
+    var saw_external_element = false;
+    while (try reader.next()) |event| switch (event.data) {
+        .start_element => |element| if (std.mem.eql(u8, element.name.raw, "p:item")) {
+            saw_external_element = true;
+            try std.testing.expectEqual(
+                xml.SourceSpan{ .source_id = 73, .start = 0, .end = external.len },
+                event.span,
+            );
+
+            const attribute = element.attributeRaw("p:a") orelse return error.MissingAttribute;
+            const attribute_offset = std.mem.indexOf(u8, external, "p:a='v'").?;
+            try std.testing.expectEqual(
+                xml.SourceSpan{
+                    .source_id = 73,
+                    .start = attribute_offset,
+                    .end = attribute_offset + "p:a='v'".len,
+                },
+                attribute.span.?,
+            );
+
+            try std.testing.expectEqual(@as(usize, 1), element.namespace_declarations.len);
+            const declaration = element.namespace_declarations[0];
+            const declaration_offset = std.mem.indexOf(u8, external, "xmlns:p='urn:p'").?;
+            try std.testing.expectEqual(
+                xml.SourceSpan{
+                    .source_id = 73,
+                    .start = declaration_offset,
+                    .end = declaration_offset + "xmlns:p='urn:p'".len,
+                },
+                declaration.span.?,
+            );
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_external_element);
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+}
+
+test "[integration] - [Reader spans]: DTD defaults have no source occurrence" {
+    const input = "<!DOCTYPE p:r [<!ATTLIST p:r xmlns:p CDATA 'urn:p' " ++
+        "mode CDATA 'auto'>]><p:r explicit='yes'/>";
+    const explicit_offset = std.mem.indexOf(u8, input, "explicit='yes'").?;
+    var reader = try xml.Reader.init(std.testing.allocator, .{ .slice = input }, .{});
+    defer reader.deinit();
+
+    var saw_start = false;
+    while (try reader.next()) |event| switch (event.data) {
+        .start_element => |element| {
+            saw_start = true;
+            const explicit = element.attributeRaw("explicit") orelse
+                return error.MissingAttribute;
+            try std.testing.expect(explicit.specified);
+            try std.testing.expectEqual(
+                physicalSpan(
+                    explicit_offset,
+                    explicit_offset + "explicit='yes'".len,
+                    0,
+                    1,
+                ),
+                explicit.span.?,
+            );
+            const mode = element.attributeRaw("mode") orelse return error.MissingAttribute;
+            try std.testing.expect(!mode.specified);
+            try std.testing.expect(mode.span == null);
+            try std.testing.expectEqual(@as(usize, 1), element.namespace_declarations.len);
+            const declaration = element.namespace_declarations[0];
+            try std.testing.expectEqualStrings("p", declaration.prefix.?);
+            try std.testing.expect(!declaration.specified);
+            try std.testing.expect(declaration.span == null);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_start);
+}
+
+fn nextStartNamed(reader: *xml.Reader, name: []const u8) !xml.Event {
+    while (try reader.next()) |event| switch (event.data) {
+        .start_element => |element| if (element.name.eqlRaw(name)) return event,
+        else => {},
+    };
+    return error.MissingStartElement;
+}
+
+fn expectReaderSkipSequence(source: xml.Source, prefix: u64, scale: u64) !void {
+    const input = "<root><item>text<item/></item><empty/><after/></root>";
+    const item_start = std.mem.indexOf(u8, input, "<item>").?;
+    const item_end = std.mem.indexOf(u8, input, "</item>").? + "</item>".len;
+    const empty_start = std.mem.indexOf(u8, input, "<empty/>").?;
+    const after_start = std.mem.indexOf(u8, input, "<after/>").?;
+
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        source,
+        .{ .dtd = .reject },
+    );
+    defer reader.deinit();
+
+    _ = try nextStartNamed(&reader, "root");
+    _ = try nextStartNamed(&reader, "item");
+    try std.testing.expectEqual(
+        physicalSpan(item_start, item_end, prefix, scale),
+        try reader.skipElement(),
+    );
+
+    const empty = (try reader.next()).?;
+    try std.testing.expectEqualStrings("empty", empty.data.start_element.name.raw);
+    try std.testing.expectEqual(
+        physicalSpan(empty_start, empty_start + "<empty/>".len, prefix, scale),
+        try reader.skipElement(),
+    );
+
+    const after = (try reader.next()).?;
+    try std.testing.expectEqualStrings("after", after.data.start_element.name.raw);
+    try std.testing.expectEqual(
+        physicalSpan(after_start, after_start + "<after/>".len, prefix, scale),
+        after.span,
+    );
+}
+
+test "[integration] - [Reader skipping]: nested and empty elements retain source spans" {
+    const input = "<root><item>text<item/></item><empty/><after/></root>";
+    try expectReaderSkipSequence(.{ .slice = input }, 0, 1);
+
+    var one_byte_buffer: [1]u8 = undefined;
+    var one_byte_source: std.testing.Reader = .init(
+        &one_byte_buffer,
+        &.{.{ .buffer = input }},
+    );
+    one_byte_source.artificial_limit = .limited(1);
+    try expectReaderSkipSequence(.{ .stream = &one_byte_source.interface }, 0, 1);
+
+    const utf16 = try encodeUtf16(std.testing.allocator, input, .little, true);
+    defer std.testing.allocator.free(utf16);
+    try expectReaderSkipSequence(.{ .slice = utf16 }, 2, 2);
+
+    const external_document = "<!DOCTYPE root [" ++
+        "<!ENTITY data SYSTEM 'data.ent'>" ++
+        "<!ENTITY selected SYSTEM 'selected.ent'>]>" ++
+        "<root><skip>&data;</skip>&selected;<after/></root>";
+    const external = "<inside/>";
+    const selected_external = "<outside><nested/></outside><tail/>";
+    const resources = [_]TestExternalResource{
+        .{ .system_id = "data.ent", .bytes = external, .source_id = 73 },
+        .{ .system_id = "selected.ent", .bytes = selected_external, .source_id = 74 },
+    };
+    var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = external_document },
+        .{ .external = .resolve, .resolver = resolver.resolver() },
+    );
+    defer reader.deinit();
+    _ = try nextStartNamed(&reader, "skip");
+    const skip_start = std.mem.indexOf(u8, external_document, "<skip>").?;
+    const skip_end = std.mem.indexOf(u8, external_document, "</skip>").? + "</skip>".len;
+    try std.testing.expectEqual(
+        physicalSpan(skip_start, skip_end, 0, 1),
+        try reader.skipElement(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+
+    _ = try nextStartNamed(&reader, "outside");
+    const outside_end = std.mem.indexOf(u8, selected_external, "</outside>").? +
+        "</outside>".len;
+    try std.testing.expectEqual(
+        xml.SourceSpan{ .source_id = 74, .start = 0, .end = outside_end },
+        try reader.skipElement(),
+    );
+    const tail = (try reader.next()).?;
+    try std.testing.expectEqualStrings("tail", tail.data.start_element.name.raw);
+    const tail_start = std.mem.indexOf(u8, selected_external, "<tail/>").?;
+    try std.testing.expectEqual(
+        xml.SourceSpan{
+            .source_id = 74,
+            .start = tail_start,
+            .end = tail_start + "<tail/>".len,
+        },
+        try reader.skipElement(),
+    );
+
+    const after = (try reader.next()).?;
+    try std.testing.expectEqualStrings("after", after.data.start_element.name.raw);
+    try std.testing.expectEqual(@as(usize, 2), resolver.closes);
+}
+
+test "[integration] - [Reader skipping]: invalid calls preserve parser progress" {
+    const input = "<root>text<item/><after/></root>";
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = input },
+        .{ .dtd = .reject },
+    );
+    defer reader.deinit();
+
+    try std.testing.expectError(error.InvalidState, reader.skipElement());
+    try std.testing.expect(reader.diagnostic() == null);
+
+    const document_start = (try reader.next()).?;
+    try std.testing.expect(document_start.data == .document_start);
+    try std.testing.expectError(error.InvalidState, reader.skipElement());
+    try std.testing.expect(reader.diagnostic() == null);
+
+    const root = (try reader.next()).?;
+    try std.testing.expectEqualStrings("root", root.data.start_element.name.raw);
+    const text = (try reader.next()).?;
+    try std.testing.expectEqualStrings("text", text.data.text.bytes);
+    try std.testing.expectError(error.InvalidState, reader.skipElement());
+    try std.testing.expectEqualStrings("text", text.data.text.bytes);
+
+    const item = try nextStartNamed(&reader, "item");
+    try std.testing.expectEqualStrings("item", item.data.start_element.name.raw);
+    _ = reader.memoryUsage();
+    try std.testing.expect(reader.diagnostic() == null);
+    var invalid_options: xml.ReaderOptions = .{ .dtd = .reject };
+    invalid_options.limits.max_depth = 0;
+    try std.testing.expectError(
+        error.InvalidOptions,
+        reader.reset(.{ .slice = "<unused/>" }, invalid_options, .retain_capacity),
+    );
+    _ = try reader.skipElement();
+
+    try std.testing.expectError(error.InvalidState, reader.skipElement());
+    const after = (try reader.next()).?;
+    try std.testing.expectEqualStrings("after", after.data.start_element.name.raw);
+    _ = try reader.skipElement();
+
+    const root_end = (try reader.next()).?;
+    try std.testing.expectEqualStrings("root", root_end.data.end_element.name.raw);
+    try std.testing.expectError(error.InvalidState, reader.skipElement());
+    try std.testing.expect((try reader.next()).?.data == .document_end);
+    try std.testing.expectError(error.InvalidState, reader.skipElement());
+    try std.testing.expect((try reader.next()) == null);
+    try std.testing.expectError(error.InvalidState, reader.skipElement());
+    try std.testing.expect(reader.diagnostic() == null);
+
+    try reader.reset(.{ .slice = "<fresh/>" }, .{ .dtd = .reject }, .retain_capacity);
+    _ = try reader.next();
+    _ = try reader.next();
+    try reader.reset(.{ .slice = "<replacement/>" }, .{ .dtd = .reject }, .retain_capacity);
+    try std.testing.expectError(error.InvalidState, reader.skipElement());
+}
+
+fn expectReaderSkipFailure(
+    input: []const u8,
+    options: xml.ReaderOptions,
+    expected_error: xml.ReadError,
+    expected_code: xml.DiagnosticCode,
+) !void {
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = input },
+        options,
+    );
+    defer reader.deinit();
+
+    _ = try nextStartNamed(&reader, "skip");
+    try std.testing.expectError(expected_error, reader.skipElement());
+    try std.testing.expectEqual(expected_code, reader.diagnostic().?.code);
+    try std.testing.expectError(expected_error, reader.next());
+    try std.testing.expectError(error.InvalidState, reader.skipElement());
+}
+
+test "[failure] - [Reader skipping]: parser policies remain active" {
+    const cases = [_]struct {
+        input: []const u8,
+        options: xml.ReaderOptions,
+        expected_error: xml.ReadError,
+        code: xml.DiagnosticCode,
+    }{
+        .{
+            .input = "<root><skip><a></b></skip></root>",
+            .options = .{ .dtd = .reject },
+            .expected_error = error.InvalidXml,
+            .code = .mismatched_end_tag,
+        },
+        .{
+            .input = "<root><skip><p:item/></skip></root>",
+            .options = .{ .dtd = .reject },
+            .expected_error = error.InvalidXml,
+            .code = .unbound_prefix,
+        },
+        .{
+            .input = "<!DOCTYPE root [<!ENTITY loop '&loop;'>]>" ++
+                "<root><skip>&loop;</skip></root>",
+            .options = .{},
+            .expected_error = error.InvalidXml,
+            .code = .recursive_entity,
+        },
+        .{
+            .input = "<root><skip>\xff</skip></root>",
+            .options = .{ .dtd = .reject },
+            .expected_error = error.InvalidEncoding,
+            .code = .malformed_utf8,
+        },
+    };
+    for (cases) |case| {
+        try expectReaderSkipFailure(
+            case.input,
+            case.options,
+            case.expected_error,
+            case.code,
+        );
+    }
+
+    var limited: xml.ReaderOptions = .{ .dtd = .reject };
+    limited.limits.max_depth = 2;
+    try expectReaderSkipFailure(
+        "<root><skip><nested/></skip></root>",
+        limited,
+        error.LimitExceeded,
+        .depth_limit,
+    );
+}
+
+test "[integration] - [Reader skipping]: DTD validation includes skipped elements" {
+    const input = "<!DOCTYPE root [" ++
+        "<!ELEMENT root (skip,after)>" ++
+        "<!ELEMENT skip (allowed)>" ++
+        "<!ELEMENT allowed EMPTY>" ++
+        "<!ELEMENT wrong EMPTY>" ++
+        "<!ELEMENT after EMPTY>]>" ++
+        "<root><skip><wrong/></skip><after/></root>";
+    var reader = try xml.Reader.init(
+        std.testing.allocator,
+        .{ .slice = input },
+        .{ .dtd = .{ .validate = .{} } },
+    );
+    defer reader.deinit();
+
+    _ = try nextStartNamed(&reader, "skip");
+    _ = try reader.skipElement();
+    try std.testing.expectEqual(
+        xml.DiagnosticCode.validity_element_content,
+        reader.firstDtdFinding().?.code,
+    );
+    const after = (try reader.next()).?;
+    try std.testing.expectEqualStrings("after", after.data.start_element.name.raw);
+
+    var validity: ?xml.DtdValidity = null;
+    while (try reader.next()) |event| switch (event.data) {
+        .document_end => |result| validity = result.dtd_validity,
+        else => {},
+    };
+    try std.testing.expectEqual(xml.DtdValidity.invalid, validity.?);
+    try std.testing.expect(reader.diagnostic() == null);
+}
+
+test "[failure] - [Reader skipping]: resolver and normalization failures remain exact" {
+    {
+        const resources = [_]TestExternalResource{
+            .{ .system_id = "data.ent", .bytes = "external", .source_id = 74 },
+        };
+        var resolver = TestResolver{ .resources = &resources, .fail_read_after = 0 };
+        var reader = try xml.Reader.init(
+            std.testing.allocator,
+            .{
+                .slice = "<!DOCTYPE root [<!ENTITY data SYSTEM 'data.ent'>]>" ++
+                    "<root><skip>&data;</skip></root>",
+            },
+            .{ .external = .resolve, .resolver = resolver.resolver() },
+        );
+        defer reader.deinit();
+
+        _ = try nextStartNamed(&reader, "skip");
+        try std.testing.expectError(error.ExternalResourceFailed, reader.skipElement());
+        try std.testing.expectEqual(
+            xml.DiagnosticCode.resolver_io_failure,
+            reader.diagnostic().?.code,
+        );
+        try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+    }
+
+    {
+        const input = "<?xml version='1.1'?><root><skip>e\xcc\x81</skip></root>";
+        var reader = try xml.Reader.init(
+            std.testing.allocator,
+            .{ .slice = input },
+            .{ .dtd = .reject, .normalization = .require },
+        );
+        defer reader.deinit();
+
+        _ = try nextStartNamed(&reader, "skip");
+        try std.testing.expectError(error.NotNormalized, reader.skipElement());
+        const diagnostic = reader.diagnostic().?;
+        try std.testing.expectEqual(xml.DiagnosticCode.not_fully_normalized, diagnostic.code);
+        try std.testing.expectEqual(
+            @as(u64, std.mem.indexOf(u8, input, "\xcc\x81").?),
+            diagnostic.primary.byte_offset,
+        );
+    }
+}
+
 fn markedEncode(output: []u8, input: []const u8, marked: u8) []u8 {
     var len: usize = 0;
     for (input) |byte| {
