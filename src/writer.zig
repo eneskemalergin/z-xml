@@ -1,4 +1,4 @@
-//! XML Writer state, ownership, limits, and errors.
+//! Streaming XML Writer state, ownership, limits, and errors.
 
 const std = @import("std");
 
@@ -41,17 +41,17 @@ pub const WriterLimits = struct {
     }
 };
 
-/// Runtime choices stored by a Writer.
+/// Runtime XML output choices.
 pub const WriterOptions = struct {
     /// Resource limits applied independently of sink capacity.
     limits: WriterLimits = WriterLimits.general,
-    /// Stores namespace-aware or raw-name handling.
+    /// Selects namespace-aware or raw-name handling.
     namespaces: reader.NormalNamespacePolicy = .process,
-    /// Stores the selected XML edition.
+    /// Selects XML 1.0 or XML 1.1 output rules.
     version: reader.XmlVersion = .xml10,
-    /// Requests an XML declaration when true.
+    /// Writes the XML declaration when true.
     emit_declaration: bool = true,
-    /// Requests the declaration's standalone value when non-null.
+    /// Writes the declaration's standalone value when non-null.
     standalone: ?bool = null,
 
     fn valid(self: WriterOptions) bool {
@@ -62,7 +62,7 @@ pub const WriterOptions = struct {
 /// Errors reported while constructing a Writer.
 pub const WriterInitError = error{InvalidOptions};
 
-/// Writer mutating-call errors.
+/// Errors reported by mutating Writer calls.
 pub const WriterError = error{
     InvalidState,
     InvalidName,
@@ -104,7 +104,33 @@ const Lifecycle = enum {
     failed,
 };
 
-/// Stateful Writer API over a caller-owned sink.
+const Element = struct {
+    name_start: usize,
+};
+
+const PendingAttribute = struct {
+    name_start: usize,
+    name_len: usize,
+};
+
+const Escape = union(enum) {
+    bytes: []const u8,
+    reference: u21,
+
+    fn len(self: Escape) usize {
+        return switch (self) {
+            .bytes => |bytes| bytes.len,
+            .reference => |codepoint| characterReferenceLen(codepoint),
+        };
+    }
+};
+
+const TextAnalysis = struct {
+    output_len: usize,
+    trailing_brackets: u2,
+};
+
+/// Stateful UTF-8 XML writer over a caller-owned sink.
 ///
 /// The allocator and sink remain borrowed until `deinit`. The Writer never
 /// flushes or deinitializes the sink. Copying an initialized Writer is not supported.
@@ -114,10 +140,14 @@ pub const Writer = struct {
     sink: *std.Io.Writer,
     options: WriterOptions,
     lifecycle: Lifecycle = .ready,
-    open_element_count: usize = 0,
     first_failure: ?WriterError = null,
     logical_byte_offset: u64 = 0,
     offset_valid: bool = true,
+    text_trailing_brackets: u2 = 0,
+    open_names: std.ArrayList(u8) = .empty,
+    elements: std.ArrayList(Element) = .empty,
+    pending_start_tag: std.ArrayList(u8) = .empty,
+    pending_attributes: std.ArrayList(PendingAttribute) = .empty,
 
     /// Returns a ready Writer without allocating or writing to `sink`.
     pub fn init(
@@ -136,34 +166,82 @@ pub const Writer = struct {
 
     /// Releases Writer-owned storage without flushing or deinitializing the sink.
     pub fn deinit(self: *Writer) void {
+        self.pending_attributes.deinit(self.allocator);
+        self.pending_start_tag.deinit(self.allocator);
+        self.elements.deinit(self.allocator);
+        self.open_names.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Enters the prolog state for one XML document.
+    /// Starts one XML document and writes its requested declaration.
     pub fn startDocument(self: *Writer) WriterError!void {
         try self.checkFailure();
         if (self.lifecycle != .ready) return self.fail(error.InvalidState);
+
+        const bytes = declaration(self.options);
+        try self.ensureOutputFits(bytes.len);
+        try self.writeAccepted(bytes);
         self.lifecycle = .prolog;
     }
 
-    /// Opens one root or child element in Writer state and leaves its start tag pending.
+    /// Starts one root or child element and leaves its start tag pending.
     pub fn startElement(self: *Writer, name: []const u8) WriterError!void {
         try self.checkFailure();
-        _ = name;
-
         switch (self.lifecycle) {
             .prolog, .start_tag, .content => {},
             else => return self.fail(error.InvalidState),
         }
-        if (self.open_element_count == self.options.limits.max_depth) {
+
+        if (self.elements.items.len == self.options.limits.max_depth) {
             return self.fail(error.WriterLimit);
         }
+        if (name.len > self.options.limits.max_name_bytes) {
+            return self.fail(error.WriterLimit);
+        }
+        const new_open_name_len = std.math.add(usize, self.open_names.items.len, name.len) catch
+            return self.fail(error.WriterLimit);
+        if (new_open_name_len > self.options.limits.max_open_name_bytes) {
+            return self.fail(error.WriterLimit);
+        }
+        const child_pending_len = std.math.add(usize, 1, name.len) catch
+            return self.fail(error.WriterLimit);
+        if (child_pending_len > self.options.limits.max_pending_start_tag_bytes) {
+            return self.fail(error.WriterLimit);
+        }
+        if (!isXmlName(name)) return self.fail(error.InvalidName);
+        if (self.options.namespaces == .process and std.mem.indexOfScalar(u8, name, ':') != null) {
+            return self.fail(error.InvalidNamespace);
+        }
 
-        self.open_element_count += 1;
+        const parent_output_len = if (self.lifecycle == .start_tag)
+            std.math.add(usize, self.pending_start_tag.items.len, 1) catch
+                return self.fail(error.WriterLimit)
+        else
+            0;
+        const required_pending_len = @max(child_pending_len, parent_output_len);
+        const element_count = std.math.add(usize, self.elements.items.len, 1) catch
+            return self.fail(error.WriterLimit);
+        try self.ensureStorage(
+            new_open_name_len,
+            element_count,
+            required_pending_len,
+            self.pending_attributes.items.len,
+        );
+        try self.ensureOutputFits(parent_output_len);
+
+        if (self.lifecycle == .start_tag) try self.writePendingUnchecked(">");
+
+        const name_start = self.open_names.items.len;
+        self.open_names.appendSliceAssumeCapacity(name);
+        self.elements.appendAssumeCapacity(.{ .name_start = name_start });
+        self.pending_start_tag.appendAssumeCapacity('<');
+        self.pending_start_tag.appendSliceAssumeCapacity(name);
+        self.pending_attributes.clearRetainingCapacity();
+        self.text_trailing_brackets = 0;
         self.lifecycle = .start_tag;
     }
 
-    /// Accepts one namespace declaration only while a start tag is pending.
+    /// Returns `InvalidNamespace` because namespace output is not supported.
     pub fn namespace(
         self: *Writer,
         prefix: ?[]const u8,
@@ -173,71 +251,225 @@ pub const Writer = struct {
         _ = prefix;
         _ = namespace_uri;
         if (self.lifecycle != .start_tag) return self.fail(error.InvalidState);
+        return self.fail(error.InvalidNamespace);
     }
 
-    /// Accepts one attribute only while a start tag is pending.
+    /// Adds one unqualified attribute to the pending start tag.
     pub fn attribute(self: *Writer, name: []const u8, value: []const u8) WriterError!void {
         try self.checkFailure();
-        _ = name;
-        _ = value;
         if (self.lifecycle != .start_tag) return self.fail(error.InvalidState);
+        if (self.pending_attributes.items.len ==
+            self.options.limits.max_attributes_per_element)
+        {
+            return self.fail(error.WriterLimit);
+        }
+        if (name.len > self.options.limits.max_name_bytes) {
+            return self.fail(error.WriterLimit);
+        }
+
+        const minimum_added = checkedSum(&.{ name.len, value.len, 4 }) orelse
+            return self.fail(error.WriterLimit);
+        const minimum_pending_len = std.math.add(
+            usize,
+            self.pending_start_tag.items.len,
+            minimum_added,
+        ) catch return self.fail(error.WriterLimit);
+        if (minimum_pending_len > self.options.limits.max_pending_start_tag_bytes) {
+            return self.fail(error.WriterLimit);
+        }
+        if (!isXmlName(name)) return self.fail(error.InvalidName);
+
+        const escaped_len = attributeOutputLen(value, self.options.version) catch |failure|
+            return self.fail(failure);
+        const added_len = checkedSum(&.{ name.len, escaped_len, 4 }) orelse
+            return self.fail(error.WriterLimit);
+        const pending_len = std.math.add(
+            usize,
+            self.pending_start_tag.items.len,
+            added_len,
+        ) catch return self.fail(error.WriterLimit);
+        if (pending_len > self.options.limits.max_pending_start_tag_bytes) {
+            return self.fail(error.WriterLimit);
+        }
+        if (self.options.namespaces == .process and
+            (std.mem.indexOfScalar(u8, name, ':') != null or std.mem.eql(u8, name, "xmlns")))
+        {
+            return self.fail(error.InvalidNamespace);
+        }
+        for (self.pending_attributes.items) |attribute_record| {
+            const previous_name = self.pending_start_tag.items[attribute_record.name_start..][0..attribute_record.name_len];
+            if (std.mem.eql(u8, previous_name, name)) {
+                return self.fail(error.DuplicateAttribute);
+            }
+        }
+
+        const attribute_count = std.math.add(
+            usize,
+            self.pending_attributes.items.len,
+            1,
+        ) catch return self.fail(error.WriterLimit);
+        try self.ensureStorage(
+            self.open_names.items.len,
+            self.elements.items.len,
+            pending_len,
+            attribute_count,
+        );
+
+        self.pending_start_tag.appendAssumeCapacity(' ');
+        const name_start = self.pending_start_tag.items.len;
+        self.pending_start_tag.appendSliceAssumeCapacity(name);
+        self.pending_start_tag.appendSliceAssumeCapacity("=\"");
+        appendEscapedAttribute(&self.pending_start_tag, value, self.options.version);
+        self.pending_start_tag.appendAssumeCapacity('"');
+        self.pending_attributes.appendAssumeCapacity(.{
+            .name_start = name_start,
+            .name_len = name.len,
+        });
     }
 
-    /// Moves the current element into content state for one character-data call.
+    /// Writes one escaped character-data fragment inside the current element.
     pub fn text(self: *Writer, bytes: []const u8) WriterError!void {
-        try self.enterContent();
-        _ = bytes;
-    }
-
-    /// Moves the current element into content state for one CDATA call.
-    pub fn cdata(self: *Writer, bytes: []const u8) WriterError!void {
-        try self.enterContent();
-        _ = bytes;
-    }
-
-    /// Accepts one comment call in the prolog, current element, or epilog.
-    pub fn comment(self: *Writer, bytes: []const u8) WriterError!void {
         try self.checkFailure();
-        _ = bytes;
-
         switch (self.lifecycle) {
-            .prolog, .content, .epilog => {},
-            .start_tag => self.lifecycle = .content,
+            .start_tag, .content => {},
             else => return self.fail(error.InvalidState),
         }
+
+        const analysis = analyzeText(
+            bytes,
+            self.options.version,
+            self.text_trailing_brackets,
+        ) catch |failure| return self.fail(failure);
+        const pending_len = try self.pendingContentOutputLen();
+        const output_len = std.math.add(usize, pending_len, analysis.output_len) catch
+            return self.fail(error.WriterLimit);
+        try self.ensureOutputFits(output_len);
+
+        if (self.lifecycle == .start_tag) try self.writePendingUnchecked(">");
+        try self.writeText(bytes);
+        self.text_trailing_brackets = analysis.trailing_brackets;
+        self.lifecycle = .content;
     }
 
-    /// Accepts one processing-instruction call in the prolog, current element, or epilog.
+    /// Writes one CDATA fragment inside the current element.
+    pub fn cdata(self: *Writer, bytes: []const u8) WriterError!void {
+        try self.checkFailure();
+        switch (self.lifecycle) {
+            .start_tag, .content => {},
+            else => return self.fail(error.InvalidState),
+        }
+
+        const cdata_len = cdataOutputLen(bytes, self.options.version) catch |failure|
+            return self.fail(failure);
+        const pending_len = try self.pendingContentOutputLen();
+        const output_len = std.math.add(usize, pending_len, cdata_len) catch
+            return self.fail(error.WriterLimit);
+        try self.ensureOutputFits(output_len);
+
+        if (self.lifecycle == .start_tag) try self.writePendingUnchecked(">");
+        try self.writeCdata(bytes);
+        self.text_trailing_brackets = 0;
+        self.lifecycle = .content;
+    }
+
+    /// Writes one comment in the prolog, current element, or epilog.
+    pub fn comment(self: *Writer, bytes: []const u8) WriterError!void {
+        try self.checkFailure();
+        switch (self.lifecycle) {
+            .prolog, .start_tag, .content, .epilog => {},
+            else => return self.fail(error.InvalidState),
+        }
+
+        validateComment(bytes, self.options.version) catch |failure|
+            return self.fail(failure);
+        const comment_len = checkedSum(&.{ bytes.len, 7 }) orelse
+            return self.fail(error.WriterLimit);
+        const pending_len = try self.pendingContentOutputLen();
+        const output_len = std.math.add(usize, pending_len, comment_len) catch
+            return self.fail(error.WriterLimit);
+        try self.ensureOutputFits(output_len);
+
+        if (self.lifecycle == .start_tag) try self.writePendingUnchecked(">");
+        try self.writeAccepted("<!--");
+        try self.writeAccepted(bytes);
+        try self.writeAccepted("-->");
+        self.text_trailing_brackets = 0;
+        if (self.elements.items.len != 0) self.lifecycle = .content;
+    }
+
+    /// Writes one processing instruction in the prolog, current element, or epilog.
     pub fn processingInstruction(
         self: *Writer,
         target: []const u8,
         data: []const u8,
     ) WriterError!void {
         try self.checkFailure();
-        _ = target;
-        _ = data;
-
         switch (self.lifecycle) {
-            .prolog, .content, .epilog => {},
-            .start_tag => self.lifecycle = .content,
+            .prolog, .start_tag, .content, .epilog => {},
             else => return self.fail(error.InvalidState),
         }
+        if (target.len > self.options.limits.max_name_bytes) {
+            return self.fail(error.WriterLimit);
+        }
+        if (!isXmlName(target)) return self.fail(error.InvalidName);
+        validateProcessingInstruction(target, data, self.options.version) catch |failure|
+            return self.fail(failure);
+
+        const instruction_len = checkedSum(&.{
+            target.len,
+            data.len,
+            if (data.len == 0) 4 else 5,
+        }) orelse return self.fail(error.WriterLimit);
+        const pending_len = try self.pendingContentOutputLen();
+        const output_len = std.math.add(usize, pending_len, instruction_len) catch
+            return self.fail(error.WriterLimit);
+        try self.ensureOutputFits(output_len);
+
+        if (self.lifecycle == .start_tag) try self.writePendingUnchecked(">");
+        try self.writeAccepted("<?");
+        try self.writeAccepted(target);
+        if (data.len != 0) {
+            try self.writeAccepted(" ");
+            try self.writeAccepted(data);
+        }
+        try self.writeAccepted("?>");
+        self.text_trailing_brackets = 0;
+        if (self.elements.items.len != 0) self.lifecycle = .content;
     }
 
-    /// Closes the current element in Writer state without requiring its name again.
+    /// Ends the current element without requiring the caller to repeat its name.
     pub fn endElement(self: *Writer) WriterError!void {
         try self.checkFailure();
         switch (self.lifecycle) {
             .start_tag, .content => {},
             else => return self.fail(error.InvalidState),
         }
-        std.debug.assert(self.open_element_count > 0);
+        std.debug.assert(self.elements.items.len != 0);
 
-        self.open_element_count -= 1;
-        self.lifecycle = if (self.open_element_count == 0) .epilog else .content;
+        const element = self.elements.items[self.elements.items.len - 1];
+        const name = self.open_names.items[element.name_start..];
+        const output_len = if (self.lifecycle == .start_tag)
+            checkedSum(&.{ self.pending_start_tag.items.len, 2 }) orelse
+                return self.fail(error.WriterLimit)
+        else
+            checkedSum(&.{ name.len, 3 }) orelse return self.fail(error.WriterLimit);
+        try self.ensureOutputFits(output_len);
+
+        if (self.lifecycle == .start_tag) {
+            try self.writePendingUnchecked("/>");
+        } else {
+            try self.writeAccepted("</");
+            try self.writeAccepted(name);
+            try self.writeAccepted(">");
+        }
+
+        _ = self.elements.pop();
+        self.open_names.shrinkRetainingCapacity(element.name_start);
+        self.text_trailing_brackets = 0;
+        self.lifecycle = if (self.elements.items.len == 0) .epilog else .content;
     }
 
-    /// Enters the done state without flushing the caller-owned sink.
+    /// Completes one document without flushing the caller-owned sink.
     pub fn endDocument(self: *Writer) WriterError!void {
         try self.checkFailure();
         if (self.lifecycle != .epilog) return self.fail(error.InvalidState);
@@ -252,22 +484,176 @@ pub const Writer = struct {
     /// Reports Writer-owned active state and retained allocation capacity.
     pub fn memoryUsage(self: *const Writer) WriterMemoryUsage {
         return .{
-            .open_element_count = self.open_element_count,
-            .open_name_bytes = 0,
+            .open_element_count = self.elements.items.len,
+            .open_name_bytes = self.open_names.items.len,
             .namespace_binding_count = 0,
             .namespace_bytes = 0,
-            .pending_attribute_count = 0,
-            .pending_start_tag_bytes = 0,
-            .retained_capacity_bytes = 0,
+            .pending_attribute_count = self.pending_attributes.items.len,
+            .pending_start_tag_bytes = self.pending_start_tag.items.len,
+            .retained_capacity_bytes = self.retainedCapacity(),
         };
     }
 
-    fn enterContent(self: *Writer) WriterError!void {
-        try self.checkFailure();
-        switch (self.lifecycle) {
-            .start_tag, .content => self.lifecycle = .content,
-            else => return self.fail(error.InvalidState),
+    fn pendingContentOutputLen(self: *Writer) WriterError!usize {
+        if (self.lifecycle != .start_tag) return 0;
+        return std.math.add(usize, self.pending_start_tag.items.len, 1) catch
+            return self.fail(error.WriterLimit);
+    }
+
+    fn ensureStorage(
+        self: *Writer,
+        open_name_len: usize,
+        element_count: usize,
+        pending_len: usize,
+        attribute_count: usize,
+    ) WriterError!void {
+        var open_name_capacity = targetCapacity(
+            u8,
+            self.open_names.capacity,
+            open_name_len,
+        );
+        var element_capacity = targetCapacity(
+            Element,
+            self.elements.capacity,
+            element_count,
+        );
+        var pending_capacity = targetCapacity(
+            u8,
+            self.pending_start_tag.capacity,
+            pending_len,
+        );
+        var attribute_capacity = targetCapacity(
+            PendingAttribute,
+            self.pending_attributes.capacity,
+            attribute_count,
+        );
+        const grown_total = capacityTotal(
+            open_name_capacity,
+            element_capacity,
+            pending_capacity,
+            attribute_capacity,
+        );
+        if (grown_total == null or grown_total.? > self.options.limits.max_retained_bytes) {
+            open_name_capacity = @max(self.open_names.capacity, open_name_len);
+            element_capacity = @max(self.elements.capacity, element_count);
+            pending_capacity = @max(self.pending_start_tag.capacity, pending_len);
+            attribute_capacity = @max(self.pending_attributes.capacity, attribute_count);
+            const precise_total = capacityTotal(
+                open_name_capacity,
+                element_capacity,
+                pending_capacity,
+                attribute_capacity,
+            ) orelse return self.fail(error.WriterLimit);
+            if (precise_total > self.options.limits.max_retained_bytes) {
+                return self.fail(error.WriterLimit);
+            }
         }
+
+        self.open_names.ensureTotalCapacityPrecise(
+            self.allocator,
+            open_name_capacity,
+        ) catch return self.fail(error.OutOfMemory);
+        self.elements.ensureTotalCapacityPrecise(
+            self.allocator,
+            element_capacity,
+        ) catch return self.fail(error.OutOfMemory);
+        self.pending_start_tag.ensureTotalCapacityPrecise(
+            self.allocator,
+            pending_capacity,
+        ) catch return self.fail(error.OutOfMemory);
+        self.pending_attributes.ensureTotalCapacityPrecise(
+            self.allocator,
+            attribute_capacity,
+        ) catch return self.fail(error.OutOfMemory);
+    }
+
+    fn ensureOutputFits(self: *Writer, amount: usize) WriterError!void {
+        const output_len = std.math.cast(u64, amount) orelse
+            return self.fail(error.WriterLimit);
+        _ = std.math.add(u64, self.logical_byte_offset, output_len) catch
+            return self.fail(error.WriterLimit);
+    }
+
+    fn writePendingUnchecked(self: *Writer, suffix: []const u8) WriterError!void {
+        try self.writeAccepted(self.pending_start_tag.items);
+        try self.writeAccepted(suffix);
+        self.pending_start_tag.clearRetainingCapacity();
+        self.pending_attributes.clearRetainingCapacity();
+    }
+
+    fn writeText(self: *Writer, bytes: []const u8) WriterError!void {
+        var index: usize = 0;
+        var run_start: usize = 0;
+        var trailing = self.text_trailing_brackets;
+        while (index < bytes.len) {
+            const scalar_start = index;
+            const codepoint = decodeCodepoint(bytes, &index) catch unreachable;
+            if (textEscape(codepoint, self.options.version, trailing)) |escape| {
+                try self.writeAccepted(bytes[run_start..scalar_start]);
+                try self.writeEscape(escape);
+                run_start = index;
+                trailing = 0;
+            } else {
+                trailing = nextTrailingBrackets(trailing, codepoint);
+            }
+        }
+        try self.writeAccepted(bytes[run_start..]);
+    }
+
+    fn writeCdata(self: *Writer, bytes: []const u8) WriterError!void {
+        if (bytes.len == 0) return self.writeAccepted("<![CDATA[]]>");
+
+        var index: usize = 0;
+        var run_start: usize = 0;
+        while (index < bytes.len) {
+            const scalar_start = index;
+            const codepoint = decodeCodepoint(bytes, &index) catch unreachable;
+            if (needsCdataReference(codepoint, self.options.version)) {
+                if (scalar_start != run_start) {
+                    try self.writeCdataRun(bytes[run_start..scalar_start]);
+                }
+                try self.writeEscape(.{ .reference = codepoint });
+                run_start = index;
+            }
+        }
+        if (run_start != bytes.len) try self.writeCdataRun(bytes[run_start..]);
+    }
+
+    fn writeCdataRun(self: *Writer, bytes: []const u8) WriterError!void {
+        try self.writeAccepted("<![CDATA[");
+        var cursor: usize = 0;
+        while (std.mem.indexOfPos(u8, bytes, cursor, "]]>")) |position| {
+            try self.writeAccepted(bytes[cursor..position]);
+            try self.writeAccepted("]]]]><![CDATA[>");
+            cursor = position + 3;
+        }
+        try self.writeAccepted(bytes[cursor..]);
+        try self.writeAccepted("]]>");
+    }
+
+    fn writeEscape(self: *Writer, escape: Escape) WriterError!void {
+        switch (escape) {
+            .bytes => |bytes| try self.writeAccepted(bytes),
+            .reference => |codepoint| {
+                var buffer: [12]u8 = undefined;
+                try self.writeAccepted(characterReference(codepoint, &buffer));
+            },
+        }
+    }
+
+    fn writeAccepted(self: *Writer, bytes: []const u8) WriterError!void {
+        if (bytes.len == 0) return;
+        self.sink.writeAll(bytes) catch return self.fail(error.WriteFailed);
+        self.logical_byte_offset += @intCast(bytes.len);
+    }
+
+    fn retainedCapacity(self: *const Writer) usize {
+        return capacityTotal(
+            self.open_names.capacity,
+            self.elements.capacity,
+            self.pending_start_tag.capacity,
+            self.pending_attributes.capacity,
+        ).?;
     }
 
     fn checkFailure(self: *Writer) WriterError!void {
@@ -282,3 +668,351 @@ pub const Writer = struct {
         return failure;
     }
 };
+
+fn declaration(options: WriterOptions) []const u8 {
+    if (!options.emit_declaration) return "";
+    return switch (options.version) {
+        .xml10 => if (options.standalone) |standalone|
+            if (standalone)
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            else
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>"
+        else
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        .xml11 => if (options.standalone) |standalone|
+            if (standalone)
+                "<?xml version=\"1.1\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+            else
+                "<?xml version=\"1.1\" encoding=\"UTF-8\" standalone=\"no\"?>"
+        else
+            "<?xml version=\"1.1\" encoding=\"UTF-8\"?>",
+    };
+}
+
+fn analyzeText(
+    bytes: []const u8,
+    version: reader.XmlVersion,
+    initial_trailing_brackets: u2,
+) WriterError!TextAnalysis {
+    var output_len: usize = 0;
+    var trailing = initial_trailing_brackets;
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const scalar_start = index;
+        const codepoint = try decodeCodepoint(bytes, &index);
+        if (!isXmlChar(codepoint, version)) return error.InvalidCharacter;
+        if (textEscape(codepoint, version, trailing)) |escape| {
+            output_len = std.math.add(usize, output_len, escape.len()) catch
+                return error.WriterLimit;
+            trailing = 0;
+        } else {
+            output_len = std.math.add(usize, output_len, index - scalar_start) catch
+                return error.WriterLimit;
+            trailing = nextTrailingBrackets(trailing, codepoint);
+        }
+    }
+    return .{
+        .output_len = output_len,
+        .trailing_brackets = trailing,
+    };
+}
+
+fn attributeOutputLen(bytes: []const u8, version: reader.XmlVersion) WriterError!usize {
+    var output_len: usize = 0;
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const scalar_start = index;
+        const codepoint = try decodeCodepoint(bytes, &index);
+        if (!isXmlChar(codepoint, version)) return error.InvalidCharacter;
+        const added = if (attributeEscape(codepoint, version)) |escape|
+            escape.len()
+        else
+            index - scalar_start;
+        output_len = std.math.add(usize, output_len, added) catch
+            return error.WriterLimit;
+    }
+    return output_len;
+}
+
+fn appendEscapedAttribute(
+    output: *std.ArrayList(u8),
+    bytes: []const u8,
+    version: reader.XmlVersion,
+) void {
+    var index: usize = 0;
+    var run_start: usize = 0;
+    while (index < bytes.len) {
+        const scalar_start = index;
+        const codepoint = decodeCodepoint(bytes, &index) catch unreachable;
+        if (attributeEscape(codepoint, version)) |escape| {
+            output.appendSliceAssumeCapacity(bytes[run_start..scalar_start]);
+            appendEscape(output, escape);
+            run_start = index;
+        }
+    }
+    output.appendSliceAssumeCapacity(bytes[run_start..]);
+}
+
+fn appendEscape(output: *std.ArrayList(u8), escape: Escape) void {
+    switch (escape) {
+        .bytes => |bytes| output.appendSliceAssumeCapacity(bytes),
+        .reference => |codepoint| {
+            var buffer: [12]u8 = undefined;
+            output.appendSliceAssumeCapacity(characterReference(codepoint, &buffer));
+        },
+    }
+}
+
+fn cdataOutputLen(bytes: []const u8, version: reader.XmlVersion) WriterError!usize {
+    if (bytes.len == 0) return "<![CDATA[]]>".len;
+
+    var output_len: usize = 0;
+    var index: usize = 0;
+    var run_start: usize = 0;
+    while (index < bytes.len) {
+        const scalar_start = index;
+        const codepoint = try decodeCodepoint(bytes, &index);
+        if (!isXmlChar(codepoint, version)) return error.InvalidCharacter;
+        if (needsCdataReference(codepoint, version)) {
+            if (scalar_start != run_start) {
+                output_len = try addCdataRunLen(output_len, bytes[run_start..scalar_start]);
+            }
+            output_len = std.math.add(
+                usize,
+                output_len,
+                characterReferenceLen(codepoint),
+            ) catch return error.WriterLimit;
+            run_start = index;
+        }
+    }
+    if (run_start != bytes.len) {
+        output_len = try addCdataRunLen(output_len, bytes[run_start..]);
+    }
+    return output_len;
+}
+
+fn addCdataRunLen(total: usize, bytes: []const u8) WriterError!usize {
+    var output_len = checkedSum(&.{ total, bytes.len, 12 }) orelse
+        return error.WriterLimit;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, cursor, "]]>")) |position| {
+        output_len = std.math.add(usize, output_len, 12) catch
+            return error.WriterLimit;
+        cursor = position + 3;
+    }
+    return output_len;
+}
+
+fn validateComment(bytes: []const u8, version: reader.XmlVersion) WriterError!void {
+    try validateCharacters(bytes, version);
+    if (std.mem.indexOf(u8, bytes, "--") != null or
+        (bytes.len != 0 and bytes[bytes.len - 1] == '-'))
+    {
+        return error.InvalidComment;
+    }
+    if (containsNormalizedLineCharacter(bytes, version)) return error.InvalidComment;
+}
+
+fn validateProcessingInstruction(
+    target: []const u8,
+    data: []const u8,
+    version: reader.XmlVersion,
+) WriterError!void {
+    try validateCharacters(data, version);
+    if (std.ascii.eqlIgnoreCase(target, "xml") or
+        std.mem.indexOf(u8, data, "?>") != null or
+        containsNormalizedLineCharacter(data, version))
+    {
+        return error.InvalidProcessingInstruction;
+    }
+}
+
+fn validateCharacters(bytes: []const u8, version: reader.XmlVersion) WriterError!void {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const codepoint = try decodeCodepoint(bytes, &index);
+        if (!isXmlChar(codepoint, version) or
+            (version == .xml11 and isXml11RestrictedChar(codepoint)))
+        {
+            return error.InvalidCharacter;
+        }
+    }
+}
+
+fn containsNormalizedLineCharacter(bytes: []const u8, version: reader.XmlVersion) bool {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const codepoint = decodeCodepoint(bytes, &index) catch unreachable;
+        if (codepoint == 0xd or
+            (version == .xml11 and (codepoint == 0x85 or codepoint == 0x2028)))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isXmlName(bytes: []const u8) bool {
+    if (bytes.len == 0) return false;
+    var index: usize = 0;
+    const first = decodeCodepoint(bytes, &index) catch return false;
+    if (!isXmlNameStart(first)) return false;
+    while (index < bytes.len) {
+        const codepoint = decodeCodepoint(bytes, &index) catch return false;
+        if (!isXmlNameChar(codepoint)) return false;
+    }
+    return true;
+}
+
+fn decodeCodepoint(bytes: []const u8, index: *usize) error{InvalidCharacter}!u21 {
+    const length = std.unicode.utf8ByteSequenceLength(bytes[index.*]) catch
+        return error.InvalidCharacter;
+    if (length > bytes.len - index.*) return error.InvalidCharacter;
+    const codepoint = std.unicode.utf8Decode(bytes[index.*..][0..length]) catch
+        return error.InvalidCharacter;
+    index.* += length;
+    return codepoint;
+}
+
+fn isXmlNameStart(codepoint: u21) bool {
+    return codepoint == ':' or
+        (codepoint >= 'A' and codepoint <= 'Z') or
+        codepoint == '_' or
+        (codepoint >= 'a' and codepoint <= 'z') or
+        (codepoint >= 0xc0 and codepoint <= 0xd6) or
+        (codepoint >= 0xd8 and codepoint <= 0xf6) or
+        (codepoint >= 0xf8 and codepoint <= 0x2ff) or
+        (codepoint >= 0x370 and codepoint <= 0x37d) or
+        (codepoint >= 0x37f and codepoint <= 0x1fff) or
+        (codepoint >= 0x200c and codepoint <= 0x200d) or
+        (codepoint >= 0x2070 and codepoint <= 0x218f) or
+        (codepoint >= 0x2c00 and codepoint <= 0x2fef) or
+        (codepoint >= 0x3001 and codepoint <= 0xd7ff) or
+        (codepoint >= 0xf900 and codepoint <= 0xfdcf) or
+        (codepoint >= 0xfdf0 and codepoint <= 0xfffd) or
+        (codepoint >= 0x10000 and codepoint <= 0xeffff);
+}
+
+fn isXmlNameChar(codepoint: u21) bool {
+    return isXmlNameStart(codepoint) or codepoint == '-' or codepoint == '.' or
+        (codepoint >= '0' and codepoint <= '9') or codepoint == 0xb7 or
+        (codepoint >= 0x300 and codepoint <= 0x36f) or
+        (codepoint >= 0x203f and codepoint <= 0x2040);
+}
+
+fn isXmlChar(codepoint: u21, version: reader.XmlVersion) bool {
+    return switch (version) {
+        .xml10 => codepoint == 0x9 or codepoint == 0xa or codepoint == 0xd or
+            (codepoint >= 0x20 and codepoint <= 0xd7ff) or
+            (codepoint >= 0xe000 and codepoint <= 0xfffd) or
+            (codepoint >= 0x10000 and codepoint <= 0x10ffff),
+        .xml11 => (codepoint >= 0x1 and codepoint <= 0xd7ff) or
+            (codepoint >= 0xe000 and codepoint <= 0xfffd) or
+            (codepoint >= 0x10000 and codepoint <= 0x10ffff),
+    };
+}
+
+fn isXml11RestrictedChar(codepoint: u21) bool {
+    return (codepoint >= 0x1 and codepoint <= 0x8) or
+        (codepoint >= 0xb and codepoint <= 0xc) or
+        (codepoint >= 0xe and codepoint <= 0x1f) or
+        (codepoint >= 0x7f and codepoint <= 0x84) or
+        (codepoint >= 0x86 and codepoint <= 0x9f);
+}
+
+fn attributeEscape(codepoint: u21, version: reader.XmlVersion) ?Escape {
+    return switch (codepoint) {
+        '&' => .{ .bytes = "&amp;" },
+        '<' => .{ .bytes = "&lt;" },
+        '"' => .{ .bytes = "&quot;" },
+        0x9, 0xa, 0xd => .{ .reference = codepoint },
+        0x85, 0x2028 => if (version == .xml11) .{ .reference = codepoint } else null,
+        else => if (version == .xml11 and isXml11RestrictedChar(codepoint))
+            .{ .reference = codepoint }
+        else
+            null,
+    };
+}
+
+fn textEscape(codepoint: u21, version: reader.XmlVersion, trailing_brackets: u2) ?Escape {
+    return switch (codepoint) {
+        '&' => .{ .bytes = "&amp;" },
+        '<' => .{ .bytes = "&lt;" },
+        '>' => if (trailing_brackets == 2) .{ .bytes = "&gt;" } else null,
+        0xd => .{ .reference = codepoint },
+        0x85, 0x2028 => if (version == .xml11) .{ .reference = codepoint } else null,
+        else => if (version == .xml11 and isXml11RestrictedChar(codepoint))
+            .{ .reference = codepoint }
+        else
+            null,
+    };
+}
+
+fn nextTrailingBrackets(current: u2, codepoint: u21) u2 {
+    if (codepoint != ']') return 0;
+    return @min(current + 1, 2);
+}
+
+fn needsCdataReference(codepoint: u21, version: reader.XmlVersion) bool {
+    return codepoint == 0xd or
+        (version == .xml11 and
+            (codepoint == 0x85 or codepoint == 0x2028 or isXml11RestrictedChar(codepoint)));
+}
+
+fn characterReferenceLen(codepoint: u21) usize {
+    var value = codepoint;
+    var digits: usize = 1;
+    while (value >= 16) : (value /= 16) digits += 1;
+    return digits + 4;
+}
+
+fn characterReference(codepoint: u21, buffer: *[12]u8) []const u8 {
+    const digits = "0123456789ABCDEF";
+    const len = characterReferenceLen(codepoint);
+    buffer[0] = '&';
+    buffer[1] = '#';
+    buffer[2] = 'x';
+    buffer[len - 1] = ';';
+
+    var value = codepoint;
+    var cursor = len - 1;
+    while (cursor > 3) {
+        cursor -= 1;
+        buffer[cursor] = digits[@intCast(value & 0xf)];
+        value >>= 4;
+    }
+    return buffer[0..len];
+}
+
+fn checkedSum(values: []const usize) ?usize {
+    var total: usize = 0;
+    for (values) |value| {
+        total = std.math.add(usize, total, value) catch return null;
+    }
+    return total;
+}
+
+fn targetCapacity(comptime T: type, current: usize, required: usize) usize {
+    return if (current >= required) current else std.ArrayList(T).growCapacity(required);
+}
+
+fn capacityTotal(
+    open_name_capacity: usize,
+    element_capacity: usize,
+    pending_capacity: usize,
+    attribute_capacity: usize,
+) ?usize {
+    const element_bytes = std.math.mul(usize, element_capacity, @sizeOf(Element)) catch
+        return null;
+    const attribute_bytes = std.math.mul(
+        usize,
+        attribute_capacity,
+        @sizeOf(PendingAttribute),
+    ) catch return null;
+    return checkedSum(&.{
+        open_name_capacity,
+        element_bytes,
+        pending_capacity,
+        attribute_bytes,
+    });
+}
