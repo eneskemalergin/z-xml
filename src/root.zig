@@ -1,4 +1,4 @@
-//! A bounded XML reader, owned document, and streaming writer for Zig.
+//! A bounded XML reader, owned document, and Writer state API for Zig.
 //!
 //! Normal callers use `Reader`. Explicit `...For(config)` aliases expose the
 //! specialized reader shapes used by package tests and layout reporting.
@@ -218,9 +218,9 @@ pub const ParseDocumentError = tree.ParseDocumentError;
 pub const Document = tree.Document;
 /// Parses one complete source into an owned document.
 pub const parseDocument = tree.parseDocument;
-/// Stateful UTF-8 XML writer over a caller-owned sink.
+/// Stateful Writer API over a caller-owned sink.
 pub const Writer = writer.Writer;
-/// Runtime XML output choices.
+/// Runtime Writer choices.
 pub const WriterOptions = writer.WriterOptions;
 /// Limits for Writer-owned active state and retained allocation capacity.
 pub const WriterLimits = writer.WriterLimits;
@@ -228,7 +228,7 @@ pub const WriterLimits = writer.WriterLimits;
 pub const WriterMemoryUsage = writer.WriterMemoryUsage;
 /// Errors reported while constructing a Writer.
 pub const WriterInitError = writer.WriterInitError;
-/// Errors reported by mutating Writer calls.
+/// Writer mutating-call errors.
 pub const WriterError = writer.WriterError;
 
 /// Options for specialized document construction.

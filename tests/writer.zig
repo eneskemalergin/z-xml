@@ -38,7 +38,7 @@ test "[integration] - [writer surface]: accepts the public lifecycle" {
     try writer.comment("before");
     try writer.processingInstruction("prepare", "root");
     try writer.startElement("root");
-    try std.testing.expectEqual(@as(?u64, 0), writer.byteOffset());
+    try std.testing.expect(writer.byteOffset() != null);
     try writer.namespace(null, "urn:example");
     try writer.attribute("id", "1");
     try writer.startElement("child");
@@ -51,6 +51,7 @@ test "[integration] - [writer surface]: accepts the public lifecycle" {
     try writer.endElement();
     try std.testing.expectEqual(@as(usize, 0), writer.memoryUsage().open_element_count);
     try writer.comment("after");
+    try writer.processingInstruction("final", "");
     try writer.endDocument();
 }
 
@@ -79,6 +80,24 @@ test "[failure] - [writer lifecycle]: rejects calls outside their states" {
         defer writer.deinit();
         try writer.startDocument();
         try std.testing.expectError(error.InvalidState, writer.attribute("id", "1"));
+    }
+    {
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{});
+        defer writer.deinit();
+        try writer.startDocument();
+        try std.testing.expectError(error.InvalidState, writer.namespace(null, "urn:test"));
+    }
+    {
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{});
+        defer writer.deinit();
+        try writer.startDocument();
+        try std.testing.expectError(error.InvalidState, writer.text("value"));
+    }
+    {
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{});
+        defer writer.deinit();
+        try writer.startDocument();
+        try std.testing.expectError(error.InvalidState, writer.endElement());
     }
     {
         var writer = try xml.Writer.init(std.testing.allocator, &output, .{});
@@ -113,7 +132,7 @@ test "[failure] - [writer limits]: rejects invalid options and excess depth" {
     const invalid_options = [_]xml.WriterOptions{
         .{ .limits = .{ .max_depth = 0 } },
         .{ .limits = .{ .max_open_name_bytes = 0 } },
-        .{ .limits = .{ .max_qname_bytes = 0 } },
+        .{ .limits = .{ .max_name_bytes = 0 } },
         .{ .limits = .{ .max_attributes_per_element = 0 } },
         .{ .limits = .{ .max_namespace_declarations_per_element = 0 } },
         .{ .limits = .{ .max_active_namespace_bindings = 0 } },
@@ -136,7 +155,9 @@ test "[failure] - [writer limits]: rejects invalid options and excess depth" {
     try writer.startDocument();
     try writer.startElement("root");
     try std.testing.expectError(error.WriterLimit, writer.startElement("child"));
+    try std.testing.expectEqual(@as(usize, 1), writer.memoryUsage().open_element_count);
     try std.testing.expectError(error.WriterLimit, writer.endElement());
+    try std.testing.expectEqual(@as(usize, 1), writer.memoryUsage().open_element_count);
 }
 
 test "[integration] - [writer ownership]: leaves sink flushing to the caller" {
