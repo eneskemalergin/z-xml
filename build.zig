@@ -56,6 +56,14 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const writer_internal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/writer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .filters = &.{"[writer "},
+    });
 
     const test_step = b.step("test", "Run z-xml package tests");
     test_step.dependOn(&b.addRunArtifact(reader_tests).step);
@@ -63,5 +71,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
     test_step.dependOn(&b.addRunArtifact(reader_internal_tests).step);
     test_step.dependOn(&b.addRunArtifact(dtd_internal_tests).step);
+    test_step.dependOn(&b.addRunArtifact(writer_internal_tests).step);
     b.default_step = test_step;
 }

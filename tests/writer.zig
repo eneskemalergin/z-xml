@@ -3,7 +3,15 @@
 const std = @import("std");
 const xml = @import("z_xml");
 
-const FlushSink = struct {
+const ALL_TOKEN_OUTPUT =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" ++
+    "<!--before--><?prepare root?>" ++
+    "<p:root xmlns:p=\"urn:p\" a=\"&quot;&amp;\">" ++
+    "plain&lt;&amp;]]&gt;" ++
+    "<![CDATA[c]]]]><![CDATA[>d]]>&#xD;" ++
+    "<p:child/></p:root><!--after--><?done?>";
+
+const CountingSink = struct {
     interface: std.Io.Writer = .{
         .vtable = &.{
             .drain = drain,
@@ -11,6 +19,7 @@ const FlushSink = struct {
         },
         .buffer = &.{},
     },
+    written_bytes: usize = 0,
     flush_count: usize = 0,
 
     fn drain(
@@ -19,14 +28,69 @@ const FlushSink = struct {
         splat: usize,
     ) std.Io.Writer.Error!usize {
         std.debug.assert(writer.end == 0);
-        return std.Io.Writer.countSplat(data, splat);
+        const self: *CountingSink = @alignCast(@fieldParentPtr("interface", writer));
+        const written = std.Io.Writer.countSplat(data, splat);
+        self.written_bytes += written;
+        return written;
     }
 
     fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        const self: *FlushSink = @alignCast(@fieldParentPtr("interface", writer));
+        const self: *CountingSink = @alignCast(@fieldParentPtr("interface", writer));
         self.flush_count += 1;
     }
 };
+
+const OneByteSink = struct {
+    interface: std.Io.Writer = .{
+        .vtable = &.{ .drain = drain },
+        .buffer = &.{},
+    },
+    storage: [ALL_TOKEN_OUTPUT.len]u8 = undefined,
+    len: usize = 0,
+    drain_count: usize = 0,
+
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        std.debug.assert(writer.end == 0);
+        std.debug.assert(data.len == 1);
+        std.debug.assert(splat == 1);
+        const self: *OneByteSink = @alignCast(@fieldParentPtr("interface", writer));
+        if (self.len == self.storage.len) return error.WriteFailed;
+        self.storage[self.len] = data[0][0];
+        self.len += 1;
+        self.drain_count += 1;
+        return 1;
+    }
+};
+
+fn writeAllTokenClasses(writer: *xml.Writer) xml.WriterError!void {
+    try writer.startDocument();
+    try writer.comment("before");
+    try writer.processingInstruction("prepare", "root");
+    try writer.startElement("p:root");
+    try writer.namespace("p", "urn:p");
+    try writer.attribute("a", "\"&");
+    try writer.text("plain<&]]");
+    try writer.text(">");
+    try writer.cdata("c]]>d\r");
+    try writer.startElement("p:child");
+    try writer.endElement();
+    try writer.endElement();
+    try writer.comment("after");
+    try writer.processingInstruction("done", "");
+    try writer.endDocument();
+}
+
+fn writerAllocationFailureCase(allocator: std.mem.Allocator) !void {
+    var sink: CountingSink = .{};
+    var writer = try xml.Writer.init(allocator, &sink.interface, .{});
+    defer writer.deinit();
+
+    try writeAllTokenClasses(&writer);
+}
 
 fn expectExpandedName(
     name: xml.Name,
@@ -87,6 +151,41 @@ test "[integration] - [writer output]: writes compact XML in call order" {
 
     try std.testing.expectEqualStrings(expected, output.buffered());
     try std.testing.expectEqual(@as(?u64, expected.len), writer.byteOffset());
+}
+
+test "[property] - [writer sink]: handles one-byte progress and every failure offset" {
+    {
+        var sink: OneByteSink = .{};
+        var writer = try xml.Writer.init(std.testing.allocator, &sink.interface, .{});
+        defer writer.deinit();
+
+        try writeAllTokenClasses(&writer);
+
+        try std.testing.expectEqualStrings(ALL_TOKEN_OUTPUT, sink.storage[0..sink.len]);
+        try std.testing.expectEqual(ALL_TOKEN_OUTPUT.len, sink.drain_count);
+        try std.testing.expectEqual(@as(?u64, ALL_TOKEN_OUTPUT.len), writer.byteOffset());
+    }
+
+    for (0..ALL_TOKEN_OUTPUT.len) |capacity| {
+        var output_buffer: [ALL_TOKEN_OUTPUT.len]u8 = undefined;
+        var output = std.Io.Writer.fixed(output_buffer[0..capacity]);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{});
+        defer writer.deinit();
+
+        try std.testing.expectError(error.WriteFailed, writeAllTokenClasses(&writer));
+        try std.testing.expectEqualStrings(
+            ALL_TOKEN_OUTPUT[0..capacity],
+            output.buffered(),
+        );
+        try std.testing.expectEqual(@as(?u64, null), writer.byteOffset());
+
+        try std.testing.expectError(error.WriteFailed, writer.endDocument());
+        try std.testing.expectEqual(@as(?u64, null), writer.byteOffset());
+        try std.testing.expectEqualStrings(
+            ALL_TOKEN_OUTPUT[0..capacity],
+            output.buffered(),
+        );
+    }
 }
 
 test "[integration] - [writer namespaces]: writes scoped names that Reader resolves exactly" {
@@ -914,6 +1013,194 @@ test "[failure] - [writer limits]: rejects invalid options and excess depth" {
     try std.testing.expectEqual(@as(usize, 1), writer.memoryUsage().open_element_count);
 }
 
+test "[edge] - [writer limits]: accepts structural boundaries and rejects one over" {
+    {
+        var output_buffer: [64]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_open_name_bytes = 2 },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("r");
+        try writer.startElement("c");
+        try writer.endElement();
+        try writer.endElement();
+        try writer.endDocument();
+        try std.testing.expectEqualStrings("<r><c/></r>", output.buffered());
+    }
+    {
+        var output_buffer: [64]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_open_name_bytes = 1 },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.comment("before");
+        try writer.startElement("r");
+        try std.testing.expectError(error.WriterLimit, writer.startElement("c"));
+        try std.testing.expectEqual(@as(usize, 1), writer.memoryUsage().open_name_bytes);
+        try std.testing.expectEqual(@as(?u64, "<!--before-->".len), writer.byteOffset());
+        try std.testing.expectEqualStrings("<!--before-->", output.buffered());
+    }
+    {
+        var output_buffer: [128]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_name_bytes = 1 },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.processingInstruction("t", "");
+        try writer.startElement("r");
+        try writer.namespace("p", "u");
+        try writer.attribute("a", "v");
+        try writer.endElement();
+        try writer.endDocument();
+        try std.testing.expectEqualStrings(
+            "<?t?><r xmlns:p=\"u\" a=\"v\"/>",
+            output.buffered(),
+        );
+    }
+
+    const NameOperation = enum { element, attribute, namespace, instruction };
+    const operations = [_]NameOperation{ .element, .attribute, .namespace, .instruction };
+    for (operations) |operation| {
+        var output_buffer: [64]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_name_bytes = 1 },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        const result: xml.WriterError!void = switch (operation) {
+            .element => writer.startElement("rr"),
+            .attribute => attribute: {
+                try writer.startElement("r");
+                break :attribute writer.attribute("aa", "v");
+            },
+            .namespace => namespace: {
+                try writer.startElement("r");
+                break :namespace writer.namespace("pp", "u");
+            },
+            .instruction => writer.processingInstruction("tt", ""),
+        };
+        try std.testing.expectError(error.WriterLimit, result);
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
+    {
+        var output_buffer: [64]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_attributes_per_element = 1 },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("r");
+        try writer.attribute("a", "1");
+        try std.testing.expectError(error.WriterLimit, writer.attribute("b", "2"));
+        try std.testing.expectEqual(@as(usize, 1), writer.memoryUsage().pending_attribute_count);
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
+}
+
+test "[edge] - [writer pending tag]: includes closing delimiters in its byte limit" {
+    const content_tag = "<p:r xmlns:p=\"u&amp;v\" p:a=\"&quot;\">";
+    const empty_tag = "<p:r xmlns:p=\"u&amp;v\" p:a=\"&quot;\"/>";
+
+    {
+        var output_buffer: [128]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_pending_start_tag_bytes = content_tag.len },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("p:r");
+        try writer.namespace("p", "u&v");
+        try writer.attribute("p:a", "\"");
+        try writer.text("");
+        try writer.endElement();
+        try writer.endDocument();
+        try std.testing.expectEqualStrings(content_tag ++ "</p:r>", output.buffered());
+    }
+    {
+        var output_buffer: [128]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_pending_start_tag_bytes = content_tag.len - 1 },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("p:r");
+        try writer.namespace("p", "u&v");
+        try std.testing.expectError(error.WriterLimit, writer.attribute("p:a", "\""));
+        try std.testing.expectEqual(@as(?u64, 0), writer.byteOffset());
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
+    {
+        var output_buffer: [128]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_pending_start_tag_bytes = empty_tag.len },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("p:r");
+        try writer.namespace("p", "u&v");
+        try writer.attribute("p:a", "\"");
+        try writer.endElement();
+        try writer.endDocument();
+        try std.testing.expectEqualStrings(empty_tag, output.buffered());
+    }
+    {
+        var output_buffer: [128]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_pending_start_tag_bytes = content_tag.len },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("p:r");
+        try writer.namespace("p", "u&v");
+        try writer.attribute("p:a", "\"");
+        try std.testing.expectError(error.WriterLimit, writer.endElement());
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
+    {
+        var output_buffer: [16]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .limits = .{ .max_pending_start_tag_bytes = 2 },
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try std.testing.expectError(error.WriterLimit, writer.startElement("r"));
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
+}
+
 test "[edge] - [writer namespace limits]: bounds declarations and binding bytes" {
     {
         var output_buffer: [256]u8 = undefined;
@@ -1013,8 +1300,92 @@ test "[property] - [writer namespace memory]: sibling declarations roll back wit
     try std.testing.expectEqual(@as(usize, 0), writer.memoryUsage().namespace_bytes);
 }
 
+test "[property] - [writer memory]: stays bounded across output and construction" {
+    const iteration_count = 128;
+    const text: [1024]u8 = @splat('x');
+    const root_start = "<root xmlns:p=\"urn:p\">";
+    const child_start = "<p:item id=\"1\">";
+    const child_end = "</p:item>";
+    const root_end = "</root>";
+    const expected_bytes = root_start.len +
+        iteration_count * (child_start.len + text.len + child_end.len) +
+        root_end.len;
+
+    var sink: CountingSink = .{};
+    var writer = try xml.Writer.init(std.testing.allocator, &sink.interface, .{
+        .emit_declaration = false,
+        .limits = .{ .max_retained_bytes = 4096 },
+    });
+    defer writer.deinit();
+
+    try writer.startDocument();
+    try writer.startElement("root");
+    try writer.namespace("p", "urn:p");
+    var retained_capacity: ?usize = null;
+    for (0..iteration_count) |_| {
+        try writer.startElement("p:item");
+        try writer.attribute("id", "1");
+        try writer.text(&text);
+        try writer.endElement();
+
+        const usage = writer.memoryUsage();
+        if (retained_capacity) |expected| {
+            try std.testing.expectEqual(expected, usage.retained_capacity_bytes);
+        } else {
+            retained_capacity = usage.retained_capacity_bytes;
+        }
+        try std.testing.expect(usage.retained_capacity_bytes <= 4096);
+    }
+    try writer.endElement();
+    try writer.endDocument();
+
+    try std.testing.expectEqual(expected_bytes, sink.written_bytes);
+    try std.testing.expectEqual(@as(?u64, expected_bytes), writer.byteOffset());
+
+    for (0..32) |_| {
+        var repeated_sink: CountingSink = .{};
+        var repeated = try xml.Writer.init(
+            std.testing.allocator,
+            &repeated_sink.interface,
+            .{ .emit_declaration = false },
+        );
+        defer repeated.deinit();
+
+        try repeated.startDocument();
+        try repeated.startElement("r");
+        try repeated.endElement();
+        try repeated.endDocument();
+        try std.testing.expectEqual(@as(usize, 4), repeated_sink.written_bytes);
+    }
+}
+
+test "[failure] - [writer allocation]: releases every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        writerAllocationFailureCase,
+        .{},
+    );
+
+    var sink: CountingSink = .{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    var writer = try xml.Writer.init(failing.allocator(), &sink.interface, .{
+        .emit_declaration = false,
+    });
+    defer writer.deinit();
+
+    try writer.startDocument();
+    try writer.comment("before");
+    try std.testing.expectError(error.OutOfMemory, writer.startElement("root"));
+    try std.testing.expectEqual(@as(?u64, "<!--before-->".len), writer.byteOffset());
+    try std.testing.expectEqual(@as(usize, "<!--before-->".len), sink.written_bytes);
+    try std.testing.expectError(error.OutOfMemory, writer.endDocument());
+    try std.testing.expectEqual(@as(usize, "<!--before-->".len), sink.written_bytes);
+}
+
 test "[integration] - [writer ownership]: leaves sink flushing to the caller" {
-    var sink: FlushSink = .{};
+    var sink: CountingSink = .{};
     var writer = try xml.Writer.init(std.testing.allocator, &sink.interface, .{});
     try writer.startDocument();
     try writer.startElement("root");
