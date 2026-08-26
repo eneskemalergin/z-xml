@@ -26,11 +26,21 @@ pub fn build(b: *std.Build) void {
     });
     tree_tests_module.addImport("z_xml", z_xml);
 
+    const writer_tests_module = b.createModule(.{
+        .root_source_file = b.path("tests/writer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    writer_tests_module.addImport("z_xml", z_xml);
+
     const reader_tests = b.addTest(.{
         .root_module = reader_tests_module,
     });
     const tree_tests = b.addTest(.{
         .root_module = tree_tests_module,
+    });
+    const writer_tests = b.addTest(.{
+        .root_module = writer_tests_module,
     });
     const reader_internal_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -50,6 +60,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run z-xml package tests");
     test_step.dependOn(&b.addRunArtifact(reader_tests).step);
     test_step.dependOn(&b.addRunArtifact(tree_tests).step);
+    test_step.dependOn(&b.addRunArtifact(writer_tests).step);
     test_step.dependOn(&b.addRunArtifact(reader_internal_tests).step);
     test_step.dependOn(&b.addRunArtifact(dtd_internal_tests).step);
     b.default_step = test_step;
