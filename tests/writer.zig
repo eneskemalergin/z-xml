@@ -1384,6 +1384,32 @@ test "[failure] - [writer allocation]: releases every partial allocation" {
     try std.testing.expectEqual(@as(usize, "<!--before-->".len), sink.written_bytes);
 }
 
+test "[failure] - [writer allocation]: keeps a pending parent unpublished" {
+    const child_name: [1024]u8 = @splat('c');
+    var output_buffer: [64]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .resize_fail_index = 0,
+    });
+    var writer = try xml.Writer.init(failing_allocator.allocator(), &output, .{
+        .emit_declaration = false,
+    });
+    defer writer.deinit();
+
+    try writer.startDocument();
+    try writer.startElement("root");
+    try std.testing.expectEqualStrings("", output.buffered());
+    try std.testing.expectEqual(@as(?u64, 0), writer.byteOffset());
+
+    failing_allocator.fail_index = failing_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, writer.startElement(&child_name));
+    try std.testing.expectEqualStrings("", output.buffered());
+    try std.testing.expectEqual(@as(?u64, 0), writer.byteOffset());
+    try std.testing.expectEqual(@as(usize, 1), writer.memoryUsage().open_element_count);
+    try std.testing.expectError(error.OutOfMemory, writer.endElement());
+    try std.testing.expectEqualStrings("", output.buffered());
+}
+
 test "[integration] - [writer ownership]: leaves sink flushing to the caller" {
     var sink: CountingSink = .{};
     var writer = try xml.Writer.init(std.testing.allocator, &sink.interface, .{});
