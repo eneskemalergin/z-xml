@@ -10159,26 +10159,178 @@ fn arbitraryOutcome(comptime config: xml.Config, input: []const u8, seed: ?u64) 
     return error.MissingDone;
 }
 
-fn fuzzArbitraryBytes(_: void, smith: *std.testing.Smith) !void {
+const NormalFuzzOutcome = struct {
+    failure: ?xml.ReadError = null,
+    code: ?xml.DiagnosticCode = null,
+    byte_offset: u64 = 0,
+    related_byte_offset: ?u64 = null,
+    source_encoding: ?xml.SourceEncoding = null,
+    version: ?xml.XmlVersion = null,
+    document_types: usize = 0,
+    starts: usize = 0,
+    ends: usize = 0,
+    attributes: usize = 0,
+    namespace_declarations: usize = 0,
+    text_bytes: usize = 0,
+    comment_bytes: usize = 0,
+    processing_instruction_bytes: usize = 0,
+    skipped_external_sources: usize = 0,
+    content: ?xml.DocumentContent = null,
+    dtd_validity: ?xml.DtdValidity = null,
+    normalization: ?xml.DocumentNormalization = null,
+    first_finding: ?xml.DiagnosticCode = null,
+    first_finding_offset: u64 = 0,
+};
+
+fn boundedNormalFuzzOptions(
+    namespaces: xml.NamespacePolicy,
+    dtd: xml.DtdPolicy,
+) xml.ReaderOptions {
+    return .{
+        .namespaces = namespaces,
+        .dtd = dtd,
+        .limits = .{
+            .max_depth = 16,
+            .max_open_name_bytes = 256,
+            .max_partial_token_bytes = 256,
+            .max_attributes_per_element = 16,
+            .max_attribute_name_bytes = 128,
+            .max_attribute_value_bytes = 256,
+            .max_attribute_bytes_per_element = 512,
+            .max_start_tag_bytes = 512,
+            .max_fragment_bytes = 64,
+            .max_processing_instruction_target_bytes = 64,
+            .max_namespace_declarations_per_element = 16,
+            .max_active_namespace_bindings = 32,
+            .max_namespace_binding_bytes = 512,
+            .max_qname_bytes = 128,
+            .max_namespace_comparison_work = 4096,
+            .max_dtd_bytes = 512,
+            .max_dtd_declarations = 32,
+            .max_dtd_declaration_bytes = 512,
+            .max_dtd_element_declarations = 32,
+            .max_dtd_attribute_declarations = 32,
+            .max_dtd_entity_declarations = 32,
+            .max_dtd_notation_declarations = 32,
+            .max_dtd_group_depth = 16,
+            .max_dtd_grammar_nodes = 256,
+            .max_dtd_entity_replacement_bytes = 512,
+            .max_dtd_entity_depth = 16,
+            .max_dtd_entity_references = 128,
+            .max_dtd_expanded_bytes = 4096,
+            .max_dtd_expansion_ratio = 16,
+            .dtd_expansion_ratio_minimum_bytes = 256,
+            .max_dtd_comparison_work = 4096,
+            .max_validation_content_positions = 128,
+            .max_validation_content_states = 512,
+            .max_validation_content_transitions = 1024,
+            .max_validation_compilation_work = 4096,
+            .max_validation_ids = 64,
+            .max_validation_idrefs = 64,
+            .max_validation_identity_bytes = 512,
+            .max_validation_comparison_work = 4096,
+            .max_validation_findings = 32,
+            .max_retained_bytes = 4096,
+        },
+    };
+}
+
+fn normalFuzzOutcome(source: xml.Source, options: xml.ReaderOptions) !NormalFuzzOutcome {
+    var reader = try xml.Reader.init(std.testing.allocator, source, options);
+    defer reader.deinit();
+    var outcome: NormalFuzzOutcome = .{};
+
+    for (0..16_384) |_| {
+        const event = reader.next() catch |failure| {
+            const diagnostic = reader.diagnostic() orelse return error.MissingDiagnostic;
+            outcome.failure = failure;
+            outcome.code = diagnostic.code;
+            outcome.byte_offset = diagnostic.primary.byte_offset;
+            outcome.related_byte_offset = if (diagnostic.related) |related|
+                related.byte_offset
+            else
+                null;
+            break;
+        };
+        const value = event orelse break;
+        switch (value.data) {
+            .document_start => |document| {
+                outcome.source_encoding = document.source_encoding;
+                outcome.version = document.effective_version;
+            },
+            .document_type => outcome.document_types += 1,
+            .start_element => |element| {
+                outcome.starts += 1;
+                outcome.attributes += element.attributes.len;
+                outcome.namespace_declarations += element.namespace_declarations.len;
+            },
+            .end_element => outcome.ends += 1,
+            .text => |text| outcome.text_bytes += text.bytes.len,
+            .comment => |comment| outcome.comment_bytes += comment.bytes.len,
+            .processing_instruction => |instruction| {
+                outcome.processing_instruction_bytes += instruction.target.len;
+                outcome.processing_instruction_bytes += instruction.data.len;
+            },
+            .skipped_external_source => outcome.skipped_external_sources += 1,
+            .document_end => |document| {
+                outcome.content = document.content;
+                outcome.dtd_validity = document.dtd_validity;
+                outcome.normalization = document.normalization;
+            },
+        }
+    } else return error.NonTerminatingReader;
+
+    if (reader.firstDtdFinding()) |finding| {
+        outcome.first_finding = finding.code;
+        outcome.first_finding_offset = finding.primary.byte_offset;
+    }
+    return outcome;
+}
+
+fn expectNormalFuzzSchedules(input: []const u8, options: xml.ReaderOptions) !void {
+    const whole = try normalFuzzOutcome(.{ .slice = input }, options);
+    var input_buffer: [7]u8 = undefined;
+    var source: std.testing.Reader = .init(&input_buffer, &.{.{ .buffer = input }});
+    source.artificial_limit = .limited(1);
+    try std.testing.expectEqual(
+        whole,
+        try normalFuzzOutcome(.{ .stream = &source.interface }, options),
+    );
+}
+
+fn fuzzReaderPolicies(_: void, smith: *std.testing.Smith) !void {
     @disableInstrumentation();
     var storage: [512]u8 = undefined;
     const input = storage[0..smith.slice(&storage)];
-    inline for (.{ FAST_CONFIG, GENERAL_FAST_CONFIG, DTD_CONFIG, DTD_NS_CONFIG }) |config| {
-        const whole = try arbitraryOutcome(config, input, null);
-        try std.testing.expectEqual(
-            whole,
-            try arbitraryOutcome(config, input, 0x7a786d6c),
+    const policies = [_]struct {
+        namespaces: xml.NamespacePolicy,
+        dtd: xml.DtdPolicy,
+    }{
+        .{ .namespaces = .raw, .dtd = .reject },
+        .{ .namespaces = .process, .dtd = .reject },
+        .{ .namespaces = .raw, .dtd = .process },
+        .{ .namespaces = .process, .dtd = .process },
+        .{ .namespaces = .raw, .dtd = .{ .validate = .{} } },
+        .{ .namespaces = .process, .dtd = .{ .validate = .{} } },
+    };
+    for (policies) |policy| {
+        try expectNormalFuzzSchedules(
+            input,
+            boundedNormalFuzzOptions(policy.namespaces, policy.dtd),
         );
     }
 }
 
-test "[fuzz] - [arbitrary bytes]: parsing is bounded and schedule invariant" {
-    try std.testing.fuzz({}, fuzzArbitraryBytes, .{
+test "[fuzz] - [Reader policies]: runtime modes are bounded and schedule invariant" {
+    try std.testing.fuzz({}, fuzzReaderPolicies, .{
         .corpus = &.{
             "<root/>",
             "<root a='&amp;'>text</root>",
+            "<p:root xmlns:p='urn:p'/>",
             "<root><item></root>",
             "<!DOCTYPE root><root/>",
+            "<!DOCTYPE root [<!ELEMENT root EMPTY>]><root/>",
+            "<!DOCTYPE root [<!ELEMENT root EMPTY>]><root>text</root>",
             "<!DOCTYPE root [<!ENTITY text 'value'>]><root>&text;</root>",
             "<!DOCTYPE root [<!ENTITY loop '&loop;'>]><root>&loop;</root>",
             "\xef\xbb\xbf<root>\xf0\x9f\x99\x82</root>",
