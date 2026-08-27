@@ -28,8 +28,6 @@ pub const NormalizationPolicy = reader.NormalNormalizationPolicy;
 pub const ProfileNormalizationStatus = reader.NormalizationStatus;
 /// Reason XML 1.1 full-normalization verification did not succeed.
 pub const NormalizationIssueKind = reader.NormalizationIssueKind;
-/// Declared DTD attribute type.
-pub const AttributeType = dtd_module.AttributeType;
 /// Observable lifecycle of a specialized reader.
 pub const ProfileLifecycle = reader.Lifecycle;
 /// Runtime resource limits for the normal Reader.
@@ -64,20 +62,6 @@ pub const ExternalEntityKind = resolver.EntityKind;
 pub const ProfileSkippedEntityKind = reader.SkippedEntityKind;
 /// Optional handle-relative filesystem resolver with no network behavior.
 pub const RootedFilesystemResolver = resolver.RootedFilesystem;
-/// Immutable compiled declarations shared by validating readers.
-pub const ExternalSubset = external_subset.ExternalSubset;
-/// Construction options for a compiled external subset.
-pub const ExternalSubsetOptions = external_subset.Options;
-/// Synchronous provider used while compiling nested external declarations.
-pub const ExternalSubsetProvider = external_subset.Provider;
-/// Errors returned while compiling external declarations.
-pub const ExternalSubsetProviderError = external_subset.ProviderError;
-/// External declaration request made during subset compilation.
-pub const ExternalSubsetRequest = external_subset.Request;
-/// External declaration result returned during subset compilation.
-pub const ExternalSubsetResult = external_subset.Result;
-/// External declaration bytes returned during subset compilation.
-pub const ExternalSubsetContent = external_subset.Content;
 /// Semantic origin reported by text fragments.
 pub const TextOrigin = reader.TextOrigin;
 /// Event production errors from the normal reader.
@@ -101,6 +85,18 @@ pub const dtd = struct {
     pub const FindingSink = reader.NormalDtdFindingSink;
     /// Immutable compiled declarations shared by validating readers.
     pub const ExternalSubset = external_subset.ExternalSubset;
+    /// Construction options for a compiled external subset.
+    pub const ExternalSubsetOptions = external_subset.Options;
+    /// Synchronous provider used while compiling nested external declarations.
+    pub const ExternalSubsetProvider = external_subset.Provider;
+    /// Errors returned while compiling external declarations.
+    pub const ExternalSubsetProviderError = external_subset.ProviderError;
+    /// External declaration request made during subset compilation.
+    pub const ExternalSubsetRequest = external_subset.Request;
+    /// External declaration result returned during subset compilation.
+    pub const ExternalSubsetResult = external_subset.Result;
+    /// External declaration bytes returned during subset compilation.
+    pub const ExternalSubsetContent = external_subset.Content;
 };
 
 /// Caller-owned input for the normal reader.

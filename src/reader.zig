@@ -7,6 +7,7 @@ const resolver_module = @import("resolver.zig");
 const validation_module = @import("validation.zig");
 const external_subset_module = @import("external_subset.zig");
 const unicode_normalization = @import("unicode_normalization.zig");
+const xml_rules = @import("xml_rules.zig");
 
 /// XML capability profile selected at compile time.
 pub const Profile = enum {
@@ -855,7 +856,7 @@ fn EndElement(comptime config: Config) type {
 }
 
 /// XML rules selected for a document entity.
-pub const XmlVersion = dtd_module.XmlVersion;
+pub const XmlVersion = xml_rules.Version;
 
 /// Source encoding detected for the document entity.
 pub const SourceEncoding = encoding_module.SourceEncoding;
@@ -2538,7 +2539,7 @@ pub fn Reader(comptime config: Config) type {
                             if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
-                            if (isXml10NameStart(scalar.codepoint)) {
+                            if (xml_rules.isNameStart(scalar.codepoint)) {
                                 return self.failAt(
                                     .multiple_document_elements,
                                     .invalid_xml,
@@ -2574,7 +2575,7 @@ pub fn Reader(comptime config: Config) type {
                             if (!self.isLiteralChar(scalar.codepoint)) {
                                 return self.failAt(.forbidden_character, .invalid_xml, start);
                             }
-                            if (isXml10NameStart(scalar.codepoint)) {
+                            if (xml_rules.isNameStart(scalar.codepoint)) {
                                 return self.failAt(
                                     .multiple_document_elements,
                                     .invalid_xml,
@@ -2620,9 +2621,9 @@ pub fn Reader(comptime config: Config) type {
                                 );
                             }
                             const valid = if (self.token_name_len == 0)
-                                isXml10NameStart(scalar.codepoint)
+                                xml_rules.isNameStart(scalar.codepoint)
                             else
-                                isXml10NameChar(scalar.codepoint);
+                                xml_rules.isNameChar(scalar.codepoint);
                             if (!valid) {
                                 return self.failAt(
                                     .malformed_start_tag,
@@ -2648,7 +2649,7 @@ pub fn Reader(comptime config: Config) type {
                                 try self.finishStartElement(false);
                                 continue;
                             }
-                            if (isXmlWhitespace(byte)) {
+                            if (xml_rules.isWhitespace(byte)) {
                                 self.vertical_state = .start_after_space;
                                 continue;
                             }
@@ -2719,9 +2720,9 @@ pub fn Reader(comptime config: Config) type {
                                 self.attribute_records.items.len - 1
                             ];
                             const valid = if (record.name_len == 0)
-                                isXml10NameStart(scalar.codepoint)
+                                xml_rules.isNameStart(scalar.codepoint)
                             else
-                                isXml10NameChar(scalar.codepoint);
+                                xml_rules.isNameChar(scalar.codepoint);
                             if (!valid) {
                                 return self.failAt(
                                     .malformed_attribute,
@@ -2742,7 +2743,7 @@ pub fn Reader(comptime config: Config) type {
                                 self.vertical_state = .attribute_before_value;
                                 continue;
                             }
-                            if (isXmlWhitespace(byte)) {
+                            if (xml_rules.isWhitespace(byte)) {
                                 self.vertical_state = .attribute_after_name;
                                 continue;
                             }
@@ -2935,7 +2936,7 @@ pub fn Reader(comptime config: Config) type {
                             self.vertical_state = .empty_slash;
                             continue;
                         }
-                        if (isXmlWhitespace(byte)) {
+                        if (xml_rules.isWhitespace(byte)) {
                             self.vertical_state = .start_after_space;
                             continue;
                         }
@@ -3056,9 +3057,9 @@ pub fn Reader(comptime config: Config) type {
                                 );
                             }
                             const valid = if (self.token_name_len == 0)
-                                isXml10NameStart(scalar.codepoint)
+                                xml_rules.isNameStart(scalar.codepoint)
                             else
-                                isXml10NameChar(scalar.codepoint);
+                                xml_rules.isNameChar(scalar.codepoint);
                             if (!valid) {
                                 return self.failAt(
                                     .malformed_end_tag,
@@ -3079,7 +3080,7 @@ pub fn Reader(comptime config: Config) type {
                                 try self.finishEndElement();
                                 continue;
                             }
-                            if (isXmlWhitespace(byte)) {
+                            if (xml_rules.isWhitespace(byte)) {
                                 self.recordShortEndMismatch();
                                 self.vertical_state = .end_after_space;
                                 continue;
@@ -4049,22 +4050,21 @@ pub fn Reader(comptime config: Config) type {
         }
 
         inline fn isLiteralChar(self: *const Self, codepoint: u32) bool {
-            if (comptime !config.profile.isXml11()) return isXml10Char(codepoint);
-            return switch (self.xmlVersion()) {
-                .xml10 => isXml10Char(codepoint),
-                .xml11 => isXml11Char(codepoint) and
-                    (!isXml11RestrictedChar(codepoint) or
-                        (comptime config.profile.dtdMode() != .rejected) and
-                            self.dtd_state.current_is_replacement),
-            };
+            if (comptime !config.profile.isXml11()) {
+                return xml_rules.isChar(codepoint, .xml10);
+            }
+            const version = self.xmlVersion();
+            if (xml_rules.isLiteralChar(codepoint, version)) return true;
+            if (version != .xml11 or !xml_rules.isXml11RestrictedChar(codepoint)) return false;
+            if (comptime config.profile.dtdMode() == .rejected) return false;
+            return self.dtd_state.current_is_replacement;
         }
 
         inline fn isReferenceChar(self: *const Self, codepoint: u32) bool {
-            if (comptime !config.profile.isXml11()) return isXml10Char(codepoint);
-            return switch (self.xmlVersion()) {
-                .xml10 => isXml10Char(codepoint),
-                .xml11 => isXml11Char(codepoint),
-            };
+            if (comptime !config.profile.isXml11()) {
+                return xml_rules.isChar(codepoint, .xml10);
+            }
+            return xml_rules.isChar(codepoint, self.xmlVersion());
         }
 
         inline fn isXml11LineEnd(self: *const Self, codepoint: u32) bool {
@@ -4350,7 +4350,7 @@ pub fn Reader(comptime config: Config) type {
             var token_start: ?usize = null;
             while (iterator.nextCodepointSlice()) |scalar| {
                 const codepoint = std.unicode.utf8Decode(scalar) catch unreachable;
-                if (isXml10NameChar(codepoint)) {
+                if (xml_rules.isNameChar(codepoint)) {
                     if (token_start == null) token_start = offset;
                 } else if (token_start) |start| {
                     try self.checkConstructNormalization(bytes[start..offset], location, true);
@@ -5270,7 +5270,7 @@ pub fn Reader(comptime config: Config) type {
                 self.options.limits.max_processing_instruction_target_bytes and
                 (!self.processing_instruction_initial or
                     !std.mem.eql(u8, self.processingInstructionTarget(), "xml") or
-                    (!isXmlWhitespace(self.input[self.cursor]) and
+                    (!xml_rules.isWhitespace(self.input[self.cursor]) and
                         self.input[self.cursor] != '?')))
             {
                 return self.failProcessingInstructionTargetLimit();
@@ -5294,9 +5294,9 @@ pub fn Reader(comptime config: Config) type {
                     return self.failAt(.forbidden_character, .invalid_xml, start);
                 }
                 const valid = if (self.processing_instruction_target_len == 0)
-                    isXml10NameStart(scalar.codepoint)
+                    xml_rules.isNameStart(scalar.codepoint)
                 else
-                    isXml10NameChar(scalar.codepoint);
+                    xml_rules.isNameChar(scalar.codepoint);
                 if (!valid) {
                     return self.failAt(
                         .malformed_processing_instruction,
@@ -5313,7 +5313,7 @@ pub fn Reader(comptime config: Config) type {
                 return self.failVoid(.malformed_processing_instruction, .invalid_xml);
             }
             const byte = self.input[self.cursor];
-            if (!isXmlWhitespace(byte) and byte != '?') {
+            if (!xml_rules.isWhitespace(byte) and byte != '?') {
                 if (!self.isLiteralChar(byte)) return self.failVoid(.forbidden_character, .invalid_xml);
                 return self.failVoid(.malformed_processing_instruction, .invalid_xml);
             }
@@ -5338,7 +5338,7 @@ pub fn Reader(comptime config: Config) type {
                 true,
             );
             if (self.processing_instruction_initial and
-                std.mem.eql(u8, target, "xml") and isXmlWhitespace(byte))
+                std.mem.eql(u8, target, "xml") and xml_rules.isWhitespace(byte))
             {
                 const declaration_bytes =
                     self.source_byte_offset - self.token_start.byte_offset;
@@ -5388,7 +5388,7 @@ pub fn Reader(comptime config: Config) type {
                 self.vertical_state = .processing_instruction;
                 return false;
             }
-            std.debug.assert(isXmlWhitespace(self.input[self.cursor]));
+            std.debug.assert(xml_rules.isWhitespace(self.input[self.cursor]));
             self.vertical_state = .processing_instruction_before_data;
             return false;
         }
@@ -6452,7 +6452,7 @@ pub fn Reader(comptime config: Config) type {
                 if (!self.isLiteralChar(scalar.codepoint)) {
                     return self.failAt(.forbidden_character, .invalid_xml, start);
                 }
-                if (!isXml10NameStart(scalar.codepoint)) {
+                if (!xml_rules.isNameStart(scalar.codepoint)) {
                     return self.failAt(.malformed_reference, .invalid_xml, start);
                 }
                 self.reference_name_len += scalar.len;
@@ -6472,7 +6472,7 @@ pub fn Reader(comptime config: Config) type {
                 if (!self.isLiteralChar(byte)) {
                     return self.failVoid(.forbidden_character, .invalid_xml);
                 }
-                if (!isXml10NameStart(byte)) {
+                if (!xml_rules.isNameStart(byte)) {
                     return self.failVoid(.malformed_reference, .invalid_xml);
                 }
                 try self.consumeReferenceNameAscii(byte);
@@ -6484,7 +6484,7 @@ pub fn Reader(comptime config: Config) type {
             if (!self.isLiteralChar(scalar.codepoint)) {
                 return self.failAt(.forbidden_character, .invalid_xml, start);
             }
-            if (!isXml10NameStart(scalar.codepoint)) {
+            if (!xml_rules.isNameStart(scalar.codepoint)) {
                 return self.failAt(.malformed_reference, .invalid_xml, start);
             }
             self.reference_name_len += scalar.len;
@@ -6560,7 +6560,7 @@ pub fn Reader(comptime config: Config) type {
                 if (!self.isLiteralChar(scalar.codepoint)) {
                     return self.failAt(.forbidden_character, .invalid_xml, start);
                 }
-                if (!isXml10NameChar(scalar.codepoint)) {
+                if (!xml_rules.isNameChar(scalar.codepoint)) {
                     return self.failAt(.malformed_reference, .invalid_xml, start);
                 }
                 self.reference_name_len += scalar.len;
@@ -6579,7 +6579,7 @@ pub fn Reader(comptime config: Config) type {
                 if (!self.isLiteralChar(byte)) {
                     return self.failVoid(.forbidden_character, .invalid_xml);
                 }
-                if (!isXml10NameChar(byte)) {
+                if (!xml_rules.isNameChar(byte)) {
                     return self.failVoid(.malformed_reference, .invalid_xml);
                 }
                 try self.consumeReferenceNameAscii(byte);
@@ -6590,7 +6590,7 @@ pub fn Reader(comptime config: Config) type {
             if (!self.isLiteralChar(scalar.codepoint)) {
                 return self.failAt(.forbidden_character, .invalid_xml, start);
             }
-            if (!isXml10NameChar(scalar.codepoint)) {
+            if (!xml_rules.isNameChar(scalar.codepoint)) {
                 return self.failAt(.malformed_reference, .invalid_xml, start);
             }
             self.reference_name_len += scalar.len;
@@ -8322,7 +8322,7 @@ pub fn Reader(comptime config: Config) type {
         fn consumeStartTagWhitespaceRun(self: *Self) ReadError!void {
             const start = self.cursor;
             var end = start;
-            while (end < self.input.len and isXmlWhitespace(self.input[end])) {
+            while (end < self.input.len and xml_rules.isWhitespace(self.input[end])) {
                 end += 1;
             }
             const run = self.input[start..end];
@@ -8342,7 +8342,7 @@ pub fn Reader(comptime config: Config) type {
         fn consumeWhitespaceRun(self: *Self) void {
             const start = self.cursor;
             var end = start;
-            while (end < self.input.len and isXmlWhitespace(self.input[end])) {
+            while (end < self.input.len and xml_rules.isWhitespace(self.input[end])) {
                 end += 1;
             }
             self.consumeRun(self.input[start..end]);
@@ -8447,7 +8447,7 @@ pub fn Reader(comptime config: Config) type {
             if (self.open_elements.items.len == 0 or self.text_fragment.len == 0) return;
             const frame = &self.open_elements.items[self.open_elements.items.len - 1].validation;
             const source = toValidationLocation(config, self.text_start);
-            const whitespace = allXmlWhitespace(self.text_fragment);
+            const whitespace = xml_rules.allWhitespace(self.text_fragment);
             if (self.standalone_declared and self.standalone and whitespace and
                 frame.declared_external and
                 self.validation_state.isIgnorableWhitespace(frame.*, self.text_fragment))
@@ -8458,7 +8458,6 @@ pub fn Reader(comptime config: Config) type {
                 }, self.text_start);
             }
             if (self.validation_state.text(
-                &self.dtd_state.declarations,
                 frame,
                 self.text_fragment,
                 self.text_origin == .character_data and !self.text_from_reference,
@@ -9737,12 +9736,12 @@ fn parseXmlDeclaration(
 
 fn skipRequiredXmlWhitespace(bytes: []const u8, index: *usize) bool {
     const start = index.*;
-    while (index.* < bytes.len and isXmlWhitespace(bytes[index.*])) index.* += 1;
+    while (index.* < bytes.len and xml_rules.isWhitespace(bytes[index.*])) index.* += 1;
     return index.* != start;
 }
 
 fn skipOptionalXmlWhitespace(bytes: []const u8, index: *usize) void {
-    while (index.* < bytes.len and isXmlWhitespace(bytes[index.*])) index.* += 1;
+    while (index.* < bytes.len and xml_rules.isWhitespace(bytes[index.*])) index.* += 1;
 }
 
 fn startsWithLiteral(bytes: []const u8, index: usize, literal: []const u8) bool {
@@ -9830,7 +9829,7 @@ fn isNcNameStart(bytes: []const u8) bool {
     const sequence_len = std.unicode.utf8ByteSequenceLength(bytes[0]) catch return false;
     if (sequence_len > bytes.len) return false;
     const codepoint = std.unicode.utf8Decode(bytes[0..sequence_len]) catch return false;
-    return codepoint != ':' and isXml10NameStart(codepoint);
+    return codepoint != ':' and xml_rules.isNameStart(codepoint);
 }
 
 fn namespaceDeclarationPrefix(raw: []const u8, parts: QNameParts) ?[]const u8 {
@@ -9935,11 +9934,6 @@ const SpaceTokenIterator = struct {
         return self.bytes[start..self.index];
     }
 };
-
-fn allXmlWhitespace(bytes: []const u8) bool {
-    for (bytes) |byte| if (!isXmlWhitespace(byte)) return false;
-    return true;
-}
 
 fn validValidationName(comptime config: Config, bytes: []const u8) bool {
     return dtd_module.validName(bytes) and
@@ -10295,7 +10289,7 @@ fn decodeExternalSource(
             .scalar => |value| value,
             .incomplete, .invalid => unreachable,
         };
-        if (!isXmlLiteralChar(scalar.codepoint, version)) {
+        if (!xml_rules.isLiteralChar(scalar.codepoint, version)) {
             var raw_offset: usize = @intCast(source_start_offset);
             for (content_advances[0..validation_cursor]) |advance| raw_offset += advance;
             setExternalDecodeFailure(
@@ -10376,7 +10370,7 @@ const ExternalTextDeclaration = struct {
 
 fn externalTextDeclaration(bytes: []const u8) ?ExternalTextDeclaration {
     if (!std.mem.startsWith(u8, bytes, "<?xml") or bytes.len == 5 or
-        !isXmlWhitespace(bytes[5])) return null;
+        !xml_rules.isWhitespace(bytes[5])) return null;
     const close = std.mem.indexOfPos(u8, bytes, 6, "?>") orelse return null;
     const declaration = bytes[5..close];
     if (hasNonAscii(declaration)) return null;
@@ -10404,7 +10398,7 @@ fn externalTextDeclaration(bytes: []const u8) ?ExternalTextDeclaration {
 
 fn malformedExternalTextDeclaration(bytes: []const u8) bool {
     return std.mem.startsWith(u8, bytes, "<?xml") and bytes.len > 5 and
-        isXmlWhitespace(bytes[5]) and std.mem.indexOfPos(u8, bytes, 6, "?>") != null and
+        xml_rules.isWhitespace(bytes[5]) and std.mem.indexOfPos(u8, bytes, 6, "?>") != null and
         externalTextDeclaration(bytes) == null;
 }
 
@@ -10449,7 +10443,7 @@ fn externalRawStartReady(
         if (actual != expected) return true;
     }
     const sixth = externalAsciiByte(raw, start + 5 * width, encoding) orelse return true;
-    if (!isXmlWhitespace(sixth)) return true;
+    if (!xml_rules.isWhitespace(sixth)) return true;
     var cursor = start + 6 * width;
     while (cursor + 2 * width <= raw.len) : (cursor += width) {
         if (externalAsciiByte(raw, cursor, encoding) == '?' and
@@ -11758,13 +11752,6 @@ pub fn AdapterAccess(comptime config: Config) type {
     };
 }
 
-fn isXmlWhitespace(byte: u8) bool {
-    return switch (byte) {
-        ' ', '\t', '\n', '\r' => true,
-        else => false,
-    };
-}
-
 fn isAsciiNameStart(byte: u8) bool {
     return std.ascii.isAlphabetic(byte) or byte == '_' or byte == ':';
 }
@@ -11775,34 +11762,6 @@ fn isAsciiNameChar(byte: u8) bool {
 
 fn isOrdinaryAttributeValueByte(byte: u8, quote: u8) bool {
     return byte >= ' ' and byte < 0x80 and byte != quote and byte != '&' and byte != '<';
-}
-
-fn isXml10Char(codepoint: u32) bool {
-    return codepoint == 0x9 or codepoint == 0xa or codepoint == 0xd or
-        (codepoint >= 0x20 and codepoint <= 0xd7ff) or
-        (codepoint >= 0xe000 and codepoint <= 0xfffd) or
-        (codepoint >= 0x10000 and codepoint <= 0x10ffff);
-}
-
-fn isXml11Char(codepoint: u32) bool {
-    return (codepoint >= 0x1 and codepoint <= 0xd7ff) or
-        (codepoint >= 0xe000 and codepoint <= 0xfffd) or
-        (codepoint >= 0x10000 and codepoint <= 0x10ffff);
-}
-
-fn isXml11RestrictedChar(codepoint: u32) bool {
-    return (codepoint >= 0x1 and codepoint <= 0x8) or
-        (codepoint >= 0xb and codepoint <= 0xc) or
-        (codepoint >= 0xe and codepoint <= 0x1f) or
-        (codepoint >= 0x7f and codepoint <= 0x84) or
-        (codepoint >= 0x86 and codepoint <= 0x9f);
-}
-
-fn isXmlLiteralChar(codepoint: u32, version: XmlVersion) bool {
-    return switch (version) {
-        .xml10 => isXml10Char(codepoint),
-        .xml11 => isXml11Char(codepoint) and !isXml11RestrictedChar(codepoint),
-    };
 }
 
 fn hasForbiddenAsciiControl(bytes: []const u8) bool {
@@ -11982,32 +11941,6 @@ fn isUtf8FourByteLeader(byte: u8) bool {
     return byte >= 0xf0 and byte <= 0xf4;
 }
 
-fn isXml10NameStart(codepoint: u32) bool {
-    return codepoint == ':' or
-        (codepoint >= 'A' and codepoint <= 'Z') or
-        codepoint == '_' or
-        (codepoint >= 'a' and codepoint <= 'z') or
-        (codepoint >= 0xc0 and codepoint <= 0xd6) or
-        (codepoint >= 0xd8 and codepoint <= 0xf6) or
-        (codepoint >= 0xf8 and codepoint <= 0x2ff) or
-        (codepoint >= 0x370 and codepoint <= 0x37d) or
-        (codepoint >= 0x37f and codepoint <= 0x1fff) or
-        (codepoint >= 0x200c and codepoint <= 0x200d) or
-        (codepoint >= 0x2070 and codepoint <= 0x218f) or
-        (codepoint >= 0x2c00 and codepoint <= 0x2fef) or
-        (codepoint >= 0x3001 and codepoint <= 0xd7ff) or
-        (codepoint >= 0xf900 and codepoint <= 0xfdcf) or
-        (codepoint >= 0xfdf0 and codepoint <= 0xfffd) or
-        (codepoint >= 0x10000 and codepoint <= 0xeffff);
-}
-
-fn isXml10NameChar(codepoint: u32) bool {
-    return isXml10NameStart(codepoint) or codepoint == '-' or codepoint == '.' or
-        (codepoint >= '0' and codepoint <= '9') or codepoint == 0xb7 or
-        (codepoint >= 0x300 and codepoint <= 0x36f) or
-        (codepoint >= 0x203f and codepoint <= 0x2040);
-}
-
 fn probeUtf8(bytes: []const u8) Utf8Probe {
     std.debug.assert(bytes.len > 0);
     const lead = bytes[0];
@@ -12072,12 +12005,7 @@ fn referenceDigit(byte: u8, kind: ReferenceKind) ?u32 {
 
 fn predefinedEntity(name: []const u8, source_len: usize) ?[]const u8 {
     if (source_len != name.len) return null;
-    if (std.mem.eql(u8, name, "amp")) return "&";
-    if (std.mem.eql(u8, name, "lt")) return "<";
-    if (std.mem.eql(u8, name, "gt")) return ">";
-    if (std.mem.eql(u8, name, "apos")) return "'";
-    if (std.mem.eql(u8, name, "quot")) return "\"";
-    return null;
+    return xml_rules.predefinedEntity(name);
 }
 
 fn locationWithByteDelta(

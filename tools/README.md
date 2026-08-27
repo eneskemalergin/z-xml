@@ -78,6 +78,8 @@ tools/python/run-valgrind.py \
 
 Standalone mode writes `standalone.log`. Corpus mode keeps its existing metadata and result files.
 
+The Reader audit runs all 67 tests under Memcheck. Its fuzz helper uses heap storage for the Reader in this build because Valgrind reports Zig's Debug stack page probes as invalid reads. Normal tests and fuzz campaigns keep stack storage.
+
 The development build installs adapters under `tools/zig-out/bin` by default.
 
 ## Target lists

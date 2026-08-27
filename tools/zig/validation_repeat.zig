@@ -71,7 +71,7 @@ fn run(init: std.process.Init) !u8 {
     defer root_dir.close(init.io);
     var filesystem_resolver = xml.RootedFilesystemResolver.init(init.gpa, init.io, root_dir);
 
-    var subset: ?xml.ExternalSubset = null;
+    var subset: ?xml.dtd.ExternalSubset = null;
     defer if (subset) |*value| value.deinit();
     if (comptime repeat_options.reuse) {
         const declaration_bytes = try std.Io.Dir.cwd().readFileAlloc(
@@ -81,7 +81,7 @@ fn run(init: std.process.Init) !u8 {
             .limited(64 * 1024 * 1024),
         );
         defer init.gpa.free(declaration_bytes);
-        subset = try xml.ExternalSubset.compileDecoded(
+        subset = try xml.dtd.ExternalSubset.compileDecoded(
             init.gpa,
             std.fs.path.basename(args[1]),
             declaration_bytes,

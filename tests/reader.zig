@@ -1,6 +1,7 @@
 //! Public contract tests for the streaming reader.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const xml = @import("z_xml");
 
 const CORE_CONFIG = xml.Configs.XML10_UTF8_NO_DTD;
@@ -4621,7 +4622,7 @@ test "[integration] - [Reader DTD validation]: reports ordered findings and fina
 }
 
 test "[failure] - [Reader cancellation]: exact callback cancellation is sticky until reset" {
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         "<!ELEMENT item EMPTY><!ELEMENT root (item|item)>" ++
@@ -4688,7 +4689,7 @@ test "[failure] - [Reader cancellation]: exact callback cancellation is sticky u
 }
 
 test "[failure] - [Reader cancellation]: resolver cancellation remains distinct after a finding" {
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         "<!ELEMENT root (#PCDATA)><!ELEMENT root EMPTY>" ++
@@ -4990,7 +4991,7 @@ test "[integration] - [Reader DTD validation]: skipped content is incomplete unl
 
 test "[edge] - [Reader validation storage]: retained ceiling includes finding traces" {
     const input = "<!DOCTYPE root SYSTEM 'schema.dtd'><root/>";
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         "<!ELEMENT root EMPTY><!ELEMENT root EMPTY>",
@@ -5028,7 +5029,7 @@ test "[edge] - [Reader validation storage]: retained ceiling includes finding tr
 
 fn normalValidationAllocationAttempt(
     allocator: std.mem.Allocator,
-    subset: *const xml.ExternalSubset,
+    subset: *const xml.dtd.ExternalSubset,
 ) !void {
     var log: NormalFindingLog = .{};
     var reader = try xml.Reader.init(
@@ -5060,7 +5061,7 @@ fn normalValidationAllocationAttempt(
 }
 
 test "[failure] - [Reader validation storage]: every allocation failure cleans up" {
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         "<!ELEMENT item EMPTY><!ELEMENT root (item|item)>" ++
@@ -10236,8 +10237,22 @@ fn boundedNormalFuzzOptions(
 }
 
 fn normalFuzzOutcome(source: xml.Source, options: xml.ReaderOptions) !NormalFuzzOutcome {
+    // HACK: Valgrind reports Zig's Debug stack probes for this Reader as invalid reads.
+    // Remove this path when Valgrind accepts the probes or Zig stops emitting them.
+    if (comptime builtin.valgrind_support) {
+        const reader = try std.testing.allocator.create(xml.Reader);
+        defer std.testing.allocator.destroy(reader);
+        reader.* = try xml.Reader.init(std.testing.allocator, source, options);
+        defer reader.deinit();
+        return drainNormalFuzzReader(reader);
+    }
+
     var reader = try xml.Reader.init(std.testing.allocator, source, options);
     defer reader.deinit();
+    return drainNormalFuzzReader(&reader);
+}
+
+fn drainNormalFuzzReader(reader: *xml.Reader) !NormalFuzzOutcome {
     var outcome: NormalFuzzOutcome = .{};
 
     for (0..16_384) |_| {
@@ -11661,7 +11676,7 @@ test "[failure] - [Reader resolver]: invalid source metadata closes before use" 
     try std.testing.expectEqual(@as(usize, 2), duplicate_resolver.resolves);
     try std.testing.expectEqual(@as(usize, 2), duplicate_resolver.closes);
 
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         "<!ELEMENT r (#PCDATA)><!ENTITY a SYSTEM 'a'>",
@@ -11735,11 +11750,11 @@ const TestSubsetProvider = struct {
     resolves: usize = 0,
     base_id: ?[]const u8 = null,
 
-    fn provider(self: *@This()) xml.ExternalSubsetProvider {
+    fn provider(self: *@This()) xml.dtd.ExternalSubsetProvider {
         return .{ .context = self, .resolveFn = resolve };
     }
 
-    fn resolve(context: ?*anyopaque, request: xml.ExternalSubsetRequest) xml.ExternalSubsetProviderError!xml.ExternalSubsetResult {
+    fn resolve(context: ?*anyopaque, request: xml.dtd.ExternalSubsetRequest) xml.dtd.ExternalSubsetProviderError!xml.dtd.ExternalSubsetResult {
         const self: *@This() = @ptrCast(@alignCast(context.?));
         self.resolves += 1;
         for (self.resources) |resource| {
@@ -11947,7 +11962,7 @@ test "[integration] - [XML 1.1 normalization]: external DTD and compiled sources
 
     const validating_config = xml.Configs.XML11_VALIDATING;
     const reusable_declarations = "<?\xe1\x85\xa1?><!ELEMENT r EMPTY>";
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         reusable_declarations,
@@ -12024,7 +12039,7 @@ test "[integration] - [Reader compiled subset]: fresh and reused validation agre
     const declarations = "<!ELEMENT root (item+)><!ELEMENT item (#PCDATA)>" ++
         "<!ATTLIST item id ID #REQUIRED>";
     const document = "<!DOCTYPE root SYSTEM 'schema.dtd'><root><item id='one'>text</item></root>";
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         declarations,
@@ -12079,7 +12094,7 @@ test "[integration] - [Reader compiled subset]: fresh and reused validation agre
 test "[integration] - [Reader compiled subset]: shared subset remains unchanged" {
     const declarations = "<!ELEMENT root (item*)><!ELEMENT item EMPTY>";
     const document = "<!DOCTYPE root SYSTEM 'schema.dtd'><root><item/></root>";
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         declarations,
@@ -12129,7 +12144,7 @@ test "[integration] - [Reader compiled subset]: shared subset remains unchanged"
 }
 
 test "[integration] - [XML 1.1 compiled subset]: edition must match the document" {
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         "<!ELEMENT root (#PCDATA)><!ENTITY e '&#x1;'>",
@@ -12182,9 +12197,9 @@ test "[integration] - [Reader compiled subset]: fresh and reused findings agree"
     const declarations = "<!ELEMENT item EMPTY>\n<!ELEMENT root (item|item)>" ++
         "<!ELEMENT root EMPTY>";
     const document = "<!DOCTYPE root SYSTEM 'schema.dtd'><root><item/></root>";
-    var subset_options: xml.ExternalSubsetOptions = .{ .source_id = 73 };
+    var subset_options: xml.dtd.ExternalSubsetOptions = .{ .source_id = 73 };
     subset_options.validation_limits.max_errors = 1;
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         declarations,
@@ -12271,7 +12286,7 @@ test "[integration] - [Reader compiled subset]: nested finding ancestry is reusa
         .{ .system_id = "child.dtd", .bytes = child, .source_id = 81 },
     };
     var provider = TestSubsetProvider{ .resources = &resources };
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         declarations,
@@ -12346,7 +12361,7 @@ fn externalSubsetAllocationAttempt(allocator: std.mem.Allocator) !void {
         .{ .system_id = "child.dtd", .bytes = "<!ELEMENT root EMPTY>", .source_id = 91 },
     };
     var provider = TestSubsetProvider{ .resources = &resources };
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         allocator,
         "schema.dtd",
         declarations,
@@ -12365,11 +12380,11 @@ test "[failure] - [compiled external subset]: every allocation failure cleans up
 
 test "[unit] - [compiled external subset limits]: rejects zero ceilings" {
     inline for (.{ "max_sources", "max_source_bytes", "max_identifier_bytes" }) |field_name| {
-        var options: xml.ExternalSubsetOptions = .{};
+        var options: xml.dtd.ExternalSubsetOptions = .{};
         @field(options, field_name) = 0;
         try std.testing.expectError(
             error.InvalidOptions,
-            xml.ExternalSubset.compileDecoded(
+            xml.dtd.ExternalSubset.compileDecoded(
                 std.testing.allocator,
                 "schema.dtd",
                 "<!ELEMENT root EMPTY>",
@@ -12387,12 +12402,12 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
         .{ .system_id = "child.dtd", .bytes = child_declarations, .source_id = 91 },
     };
     var provider = TestSubsetProvider{ .resources = &resources };
-    const at_options: xml.ExternalSubsetOptions = .{
+    const at_options: xml.dtd.ExternalSubsetOptions = .{
         .provider = provider.provider(),
         .max_sources = 2,
         .max_source_bytes = root_declarations.len + child_declarations.len,
     };
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         root_declarations,
@@ -12409,7 +12424,7 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
     provider.resolves = 0;
     try std.testing.expectError(
         error.LimitExceeded,
-        xml.ExternalSubset.compileDecoded(
+        xml.dtd.ExternalSubset.compileDecoded(
             std.testing.allocator,
             "schema.dtd",
             root_declarations,
@@ -12423,7 +12438,7 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
     provider.resolves = 0;
     try std.testing.expectError(
         error.LimitExceeded,
-        xml.ExternalSubset.compileDecoded(
+        xml.dtd.ExternalSubset.compileDecoded(
             std.testing.allocator,
             "schema.dtd",
             root_declarations,
@@ -12433,8 +12448,8 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
     try std.testing.expectEqual(@as(usize, 1), provider.resolves);
 
     const declarations = "<!ELEMENT root EMPTY>";
-    var identifier_options: xml.ExternalSubsetOptions = .{ .max_identifier_bytes = 1 };
-    var identifier_subset = try xml.ExternalSubset.compileDecoded(
+    var identifier_options: xml.dtd.ExternalSubsetOptions = .{ .max_identifier_bytes = 1 };
+    var identifier_subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "s",
         declarations,
@@ -12443,7 +12458,7 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
     identifier_subset.deinit();
     try std.testing.expectError(
         error.LimitExceeded,
-        xml.ExternalSubset.compileDecoded(
+        xml.dtd.ExternalSubset.compileDecoded(
             std.testing.allocator,
             "ss",
             declarations,
@@ -12453,7 +12468,7 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
     identifier_options.public_id = "pp";
     try std.testing.expectError(
         error.LimitExceeded,
-        xml.ExternalSubset.compileDecoded(
+        xml.dtd.ExternalSubset.compileDecoded(
             std.testing.allocator,
             "s",
             declarations,
@@ -12464,7 +12479,7 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
     identifier_options.base_id = "bb";
     try std.testing.expectError(
         error.LimitExceeded,
-        xml.ExternalSubset.compileDecoded(
+        xml.dtd.ExternalSubset.compileDecoded(
             std.testing.allocator,
             "s",
             declarations,
@@ -12477,11 +12492,11 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
         .{ .system_id = "child.dtd", .bytes = declarations, .source_id = 93 },
     };
     var nested_provider = TestSubsetProvider{ .resources = &nested_resources };
-    var nested_options: xml.ExternalSubsetOptions = .{
+    var nested_options: xml.dtd.ExternalSubsetOptions = .{
         .provider = nested_provider.provider(),
         .max_identifier_bytes = 10,
     };
-    var nested_subset = try xml.ExternalSubset.compileDecoded(
+    var nested_subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "s",
         "<!ENTITY % child SYSTEM '1234567890'>%child;",
@@ -12493,7 +12508,7 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
     nested_provider.resolves = 0;
     try std.testing.expectError(
         error.LimitExceeded,
-        xml.ExternalSubset.compileDecoded(
+        xml.dtd.ExternalSubset.compileDecoded(
             std.testing.allocator,
             "s",
             "<!ENTITY % child SYSTEM '12345678901'>%child;",
@@ -12505,7 +12520,7 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
     nested_provider.resolves = 0;
     try std.testing.expectError(
         error.LimitExceeded,
-        xml.ExternalSubset.compileDecoded(
+        xml.dtd.ExternalSubset.compileDecoded(
             std.testing.allocator,
             "s",
             "<!ENTITY % child PUBLIC '12345678901' 'child.dtd'>%child;",
@@ -12519,7 +12534,7 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
     nested_options.provider = nested_provider.provider();
     try std.testing.expectError(
         error.LimitExceeded,
-        xml.ExternalSubset.compileDecoded(
+        xml.dtd.ExternalSubset.compileDecoded(
             std.testing.allocator,
             "s",
             "<!ENTITY % child SYSTEM 'child.dtd'>%child;",
@@ -12531,7 +12546,7 @@ test "[edge] - [compiled external subset limits]: sources and identifiers stop a
 
 test "[failure] - [compiled external subset]: rejects a skipped parameter entity" {
     var provider = TestSubsetProvider{ .resources = &.{} };
-    const result = xml.ExternalSubset.compileDecoded(
+    const result = xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         "<!ELEMENT root EMPTY><!ENTITY % child SYSTEM 'child.dtd'>%child;",
@@ -12574,7 +12589,7 @@ test "[failure] - [non-validating standalone]: externally declared entity is und
 }
 
 test "[integration] - [Reader compiled subset]: internal declarations retain precedence" {
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         "<!ELEMENT root EMPTY><!ATTLIST root mode (a|b) 'a'>",
@@ -12623,7 +12638,7 @@ test "[integration] - [compiled external subset]: content position limits remain
     };
 
     for (cases) |case| {
-        var subset = try xml.ExternalSubset.compileDecoded(
+        var subset = try xml.dtd.ExternalSubset.compileDecoded(
             std.testing.allocator,
             "schema.dtd",
             case.declarations,
@@ -12671,7 +12686,7 @@ test "[integration] - [compiled external subset]: content position limits remain
 }
 
 test "[failure] - [Reader compiled subset]: identifier mismatch is explicit" {
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "expected.dtd",
         "<!ELEMENT root EMPTY>",

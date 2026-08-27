@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const dtd = @import("dtd.zig");
+const xml_rules = @import("xml_rules.zig");
 
 pub const Limits = struct {
     max_content_positions: usize = 4096,
@@ -448,7 +449,6 @@ pub const State = struct {
 
     pub fn text(
         self: *State,
-        declarations: *const dtd.State,
         frame: *Frame,
         bytes: []const u8,
         allow_ignorable_whitespace: bool,
@@ -467,12 +467,11 @@ pub const State = struct {
                 return .{ .code = .invalid_element_content, .occurrence = location };
             },
             .children => {
-                if (allow_ignorable_whitespace and allXmlWhitespace(bytes)) return null;
+                if (allow_ignorable_whitespace and xml_rules.allWhitespace(bytes)) return null;
                 frame.invalid_content = true;
                 return .{ .code = .invalid_element_content, .occurrence = location };
             },
         }
-        _ = declarations;
     }
 
     pub fn contentMarker(self: *const State, frame: *Frame, location: SourceLocation) ?Issue {
@@ -488,7 +487,7 @@ pub const State = struct {
 
     pub fn isIgnorableWhitespace(self: *const State, frame: Frame, bytes: []const u8) bool {
         if (frame.invalid_content or frame.content_incomplete or
-            frame.model_index == null or !allXmlWhitespace(bytes))
+            frame.model_index == null or !xml_rules.allWhitespace(bytes))
         {
             return false;
         }
@@ -1131,24 +1130,15 @@ fn appendOccurrence(
 
 fn isContentDelimiter(byte: u8) bool {
     return byte == '(' or byte == ')' or byte == ',' or byte == '|' or
-        byte == '?' or byte == '*' or byte == '+' or isSpace(byte);
+        byte == '?' or byte == '*' or byte == '+' or xml_rules.isWhitespace(byte);
 }
 
 fn isMixedDelimiter(byte: u8) bool {
-    return byte == '(' or byte == ')' or byte == '|' or byte == '*' or isSpace(byte);
+    return byte == '(' or byte == ')' or byte == '|' or byte == '*' or xml_rules.isWhitespace(byte);
 }
 
 fn skipSpace(bytes: []const u8, index: *usize) void {
-    while (index.* < bytes.len and isSpace(bytes[index.*])) index.* += 1;
-}
-
-fn isSpace(byte: u8) bool {
-    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
-}
-
-fn allXmlWhitespace(bytes: []const u8) bool {
-    for (bytes) |byte| if (!isSpace(byte)) return false;
-    return true;
+    while (index.* < bytes.len and xml_rules.isWhitespace(bytes[index.*])) index.* += 1;
 }
 
 pub fn groupContains(bytes: []const u8, value: []const u8) bool {
@@ -1183,14 +1173,14 @@ const GroupIterator = struct {
 
     fn next(self: *GroupIterator) ?[]const u8 {
         while (self.index < self.bytes.len and
-            (isSpace(self.bytes[self.index]) or self.bytes[self.index] == '(' or
+            (xml_rules.isWhitespace(self.bytes[self.index]) or self.bytes[self.index] == '(' or
                 self.bytes[self.index] == ')' or self.bytes[self.index] == '|'))
         {
             self.index += 1;
         }
         if (self.index == self.bytes.len) return null;
         const start = self.index;
-        while (self.index < self.bytes.len and !isSpace(self.bytes[self.index]) and
+        while (self.index < self.bytes.len and !xml_rules.isWhitespace(self.bytes[self.index]) and
             self.bytes[self.index] != '(' and self.bytes[self.index] != ')' and
             self.bytes[self.index] != '|')
         {

@@ -36,7 +36,7 @@ fn parseTemporaryDocument(allocator: std.mem.Allocator) !xml.Document {
 }
 
 fn parseDocumentWithExternalFinding(allocator: std.mem.Allocator) !xml.Document {
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         allocator,
         "schema.dtd",
         "<!ELEMENT r EMPTY><!ELEMENT r EMPTY>",
@@ -224,7 +224,7 @@ test "[integration] - [document]: retains validation and normalization findings"
     const defaulted = document.attribute(document.documentElement(), null, "mode").?;
     try std.testing.expectEqualStrings("a", defaulted.value);
     try std.testing.expect(!defaulted.specified);
-    try std.testing.expectEqual(xml.AttributeType.enumeration, defaulted.declared_type.?);
+    try std.testing.expectEqual(xml.dtd.AttributeType.enumeration, defaulted.declared_type.?);
 
     var external_finding = try parseDocumentWithExternalFinding(std.testing.allocator);
     defer external_finding.deinit();
@@ -339,7 +339,7 @@ fn documentAllocationFailureCase(allocator: std.mem.Allocator) !void {
 
 fn documentFindingAllocationFailureCase(
     allocator: std.mem.Allocator,
-    subset: *const xml.ExternalSubset,
+    subset: *const xml.dtd.ExternalSubset,
 ) !void {
     var document = try xml.parseDocument(
         allocator,
@@ -355,7 +355,7 @@ test "[failure] - [document]: releases every construction allocation" {
         documentAllocationFailureCase,
         .{},
     );
-    var subset = try xml.ExternalSubset.compileDecoded(
+    var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
         "schema.dtd",
         "<!ELEMENT r EMPTY><!ELEMENT r EMPTY>",
@@ -978,7 +978,7 @@ test "[integration] - [owned tree]: preserves namespaces and default attributes"
     const attribute = document.attributeByExpanded(element, null, "mode").?;
     try std.testing.expectEqualStrings("a", attribute.value);
     try std.testing.expect(!attribute.specified);
-    try std.testing.expectEqual(xml.AttributeType.enumeration, attribute.declared_type.?);
+    try std.testing.expectEqual(xml.dtd.AttributeType.enumeration, attribute.declared_type.?);
     try std.testing.expectEqualStrings("p:r", document.documentType().?.root_name);
 }
 

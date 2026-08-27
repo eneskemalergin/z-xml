@@ -3,11 +3,9 @@
 //! Stored strings use offsets into one owned arena so growth cannot invalidate declarations.
 
 const std = @import("std");
+const xml_rules = @import("xml_rules.zig");
 
-pub const XmlVersion = enum {
-    xml10,
-    xml11,
-};
+pub const XmlVersion = xml_rules.Version;
 
 pub const AttributeType = enum {
     cdata,
@@ -1264,7 +1262,7 @@ const Parser = struct {
         while (true) {
             const byte = (try self.nextConditionalHeaderByte()) orelse
                 return self.invalid(.malformed_declaration, self.logicalOffset());
-            if (isWhitespace(byte)) {
+            if (xml_rules.isWhitespace(byte)) {
                 if (keyword_len == 0) continue;
                 break;
             }
@@ -1282,7 +1280,7 @@ const Parser = struct {
             while (true) {
                 byte = (try self.nextConditionalHeaderByte()) orelse
                     return self.invalid(.malformed_declaration, self.logicalOffset());
-                if (!isWhitespace(byte)) break;
+                if (!xml_rules.isWhitespace(byte)) break;
             }
             if (byte != '[') return self.invalid(.malformed_declaration, self.logicalOffset());
             improper_header_nesting = self.conditional_header_byte_entity != section_entity;
@@ -1386,7 +1384,7 @@ const Parser = struct {
             return self.invalid(.malformed_processing_instruction, self.sourceOffset(source_index, start));
         }
         const data_start = cursor.*;
-        if (cursor.* < source.len and !isWhitespace(source[cursor.*]) and
+        if (cursor.* < source.len and !xml_rules.isWhitespace(source[cursor.*]) and
             !std.mem.startsWith(u8, source[cursor.*..], "?>"))
         {
             return self.invalid(.malformed_processing_instruction, self.sourceOffset(source_index, cursor.*));
@@ -1394,7 +1392,7 @@ const Parser = struct {
         const close = std.mem.indexOfPos(u8, source, cursor.*, "?>") orelse
             return self.invalid(.malformed_processing_instruction, self.sourceOffset(source_index, start));
         var normalized_start = data_start;
-        while (normalized_start < close and isWhitespace(source[normalized_start])) {
+        while (normalized_start < close and xml_rules.isWhitespace(source[normalized_start])) {
             normalized_start += 1;
         }
         const stored_target = try self.state.store(self.allocator, target);
@@ -1865,7 +1863,7 @@ const Parser = struct {
             return self.invalid(.malformed_entity_declaration, self.sourceOffset(source_index, cursor.*));
         }
         cursor.* += 1;
-        if (!parameter and predefined(name) != null and declaration.value == null) {
+        if (!parameter and xml_rules.predefinedEntity(name) != null and declaration.value == null) {
             return self.invalid(
                 .malformed_entity_declaration,
                 self.sourceOffset(source_index, cursor.*),
@@ -2097,7 +2095,7 @@ const Parser = struct {
                         raw[cursor .. end + 1],
                         self.sourceOffset(source_index, raw_start + cursor),
                     );
-                } else if (predefined(token)) |replacement| {
+                } else if (xml_rules.predefinedEntity(token)) |replacement| {
                     try self.appendReplacement(
                         &output,
                         replacement,
@@ -2207,7 +2205,7 @@ const Parser = struct {
                 return self.invalid(.malformed_attribute_list, offset);
             const name = frame.bytes[amp + 1 .. end];
             frame.cursor = end + 1;
-            if (predefined(name)) |replacement| {
+            if (xml_rules.predefinedEntity(name)) |replacement| {
                 try self.appendReplacement(output, replacement, offset);
                 continue;
             }
@@ -2558,7 +2556,7 @@ fn findSubsetEnd(bytes: []const u8, start: usize) ?usize {
 }
 
 fn skipWhitespace(bytes: []const u8, cursor: *usize) void {
-    while (cursor.* < bytes.len and isWhitespace(bytes[cursor.*])) cursor.* += 1;
+    while (cursor.* < bytes.len and xml_rules.isWhitespace(bytes[cursor.*])) cursor.* += 1;
 }
 
 fn requireWhitespace(bytes: []const u8, cursor: *usize) bool {
@@ -2567,14 +2565,10 @@ fn requireWhitespace(bytes: []const u8, cursor: *usize) bool {
     return cursor.* != start;
 }
 
-fn isWhitespace(byte: u8) bool {
-    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r';
-}
-
 fn scanName(bytes: []const u8, cursor: *usize) ?[]const u8 {
     const start = cursor.*;
     const first = scanCodepoint(bytes, cursor) orelse return null;
-    if (!isNameStart(first)) {
+    if (!xml_rules.isNameStart(first)) {
         cursor.* = start;
         return null;
     }
@@ -2584,7 +2578,7 @@ fn scanName(bytes: []const u8, cursor: *usize) ?[]const u8 {
             cursor.* = start;
             return null;
         };
-        if (!isNameChar(value)) {
+        if (!xml_rules.isNameChar(value)) {
             cursor.* = before;
             break;
         }
@@ -2600,7 +2594,7 @@ fn scanNmtoken(bytes: []const u8, cursor: *usize) ?[]const u8 {
             cursor.* = start;
             return null;
         };
-        if (!isNameChar(value)) {
+        if (!xml_rules.isNameChar(value)) {
             cursor.* = before;
             break;
         }
@@ -2615,31 +2609,6 @@ fn scanCodepoint(bytes: []const u8, cursor: *usize) ?u21 {
     const value = std.unicode.utf8Decode(bytes[cursor.*..][0..len]) catch return null;
     cursor.* += len;
     return value;
-}
-
-fn isNameStart(value: u21) bool {
-    return value == ':' or value == '_' or
-        (value >= 'A' and value <= 'Z') or
-        (value >= 'a' and value <= 'z') or
-        (value >= 0xc0 and value <= 0xd6) or
-        (value >= 0xd8 and value <= 0xf6) or
-        (value >= 0xf8 and value <= 0x2ff) or
-        (value >= 0x370 and value <= 0x37d) or
-        (value >= 0x37f and value <= 0x1fff) or
-        (value >= 0x200c and value <= 0x200d) or
-        (value >= 0x2070 and value <= 0x218f) or
-        (value >= 0x2c00 and value <= 0x2fef) or
-        (value >= 0x3001 and value <= 0xd7ff) or
-        (value >= 0xf900 and value <= 0xfdcf) or
-        (value >= 0xfdf0 and value <= 0xfffd) or
-        (value >= 0x10000 and value <= 0xeffff);
-}
-
-fn isNameChar(value: u21) bool {
-    return isNameStart(value) or value == '-' or value == '.' or
-        (value >= '0' and value <= '9') or value == 0xb7 or
-        (value >= 0x300 and value <= 0x36f) or
-        (value >= 0x203f and value <= 0x2040);
 }
 
 fn scanQuoted(bytes: []const u8, cursor: *usize) ?[]const u8 {
@@ -2660,7 +2629,7 @@ fn startsKeyword(bytes: []const u8, cursor: usize, keyword: []const u8) bool {
     if (end == bytes.len) return true;
     var next = end;
     const value = scanCodepoint(bytes, &next) orelse return false;
-    return !isNameChar(value);
+    return !xml_rules.isNameChar(value);
 }
 
 fn validPublicId(bytes: []const u8) bool {
@@ -2702,15 +2671,6 @@ fn asciiEqualIgnoreCase(left: []const u8, right: []const u8) bool {
     return true;
 }
 
-fn predefined(name: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, name, "amp")) return "&";
-    if (std.mem.eql(u8, name, "lt")) return "<";
-    if (std.mem.eql(u8, name, "gt")) return ">";
-    if (std.mem.eql(u8, name, "apos")) return "'";
-    if (std.mem.eql(u8, name, "quot")) return "\"";
-    return null;
-}
-
 fn decodeCharacterReference(
     token: []const u8,
     output: *[4]u8,
@@ -2721,7 +2681,7 @@ fn decodeCharacterReference(
     const digits = token[if (hexadecimal) 2 else 1..];
     if (digits.len == 0) return null;
     const value = std.fmt.parseInt(u21, digits, if (hexadecimal) 16 else 10) catch return null;
-    if (!isXmlChar(value, version)) return null;
+    if (!xml_rules.isChar(value, version)) return null;
     return std.unicode.utf8Encode(value, output) catch null;
 }
 
@@ -2735,22 +2695,6 @@ fn characterReferenceEquals(reference: []const u8, expected: u21, version: XmlVe
     var expected_output: [4]u8 = undefined;
     const expected_len = std.unicode.utf8Encode(expected, &expected_output) catch return false;
     return len == expected_len and std.mem.eql(u8, output[0..len], expected_output[0..expected_len]);
-}
-
-fn isXml10Char(value: u21) bool {
-    return value == 0x9 or value == 0xa or value == 0xd or
-        (value >= 0x20 and value <= 0xd7ff) or
-        (value >= 0xe000 and value <= 0xfffd) or
-        (value >= 0x10000 and value <= 0x10ffff);
-}
-
-fn isXmlChar(value: u21, version: XmlVersion) bool {
-    return switch (version) {
-        .xml10 => isXml10Char(value),
-        .xml11 => value >= 0x1 and value <= 0xd7ff or
-            value >= 0xe000 and value <= 0xfffd or
-            value >= 0x10000 and value <= 0x10ffff,
-    };
 }
 
 pub fn collapseSpaces(bytes: []u8) usize {
