@@ -127,7 +127,3 @@ fn run(init: std.process.Init) !u8 {
     try output_file.interface.flush();
     return 0;
 }
-
-test "[unit] - [validation repeat adapter]: configuration is compile-time selected" {
-    try std.testing.expect(@TypeOf(repeat_options.reuse) == bool);
-}

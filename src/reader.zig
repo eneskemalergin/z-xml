@@ -11982,6 +11982,139 @@ fn isUtf8FourByteLeader(byte: u8) bool {
     return byte >= 0xf0 and byte <= 0xf4;
 }
 
+fn isXml10NameStart(codepoint: u32) bool {
+    return codepoint == ':' or
+        (codepoint >= 'A' and codepoint <= 'Z') or
+        codepoint == '_' or
+        (codepoint >= 'a' and codepoint <= 'z') or
+        (codepoint >= 0xc0 and codepoint <= 0xd6) or
+        (codepoint >= 0xd8 and codepoint <= 0xf6) or
+        (codepoint >= 0xf8 and codepoint <= 0x2ff) or
+        (codepoint >= 0x370 and codepoint <= 0x37d) or
+        (codepoint >= 0x37f and codepoint <= 0x1fff) or
+        (codepoint >= 0x200c and codepoint <= 0x200d) or
+        (codepoint >= 0x2070 and codepoint <= 0x218f) or
+        (codepoint >= 0x2c00 and codepoint <= 0x2fef) or
+        (codepoint >= 0x3001 and codepoint <= 0xd7ff) or
+        (codepoint >= 0xf900 and codepoint <= 0xfdcf) or
+        (codepoint >= 0xfdf0 and codepoint <= 0xfffd) or
+        (codepoint >= 0x10000 and codepoint <= 0xeffff);
+}
+
+fn isXml10NameChar(codepoint: u32) bool {
+    return isXml10NameStart(codepoint) or codepoint == '-' or codepoint == '.' or
+        (codepoint >= '0' and codepoint <= '9') or codepoint == 0xb7 or
+        (codepoint >= 0x300 and codepoint <= 0x36f) or
+        (codepoint >= 0x203f and codepoint <= 0x2040);
+}
+
+fn probeUtf8(bytes: []const u8) Utf8Probe {
+    std.debug.assert(bytes.len > 0);
+    const lead = bytes[0];
+    const expected: u3 = if (lead < 0x80)
+        1
+    else if (lead >= 0xc2 and lead <= 0xdf)
+        2
+    else if (lead >= 0xe0 and lead <= 0xef)
+        3
+    else if (lead >= 0xf0 and lead <= 0xf4)
+        4
+    else
+        return .{ .invalid = 0 };
+    if (bytes.len < expected) {
+        for (bytes[1..], 1..) |byte, index| {
+            if (byte < 0x80 or byte > 0xbf) return .{ .invalid = index };
+            if (index == 1 and !validUtf8SecondByte(lead, byte)) {
+                return .{ .invalid = index };
+            }
+        }
+        return .incomplete;
+    }
+    for (bytes[1..expected], 1..) |byte, index| {
+        if (byte < 0x80 or byte > 0xbf) return .{ .invalid = index };
+        if (index == 1 and !validUtf8SecondByte(lead, byte)) {
+            return .{ .invalid = index };
+        }
+    }
+    const codepoint = std.unicode.utf8Decode(bytes[0..expected]) catch unreachable;
+    return .{ .scalar = .{ .codepoint = codepoint, .len = expected } };
+}
+
+fn validUtf8SecondByte(lead: u8, byte: u8) bool {
+    if (lead == 0xe0) return byte >= 0xa0;
+    if (lead == 0xed) return byte <= 0x9f;
+    if (lead == 0xf0) return byte >= 0x90;
+    if (lead == 0xf4) return byte <= 0x8f;
+    return true;
+}
+
+fn utf8ExpectedLength(lead: u8) ?u3 {
+    if (lead < 0x80) return 1;
+    if (lead >= 0xc2 and lead <= 0xdf) return 2;
+    if (lead >= 0xe0 and lead <= 0xef) return 3;
+    if (lead >= 0xf0 and lead <= 0xf4) return 4;
+    return null;
+}
+
+fn referenceDigit(byte: u8, kind: ReferenceKind) ?u32 {
+    return switch (kind) {
+        .decimal => if (byte >= '0' and byte <= '9') byte - '0' else null,
+        .hexadecimal => if (byte >= '0' and byte <= '9')
+            byte - '0'
+        else if (byte >= 'a' and byte <= 'f')
+            byte - 'a' + 10
+        else if (byte >= 'A' and byte <= 'F')
+            byte - 'A' + 10
+        else
+            null,
+    };
+}
+
+fn predefinedEntity(name: []const u8, source_len: usize) ?[]const u8 {
+    if (source_len != name.len) return null;
+    if (std.mem.eql(u8, name, "amp")) return "&";
+    if (std.mem.eql(u8, name, "lt")) return "<";
+    if (std.mem.eql(u8, name, "gt")) return ">";
+    if (std.mem.eql(u8, name, "apos")) return "'";
+    if (std.mem.eql(u8, name, "quot")) return "\"";
+    return null;
+}
+
+fn locationWithByteDelta(
+    comptime config: Config,
+    location: Location(config),
+    delta: usize,
+) Location(config) {
+    var result = location;
+    result.byte_offset += delta;
+    if (config.diagnostic_location == .line_column) result.byte_column += delta;
+    return result;
+}
+
+fn locationFromSource(comptime config: Config, source_id: u32, byte_offset: usize) Location(config) {
+    if (config.diagnostic_location == .line_column) {
+        return .{
+            .source_id = source_id,
+            .byte_offset = byte_offset,
+            .line = 1,
+            .byte_column = byte_offset + 1,
+        };
+    }
+    return .{ .source_id = source_id, .byte_offset = byte_offset };
+}
+
+fn nameFromRaw(comptime config: Config, raw: []const u8) Name(config) {
+    if (comptime config.profile.hasNamespaces()) {
+        return .{
+            .raw = raw,
+            .prefix = null,
+            .local = raw,
+            .namespace_uri = null,
+        };
+    }
+    return .{ .raw = raw };
+}
+
 // --- Tests ---
 
 test "[unit] - [normal Reader DTD policy]: rejection selects no-DTD engines" {
@@ -12121,137 +12254,4 @@ test "[unit] - [content SIMD]: structural scan matches scalar boundaries" {
             bytes[position] = 'x';
         }
     }
-}
-
-fn isXml10NameStart(codepoint: u32) bool {
-    return codepoint == ':' or
-        (codepoint >= 'A' and codepoint <= 'Z') or
-        codepoint == '_' or
-        (codepoint >= 'a' and codepoint <= 'z') or
-        (codepoint >= 0xc0 and codepoint <= 0xd6) or
-        (codepoint >= 0xd8 and codepoint <= 0xf6) or
-        (codepoint >= 0xf8 and codepoint <= 0x2ff) or
-        (codepoint >= 0x370 and codepoint <= 0x37d) or
-        (codepoint >= 0x37f and codepoint <= 0x1fff) or
-        (codepoint >= 0x200c and codepoint <= 0x200d) or
-        (codepoint >= 0x2070 and codepoint <= 0x218f) or
-        (codepoint >= 0x2c00 and codepoint <= 0x2fef) or
-        (codepoint >= 0x3001 and codepoint <= 0xd7ff) or
-        (codepoint >= 0xf900 and codepoint <= 0xfdcf) or
-        (codepoint >= 0xfdf0 and codepoint <= 0xfffd) or
-        (codepoint >= 0x10000 and codepoint <= 0xeffff);
-}
-
-fn isXml10NameChar(codepoint: u32) bool {
-    return isXml10NameStart(codepoint) or codepoint == '-' or codepoint == '.' or
-        (codepoint >= '0' and codepoint <= '9') or codepoint == 0xb7 or
-        (codepoint >= 0x300 and codepoint <= 0x36f) or
-        (codepoint >= 0x203f and codepoint <= 0x2040);
-}
-
-fn probeUtf8(bytes: []const u8) Utf8Probe {
-    std.debug.assert(bytes.len > 0);
-    const lead = bytes[0];
-    const expected: u3 = if (lead < 0x80)
-        1
-    else if (lead >= 0xc2 and lead <= 0xdf)
-        2
-    else if (lead >= 0xe0 and lead <= 0xef)
-        3
-    else if (lead >= 0xf0 and lead <= 0xf4)
-        4
-    else
-        return .{ .invalid = 0 };
-    if (bytes.len < expected) {
-        for (bytes[1..], 1..) |byte, index| {
-            if (byte < 0x80 or byte > 0xbf) return .{ .invalid = index };
-            if (index == 1 and !validUtf8SecondByte(lead, byte)) {
-                return .{ .invalid = index };
-            }
-        }
-        return .incomplete;
-    }
-    for (bytes[1..expected], 1..) |byte, index| {
-        if (byte < 0x80 or byte > 0xbf) return .{ .invalid = index };
-        if (index == 1 and !validUtf8SecondByte(lead, byte)) {
-            return .{ .invalid = index };
-        }
-    }
-    const codepoint = std.unicode.utf8Decode(bytes[0..expected]) catch unreachable;
-    return .{ .scalar = .{ .codepoint = codepoint, .len = expected } };
-}
-
-fn validUtf8SecondByte(lead: u8, byte: u8) bool {
-    if (lead == 0xe0) return byte >= 0xa0;
-    if (lead == 0xed) return byte <= 0x9f;
-    if (lead == 0xf0) return byte >= 0x90;
-    if (lead == 0xf4) return byte <= 0x8f;
-    return true;
-}
-
-fn utf8ExpectedLength(lead: u8) ?u3 {
-    if (lead < 0x80) return 1;
-    if (lead >= 0xc2 and lead <= 0xdf) return 2;
-    if (lead >= 0xe0 and lead <= 0xef) return 3;
-    if (lead >= 0xf0 and lead <= 0xf4) return 4;
-    return null;
-}
-
-fn referenceDigit(byte: u8, kind: ReferenceKind) ?u32 {
-    return switch (kind) {
-        .decimal => if (byte >= '0' and byte <= '9') byte - '0' else null,
-        .hexadecimal => if (byte >= '0' and byte <= '9')
-            byte - '0'
-        else if (byte >= 'a' and byte <= 'f')
-            byte - 'a' + 10
-        else if (byte >= 'A' and byte <= 'F')
-            byte - 'A' + 10
-        else
-            null,
-    };
-}
-
-fn predefinedEntity(name: []const u8, source_len: usize) ?[]const u8 {
-    if (source_len != name.len) return null;
-    if (std.mem.eql(u8, name, "amp")) return "&";
-    if (std.mem.eql(u8, name, "lt")) return "<";
-    if (std.mem.eql(u8, name, "gt")) return ">";
-    if (std.mem.eql(u8, name, "apos")) return "'";
-    if (std.mem.eql(u8, name, "quot")) return "\"";
-    return null;
-}
-
-fn locationWithByteDelta(
-    comptime config: Config,
-    location: Location(config),
-    delta: usize,
-) Location(config) {
-    var result = location;
-    result.byte_offset += delta;
-    if (config.diagnostic_location == .line_column) result.byte_column += delta;
-    return result;
-}
-
-fn locationFromSource(comptime config: Config, source_id: u32, byte_offset: usize) Location(config) {
-    if (config.diagnostic_location == .line_column) {
-        return .{
-            .source_id = source_id,
-            .byte_offset = byte_offset,
-            .line = 1,
-            .byte_column = byte_offset + 1,
-        };
-    }
-    return .{ .source_id = source_id, .byte_offset = byte_offset };
-}
-
-fn nameFromRaw(comptime config: Config, raw: []const u8) Name(config) {
-    if (comptime config.profile.hasNamespaces()) {
-        return .{
-            .raw = raw,
-            .prefix = null,
-            .local = raw,
-            .namespace_uri = null,
-        };
-    }
-    return .{ .raw = raw };
 }

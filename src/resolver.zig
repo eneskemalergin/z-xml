@@ -242,63 +242,7 @@ fn safeIdentifier(path: []const u8) bool {
         std.mem.indexOfAny(u8, path, "\\:#?") == null;
 }
 
-test "[unit] - [resolver source]: validates bounded reads and closes explicitly" {
-    const Context = struct {
-        input: []const u8,
-        cursor: usize = 0,
-        closes: usize = 0,
-
-        fn read(context: ?*anyopaque, output: []u8) ReadResult {
-            const self: *@This() = @ptrCast(@alignCast(context.?));
-            if (self.cursor == self.input.len) return .end;
-            const len = @min(output.len, self.input.len - self.cursor);
-            @memcpy(output[0..len], self.input[self.cursor..][0..len]);
-            self.cursor += len;
-            return .{ .bytes = len };
-        }
-
-        fn close(context: ?*anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(context.?));
-            self.closes += 1;
-        }
-    };
-    var context: Context = .{ .input = "external" };
-    const source: Source = .{
-        .context = &context,
-        .source_id = 7,
-        .readFn = Context.read,
-        .closeFn = Context.close,
-    };
-    var buffer: [4]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 4), source.read(&buffer).bytes);
-    try std.testing.expectEqualStrings("exte", &buffer);
-    source.close();
-    try std.testing.expectEqual(@as(usize, 1), context.closes);
-}
-
-test "[unit] - [resolver source]: rejects invalid callback byte counts" {
-    const InvalidReader = struct {
-        count: usize,
-
-        fn read(context: ?*anyopaque, _: []u8) ReadResult {
-            const self: *@This() = @ptrCast(@alignCast(context.?));
-            return .{ .bytes = self.count };
-        }
-
-        fn close(_: ?*anyopaque) void {}
-    };
-    var buffer: [4]u8 = undefined;
-    inline for (.{ 0, buffer.len + 1 }) |count| {
-        var context = InvalidReader{ .count = count };
-        const source: Source = .{
-            .context = &context,
-            .source_id = 1,
-            .readFn = InvalidReader.read,
-            .closeFn = InvalidReader.close,
-        };
-        try std.testing.expectEqual(ReadResult.io_failure, source.read(&buffer));
-    }
-}
+// --- Tests ---
 
 test "[unit] - [rooted resolver]: rejects absolute, escaping, scheme, and fragment paths" {
     try std.testing.expect(!safeRelativePath("/etc/passwd"));

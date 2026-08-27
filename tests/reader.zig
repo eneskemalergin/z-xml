@@ -11111,6 +11111,57 @@ test "[property] - [expanded attributes]: sorted duplicate path preserves source
     );
 }
 
+test "[unit] - [resolver source]: bounds callback reads and delegates close" {
+    const Context = struct {
+        input: []const u8 = "",
+        cursor: usize = 0,
+        returned_bytes: ?usize = null,
+        closes: usize = 0,
+
+        fn read(context: ?*anyopaque, output: []u8) xml.ResolverReadResult {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.returned_bytes) |count| return .{ .bytes = count };
+            if (self.cursor == self.input.len) return .end;
+            const len = @min(output.len, self.input.len - self.cursor);
+            @memcpy(output[0..len], self.input[self.cursor..][0..len]);
+            self.cursor += len;
+            return .{ .bytes = len };
+        }
+
+        fn close(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.closes += 1;
+        }
+    };
+
+    var valid_context: Context = .{ .input = "external" };
+    const valid_source: xml.ResolverSource = .{
+        .context = &valid_context,
+        .source_id = 7,
+        .readFn = Context.read,
+        .closeFn = Context.close,
+    };
+    var buffer: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), valid_source.read(&buffer).bytes);
+    try std.testing.expectEqualStrings("exte", &buffer);
+    valid_source.close();
+    try std.testing.expectEqual(@as(usize, 1), valid_context.closes);
+
+    inline for (.{ 0, buffer.len + 1 }) |count| {
+        var invalid_context: Context = .{ .returned_bytes = count };
+        const invalid_source: xml.ResolverSource = .{
+            .context = &invalid_context,
+            .source_id = 1,
+            .readFn = Context.read,
+            .closeFn = Context.close,
+        };
+        try std.testing.expectEqual(
+            xml.ResolverReadResult.io_failure,
+            invalid_source.read(&buffer),
+        );
+    }
+}
+
 const TestExternalResource = struct {
     system_id: []const u8,
     bytes: []const u8,
