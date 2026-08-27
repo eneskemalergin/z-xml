@@ -818,15 +818,18 @@ test "[failure] - [writer raw names]: rejects namespace declarations" {
 test "[failure] - [writer document]: rejects unfinished output without publishing a pending tag" {
     var output_buffer: [256]u8 = undefined;
     var output = std.Io.Writer.fixed(&output_buffer);
-    var writer = try xml.Writer.init(std.testing.allocator, &output, .{
-        .emit_declaration = false,
-    });
-    defer writer.deinit();
+    {
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+        });
+        defer writer.deinit();
 
-    try writer.startDocument();
-    try writer.startElement("root");
-    try writer.attribute("a", "value");
-    try std.testing.expectError(error.InvalidState, writer.endDocument());
+        try writer.startDocument();
+        try writer.startElement("root");
+        try writer.attribute("a", "value");
+        try std.testing.expectError(error.InvalidState, writer.endDocument());
+        try std.testing.expectEqualStrings("", output.buffered());
+    }
     try std.testing.expectEqualStrings("", output.buffered());
 }
 

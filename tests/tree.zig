@@ -262,12 +262,26 @@ test "[integration] - [document]: retains validation and normalization findings"
     );
 }
 
-test "[failure] - [document]: reports option, XML, and document limit errors" {
+test "[failure] - [document]: reports option, source, XML, and document limit errors" {
+    inline for ([_][]const u8{
+        "max_nodes",
+        "max_attributes",
+        "max_namespace_declarations",
+        "max_string_bytes",
+        "max_children_per_element",
+        "max_coalesced_text_bytes",
+        "max_retained_bytes",
+    }) |field_name| {
+        var options: xml.DocumentOptions = .{};
+        @field(options.limits, field_name) = 0;
+        try std.testing.expectError(
+            error.InvalidOptions,
+            xml.parseDocument(std.testing.allocator, .{ .slice = "<r/>" }, options),
+        );
+    }
     try std.testing.expectError(
-        error.InvalidOptions,
-        xml.parseDocument(std.testing.allocator, .{ .slice = "<r/>" }, .{
-            .limits = .{ .max_nodes = 0 },
-        }),
+        error.InvalidXml,
+        xml.parseDocument(std.testing.allocator, .{ .slice = "" }, .{}),
     );
     try std.testing.expectError(
         error.InvalidXml,
@@ -291,6 +305,15 @@ test "[failure] - [document]: reports option, XML, and document limit errors" {
             .{ .stream = &source.interface },
             .{ .reader = .{ .limits = .{ .max_fragment_bytes = 1 } } },
         ),
+    );
+
+    var failed_bytes = "<r>".*;
+    var failed_source = std.Io.Reader.failing;
+    failed_source.buffer = &failed_bytes;
+    failed_source.end = failed_bytes.len;
+    try std.testing.expectError(
+        error.ReadFailed,
+        xml.parseDocument(std.testing.allocator, .{ .stream = &failed_source }, .{}),
     );
 }
 
