@@ -1,6 +1,9 @@
-//! Shared XML character, name, whitespace, and predefined-entity rules.
+//! Shared XML character, name, namespace, whitespace, and predefined-entity rules.
 
 const std = @import("std");
+
+pub const XML_NAMESPACE_URI = "http://www.w3.org/XML/1998/namespace";
+pub const XMLNS_NAMESPACE_URI = "http://www.w3.org/2000/xmlns/";
 
 pub const Version = enum {
     xml10,

@@ -3,6 +3,7 @@
 const std = @import("std");
 
 const reader = @import("reader.zig");
+const xml_rules = @import("xml_rules.zig");
 
 /// Limits for Writer-owned active state and retained allocation capacity.
 pub const WriterLimits = struct {
@@ -134,9 +135,6 @@ const QNameParts = struct {
     prefix: ?[]const u8,
     local: []const u8,
 };
-
-const XML_NAMESPACE_URI = "http://www.w3.org/XML/1998/namespace";
-const XMLNS_NAMESPACE_URI = "http://www.w3.org/2000/xmlns/";
 
 const Escape = union(enum) {
     bytes: []const u8,
@@ -353,9 +351,9 @@ pub const Writer = struct {
         _ = try self.pendingOutputLen(pending_len, 1);
 
         if (std.mem.eql(u8, declared_prefix, "xmlns") or
-            std.mem.eql(u8, namespace_uri, XMLNS_NAMESPACE_URI) or
+            std.mem.eql(u8, namespace_uri, xml_rules.XMLNS_NAMESPACE_URI) or
             (std.mem.eql(u8, declared_prefix, "xml") !=
-                std.mem.eql(u8, namespace_uri, XML_NAMESPACE_URI)) or
+                std.mem.eql(u8, namespace_uri, xml_rules.XML_NAMESPACE_URI)) or
             (prefix != null and namespace_uri.len == 0 and
                 self.options.version == .xml10))
         {
@@ -760,7 +758,7 @@ pub const Writer = struct {
     ) ?[]const u8 {
         return switch (reference) {
             .none => null,
-            .predefined_xml => XML_NAMESPACE_URI,
+            .predefined_xml => xml_rules.XML_NAMESPACE_URI,
             .binding => |index| self.bindingUri(self.namespace_bindings.items[index]),
         };
     }
@@ -996,10 +994,11 @@ fn analyzeText(
     var output_len: usize = 0;
     var trailing = initial_trailing_brackets;
     var index: usize = 0;
+    const rules_version = ruleVersion(version);
     while (index < bytes.len) {
         const scalar_start = index;
         const codepoint = try decodeCodepoint(bytes, &index);
-        if (!isXmlChar(codepoint, version)) return error.InvalidCharacter;
+        if (!xml_rules.isChar(codepoint, rules_version)) return error.InvalidCharacter;
         if (textEscape(codepoint, version, trailing)) |escape| {
             output_len = std.math.add(usize, output_len, escape.len()) catch
                 return error.WriterLimit;
@@ -1019,10 +1018,11 @@ fn analyzeText(
 fn attributeOutputLen(bytes: []const u8, version: reader.XmlVersion) WriterError!usize {
     var output_len: usize = 0;
     var index: usize = 0;
+    const rules_version = ruleVersion(version);
     while (index < bytes.len) {
         const scalar_start = index;
         const codepoint = try decodeCodepoint(bytes, &index);
-        if (!isXmlChar(codepoint, version)) return error.InvalidCharacter;
+        if (!xml_rules.isChar(codepoint, rules_version)) return error.InvalidCharacter;
         const added = if (attributeEscape(codepoint, version)) |escape|
             escape.len()
         else
@@ -1068,10 +1068,11 @@ fn cdataOutputLen(bytes: []const u8, version: reader.XmlVersion) WriterError!usi
     var output_len: usize = 0;
     var index: usize = 0;
     var run_start: usize = 0;
+    const rules_version = ruleVersion(version);
     while (index < bytes.len) {
         const scalar_start = index;
         const codepoint = try decodeCodepoint(bytes, &index);
-        if (!isXmlChar(codepoint, version)) return error.InvalidCharacter;
+        if (!xml_rules.isChar(codepoint, rules_version)) return error.InvalidCharacter;
         if (needsCdataReference(codepoint, version)) {
             if (scalar_start != run_start) {
                 output_len = try addCdataRunLen(output_len, bytes[run_start..scalar_start]);
@@ -1128,11 +1129,10 @@ fn validateProcessingInstruction(
 
 fn validateCharacters(bytes: []const u8, version: reader.XmlVersion) WriterError!void {
     var index: usize = 0;
+    const rules_version = ruleVersion(version);
     while (index < bytes.len) {
         const codepoint = try decodeCodepoint(bytes, &index);
-        if (!isXmlChar(codepoint, version) or
-            (version == .xml11 and isXml11RestrictedChar(codepoint)))
-        {
+        if (!xml_rules.isLiteralChar(codepoint, rules_version)) {
             return error.InvalidCharacter;
         }
     }
@@ -1155,10 +1155,10 @@ fn isXmlName(bytes: []const u8) bool {
     if (bytes.len == 0) return false;
     var index: usize = 0;
     const first = decodeCodepoint(bytes, &index) catch return false;
-    if (!isXmlNameStart(first)) return false;
+    if (!xml_rules.isNameStart(first)) return false;
     while (index < bytes.len) {
         const codepoint = decodeCodepoint(bytes, &index) catch return false;
-        if (!isXmlNameChar(codepoint)) return false;
+        if (!xml_rules.isNameChar(codepoint)) return false;
     }
     return true;
 }
@@ -1189,50 +1189,11 @@ fn decodeCodepoint(bytes: []const u8, index: *usize) error{InvalidCharacter}!u21
     return codepoint;
 }
 
-fn isXmlNameStart(codepoint: u21) bool {
-    return codepoint == ':' or
-        (codepoint >= 'A' and codepoint <= 'Z') or
-        codepoint == '_' or
-        (codepoint >= 'a' and codepoint <= 'z') or
-        (codepoint >= 0xc0 and codepoint <= 0xd6) or
-        (codepoint >= 0xd8 and codepoint <= 0xf6) or
-        (codepoint >= 0xf8 and codepoint <= 0x2ff) or
-        (codepoint >= 0x370 and codepoint <= 0x37d) or
-        (codepoint >= 0x37f and codepoint <= 0x1fff) or
-        (codepoint >= 0x200c and codepoint <= 0x200d) or
-        (codepoint >= 0x2070 and codepoint <= 0x218f) or
-        (codepoint >= 0x2c00 and codepoint <= 0x2fef) or
-        (codepoint >= 0x3001 and codepoint <= 0xd7ff) or
-        (codepoint >= 0xf900 and codepoint <= 0xfdcf) or
-        (codepoint >= 0xfdf0 and codepoint <= 0xfffd) or
-        (codepoint >= 0x10000 and codepoint <= 0xeffff);
-}
-
-fn isXmlNameChar(codepoint: u21) bool {
-    return isXmlNameStart(codepoint) or codepoint == '-' or codepoint == '.' or
-        (codepoint >= '0' and codepoint <= '9') or codepoint == 0xb7 or
-        (codepoint >= 0x300 and codepoint <= 0x36f) or
-        (codepoint >= 0x203f and codepoint <= 0x2040);
-}
-
-fn isXmlChar(codepoint: u21, version: reader.XmlVersion) bool {
+fn ruleVersion(version: reader.XmlVersion) xml_rules.Version {
     return switch (version) {
-        .xml10 => codepoint == 0x9 or codepoint == 0xa or codepoint == 0xd or
-            (codepoint >= 0x20 and codepoint <= 0xd7ff) or
-            (codepoint >= 0xe000 and codepoint <= 0xfffd) or
-            (codepoint >= 0x10000 and codepoint <= 0x10ffff),
-        .xml11 => (codepoint >= 0x1 and codepoint <= 0xd7ff) or
-            (codepoint >= 0xe000 and codepoint <= 0xfffd) or
-            (codepoint >= 0x10000 and codepoint <= 0x10ffff),
+        .xml10 => .xml10,
+        .xml11 => .xml11,
     };
-}
-
-fn isXml11RestrictedChar(codepoint: u21) bool {
-    return (codepoint >= 0x1 and codepoint <= 0x8) or
-        (codepoint >= 0xb and codepoint <= 0xc) or
-        (codepoint >= 0xe and codepoint <= 0x1f) or
-        (codepoint >= 0x7f and codepoint <= 0x84) or
-        (codepoint >= 0x86 and codepoint <= 0x9f);
 }
 
 fn attributeEscape(codepoint: u21, version: reader.XmlVersion) ?Escape {
@@ -1242,7 +1203,7 @@ fn attributeEscape(codepoint: u21, version: reader.XmlVersion) ?Escape {
         '"' => .{ .bytes = "&quot;" },
         0x9, 0xa, 0xd => .{ .reference = codepoint },
         0x85, 0x2028 => if (version == .xml11) .{ .reference = codepoint } else null,
-        else => if (version == .xml11 and isXml11RestrictedChar(codepoint))
+        else => if (version == .xml11 and xml_rules.isXml11RestrictedChar(codepoint))
             .{ .reference = codepoint }
         else
             null,
@@ -1256,7 +1217,7 @@ fn textEscape(codepoint: u21, version: reader.XmlVersion, trailing_brackets: u2)
         '>' => if (trailing_brackets == 2) .{ .bytes = "&gt;" } else null,
         0xd => .{ .reference = codepoint },
         0x85, 0x2028 => if (version == .xml11) .{ .reference = codepoint } else null,
-        else => if (version == .xml11 and isXml11RestrictedChar(codepoint))
+        else => if (version == .xml11 and xml_rules.isXml11RestrictedChar(codepoint))
             .{ .reference = codepoint }
         else
             null,
@@ -1271,7 +1232,8 @@ fn nextTrailingBrackets(current: u2, codepoint: u21) u2 {
 fn needsCdataReference(codepoint: u21, version: reader.XmlVersion) bool {
     return codepoint == 0xd or
         (version == .xml11 and
-            (codepoint == 0x85 or codepoint == 0x2028 or isXml11RestrictedChar(codepoint)));
+            (codepoint == 0x85 or codepoint == 0x2028 or
+                xml_rules.isXml11RestrictedChar(codepoint)));
 }
 
 fn characterReferenceLen(codepoint: u21) usize {

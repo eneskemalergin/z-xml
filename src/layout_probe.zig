@@ -1,4 +1,4 @@
-//! Prints the normal reader layout and private split evidence.
+//! Prints Reader and Document layouts used by current memory work.
 
 const std = @import("std");
 const xml = @import("z_xml");
@@ -22,7 +22,7 @@ pub fn main() void {
     std.debug.print(
         "document\tdocument={d}\tnode_index={d}\tnode={d}\telement={d}\t" ++
             "attribute={d}\tnamespace={d}\ttext={d}\ttext_origin={d}\t" ++
-            "comment={d}\tpi={d}\tlocation={d}\n",
+            "comment={d}\tpi={d}\tfinding_location={d}\n",
         .{
             @sizeOf(xml.Document),
             @sizeOf(xml.Node),

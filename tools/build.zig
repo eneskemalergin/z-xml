@@ -181,7 +181,7 @@ pub fn build(b: *std.Build) void {
         .name = "z-xml-layout",
         .root_module = layout_module,
     });
-    const layout_step = b.step("layout", "Print normal and private reader type layouts");
+    const layout_step = b.step("layout", "Print current Reader and Document layouts");
     layout_step.dependOn(&b.addRunArtifact(layout_probe).step);
 
     tools_step.dependOn(tree_adapter_step);

@@ -1602,9 +1602,6 @@ const QNameParts = struct {
     local: []const u8,
 };
 
-const xml_namespace_uri = "http://www.w3.org/XML/1998/namespace";
-const xmlns_namespace_uri = "http://www.w3.org/2000/xmlns/";
-
 fn NamespaceState(comptime config: Config) type {
     return if (config.profile.hasNamespaces())
         struct {
@@ -7680,9 +7677,9 @@ pub fn Reader(comptime config: Config) type {
 
             if ((!is_default and uri.len == 0 and self.xmlVersion() == .xml10) or
                 std.mem.eql(u8, declared_prefix, "xmlns") or
-                std.mem.eql(u8, uri, xmlns_namespace_uri) or
+                std.mem.eql(u8, uri, xml_rules.XMLNS_NAMESPACE_URI) or
                 (std.mem.eql(u8, declared_prefix, "xml") !=
-                    std.mem.eql(u8, uri, xml_namespace_uri)))
+                    std.mem.eql(u8, uri, xml_rules.XML_NAMESPACE_URI)))
             {
                 return self.failAt(
                     .illegal_namespace_declaration,
@@ -7817,7 +7814,7 @@ pub fn Reader(comptime config: Config) type {
         fn namespaceUri(self: *const Self, reference: NamespaceReference) ?[]const u8 {
             return switch (reference) {
                 .none => null,
-                .predefined_xml => xml_namespace_uri,
+                .predefined_xml => xml_rules.XML_NAMESPACE_URI,
                 .binding => |index| uri: {
                     const binding = self.namespace_state.bindings.items[index];
                     break :uri self.namespace_state.bytes.items[binding.uri_offset..][0..binding.uri_len];
