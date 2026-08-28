@@ -1,4 +1,14 @@
-//! Public contract tests for the streaming reader.
+//! Public Reader contract tests through the package facade.
+//!
+//! Summary helpers copy event data before the next read and compare exact results
+//! across whole input, split input, one-byte feeds, and buffered sources. Tests for
+//! borrowed lifetimes inspect event views directly instead. The suite covers both
+//! the normal runtime-policy Reader and public specialized Reader configurations.
+//!
+//! Inputs are deterministic and self-contained. Byte-sensitive encoding inputs are
+//! embedded from `tests/data/encoding`, while resolvers, transcoders, external
+//! sources, and injected failures are test-owned. Contracts that require private
+//! parser state remain in `src/reader.zig`.
 
 const std = @import("std");
 const builtin = @import("builtin");

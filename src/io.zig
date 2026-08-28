@@ -1,22 +1,26 @@
-//! Pull and push adapters for specialized readers used by package tools.
+//! Adapts configured Readers to final slices, buffered `std.Io.Reader` sources, and synchronous
+//! event callbacks.
+//!
+//! Adapters own parser state and borrow their input. A slice remains borrowed until `.done`, an
+//! error, or `deinit`; `IoReader` borrows the input reader until `deinit` and does not deinitialize
+//! it. Reported memory covers parser-owned storage only.
+//!
+//! Drain callbacks run synchronously. Returning `.cancel` stops with `error.Cancelled`.
 
 const std = @import("std");
 const reader = @import("reader.zig");
 
-/// Control returned by specialized push-drain callbacks.
 pub const DrainControl = enum {
     continue_parsing,
     cancel,
 };
 
-/// Specialized pull reader initialized from one final caller-owned slice.
 pub fn SliceReader(comptime config: reader.Config) type {
     return struct {
         const Self = @This();
 
         parser: reader.Reader(config),
 
-        /// Initializes the parser and installs `input` as its final chunk.
         pub fn init(
             allocator: std.mem.Allocator,
             options: reader.Options(config),
@@ -28,29 +32,24 @@ pub fn SliceReader(comptime config: reader.Config) type {
             return .{ .parser = parser };
         }
 
-        /// Releases parser-owned memory.
         pub fn deinit(self: *Self) void {
             self.parser.deinit();
         }
 
-        /// Produces the next event from the installed slice.
         pub fn next(self: *Self) reader.ReadError!reader.Step(config) {
             return self.parser.next();
         }
 
-        /// Returns the first parser diagnostic.
         pub fn diagnostic(self: *const Self) ?reader.Diagnostic(config) {
             return self.parser.diagnostic();
         }
 
-        /// Reports memory owned by the parser.
         pub fn memoryUsage(self: *const Self) reader.MemoryUsage {
             return self.parser.memoryUsage();
         }
     };
 }
 
-/// Specialized pull adapter over a buffered Zig 0.16 `std.Io.Reader`.
 pub fn IoReader(comptime config: reader.Config) type {
     return struct {
         const Self = @This();
@@ -60,7 +59,6 @@ pub fn IoReader(comptime config: reader.Config) type {
         pending_toss: usize = 0,
         source_finished: bool = false,
 
-        /// Initializes an adapter without reading from `input`.
         pub fn init(
             allocator: std.mem.Allocator,
             options: reader.Options(config),
@@ -72,12 +70,10 @@ pub fn IoReader(comptime config: reader.Config) type {
             };
         }
 
-        /// Releases parser-owned memory. The caller retains the input reader.
         pub fn deinit(self: *Self) void {
             self.parser.deinit();
         }
 
-        /// Produces the next event, refilling only when the parser needs input.
         pub fn next(self: *Self) reader.ReadError!reader.Step(config) {
             while (true) {
                 if (self.parser.lifecycle == .ready or self.parser.lifecycle == .needs_input) {
@@ -92,12 +88,10 @@ pub fn IoReader(comptime config: reader.Config) type {
             }
         }
 
-        /// Returns the first parser or source diagnostic.
         pub fn diagnostic(self: *const Self) ?reader.Diagnostic(config) {
             return self.parser.diagnostic();
         }
 
-        /// Reports memory owned by the parser, excluding the caller's I/O buffer.
         pub fn memoryUsage(self: *const Self) reader.MemoryUsage {
             return self.parser.memoryUsage();
         }
@@ -123,7 +117,6 @@ pub fn IoReader(comptime config: reader.Config) type {
     };
 }
 
-/// Parses one complete slice and invokes `callback` for every event.
 pub fn drainSlice(
     comptime config: reader.Config,
     allocator: std.mem.Allocator,
@@ -137,7 +130,6 @@ pub fn drainSlice(
     try drainPull(config, &pull, context, callback);
 }
 
-/// Drains one complete buffered source and invokes `callback` for every event.
 pub fn drainIo(
     comptime config: reader.Config,
     allocator: std.mem.Allocator,

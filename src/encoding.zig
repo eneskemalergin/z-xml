@@ -1,6 +1,14 @@
-//! Source-encoding types and the bounded caller-transcoder bridge.
+//! Adapts XML byte sources to UTF-8 while preserving physical source locations.
+//!
+//! Reader handles UTF-8 and UTF-16 directly. Other encodings use a caller-owned `Transcoder`.
+//! Calls are synchronous and borrow the context and all supplied buffers; the callback must not
+//! retain them.
+//!
+//! Input windows are at most 255 bytes, so one encoded unit must fit within that bound. To retain
+//! raw-byte locations, `source_advances` has one entry per produced UTF-8 byte and its entries must
+//! sum to `consumed`. Empty final input followed by `need_input` completes the source; incomplete
+//! final input must return `malformed`.
 
-/// Source encoding selected for one parsed entity.
 pub const SourceEncoding = enum {
     utf8,
     utf16_le,
@@ -8,7 +16,6 @@ pub const SourceEncoding = enum {
     other,
 };
 
-/// One caller-transcoder result.
 pub const TranscodeStep = union(enum) {
     progress: struct {
         consumed: usize,
@@ -21,21 +28,8 @@ pub const TranscodeStep = union(enum) {
     cancelled,
 };
 
-/// Failure caused by a caller transcoder violating its bounded-buffer contract.
 pub const TranscoderError = error{InvalidResult};
 
-/// Caller-owned incremental converter from source bytes to UTF-8.
-///
-/// Reader calls contain at most 255 input bytes. The output and source-advance
-/// slices have equal length.
-/// Each progress result consumes and produces at least one byte. The callback
-/// fills one source-advance entry per produced byte; their sum must equal the
-/// consumed count, and advances occur after the corresponding output byte.
-/// `need_input` with empty final input finishes the source. A callback reports
-/// malformed final input instead of requesting more bytes that cannot arrive.
-/// `need_output` reports that the next UTF-8 output does not fit. `malformed`
-/// gives an offset in the supplied input. `unsupported` and `cancelled` stop
-/// decoding without progress.
 pub const Transcoder = struct {
     context: ?*anyopaque,
     runFn: *const fn (
@@ -46,7 +40,6 @@ pub const Transcoder = struct {
         source_advances: []u8,
     ) TranscodeStep,
 
-    /// Converts one bounded input and output window and validates callback progress.
     pub fn run(
         self: Transcoder,
         input: []const u8,

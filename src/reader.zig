@@ -1,4 +1,24 @@
-//! Incremental XML parsing and the normal Reader API.
+//! Incremental XML parsing for borrowed chunks, slices, and streams.
+//!
+//! `Reader(config)` specializes XML support and event data at compile time.
+//! `NormalReader` selects namespace, DTD, external-source, and XML 1.1 behavior at
+//! run time. Both produce source-ordered events without building a document.
+//!
+//! Inputs and options remain caller-owned. A chunk passed to a specialized reader
+//! must remain valid until `next` requests more input, completes, or fails. Pointers
+//! retained by specialized options must outlive that reader. A normal reader's root
+//! source and retained option values must remain valid until reset succeeds or the
+//! reader is deinitialized. External sources acquired through a resolver are closed
+//! by the reader.
+//!
+//! Event slices remain valid until the next read begins. Callback payloads are valid
+//! only during the callback. Stored diagnostics and the first DTD finding remain
+//! valid until reset succeeds or the reader is deinitialized. `NormalReader`
+//! callbacks cannot reenter or reset the reader.
+//!
+//! Fatal failures are sticky until reset. Construction validates options without
+//! reading or allocating. Runtime limits bound retained memory, token size, nesting,
+//! namespace and DTD work, entity expansion, external input, and validation.
 
 const std = @import("std");
 const encoding_module = @import("encoding.zig");
@@ -9,7 +29,6 @@ const external_subset_module = @import("external_subset.zig");
 const unicode_normalization = @import("unicode_normalization.zig");
 const xml_rules = @import("xml_rules.zig");
 
-/// XML capability profile selected at compile time.
 pub const Profile = enum {
     xml10_utf8_no_dtd,
     xml10_utf8_ns_no_dtd,
@@ -26,7 +45,6 @@ pub const Profile = enum {
     xml11_dtd_validating,
     xml11_ns_dtd_validating,
 
-    /// Returns whether namespace processing is required by this profile.
     pub fn hasNamespaces(comptime self: Profile) bool {
         return switch (self) {
             .xml10_utf8_ns_no_dtd,
@@ -41,7 +59,6 @@ pub const Profile = enum {
         };
     }
 
-    /// Returns the DTD processing mode required by this profile.
     pub fn dtdMode(comptime self: Profile) DtdMode {
         return switch (self) {
             .xml10_utf8_no_dtd,
@@ -64,7 +81,6 @@ pub const Profile = enum {
         };
     }
 
-    /// Returns whether the profile includes XML 1.1 behavior.
     pub fn isXml11(comptime self: Profile) bool {
         return switch (self) {
             .xml11_no_dtd,
@@ -78,7 +94,6 @@ pub const Profile = enum {
         };
     }
 
-    /// Returns whether the profile is the UTF-8-only core subset.
     pub fn isUtf8Only(comptime self: Profile) bool {
         return switch (self) {
             .xml10_utf8_no_dtd, .xml10_utf8_ns_no_dtd => true,
@@ -87,35 +102,29 @@ pub const Profile = enum {
     }
 };
 
-/// DTD capability implied by a profile.
 pub const DtdMode = enum {
     rejected,
     nonvalidating,
     validating,
 };
 
-/// Optional event detail selected at compile time.
 pub const Report = enum {
     semantic,
     detailed,
 };
 
-/// Diagnostic location detail selected at compile time.
 pub const DiagnosticLocation = enum {
     byte_offset,
     line_column,
 };
 
-/// Compile-time reader configuration.
 pub const Config = struct {
     profile: Profile,
     report: Report = .semantic,
     diagnostic_location: DiagnosticLocation = .line_column,
     event_locations: bool = false,
-    /// Includes caller-controlled external parsed-entity resolution.
     external_sources: bool = false,
 
-    /// Rejects combinations whose promised events cannot exist in a profile.
     pub fn validate(comptime self: Config) void {
         if (self.report == .detailed and self.profile.dtdMode() == .rejected) {
             @compileError("detailed reporting requires a DTD-capable profile");
@@ -126,113 +135,90 @@ pub const Config = struct {
     }
 };
 
-/// Named configurations for specialized parser users and package tools.
 pub const Configs = struct {
-    /// Line-aware XML 1.0 UTF-8 core profile.
     pub const XML10_UTF8_NO_DTD: Config = .{
         .profile = .xml10_utf8_no_dtd,
     };
-    /// Byte-offset-only XML 1.0 UTF-8 performance profile.
     pub const XML10_UTF8_NO_DTD_FAST: Config = .{
         .profile = .xml10_utf8_no_dtd,
         .diagnostic_location = .byte_offset,
     };
-    /// XML 1.0 UTF-8 core profile with line-aware event spans.
     pub const XML10_UTF8_NO_DTD_LOCATED: Config = .{
         .profile = .xml10_utf8_no_dtd,
         .event_locations = true,
     };
-    /// Namespace-aware XML 1.0 UTF-8 core profile.
     pub const XML10_UTF8_NAMESPACES_NO_DTD: Config = .{
         .profile = .xml10_utf8_ns_no_dtd,
     };
-    /// Byte-offset-only namespace-aware XML 1.0 UTF-8 performance profile.
     pub const XML10_UTF8_NAMESPACES_NO_DTD_FAST: Config = .{
         .profile = .xml10_utf8_ns_no_dtd,
         .diagnostic_location = .byte_offset,
     };
-    /// Line-aware XML 1.0 UTF-8 and UTF-16 no-DTD profile.
     pub const XML10_NO_DTD: Config = .{
         .profile = .xml10_no_dtd,
     };
-    /// Byte-offset-only XML 1.0 UTF-8 and UTF-16 no-DTD profile.
     pub const XML10_NO_DTD_FAST: Config = .{
         .profile = .xml10_no_dtd,
         .diagnostic_location = .byte_offset,
     };
-    /// Namespace-aware XML 1.0 UTF-8 and UTF-16 no-DTD profile.
     pub const XML10_NAMESPACES_NO_DTD: Config = .{
         .profile = .xml10_ns_no_dtd,
     };
-    /// Byte-offset-only namespace-aware UTF-8 and UTF-16 no-DTD profile.
     pub const XML10_NAMESPACES_NO_DTD_FAST: Config = .{
         .profile = .xml10_ns_no_dtd,
         .diagnostic_location = .byte_offset,
     };
-    /// Full non-validating XML 1.0 profile without namespaces.
     pub const XML10_NONVALIDATING: Config = .{
         .profile = .xml10_nonvalidating,
         .external_sources = true,
     };
-    /// Full namespace-aware non-validating XML 1.0 profile.
     pub const XML10_NAMESPACES_NONVALIDATING: Config = .{
         .profile = .xml10_ns_nonvalidating,
         .external_sources = true,
     };
-    /// Non-validating XML 1.0 restricted to the document and internal subset.
     pub const XML10_NONVALIDATING_INTERNAL: Config = .{
         .profile = .xml10_nonvalidating,
     };
-    /// Namespace-aware non-validating XML 1.0 restricted to internal sources.
     pub const XML10_NAMESPACES_NONVALIDATING_INTERNAL: Config = .{
         .profile = .xml10_ns_nonvalidating,
     };
-    /// DTD-validating XML 1.0 profile without namespaces.
     pub const XML10_VALIDATING: Config = .{
         .profile = .xml10_dtd_validating,
         .external_sources = true,
     };
-    /// Namespace-aware DTD-validating XML 1.0 profile.
     pub const XML10_NAMESPACES_VALIDATING: Config = .{
         .profile = .xml10_ns_dtd_validating,
         .external_sources = true,
     };
-    /// Detailed namespace-aware DTD-validating XML 1.0 profile.
     pub const XML10_NAMESPACES_VALIDATING_DETAILED: Config = .{
         .profile = .xml10_ns_dtd_validating,
         .report = .detailed,
         .event_locations = true,
         .external_sources = true,
     };
-    /// Namespace-aware DTD-validating XML 1.1 profile.
     pub const XML11_NAMESPACES_VALIDATING: Config = .{
         .profile = .xml11_ns_dtd_validating,
         .external_sources = true,
     };
-    /// Full non-validating XML 1.1 profile without namespaces.
     pub const XML11_NONVALIDATING: Config = .{
         .profile = .xml11_nonvalidating,
         .external_sources = true,
     };
-    /// Full namespace-aware non-validating XML 1.1 profile.
     pub const XML11_NAMESPACES_NONVALIDATING: Config = .{
         .profile = .xml11_ns_nonvalidating,
         .external_sources = true,
     };
-    /// DTD-validating XML 1.1 profile without namespaces.
     pub const XML11_VALIDATING: Config = .{
         .profile = .xml11_dtd_validating,
         .external_sources = true,
     };
 };
 
-/// Reader reset policy.
 pub const ResetMode = enum {
     retain_capacity,
     release_memory,
 };
 
-/// Observable reader lifecycle.
 pub const Lifecycle = enum {
     ready,
     producing,
@@ -242,32 +228,19 @@ pub const Lifecycle = enum {
     deinitialized,
 };
 
-/// Runtime limits enforced by the reader.
 pub const Limits = struct {
-    /// Finite default limits for specialized readers.
     pub const general: Limits = .{};
 
-    /// Maximum simultaneously open element count.
     max_depth: usize = 256,
-    /// Maximum cumulative raw-name bytes for open elements.
     max_open_name_bytes: usize = 1024 * 1024,
-    /// Maximum bytes accepted in one unfinished token.
     max_partial_token_bytes: usize = 64 * 1024,
-    /// Maximum source attributes accepted on one element.
     max_attributes_per_element: usize = 256,
-    /// Maximum raw bytes accepted in one attribute name.
     max_attribute_name_bytes: usize = 64 * 1024,
-    /// Maximum semantic bytes accepted in one attribute value.
     max_attribute_value_bytes: usize = 1024 * 1024,
-    /// Maximum aggregate name and value bytes accepted on one element.
     max_attribute_bytes_per_element: usize = 1024 * 1024,
-    /// Maximum source bytes accepted in one complete start tag.
     max_start_tag_bytes: usize = 1024 * 1024,
-    /// Maximum bytes exposed by one fragmented semantic event.
     max_fragment_bytes: usize = 64 * 1024,
-    /// Maximum UTF-8 bytes accepted in one processing-instruction target.
     max_processing_instruction_target_bytes: usize = 64 * 1024,
-    /// Maximum owned capacity retained across a retain reset.
     max_retained_bytes: usize = 1024 * 1024,
 
     fn validate(self: Limits) bool {
@@ -284,19 +257,13 @@ pub const Limits = struct {
     }
 };
 
-/// Namespace limits specialized out of namespace-off reader options.
 pub fn NamespaceLimits(comptime config: Config) type {
     return if (config.profile.hasNamespaces())
         struct {
-            /// Maximum namespace declarations accepted on one element.
             max_declarations_per_element: usize = 64,
-            /// Maximum active namespace bindings, including shadowed bindings.
             max_active_bindings: usize = 1024,
-            /// Maximum bytes retained by active namespace bindings.
             max_binding_bytes: usize = 1024 * 1024,
-            /// Maximum UTF-8 bytes accepted in one qualified name.
             max_qname_bytes: usize = 64 * 1024,
-            /// Maximum weighted prefix and expanded-name comparison work per start element.
             max_comparison_work: usize = 1024 * 1024,
 
             fn validate(self: @This()) bool {
@@ -315,100 +282,53 @@ pub fn NamespaceLimits(comptime config: Config) type {
         };
 }
 
-/// Runtime resource limits exposed by the normal reader.
 pub const NormalLimits = struct {
-    /// Finite default limits for the normal reader.
     pub const general: NormalLimits = .{};
 
-    /// Maximum simultaneously open element count.
     max_depth: usize = 256,
-    /// Maximum cumulative raw-name bytes for open elements.
     max_open_name_bytes: usize = 1024 * 1024,
-    /// Maximum bytes accepted in one unfinished token.
     max_partial_token_bytes: usize = 64 * 1024,
-    /// Maximum source attributes accepted on one element.
     max_attributes_per_element: usize = 256,
-    /// Maximum raw bytes accepted in one attribute name.
     max_attribute_name_bytes: usize = 64 * 1024,
-    /// Maximum semantic bytes accepted in one attribute value.
     max_attribute_value_bytes: usize = 1024 * 1024,
-    /// Maximum aggregate name and value bytes accepted on one element.
     max_attribute_bytes_per_element: usize = 1024 * 1024,
-    /// Maximum source bytes accepted in one complete start tag.
     max_start_tag_bytes: usize = 1024 * 1024,
-    /// Maximum bytes exposed by one fragmented semantic event.
     max_fragment_bytes: usize = 64 * 1024,
-    /// Maximum UTF-8 bytes accepted in one processing-instruction target.
     max_processing_instruction_target_bytes: usize = 64 * 1024,
-    /// Maximum namespace declarations accepted on one element.
     max_namespace_declarations_per_element: usize = 64,
-    /// Maximum active namespace bindings, including shadowed bindings.
     max_active_namespace_bindings: usize = 1024,
-    /// Maximum prefix and URI bytes retained by active namespace bindings.
     max_namespace_binding_bytes: usize = 1024 * 1024,
-    /// Maximum UTF-8 bytes accepted in one qualified name.
     max_qname_bytes: usize = 64 * 1024,
-    /// Maximum weighted namespace comparison work per start element.
     max_namespace_comparison_work: usize = 1024 * 1024,
-    /// Maximum decoded bytes in one document type declaration.
     max_dtd_bytes: usize = 1024 * 1024,
-    /// Maximum markup declarations processed from DTD subsets and parameter entities.
     max_dtd_declarations: usize = 4096,
-    /// Maximum cumulative decoded bytes in DTD markup declarations.
     max_dtd_declaration_bytes: usize = 1024 * 1024,
-    /// Maximum retained DTD element declarations.
     max_dtd_element_declarations: usize = 1024,
-    /// Maximum retained DTD attribute declarations.
     max_dtd_attribute_declarations: usize = 4096,
-    /// Maximum retained general and parameter entity declarations.
     max_dtd_entity_declarations: usize = 1024,
-    /// Maximum retained DTD notation declarations.
     max_dtd_notation_declarations: usize = 1024,
-    /// Maximum nested DTD content-model group depth.
     max_dtd_group_depth: usize = 256,
-    /// Maximum cumulative DTD content-model and attribute-type grammar nodes.
     max_dtd_grammar_nodes: usize = 64 * 1024,
-    /// Maximum cumulative normalized DTD replacement and default bytes.
     max_dtd_entity_replacement_bytes: usize = 1024 * 1024,
-    /// Maximum active parameter or general entity depth.
     max_dtd_entity_depth: usize = 64,
-    /// Maximum cumulative parameter and general entity reference count.
     max_dtd_entity_references: usize = 1024 * 1024,
-    /// Maximum cumulative bytes included from entity replacement text.
     max_dtd_expanded_bytes: usize = 8 * 1024 * 1024,
-    /// Maximum expanded bytes per entity-reference source byte after the minimum threshold.
     max_dtd_expansion_ratio: usize = 100,
-    /// Expanded-byte count at or below which ratio enforcement remains disabled.
     dtd_expansion_ratio_minimum_bytes: usize = 4096,
-    /// Maximum cumulative weighted DTD name-comparison work.
     max_dtd_comparison_work: usize = 8 * 1024 * 1024,
-    /// Maximum positions compiled for one DTD element content model.
     max_validation_content_positions: usize = 4096,
-    /// Maximum states compiled across DTD element content models.
     max_validation_content_states: usize = 16 * 1024,
-    /// Maximum transitions compiled across DTD element content models.
     max_validation_content_transitions: usize = 64 * 1024,
-    /// Maximum cumulative DTD content-model compilation work.
     max_validation_compilation_work: usize = 8 * 1024 * 1024,
-    /// Maximum IDs retained for DTD validity checks.
     max_validation_ids: usize = 1024 * 1024,
-    /// Maximum IDREF values retained for DTD validity checks.
     max_validation_idrefs: usize = 1024 * 1024,
-    /// Maximum cumulative bytes retained for IDs and IDREF values.
     max_validation_identity_bytes: usize = 8 * 1024 * 1024,
-    /// Maximum cumulative DTD validity comparison work.
     max_validation_comparison_work: usize = 16 * 1024 * 1024,
-    /// Maximum DTD validity findings reported for one document.
     max_validation_findings: usize = 1024,
-    /// Maximum external resources acquired for one document.
     max_external_resources: usize = 256,
-    /// Maximum bytes read from one external resource.
     max_external_source_bytes: usize = 8 * 1024 * 1024,
-    /// Maximum cumulative bytes read from external resources.
     max_external_total_bytes: usize = 32 * 1024 * 1024,
-    /// Maximum bytes accepted in one external source identifier.
     max_external_identifier_bytes: usize = 64 * 1024,
-    /// Maximum owned capacity retained across a retain reset.
     max_retained_bytes: usize = 1024 * 1024,
 
     fn validate(self: NormalLimits) bool {
@@ -427,63 +347,35 @@ pub const NormalLimits = struct {
     }
 };
 
-/// Categories of memory owned by a reader.
 pub const MemoryUsage = struct {
-    /// Number of active open-element frames.
     parser_stack_len: usize = 0,
-    /// Open-element frame capacity measured in frame slots.
     parser_stack_capacity: usize = 0,
-    /// Active raw-name bytes owned by open frames and an unfinished start tag.
     open_name_bytes: usize = 0,
-    /// Raw-name arena capacity measured in bytes.
     open_name_capacity: usize = 0,
-    /// Source attributes retained for the current start element.
     attribute_count: usize = 0,
-    /// Reusable source-attribute record capacity measured in slots.
     attribute_record_capacity: usize = 0,
-    /// Reusable public-attribute capacity measured in slots.
     attribute_event_capacity: usize = 0,
-    /// Active attribute name and value bytes.
     attribute_bytes: usize = 0,
-    /// Active reusable scratch bytes, including attributes and markup targets.
     scratch_bytes: usize = 0,
-    /// Reusable attribute and markup scratch capacity measured in bytes.
     scratch_capacity: usize = 0,
-    /// Reusable decoded UTF-8 bytes and source-width metadata.
     decoder_capacity: usize = 0,
-    /// Namespace storage capacity measured in bytes.
     namespace_capacity: usize = 0,
-    /// Active namespace bindings, including shadowed bindings.
     namespace_binding_count: usize = 0,
-    /// Active bytes retained by namespace bindings.
     namespace_bytes: usize = 0,
-    /// DTD storage capacity measured in bytes.
     dtd_capacity: usize = 0,
-    /// Retained notation-record storage measured in bytes.
     notation_capacity: usize = 0,
-    /// Validation storage capacity measured in bytes.
     validation_capacity: usize = 0,
-    /// Retained compiled content-model storage measured in bytes.
     content_model_capacity: usize = 0,
-    /// Retained ID and IDREF storage measured in bytes.
     identity_capacity: usize = 0,
-    /// IDs retained for uniqueness and reference checks.
     id_count: usize = 0,
-    /// IDREF values retained for document-end resolution.
     idref_count: usize = 0,
-    /// Active bytes retained for ID and IDREF values.
     identity_bytes: usize = 0,
-    /// Retained ID-record storage measured in bytes.
     id_capacity: usize = 0,
-    /// Retained IDREF-record storage measured in bytes.
     idref_capacity: usize = 0,
-    /// Retained ID lookup-index storage measured in bytes.
     id_index_capacity: usize = 0,
-    /// Total reader-owned reusable capacity measured in bytes.
     retained_capacity: usize = 0,
 };
 
-/// Stable diagnostic category returned by the reader.
 pub const DiagnosticCode = enum {
     dtd_forbidden,
     external_resource_forbidden,
@@ -622,7 +514,6 @@ pub const DiagnosticCode = enum {
     validity_standalone_external_whitespace,
 };
 
-/// Location containing the precision selected by `config`.
 pub fn Location(comptime config: Config) type {
     config.validate();
     return if (config.diagnostic_location == .line_column)
@@ -639,7 +530,6 @@ pub fn Location(comptime config: Config) type {
         };
 }
 
-/// Diagnostic type specialized to the selected location precision.
 pub fn Diagnostic(comptime config: Config) type {
     return struct {
         code: DiagnosticCode,
@@ -655,19 +545,13 @@ fn ResolverOptions(comptime config: Config) type {
         struct {}
     else
         struct {
-            /// Whether external declarations are skipped or passed to `resolver`.
             policy: ExternalPolicy = .skip,
-            /// Caller-owned resolver. Required when `policy` is `resolve`.
+            /// Required with `resolve`; remains caller-owned.
             resolver: ?resolver_module.Resolver = null,
-            /// Base identifier of the document entity, when known.
             document_base_id: ?[]const u8 = null,
-            /// Maximum external resources acquired for one document.
             max_resources: usize = 256,
-            /// Maximum bytes read from one external resource.
             max_source_bytes: usize = 8 * 1024 * 1024,
-            /// Maximum cumulative bytes read from external resources.
             max_total_bytes: usize = 32 * 1024 * 1024,
-            /// Maximum bytes accepted in one external source identifier.
             max_identifier_bytes: usize = 64 * 1024,
 
             fn validate(self: @This()) bool {
@@ -678,50 +562,36 @@ fn ResolverOptions(comptime config: Config) type {
         };
 }
 
-/// Runtime handling of external declarations in non-validating profiles.
 pub const ExternalPolicy = enum {
     skip,
     resolve,
 };
 
-/// Continuation selected by a validity diagnostic sink.
 pub const ValidityAction = enum { continue_validation, cancel };
 
-/// Final state reported by a validating reader.
 pub const ValidationStatus = enum { valid, invalid, incomplete };
 
-/// Runtime policy for XML 1.1 full-normalization verification.
 pub const NormalizationPolicy = enum {
-    /// Skip verification only when the caller certifies the input.
+    /// Requires the caller to certify full normalization.
     unchecked,
-    /// Continue parsing and expose the final verification result.
     report,
-    /// Stop at the first definite or indeterminate finding.
     require,
 };
 
-/// Progress or final result of XML 1.1 full-normalization verification.
 pub const NormalizationStatus = enum {
-    /// Verification was not requested or the document selected XML 1.0 rules.
     unchecked,
-    /// Verification is active and the document is not complete.
     checking,
-    /// Every read parsed entity and relevant construct passed verification.
     normalized,
-    /// A definite full-normalization violation was found.
     not_normalized,
-    /// The input used a character newer than the available property tables.
     indeterminate,
 };
 
-/// Reason that XML 1.1 full-normalization verification did not succeed.
 pub const NormalizationIssueKind = enum {
     not_nfc,
     composing_start,
     unknown_character,
 };
 
-/// First XML 1.1 full-normalization finding and its associated source location.
 pub fn NormalizationIssue(comptime config: Config) type {
     return struct {
         kind: NormalizationIssueKind,
@@ -729,7 +599,6 @@ pub fn NormalizationIssue(comptime config: Config) type {
     };
 }
 
-/// XML 1.1 full-normalization result specialized out of XML 1.0 readers.
 pub fn NormalizationResult(comptime config: Config) type {
     return if (config.profile.isXml11())
         struct {
@@ -740,7 +609,6 @@ pub fn NormalizationResult(comptime config: Config) type {
         struct {};
 }
 
-/// Synchronous validity diagnostic callback specialized to the reader.
 pub fn ValiditySink(comptime config: Config) type {
     return struct {
         context: ?*anyopaque,
@@ -768,7 +636,6 @@ fn NormalizationOptions(comptime config: Config) type {
     return if (config.profile.isXml11()) NormalizationPolicy else void;
 }
 
-/// Runtime options containing only state permitted by `config`.
 pub fn Options(comptime config: Config) type {
     config.validate();
     return if (config.external_sources) struct {
@@ -777,14 +644,12 @@ pub fn Options(comptime config: Config) type {
         dtd_limits: if (config.profile.dtdMode() == .rejected) struct {} else dtd_module.Limits = .{},
         resolver: ResolverOptions(config) = .{},
         validation: ValidationOptions(config) = .{},
-        /// XML 1.1 full-normalization verification policy.
         normalization: NormalizationOptions(config) = if (config.profile.isXml11()) .report else {},
     } else struct {
         limits: Limits = .{},
         namespace_limits: NamespaceLimits(config) = .{},
         dtd_limits: if (config.profile.dtdMode() == .rejected) struct {} else dtd_module.Limits = .{},
         validation: ValidationOptions(config) = .{},
-        /// XML 1.1 full-normalization verification policy.
         normalization: NormalizationOptions(config) = if (config.profile.isXml11()) .report else {},
     };
 }
@@ -800,12 +665,10 @@ const ExpandedName = struct {
     namespace_uri: ?[]const u8,
 };
 
-/// Element or attribute name specialized to the selected namespace profile.
 pub fn Name(comptime config: Config) type {
     return if (config.profile.hasNamespaces()) ExpandedName else RawName;
 }
 
-/// Source attribute whose slices follow the enclosing event lifetime.
 pub fn Attribute(comptime config: Config) type {
     return if (config.profile.dtdMode() == .rejected)
         struct {
@@ -823,7 +686,6 @@ pub fn Attribute(comptime config: Config) type {
         };
 }
 
-/// One source-ordered namespace declaration whose slices follow the event lifetime.
 pub fn NamespaceDeclaration(comptime config: Config) type {
     return struct {
         prefix: ?[]const u8,
@@ -855,13 +717,10 @@ fn EndElement(comptime config: Config) type {
     };
 }
 
-/// XML rules selected for a document entity.
 pub const XmlVersion = xml_rules.Version;
 
-/// Source encoding detected for the document entity.
 pub const SourceEncoding = encoding_module.SourceEncoding;
 
-/// Origin of one text fragment.
 pub const TextOrigin = enum {
     character_data,
     cdata,
@@ -911,7 +770,6 @@ const ProcessingInstruction = struct {
 const Declaration = struct {
     name: []const u8,
 };
-/// Kind of external input intentionally not read by the selected policy.
 pub const SkippedEntityKind = enum { external_subset, parameter_entity, general_entity };
 
 fn SkippedEntity(comptime config: Config) type {
@@ -1001,7 +859,6 @@ fn Span(comptime config: Config) type {
     };
 }
 
-/// Semantic event type with impossible tags removed at compile time.
 pub fn Event(comptime config: Config) type {
     config.validate();
     return if (config.event_locations)
@@ -1013,7 +870,6 @@ pub fn Event(comptime config: Config) type {
         EventPayload(config);
 }
 
-/// Pull-reader result.
 pub fn Step(comptime config: Config) type {
     return union(enum) {
         event: Event(config),
@@ -1022,17 +878,14 @@ pub fn Step(comptime config: Config) type {
     };
 }
 
-/// Errors reported while constructing a reader.
 pub const InitError = error{
     InvalidOptions,
 };
 
-/// Errors reported while installing an input chunk.
 pub const FeedError = error{
     InvalidState,
 };
 
-/// Errors reported while producing an event.
 pub const ReadError = error{
     InvalidXml,
     InvalidDtd,
@@ -1047,31 +900,26 @@ pub const ReadError = error{
     InvalidState,
 };
 
-/// Errors reported while resetting a reader.
 pub const ResetError = error{
     InvalidState,
 };
 
-/// Caller-owned input that remains valid until a successful reset or deinitialization.
 pub const NormalSource = union(enum) {
     slice: []const u8,
     stream: *std.Io.Reader,
 };
 
-/// Namespace handling selected at runtime by the normal reader.
 pub const NormalNamespacePolicy = enum {
     process,
     raw,
 };
 
-/// External-resource handling selected at runtime by the normal reader.
 pub const NormalExternalPolicy = enum {
     forbid,
     skip,
     resolve,
 };
 
-/// One DTD validity finding borrowed from the Reader or Document that returned it.
 pub const NormalDtdFinding = struct {
     code: DiagnosticCode,
     primary: NormalLocation,
@@ -1079,51 +927,43 @@ pub const NormalDtdFinding = struct {
     inclusion_trace: []const NormalLocation,
 };
 
-/// Action returned by a DTD validity finding callback.
 pub const NormalDtdFindingAction = enum {
     continue_validation,
     cancel,
 };
 
-/// Synchronous DTD validity finding callback.
 pub const NormalDtdFindingSink = struct {
     context: ?*anyopaque,
     report_fn: *const fn (?*anyopaque, NormalDtdFinding) NormalDtdFindingAction,
 
-    /// Reports one borrowed finding.
     pub fn report(self: NormalDtdFindingSink, finding: NormalDtdFinding) NormalDtdFindingAction {
         return self.report_fn(self.context, finding);
     }
 };
 
-/// Runtime options used when DTD validation is enabled.
 pub const NormalDtdValidationOptions = struct {
     finding_sink: ?NormalDtdFindingSink = null,
     external_subset: ?*const external_subset_module.ExternalSubset = null,
 };
 
-/// DTD behavior selected at runtime by the normal reader.
 pub const NormalDtdPolicy = union(enum) {
     reject,
     process,
     validate: NormalDtdValidationOptions,
 };
 
-/// Runtime XML 1.1 normalization behavior for the normal reader.
 pub const NormalNormalizationPolicy = enum {
     report,
     require,
     unchecked,
 };
 
-/// Original physical byte range in one XML source.
 pub const NormalSourceSpan = struct {
     source_id: u32,
     start: u64,
     end: u64,
 };
 
-/// Physical source location with optional line information.
 pub const NormalLocation = struct {
     source_id: u32,
     byte_offset: u64,
@@ -1131,7 +971,6 @@ pub const NormalLocation = struct {
     byte_column: ?u64,
 };
 
-/// Fatal reader diagnostic whose inclusion trace borrows reader storage.
 pub const NormalDiagnostic = struct {
     code: DiagnosticCode,
     primary: NormalLocation,
@@ -1139,19 +978,15 @@ pub const NormalDiagnostic = struct {
     inclusion_trace: []const NormalLocation,
 };
 
-/// Synchronous fatal diagnostic callback.
 pub const NormalDiagnosticSink = struct {
     context: ?*anyopaque,
     report_fn: *const fn (?*anyopaque, NormalDiagnostic) void,
 
-    /// Reports one borrowed fatal diagnostic.
     pub fn report(self: NormalDiagnosticSink, diagnostic: NormalDiagnostic) void {
         self.report_fn(self.context, diagnostic);
     }
 };
 
-/// Runtime options retain caller-owned pointers, slices, and callback contexts.
-/// Those borrows must remain valid until a successful reset or deinitialization.
 pub const NormalReaderOptions = struct {
     limits: NormalLimits = NormalLimits.general,
     namespaces: NormalNamespacePolicy = .process,
@@ -1159,17 +994,15 @@ pub const NormalReaderOptions = struct {
     external: NormalExternalPolicy = .forbid,
     resolver: ?resolver_module.Resolver = null,
     document_base_id: ?[]const u8 = null,
-    /// Decodes the document entity from byte zero instead of using built-in detection.
+    /// Must accept the document entity from byte zero; built-in detection is bypassed.
     transcoder: ?encoding_module.Transcoder = null,
     track_lines: bool = true,
     normalization: NormalNormalizationPolicy = .report,
     diagnostic_sink: ?NormalDiagnosticSink = null,
 };
 
-/// Errors reported while constructing the normal reader.
 pub const NormalInitError = error{InvalidOptions};
 
-/// Errors reported while producing a normal reader event.
 pub const NormalReadError = error{
     InvalidXml,
     UnsupportedVersion,
@@ -1187,38 +1020,32 @@ pub const NormalReadError = error{
     InvalidState,
 };
 
-/// Errors reported while replacing a normal reader source and options.
 pub const NormalResetError = error{
     InvalidOptions,
     InvalidState,
 };
 
-/// Resolved identity of a namespace-aware name.
 pub const NormalExpandedName = struct {
     prefix: ?[]const u8,
     local: []const u8,
     namespace_uri: ?[]const u8,
 };
 
-/// Raw name spelling with optional namespace identity.
 pub const NormalName = struct {
     raw: []const u8,
     expanded: ?NormalExpandedName,
 
-    /// Returns whether the expanded identity matches.
     pub fn eql(self: NormalName, namespace_uri: ?[]const u8, local: []const u8) bool {
         const expanded = self.expanded orelse return false;
         return optionalBytesOrder(expanded.namespace_uri, namespace_uri) == .eq and
             std.mem.eql(u8, expanded.local, local);
     }
 
-    /// Returns whether the raw source spelling matches.
     pub fn eqlRaw(self: NormalName, raw: []const u8) bool {
         return std.mem.eql(u8, self.raw, raw);
     }
 };
 
-/// Attribute borrowed from a start-element event or owned Document.
 pub const NormalAttribute = struct {
     name: NormalName,
     value: []const u8,
@@ -1227,7 +1054,6 @@ pub const NormalAttribute = struct {
     declared_type: ?dtd_module.AttributeType,
 };
 
-/// Namespace declaration borrowed from one start-element event.
 pub const NormalNamespaceDeclaration = struct {
     prefix: ?[]const u8,
     namespace_uri: []const u8,
@@ -1235,35 +1061,30 @@ pub const NormalNamespaceDeclaration = struct {
     specified: bool,
 };
 
-/// XML declaration reported by the normal reader.
 pub const NormalXmlDeclaration = struct {
     version: XmlVersion,
     encoding: ?[]const u8,
     standalone: ?bool,
 };
 
-/// Document-start information returned by a Reader event or owned Document.
 pub const NormalDocumentStart = struct {
     effective_version: XmlVersion,
     source_encoding: SourceEncoding,
     declaration: ?NormalXmlDeclaration,
 };
 
-/// Document type header returned by a Reader event or owned Document.
 pub const NormalDocumentType = struct {
     root_name: []const u8,
     public_id: ?[]const u8,
     system_id: ?[]const u8,
 };
 
-/// Start-element payload.
 pub const NormalStartElement = struct {
     name: NormalName,
     attributes: []const NormalAttribute,
     namespace_declarations: []const NormalNamespaceDeclaration,
     empty_syntax: bool,
 
-    /// Returns the first attribute with the requested expanded identity.
     pub fn attribute(
         self: NormalStartElement,
         namespace_uri: ?[]const u8,
@@ -1275,7 +1096,6 @@ pub const NormalStartElement = struct {
         return null;
     }
 
-    /// Returns the first attribute with the requested raw spelling.
     pub fn attributeRaw(self: NormalStartElement, raw: []const u8) ?NormalAttribute {
         for (self.attributes) |value| {
             if (value.name.eqlRaw(raw)) return value;
@@ -1284,40 +1104,34 @@ pub const NormalStartElement = struct {
     }
 };
 
-/// End-element payload.
 pub const NormalEndElement = struct {
     name: NormalName,
 };
 
-/// One fragment of a run of adjacent XML text.
-/// `final_fragment` ends the run and may be true on an empty fragment.
+/// An empty final fragment may terminate a text run.
 pub const NormalText = struct {
     bytes: []const u8,
     origin: TextOrigin,
     final_fragment: bool,
 };
 
-/// Comment fragment payload.
 pub const NormalComment = struct {
     bytes: []const u8,
     final_fragment: bool,
 };
 
-/// Processing-instruction fragment payload.
 pub const NormalProcessingInstruction = struct {
     target: []const u8,
     data: []const u8,
     final_fragment: bool,
 };
 
-/// Kind of external source intentionally skipped.
 pub const NormalSkippedExternalSourceKind = enum {
     external_subset,
     parameter_entity,
     general_entity,
 };
 
-/// External source omitted by the selected policy.
 pub const NormalSkippedExternalSource = struct {
     kind: NormalSkippedExternalSourceKind,
     name: ?[]const u8,
@@ -1325,13 +1139,11 @@ pub const NormalSkippedExternalSource = struct {
     system_id: ?[]const u8,
 };
 
-/// Completeness of parsed document content.
 pub const NormalDocumentContent = enum {
     complete,
     external_content_skipped,
 };
 
-/// Final DTD validity result.
 pub const NormalDtdValidity = enum {
     not_requested,
     valid,
@@ -1339,7 +1151,6 @@ pub const NormalDtdValidity = enum {
     incomplete,
 };
 
-/// Final XML 1.1 normalization result.
 pub const NormalDocumentNormalization = enum {
     not_applicable,
     unchecked,
@@ -1349,14 +1160,12 @@ pub const NormalDocumentNormalization = enum {
     incomplete,
 };
 
-/// Document-end results.
 pub const NormalDocumentEnd = struct {
     content: NormalDocumentContent,
     dtd_validity: NormalDtdValidity,
     normalization: NormalDocumentNormalization,
 };
 
-/// Stable event payload for the normal reader.
 pub const NormalEventData = union(enum) {
     document_start: NormalDocumentStart,
     document_type: NormalDocumentType,
@@ -1369,13 +1178,11 @@ pub const NormalEventData = union(enum) {
     document_end: NormalDocumentEnd,
 };
 
-/// Stable event whose slices remain valid until the next read begins.
 pub const NormalEvent = struct {
     span: NormalSourceSpan,
     data: NormalEventData,
 };
 
-/// First XML 1.1 normalization finding.
 pub const NormalNormalizationFinding = struct {
     kind: NormalizationIssueKind,
     location: NormalLocation,
@@ -1830,7 +1637,6 @@ fn SourceState(comptime config: Config) type {
 
 const InternalReadError = ReadError || error{RefillDecodedInput};
 
-/// Incremental reader specialized to `config`.
 pub fn Reader(comptime config: Config) type {
     config.validate();
 
@@ -1939,7 +1745,6 @@ pub fn Reader(comptime config: Config) type {
         declaration_data_start: Location(config) = .{},
         declaration_question_advance: u8 = 0,
 
-        /// Initializes a reader without allocating.
         pub fn init(allocator: std.mem.Allocator, options: Options(config)) InitError!Self {
             if (!options.limits.validate() or !options.namespace_limits.validate()) {
                 return error.InvalidOptions;
@@ -1961,7 +1766,6 @@ pub fn Reader(comptime config: Config) type {
             };
         }
 
-        /// Releases all reader-owned memory and invalidates the reader.
         pub fn deinit(self: *Self) void {
             std.debug.assert(self.lifecycle != .deinitialized);
             self.releaseStorage();
@@ -1971,7 +1775,6 @@ pub fn Reader(comptime config: Config) type {
             self.lifecycle = .deinitialized;
         }
 
-        /// Clears document state using the selected capacity policy.
         pub fn reset(self: *Self, mode: ResetMode) ResetError!void {
             if (self.lifecycle == .deinitialized) return error.InvalidState;
             switch (mode) {
@@ -2078,7 +1881,6 @@ pub fn Reader(comptime config: Config) type {
             }
         }
 
-        /// Installs one caller-owned input chunk.
         pub fn feed(self: *Self, input: []const u8, final: bool) FeedError!void {
             if (self.lifecycle != .ready and self.lifecycle != .needs_input) {
                 return error.InvalidState;
@@ -2145,7 +1947,6 @@ pub fn Reader(comptime config: Config) type {
             self.lifecycle = .producing;
         }
 
-        /// Produces the next semantic event.
         pub fn next(self: *Self) ReadError!Step(config) {
             while (true) {
                 return self.nextParser() catch |err| switch (err) {
@@ -3365,12 +3166,10 @@ pub fn Reader(comptime config: Config) type {
             }
         }
 
-        /// Returns the first sticky diagnostic, if one exists.
         pub fn diagnostic(self: *const Self) ?Diagnostic(config) {
             return self.first_diagnostic;
         }
 
-        /// Returns XML 1.1 full-normalization progress or the final result.
         pub fn normalizationResult(self: *const Self) NormalizationResult(config) {
             if (comptime config.profile.isXml11()) {
                 return .{
@@ -3381,7 +3180,6 @@ pub fn Reader(comptime config: Config) type {
             return .{};
         }
 
-        /// Reports memory currently owned by the reader.
         pub fn memoryUsage(self: *const Self) MemoryUsage {
             return .{
                 .parser_stack_len = self.open_elements.items.len,
@@ -7920,7 +7718,7 @@ pub fn Reader(comptime config: Config) type {
             var levels: usize = 1;
             var width = attributes.len;
             while (width > 1) : (levels +|= 1) width = (width + 1) / 2;
-            // The factor bounds heap-sort comparisons; the final term covers adjacency checks.
+            // This conservative preflight bound must dominate heap-sort and adjacency work.
             const comparison_bound = 8 *| attributes.len *| levels +| attributes.len;
             const cost_bound = 2 *| max_uri_len +| 2 *| max_local_len +| 2;
             const work_bound = comparison_bound *| cost_bound;
@@ -10543,7 +10341,6 @@ const NormalDtdCancelTrace = enum {
     later_finding,
 };
 
-/// Normal reader with runtime namespace and DTD policy selection.
 pub const NormalReader = struct {
     const Self = @This();
 
@@ -10576,7 +10373,6 @@ pub const NormalReader = struct {
     text_run_end: u64 = 0,
     text_run_origin: TextOrigin = .character_data,
 
-    /// Initializes the normal reader without reading or allocating.
     pub fn init(
         allocator: std.mem.Allocator,
         source: NormalSource,
@@ -10591,7 +10387,6 @@ pub const NormalReader = struct {
         };
     }
 
-    /// Releases parser-owned memory. The caller retains the root source.
     pub fn deinit(self: *Self) void {
         std.debug.assert(!self.deinitialized);
         std.debug.assert(!self.in_call);
@@ -10608,7 +10403,6 @@ pub const NormalReader = struct {
         self.in_call = false;
     }
 
-    /// Replaces the source and options without reading or allocating.
     pub fn reset(
         self: *Self,
         source: NormalSource,
@@ -10725,7 +10519,6 @@ pub const NormalReader = struct {
         self.text_run_origin = .character_data;
     }
 
-    /// Produces the next stable event or returns null after the document ends.
     pub fn next(self: *Self) NormalReadError!?NormalEvent {
         if (self.deinitialized) return error.InvalidState;
         if (self.in_call) return error.InvalidState;
@@ -10736,7 +10529,7 @@ pub const NormalReader = struct {
         self.in_call = true;
         defer self.in_call = false;
 
-        // A queued start event still borrows the facade arrays filled during conversion.
+        // Do not clear facade arrays before returning a queued event that borrows them.
         if (self.pending_event) |event| {
             self.pending_event = null;
             if (event.span.source_id == 0) self.commitRootStreamBytes(event.span.end);
@@ -10765,8 +10558,7 @@ pub const NormalReader = struct {
         return event;
     }
 
-    /// Consumes the most recently returned start element through its matching end.
-    /// Other states return `error.InvalidState` without changing the Reader.
+    /// Requires the latest event to be a start element; rejection does not advance the reader.
     pub fn skipElement(self: *Self) NormalReadError!NormalSourceSpan {
         if (self.deinitialized or self.in_call) return error.InvalidState;
         const start = self.skippable_start orelse return error.InvalidState;
@@ -10802,7 +10594,6 @@ pub const NormalReader = struct {
         return error.InvalidXml;
     }
 
-    /// Returns the first fatal diagnostic, if one exists.
     pub fn diagnostic(self: *const Self) ?NormalDiagnostic {
         const value = self.first_diagnostic orelse return null;
         const inclusions = if (value.code == .dtd_finding_cancelled)
@@ -10821,7 +10612,6 @@ pub const NormalReader = struct {
         };
     }
 
-    /// Returns the first DTD validity finding, retained until reset or deinitialization.
     pub fn firstDtdFinding(self: *const Self) ?NormalDtdFinding {
         const value = self.first_dtd_finding orelse return null;
         return .{
@@ -10832,7 +10622,6 @@ pub const NormalReader = struct {
         };
     }
 
-    /// Reports memory owned by the selected parser and event conversion storage.
     pub fn memoryUsage(self: *const Self) MemoryUsage {
         var usage = switch (self.engine) {
             inline else => |*parser| parser.memoryUsage(),
@@ -10851,7 +10640,6 @@ pub const NormalReader = struct {
         return usage;
     }
 
-    /// Returns the first XML 1.1 normalization finding, if one exists.
     pub fn normalizationFinding(self: *const Self) ?NormalNormalizationFinding {
         return switch (self.engine) {
             inline else => |*parser| finding: {
@@ -11724,7 +11512,6 @@ fn normalValidityReporter(
     }.report;
 }
 
-/// Internal bridge used by package adapters without exposing parser state.
 pub fn AdapterAccess(comptime config: Config) type {
     return struct {
         pub fn recordReadFailure(reader: *Reader(config)) ReadError {

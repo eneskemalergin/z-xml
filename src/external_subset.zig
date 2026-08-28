@@ -1,4 +1,19 @@
-//! Immutable, caller-owned compiled external DTD subsets.
+//! Builds an owned validation grammar from caller-decoded external DTD sources for reuse by
+//! validating Readers.
+//!
+//! Sources must already be UTF-8 with normalized line endings; this module does not open, decode,
+//! or normalize them. Compilation copies retained source and identifier bytes. Option slices,
+//! provider state, and provider result slices are borrowed only during the call. The returned
+//! subset must outlive every Reader that borrows it.
+//!
+//! The top-level system identifier must be nonempty, and all source IDs must be nonzero and unique.
+//! `max_sources` includes the top-level source, `max_source_bytes` covers all source bytes, and
+//! `max_identifier_bytes` applies to each system, public, and base identifier. A referenced
+//! external parameter entity requires provider content; an absent provider or `skipped` result
+//! returns `error.UnsupportedFeature`.
+//!
+//! A Reader accepts the subset only when its XML version and document type identifiers match.
+//! Document declarations retain precedence over appended external declarations.
 
 const std = @import("std");
 const dtd = @import("dtd.zig");
@@ -13,27 +28,20 @@ pub const Content = dtd.ExternalContent;
 
 pub const CompileError = dtd.ParseError || error{InvalidOptions};
 
-/// Construction policy and limits for one compiled external subset.
 pub const Options = struct {
-    /// XML character rules used while compiling declaration values.
     version: dtd.XmlVersion = .xml10,
     public_id: ?[]const u8 = null,
     base_id: ?[]const u8 = null,
-    /// Nonzero diagnostic identity assigned to the top-level declaration source.
     source_id: u32 = 1,
     dtd_limits: dtd.Limits = .{},
     validation_limits: validation.Limits = .{},
-    /// Maximum declaration sources retained by the compiled subset.
     max_sources: usize = 256,
-    /// Maximum cumulative bytes retained from declaration sources.
     max_source_bytes: usize = 32 * 1024 * 1024,
-    /// Maximum bytes accepted in one system, public, or base identifier.
     max_identifier_bytes: usize = 64 * 1024,
-    /// Optional synchronous provider for external parameter entities.
     provider: ?Provider = null,
 };
 
-/// Caller-owned capacity retained by a compiled subset.
+/// All fields are byte counts and exclude storage allocated by borrowing Readers.
 pub const MemoryUsage = struct {
     declaration_capacity: usize,
     validation_capacity: usize,
@@ -41,23 +49,20 @@ pub const MemoryUsage = struct {
     source_capacity: usize,
 };
 
-/// Position in one normalized declaration source.
+/// `byte_offset` is zero-based; `line` and `byte_column` are one-based.
 pub const SourcePosition = struct {
     byte_offset: u64,
     line: u64,
     byte_column: u64,
 };
 
-/// Source and normalized byte offset that included another declaration source.
 pub const Inclusion = struct {
     source_id: u32,
     offset: usize,
 };
 
-/// Normalization outcome retained for a decoded XML 1.1 declaration source.
 pub const NormalizationFindingKind = enum { not_nfc, unknown_character };
 
-/// First normalization finding retained by a compiled subset.
 pub const NormalizationFinding = struct {
     kind: NormalizationFindingKind,
     source_id: u32,
@@ -70,7 +75,6 @@ const SourceRecord = struct {
     inclusion: ?Inclusion,
 };
 
-/// Immutable declaration grammar borrowed by compatible validating readers.
 pub const ExternalSubset = struct {
     allocator: std.mem.Allocator,
     declarations: dtd.State = .{},
@@ -80,8 +84,6 @@ pub const ExternalSubset = struct {
     sources: std.ArrayList(SourceRecord) = .empty,
     normalization_finding: ?NormalizationFinding = null,
 
-    /// Compiles decoded UTF-8 declarations whose line endings are already normalized.
-    /// Nested declaration bytes returned by `options.provider` follow the same contract.
     pub fn compileDecoded(
         allocator: std.mem.Allocator,
         system_id: []const u8,
@@ -152,7 +154,6 @@ pub const ExternalSubset = struct {
         return result;
     }
 
-    /// Releases all declarations, grammar tables, identities, and source maps.
     pub fn deinit(self: *ExternalSubset) void {
         self.compiled.deinit(self.allocator);
         self.declarations.deinit(self.allocator);
@@ -163,7 +164,6 @@ pub const ExternalSubset = struct {
         self.* = undefined;
     }
 
-    /// Returns retained capacities without changing the subset.
     pub fn memoryUsage(self: *const ExternalSubset) MemoryUsage {
         return .{
             .declaration_capacity = self.declarations.capacity(),
@@ -194,7 +194,7 @@ pub const ExternalSubset = struct {
         return &self.compiled;
     }
 
-    /// Returns the first retained normalization finding, if any.
+    /// A definite `not_nfc` issue takes precedence over an earlier `unknown_character`.
     pub fn normalizationFinding(self: *const ExternalSubset) ?NormalizationFinding {
         return self.normalization_finding;
     }

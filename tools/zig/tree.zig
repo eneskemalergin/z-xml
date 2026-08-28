@@ -1,4 +1,9 @@
-//! Public Document adapter for construction, traversal, and memory measurements.
+//! Builds and traverses the public owned Document for correctness and measurement.
+//!
+//! Input uses a bounded stream, raw names, and DTD rejection. Normal output keeps a Reader-compatible
+//! checksum separate from one that also covers comments and processing instructions. Timing reports
+//! construction and traversal separately; memory reporting checks retained Document capacity and
+//! measures traversal scratch allocation with an independent tracker.
 
 const std = @import("std");
 const xml = @import("z_xml");

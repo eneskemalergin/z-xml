@@ -1,4 +1,14 @@
-//! Verifies the public immutable owned-tree contract.
+//! Public Document contract tests through the package facade.
+//!
+//! Each completed document is treated as an immutable owner. Source storage may be
+//! released after parsing, returned views remain document-scoped, and all retained
+//! storage is released by deinitialization. The suite covers the normal runtime
+//! Document and documents built for explicit Reader configurations.
+//!
+//! Public Reader event summaries provide a separate ordering and value oracle for
+//! tree traversal. Generated wide, deep, and large-text documents exercise bounds
+//! without repository fixtures. Direct builder tests cover invalid event sequences
+//! and one-time ownership transfer.
 
 const std = @import("std");
 const xml = @import("z_xml");

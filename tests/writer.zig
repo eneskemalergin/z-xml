@@ -1,4 +1,15 @@
-//! Public Writer output, validation, lifecycle, ownership, and limit tests.
+//! Public Writer contract tests through the package facade.
+//!
+//! Exact UTF-8 output is the primary oracle. Selected namespace and escaping cases
+//! are parsed with the public Reader to verify their semantic values. Controlled
+//! sinks force one-byte progress, failure at every output offset, and observable
+//! flush calls.
+//!
+//! The Writer borrows its allocator and sink. Deinitialization releases Writer
+//! storage without flushing the sink. Mutable argument buffers are overwritten
+//! before pending tags are published to prove retained input is copied. Allocation
+//! failures preserve unpublished state; sink failures make the logical output
+//! position unknown and remain sticky. All inputs are deterministic and self-contained.
 
 const std = @import("std");
 const xml = @import("z_xml");

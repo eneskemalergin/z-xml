@@ -1,6 +1,23 @@
-//! Parses and stores XML internal and external DTD declarations.
+//! Parses the DTD grammar used by the Reader and stores the resulting declarations.
 //!
-//! Stored strings use offsets into one owned arena so growth cannot invalidate declarations.
+//! The parser handles document type headers, internal and external subsets, element and
+//! attribute declarations, general and parameter entity declarations, notations, conditional
+//! sections, and declaration reports. It expands parameter entities while parsing subsets and
+//! retains general entity declarations for the Reader. Document-content validity is handled by
+//! `validation.zig` from the declarations stored here.
+//!
+//! This module does not open files or perform network access. External subset bytes and
+//! parameter entity bytes come from a synchronous caller-provided callback.
+//!
+//! `State` owns declaration records and one byte arena. Records store offsets into that arena,
+//! so arena growth does not invalidate stored references. Provider request slices are borrowed
+//! for the callback. Provider result bytes and base identifiers remain borrowed until the active
+//! parse or external-subset compilation call returns.
+//!
+//! Parsing is bounded by `Limits`. The bounds cover document-type and declaration bytes,
+//! declaration counts, grammar depth and size, entity depth and expansion, and weighted
+//! name-comparison work. Entity expansion has both an absolute byte limit and a ratio limit after
+//! a minimum threshold.
 
 const std = @import("std");
 const xml_rules = @import("xml_rules.zig");
@@ -31,42 +48,26 @@ pub const DefaultKind = enum {
     fixed,
 };
 
-/// Finite limits for DTD storage, grammar work, lookup work, and entity expansion.
+/// Every `max_*` value must be nonzero. Declaration, expansion, and comparison counters
+/// accumulate across every subset parsed or appended into the same `State`.
 pub const Limits = struct {
-    /// Maximum decoded bytes in one document type declaration.
     max_dtd_bytes: usize = 1024 * 1024,
-    /// Maximum markup declarations processed from the internal subset and parameter entities.
     max_declarations: usize = 4096,
-    /// Maximum cumulative decoded bytes in markup declarations.
     max_declaration_bytes: usize = 1024 * 1024,
-    /// Maximum retained element declarations.
     max_element_declarations: usize = 1024,
-    /// Maximum retained attribute declarations.
     max_attribute_declarations: usize = 4096,
-    /// Maximum retained general and parameter entity declarations.
     max_entity_declarations: usize = 1024,
-    /// Maximum retained notation declarations.
     max_notation_declarations: usize = 1024,
-    /// Maximum nested content-model group depth.
     max_group_depth: usize = 256,
-    /// Maximum cumulative content-model and attribute-type grammar nodes.
     max_grammar_nodes: usize = 64 * 1024,
-    /// Maximum cumulative normalized replacement and default bytes.
     max_entity_replacement_bytes: usize = 1024 * 1024,
-    /// Maximum active parameter or general entity depth.
     max_active_entity_depth: usize = 64,
-    /// Maximum cumulative parameter and general entity reference count.
     max_entity_references: usize = 1024 * 1024,
-    /// Maximum cumulative bytes included from entity replacement text.
     max_expanded_bytes: usize = 8 * 1024 * 1024,
-    /// Maximum expanded bytes per entity-reference source byte after the minimum threshold.
     max_expansion_ratio: usize = 100,
-    /// Expanded-byte count at or below which ratio enforcement remains disabled.
     expansion_ratio_minimum_bytes: usize = 4096,
-    /// Maximum cumulative weighted DTD name-comparison work.
     max_comparison_work: usize = 8 * 1024 * 1024,
 
-    /// Returns whether every required limit has a usable nonzero value.
     pub fn validate(self: Limits) bool {
         return self.max_dtd_bytes > 0 and
             self.max_declarations > 0 and
@@ -438,7 +439,6 @@ pub const State = struct {
         };
     }
 
-    /// Returns the source location retained for a miscellaneous report.
     pub fn reportLocation(self: *const State, report: Report) ?DeclarationLocation {
         return switch (report.kind) {
             .comment, .processing_instruction => self.misc.items[report.index].location,
@@ -515,8 +515,7 @@ pub const State = struct {
         self.expanded_bytes = next_expanded_bytes;
     }
 
-    /// Charges semantic bytes produced after an external entity reference has
-    /// already been counted. Streaming sources call this once per decoded run.
+    /// Call only after `chargeEntity` has counted the external reference, and once per decoded run.
     pub fn chargeExpanded(
         self: *State,
         limits: Limits,
@@ -578,7 +577,6 @@ pub const State = struct {
         try parser.parseDoctype();
     }
 
-    /// Parses the document type while leaving its external subset unattached.
     pub fn parseDoctypeInternalOnly(
         self: *State,
         allocator: std.mem.Allocator,
@@ -596,7 +594,6 @@ pub const State = struct {
         try parser.parseDoctype();
     }
 
-    /// Parses a document type and obtains external declaration sources through `provider`.
     pub fn parseDoctypeExternal(
         self: *State,
         allocator: std.mem.Allocator,
@@ -615,7 +612,7 @@ pub const State = struct {
         try parser.parseDoctype();
     }
 
-    /// Parses one decoded UTF-8 external subset without a document type wrapper.
+    /// Requires decoded UTF-8 declaration bytes rather than a `DOCTYPE` wrapper.
     pub fn parseExternalSubset(
         self: *State,
         allocator: std.mem.Allocator,
@@ -651,7 +648,7 @@ pub const State = struct {
         grammar_unchanged: bool,
     };
 
-    /// Appends pre-parsed external declarations after per-document declarations.
+    /// Call after parsing document declarations so their first declarations take precedence.
     pub fn appendExternalDeclarations(
         self: *State,
         allocator: std.mem.Allocator,
@@ -1015,8 +1012,8 @@ const Parser = struct {
         } else if (self.state.external_id.public_id != null) {
             return self.invalid(.malformed_doctype, 0);
         }
-        // Sources are consumed from the end. The internal subset is processed
-        // first so its first declarations take precedence over external ones.
+        // XML gives internal-subset declarations precedence, so its source must be last on this
+        // LIFO stack.
         if (internal_source) |source| try self.sources.append(self.allocator, source);
         if (self.sources.items.len != 0) try self.parseSubset();
     }

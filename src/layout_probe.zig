@@ -1,4 +1,4 @@
-//! Prints Reader and Document layouts used by current memory work.
+//! Prints Reader and Document type layouts.
 
 const std = @import("std");
 const xml = @import("z_xml");

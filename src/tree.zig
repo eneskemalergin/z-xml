@@ -1,19 +1,33 @@
-//! Builds an immutable, caller-owned document tree from public reader events.
+//! Builds immutable, caller-owned XML documents from Reader events.
 //!
-//! Document-scoped indices remain valid until `Document.deinit`. All strings
-//! returned by navigation methods borrow from the document byte pool.
-//! Initialized builders and completed documents are single owners. Moving one
-//! invalidates the source value; copying one is not supported.
+//! The normal API parses one source with runtime Reader and retention options.
+//! Specialized builders consume events from one compile-time Reader configuration;
+//! their builder, event, and document types cannot be mixed across configurations.
+//!
+//! Construction copies retained XML into document-owned byte and record arrays, so
+//! input and Reader storage may be released after construction. Node indices, returned
+//! slices, and iterators are document-scoped and expire at `deinit`. Documents are
+//! immutable after construction, and traversal preserves Reader event order.
+//!
+//! Initialized builders and completed documents have single ownership. Assignment or
+//! return transfers that ownership; using or deinitializing the old copy is unsupported.
+//! Specialized builders become unusable after a consume failure or successful transfer,
+//! but must still be deinitialized to release construction scratch.
+//!
+//! Tree limits are independent of Reader limits. Retained-byte limits cover document
+//! arrays and copied strings but not temporary builder stacks. Memory reports measure
+//! retained allocation capacity; node capacity includes kind-specific payload arrays.
+//! Invalid or inapplicable node queries return the no-node sentinel, null, or an empty
+//! iterator rather than failing.
 
 const std = @import("std");
 
 const dtd = @import("dtd.zig");
 const reader = @import("reader.zig");
 
-/// Index zero represents no node.
+/// `0` is reserved as the no-node sentinel and is never a valid document node.
 pub const NodeIndex = u32;
 
-/// Kinds retained in the document node array.
 pub const NodeKind = enum(u8) {
     document,
     element,
@@ -22,11 +36,7 @@ pub const NodeKind = enum(u8) {
     processing_instruction,
 };
 
-/// Limits applied independently of parser limits.
-/// Node counts include the synthetic document node. `max_tree_bytes` covers
-/// dynamic capacity retained by the document, not temporary builder stacks.
 pub const Limits = struct {
-    /// Finite default limits for normal and specialized documents.
     pub const general: Limits = .{};
 
     max_nodes: usize = 32 * 1024 * 1024,
@@ -48,9 +58,7 @@ pub const Limits = struct {
     }
 };
 
-/// Limits applied to normal Document construction and retained storage.
 pub const DocumentLimits = struct {
-    /// Finite default limits for normal documents.
     pub const general: DocumentLimits = .{};
 
     max_nodes: usize = 32 * 1024 * 1024,
@@ -72,7 +80,6 @@ pub const DocumentLimits = struct {
     }
 };
 
-/// Optional initial capacities for callers that know document statistics.
 pub const CapacityHints = struct {
     nodes: usize = 0,
     attributes: usize = 0,
@@ -80,16 +87,13 @@ pub const CapacityHints = struct {
     string_bytes: usize = 0,
 };
 
-/// Runtime tree construction choices.
 pub const Options = struct {
     limits: Limits = .{},
     capacity_hints: CapacityHints = .{},
-    /// Keeps CDATA and character data in separate nodes with their original origins.
-    /// When false, compatible text is merged and reported as character data.
+    /// CDATA and character data can coalesce into one node only when this is false.
     preserve_cdata_origin: bool = true,
 };
 
-/// Errors produced by tree construction independently of XML parsing.
 pub const BuildError = error{
     InvalidOptions,
     InvalidEventSequence,
@@ -97,8 +101,6 @@ pub const BuildError = error{
     OutOfMemory,
 };
 
-/// Owned-capacity categories for a completed document.
-/// `node_capacity_bytes` includes nodes and their kind-specific payload arrays.
 pub const MemoryUsage = struct {
     node_count: usize,
     node_capacity_bytes: usize,
@@ -113,7 +115,6 @@ pub const MemoryUsage = struct {
     total_capacity_bytes: usize,
 };
 
-/// Logical counts and retained allocation capacities owned by a normal document.
 pub const DocumentMemoryUsage = struct {
     node_count: usize,
     node_capacity_bytes: usize,
@@ -127,7 +128,6 @@ pub const DocumentMemoryUsage = struct {
     total_capacity_bytes: usize,
 };
 
-/// Runtime options for normal owned-document construction.
 pub const DocumentOptions = struct {
     reader: reader.NormalReaderOptions = .{},
     limits: DocumentLimits = DocumentLimits.general,
@@ -136,14 +136,12 @@ pub const DocumentOptions = struct {
     retain_text_origin: bool = false,
 };
 
-/// Errors returned while parsing a normal owned document.
 pub const ParseDocumentError = reader.NormalReadError || error{
     InvalidOptions,
     InvalidEventSequence,
     DocumentLimit,
 };
 
-/// Name whose slices borrow from the document.
 pub const Name = struct {
     raw: []const u8,
     prefix: ?[]const u8,
@@ -151,7 +149,6 @@ pub const Name = struct {
     namespace_uri: ?[]const u8,
 };
 
-/// Attribute whose slices borrow from the document.
 pub const Attribute = struct {
     name: Name,
     value: []const u8,
@@ -159,13 +156,11 @@ pub const Attribute = struct {
     declared_type: ?dtd.AttributeType,
 };
 
-/// Namespace declaration whose slices borrow from the document.
 pub const NamespaceDeclaration = struct {
     prefix: ?[]const u8,
     namespace_uri: []const u8,
 };
 
-/// XML declaration information retained from `document_start`.
 pub const Declaration = struct {
     effective_version: reader.XmlVersion,
     declared_version: ?[]const u8,
@@ -175,14 +170,12 @@ pub const Declaration = struct {
     standalone_declared: bool,
 };
 
-/// Document type header whose slices borrow from the document.
 pub const DocumentType = struct {
     root_name: []const u8,
     public_id: ?[]const u8,
     system_id: ?[]const u8,
 };
 
-/// DTD information made visible by the selected reader report.
 pub const DtdRecordKind = enum(u8) {
     notation,
     unparsed_entity,
@@ -194,7 +187,6 @@ pub const DtdRecordKind = enum(u8) {
     entity_end,
 };
 
-/// One source-ordered DTD report whose slices borrow from the document.
 pub const DtdRecord = struct {
     kind: DtdRecordKind,
     name: ?[]const u8,
@@ -272,11 +264,6 @@ const StoredDocumentType = struct {
     system_id: StringRef,
 };
 
-/// Immutable XML document owned independently of its source and Reader.
-///
-/// After assignment or return, only the destination may be used. Using or
-/// deinitializing both copies is not supported. Values returned by query methods
-/// borrow from the document and expire on `deinit`.
 pub const Document = struct {
     const Self = @This();
 
@@ -300,7 +287,6 @@ pub const Document = struct {
     namespaces_processed: bool,
     text_origin_retained: bool,
 
-    /// Releases all document-owned storage. Call exactly once for each owned value.
     pub fn deinit(self: *Self) void {
         self.nodes.deinit(self.allocator);
         self.elements.deinit(self.allocator);
@@ -315,43 +301,36 @@ pub const Document = struct {
         self.* = undefined;
     }
 
-    /// Returns the synthetic document node.
     pub fn root(self: *const Self) NodeIndex {
         _ = self;
         return 1;
     }
 
-    /// Returns the document's single element node.
     pub fn documentElement(self: *const Self) NodeIndex {
         return self.document_element;
     }
 
-    /// Returns a node kind, or null for an invalid index.
     pub fn nodeKind(self: *const Self, node: NodeIndex) ?NodeKind {
         const value = self.getNode(node) orelse return null;
         return value.kind;
     }
 
-    /// Returns a node's parent, or zero for an invalid node or the document node.
     pub fn parent(self: *const Self, node: NodeIndex) NodeIndex {
         const value = self.getNode(node) orelse return 0;
         return value.parent;
     }
 
-    /// Returns an allocation-free iterator over source-ordered child nodes.
     pub fn children(self: *const Self, node: NodeIndex) ChildIterator {
         const value = self.getNode(node) orelse return .{ .document = self, .next_node = 0 };
         return .{ .document = self, .next_node = value.first_child };
     }
 
-    /// Returns an element name, or null for another node kind or an invalid index.
     pub fn nodeName(self: *const Self, node: NodeIndex) ?reader.NormalName {
         const value = self.getNode(node) orelse return null;
         if (value.kind != .element) return null;
         return self.normalName(self.elements.items[value.payload].name);
     }
 
-    /// Returns text or comment bytes, or null for another node kind or an invalid index.
     pub fn nodeValue(self: *const Self, node: NodeIndex) ?[]const u8 {
         const value = self.getNode(node) orelse return null;
         return switch (value.kind) {
@@ -361,7 +340,6 @@ pub const Document = struct {
         };
     }
 
-    /// Returns retained text origin, or null when origin retention is disabled.
     pub fn textOrigin(self: *const Self, node: NodeIndex) ?reader.TextOrigin {
         if (!self.text_origin_retained) return null;
         const value = self.getNode(node) orelse return null;
@@ -369,7 +347,6 @@ pub const Document = struct {
         return self.text_origins.items[value.payload];
     }
 
-    /// Returns a processing instruction, or null for another node kind or an invalid index.
     pub fn processingInstruction(
         self: *const Self,
         node: NodeIndex,
@@ -380,12 +357,11 @@ pub const Document = struct {
         return .{ .target = self.bytes(instruction.target), .data = self.bytes(instruction.data) };
     }
 
-    /// Returns an allocation-free iterator over source-ordered attributes.
     pub fn attributes(self: *const Self, element: NodeIndex) AttributeIterator {
         return .{ .document = self, .element = element };
     }
 
-    /// Finds an attribute by expanded identity, or returns null in raw-name mode.
+    /// Expanded lookup is unavailable when the Reader namespace policy is `.raw`.
     pub fn attribute(
         self: *const Self,
         element: NodeIndex,
@@ -400,7 +376,6 @@ pub const Document = struct {
         return null;
     }
 
-    /// Finds an attribute by raw spelling.
     pub fn attributeRaw(
         self: *const Self,
         element: NodeIndex,
@@ -413,7 +388,6 @@ pub const Document = struct {
         return null;
     }
 
-    /// Returns an allocation-free iterator over source-ordered namespace declarations.
     pub fn namespaceDeclarations(
         self: *const Self,
         element: NodeIndex,
@@ -423,7 +397,6 @@ pub const Document = struct {
         return .{ .document = self, .element = element, .count = count };
     }
 
-    /// Returns the effective document-start information and optional XML declaration.
     pub fn documentStart(self: *const Self) reader.NormalDocumentStart {
         const value = self.start_result;
         return .{
@@ -437,7 +410,6 @@ pub const Document = struct {
         };
     }
 
-    /// Returns the optional document type header.
     pub fn documentType(self: *const Self) ?reader.NormalDocumentType {
         const value = self.document_type orelse return null;
         return .{
@@ -447,12 +419,10 @@ pub const Document = struct {
         };
     }
 
-    /// Returns the final Reader result retained by the document.
     pub fn documentEnd(self: *const Self) reader.NormalDocumentEnd {
         return self.end_result;
     }
 
-    /// Returns the first DTD validity finding retained by the document.
     pub fn firstDtdFinding(self: *const Self) ?reader.NormalDtdFinding {
         const value = self.first_dtd_finding orelse return null;
         return .{
@@ -463,12 +433,10 @@ pub const Document = struct {
         };
     }
 
-    /// Returns the first XML 1.1 normalization finding retained by the document.
     pub fn normalizationFinding(self: *const Self) ?reader.NormalNormalizationFinding {
         return self.normalization_finding;
     }
 
-    /// Reports document-owned allocation counts and capacities.
     pub fn memoryUsage(self: *const Self) DocumentMemoryUsage {
         const node_bytes = self.nodes.capacity *| @sizeOf(Node) +|
             self.elements.capacity *| @sizeOf(DocumentElementRecord) +|
@@ -547,12 +515,10 @@ pub const Document = struct {
         return self.bytes(value);
     }
 
-    /// Iterates source-ordered child nodes.
     pub const ChildIterator = struct {
         document: *const Self,
         next_node: NodeIndex,
 
-        /// Returns the next node, or null after the final child.
         pub fn next(self: *ChildIterator) ?NodeIndex {
             if (self.next_node == 0) return null;
             const current = self.next_node;
@@ -561,13 +527,11 @@ pub const Document = struct {
         }
     };
 
-    /// Iterates source-ordered attributes.
     pub const AttributeIterator = struct {
         document: *const Self,
         element: NodeIndex,
         offset: usize = 0,
 
-        /// Returns the next attribute, or null after the final attribute.
         pub fn next(self: *AttributeIterator) ?reader.NormalAttribute {
             const element = self.document.getElement(self.element) orelse return null;
             if (self.offset >= element.attribute_count) return null;
@@ -577,14 +541,12 @@ pub const Document = struct {
         }
     };
 
-    /// Iterates source-ordered namespace declarations.
     pub const NamespaceDeclarationIterator = struct {
         document: *const Self,
         element: NodeIndex,
         count: usize,
         offset: usize = 0,
 
-        /// Returns the next declaration, or null after the final declaration.
         pub fn next(self: *NamespaceDeclarationIterator) ?NamespaceDeclaration {
             if (self.offset >= self.count) return null;
             const element = self.document.getElement(self.element) orelse return null;
@@ -667,7 +629,6 @@ const StoredDtdRecord = struct {
     skipped_entity_kind: ?reader.SkippedEntityKind = null,
 };
 
-/// Returns the immutable document type specialized to a parser profile.
 pub fn ProfileDocumentFor(comptime config: reader.Config) type {
     config.validate();
     return struct {
@@ -689,7 +650,6 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
         document_element: NodeIndex,
         validation_status: ?reader.ValidationStatus,
 
-        /// Releases all storage owned by the document.
         pub fn deinit(self: *Self) void {
             self.nodes.deinit(self.allocator);
             self.elements.deinit(self.allocator);
@@ -704,54 +664,45 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
             self.* = undefined;
         }
 
-        /// Returns the synthetic document node.
         pub fn root(self: *const Self) NodeIndex {
             _ = self;
             return 1;
         }
 
-        /// Returns the single document element.
         pub fn documentElement(self: *const Self) NodeIndex {
             return self.document_element;
         }
 
-        /// Returns a node kind, or null for an invalid index.
         pub fn nodeKind(self: *const Self, index: NodeIndex) ?NodeKind {
             const slot = self.nodeSlot(index) orelse return null;
             return self.nodes.items[slot].kind;
         }
 
-        /// Returns a node's parent, or zero when it has no parent.
         pub fn parent(self: *const Self, index: NodeIndex) NodeIndex {
             const slot = self.nodeSlot(index) orelse return 0;
             return self.nodes.items[slot].parent;
         }
 
-        /// Returns a node's first child, or zero when it has no children.
         pub fn firstChild(self: *const Self, index: NodeIndex) NodeIndex {
             const slot = self.nodeSlot(index) orelse return 0;
             return self.nodes.items[slot].first_child;
         }
 
-        /// Returns the next source-ordered sibling, or zero when absent.
         pub fn nextSibling(self: *const Self, index: NodeIndex) NodeIndex {
             const slot = self.nodeSlot(index) orelse return 0;
             return self.nodes.items[slot].next_sibling;
         }
 
-        /// Iterates source-ordered children without allocation.
         pub fn children(self: *const Self, index: NodeIndex) ProfileChildIteratorFor(config) {
             return .{ .document = self, .next_index = self.firstChild(index) };
         }
 
-        /// Returns an element name, or null for a non-element or invalid index.
         pub fn nodeName(self: *const Self, index: NodeIndex) ?Name {
             const node = self.getNode(index) orelse return null;
             if (node.kind != .element) return null;
             return self.name(self.elements.items[node.payload].name);
         }
 
-        /// Returns text or comment content, or null for other node kinds.
         pub fn nodeValue(self: *const Self, index: NodeIndex) ?[]const u8 {
             const node = self.getNode(index) orelse return null;
             return switch (node.kind) {
@@ -761,20 +712,17 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
             };
         }
 
-        /// Returns the retained semantic origin of a text node.
         pub fn textOrigin(self: *const Self, index: NodeIndex) ?reader.TextOrigin {
             const node = self.getNode(index) orelse return null;
             if (node.kind != .text) return null;
             return self.texts.items[node.payload].origin;
         }
 
-        /// Reports whether validating parsing classified a text node as ignorable whitespace.
         pub fn isIgnorableWhitespace(self: *const Self, index: NodeIndex) bool {
             const node = self.getNode(index) orelse return false;
             return node.kind == .text and self.texts.items[node.payload].ignorable_whitespace;
         }
 
-        /// Returns processing-instruction target and data slices.
         pub fn processingInstruction(
             self: *const Self,
             index: NodeIndex,
@@ -785,20 +733,17 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
             return .{ .target = self.bytes(value.target), .data = self.bytes(value.data) };
         }
 
-        /// Returns the number of source-ordered attributes on an element.
         pub fn attributeCount(self: *const Self, element: NodeIndex) usize {
             const record = self.getElement(element) orelse return 0;
             return record.attribute_count;
         }
 
-        /// Returns one source-ordered attribute.
         pub fn attributeAt(self: *const Self, element: NodeIndex, offset: usize) ?Attribute {
             const record = self.getElement(element) orelse return null;
             if (offset >= record.attribute_count) return null;
             return self.attribute(self.attributes.items[record.attribute_start + offset]);
         }
 
-        /// Finds the first attribute with the requested raw name.
         pub fn attributeByRaw(self: *const Self, element: NodeIndex, raw: []const u8) ?Attribute {
             const record = self.getElement(element) orelse return null;
             const end = record.attribute_start + record.attribute_count;
@@ -808,7 +753,6 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
             return null;
         }
 
-        /// Finds the first attribute with the requested expanded name.
         pub fn attributeByExpanded(
             self: *const Self,
             element: NodeIndex,
@@ -825,7 +769,6 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
             return null;
         }
 
-        /// Returns the number of source-ordered namespace declarations on an element.
         pub fn namespaceDeclarationCount(self: *const Self, element: NodeIndex) usize {
             if (comptime !config.profile.hasNamespaces()) {
                 return 0;
@@ -834,7 +777,6 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
             return record.namespace_count;
         }
 
-        /// Returns one source-ordered namespace declaration.
         pub fn namespaceDeclarationAt(
             self: *const Self,
             element: NodeIndex,
@@ -852,7 +794,6 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
             };
         }
 
-        /// Returns source location for a node when event locations are configured.
         pub fn location(self: *const Self, index: NodeIndex) if (config.event_locations)
             ?reader.Location(config)
         else
@@ -863,7 +804,6 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
             }
         }
 
-        /// Returns retained XML declaration information.
         pub fn xmlDeclaration(self: *const Self) Declaration {
             return .{
                 .effective_version = self.declaration.effective_version,
@@ -875,7 +815,6 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
             };
         }
 
-        /// Returns the optional document type header.
         pub fn documentType(self: *const Self) ?DocumentType {
             const value = self.document_type orelse return null;
             return .{
@@ -885,17 +824,14 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
             };
         }
 
-        /// Returns the final validation result for a validating configuration.
         pub fn validationStatus(self: *const Self) ?reader.ValidationStatus {
             return self.validation_status;
         }
 
-        /// Returns the number of source-ordered DTD reports retained by the tree.
         pub fn dtdRecordCount(self: *const Self) usize {
             return self.dtd_records.items.len;
         }
 
-        /// Returns one source-ordered DTD report.
         pub fn dtdRecordAt(self: *const Self, index: usize) ?DtdRecord {
             if (index >= self.dtd_records.items.len) return null;
             const value = self.dtd_records.items[index];
@@ -909,7 +845,6 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
             };
         }
 
-        /// Reports logical counts and allocated capacities owned by the document.
         pub fn memoryUsage(self: *const Self) MemoryUsage {
             const location_bytes = if (comptime config.event_locations)
                 self.locations.capacity * @sizeOf(reader.Location(config))
@@ -996,13 +931,11 @@ pub fn ProfileDocumentFor(comptime config: reader.Config) type {
     };
 }
 
-/// Returns the allocation-free child iterator specialized to a parser profile.
 pub fn ProfileChildIteratorFor(comptime config: reader.Config) type {
     return struct {
         document: *const ProfileDocumentFor(config),
         next_index: NodeIndex,
 
-        /// Returns the next child index, or null after the final child.
         pub fn next(self: *@This()) ?NodeIndex {
             if (self.next_index == 0) return null;
             const current = self.next_index;
@@ -1012,7 +945,6 @@ pub fn ProfileChildIteratorFor(comptime config: reader.Config) type {
     };
 }
 
-/// Returns an event consumer specialized to a parser profile.
 pub fn ProfileBuilderFor(comptime config: reader.Config) type {
     config.validate();
     return struct {
@@ -1046,7 +978,6 @@ pub fn ProfileBuilderFor(comptime config: reader.Config) type {
         fragment_complete: bool = true,
         text_boundary: bool = false,
 
-        /// Initializes an empty builder and applies optional capacity hints.
         pub fn init(allocator: std.mem.Allocator, options: Options) BuildError!Self {
             if (!options.limits.valid()) return error.InvalidOptions;
             if (options.capacity_hints.nodes > options.limits.max_nodes or
@@ -1081,7 +1012,6 @@ pub fn ProfileBuilderFor(comptime config: reader.Config) type {
             return self;
         }
 
-        /// Releases all partially constructed storage.
         pub fn deinit(self: *Self) void {
             self.nodes.deinit(self.allocator);
             self.elements.deinit(self.allocator);
@@ -1099,9 +1029,6 @@ pub fn ProfileBuilderFor(comptime config: reader.Config) type {
             self.* = undefined;
         }
 
-        /// Copies one public event into the partial document.
-        /// After an error, later `consume` and `finish` calls return
-        /// `InvalidEventSequence`; the caller must still call `deinit`.
         pub fn consume(self: *Self, event: reader.Event(config)) BuildError!void {
             if (self.document_ended or self.failed) return error.InvalidEventSequence;
             self.consumeEvent(event) catch |err| {
@@ -1139,9 +1066,6 @@ pub fn ProfileBuilderFor(comptime config: reader.Config) type {
             }
         }
 
-        /// Freezes a complete event stream and transfers the document storage.
-        /// A successful transfer can occur only once.
-        /// The caller must still deinitialize the builder to release construction scratch.
         pub fn finish(self: *Self) BuildError!ProfileDocumentFor(config) {
             if (self.failed or !self.document_ended or self.declaration == null or
                 self.document_element == 0 or self.open_elements.items.len != 0)
@@ -1598,11 +1522,6 @@ pub fn ProfileBuilderFor(comptime config: reader.Config) type {
     };
 }
 
-/// Parses one complete source into an owned document.
-///
-/// The source, Reader option borrows, and callback contexts need to remain valid
-/// only until this call returns. The returned document owns its retained XML.
-/// That ownership transfers to the caller and must be released with `deinit`.
 pub fn parseDocument(
     allocator: std.mem.Allocator,
     source: reader.NormalSource,
@@ -2095,7 +2014,6 @@ fn addCapacity(total: *usize, count: usize, item_size: usize) !void {
     total.* = std.math.add(usize, total.*, bytes) catch return error.Overflow;
 }
 
-/// Builds a document from any pull reader exposing `next()` with the matching event type.
 pub fn buildProfileFromPull(
     comptime config: reader.Config,
     allocator: std.mem.Allocator,

@@ -1,4 +1,8 @@
-//! Counts allocator operations and live bytes for development adapters.
+//! Wraps an allocator to measure allocation work for development adapters.
+//!
+//! Counts successful allocations, resizes, and remaps. `requested_bytes` accumulates newly acquired
+//! bytes, while `live_bytes` and `peak_live_bytes` track ownership held through this wrapper. The
+//! wrapper borrows its child allocator and does not deinitialize it.
 
 const std = @import("std");
 

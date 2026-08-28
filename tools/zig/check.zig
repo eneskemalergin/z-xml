@@ -1,4 +1,8 @@
-//! Streaming corpus adapter for implemented XML profiles.
+//! Runs one compiled z-xml Reader profile as a streaming corpus adapter.
+//!
+//! The adapter reads one file and writes deterministic event counts and a checksum. DTD-enabled
+//! profiles resolve external sources relative to that file. XML rejection returns status 2,
+//! resource exhaustion returns status 3, and other operational failures return status 1.
 
 const std = @import("std");
 const xml = @import("z_xml");

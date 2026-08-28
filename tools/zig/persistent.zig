@@ -1,4 +1,11 @@
-//! Persistent adapter for normal Reader profiles.
+//! Measures repeated parsing with one compiled normal Reader configuration.
+//!
+//! Resident input is passed as one slice; stream input reuses a bounded file-reader buffer. The
+//! adapter resets the same Reader with retained capacity between iterations and rejects any change
+//! in the observed event summary.
+//!
+//! Full consumption hashes observed event data; minimal consumption records only counters. Optional
+//! memory output measures Reader allocation work and live bytes separately from input storage.
 
 const std = @import("std");
 const xml = @import("z_xml");

@@ -1,4 +1,15 @@
-//! Shared XML character, name, namespace, whitespace, and predefined-entity rules.
+//! Allocation-free XML grammar rules shared by the reader, DTD processing,
+//! validation, and writer.
+//!
+//! Character and name checks operate on decoded Unicode scalar values. Whitespace
+//! checks operate on bytes and recognize only XML `S`: space, tab, line feed, and
+//! carriage return. XML Name ranges include the colon allowed by the XML grammar;
+//! QName, NCName, and namespace-binding restrictions remain the caller's job.
+//!
+//! Character legality is versioned. XML 1.1 restricted characters are document
+//! characters but cannot appear literally, so literal checks exclude them while
+//! general character checks include them. Reserved namespace URIs and predefined
+//! entity replacements are static borrowed bytes.
 
 const std = @import("std");
 

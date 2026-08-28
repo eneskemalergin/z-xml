@@ -1,26 +1,37 @@
-//! Caller-controlled external XML resource resolution.
+//! Caller-controlled external XML resource resolution without ambient authority.
 //!
-//! The parser never opens a path or performs network access. A resolver returns
-//! a bounded byte stream whose ownership ends when `close` is called exactly
-//! once by the parser.
+//! A `Resolver` and its context remain caller-owned. Request slices are valid only
+//! during `resolve`. Returning a `Source` transfers responsibility for closing that
+//! source to the parser. The source context, callbacks, base identifier, and optional
+//! transcoder must remain valid until the parser calls `close` exactly once. Source
+//! identifiers must be nonzero and unique within one document parse.
+//!
+//! Source reads receive a nonempty bounded destination. A successful read reports
+//! between one byte and the destination length; zero or an excessive count becomes
+//! `io_failure`.
+//!
+//! `RootedFilesystem` is an optional local-file resolver. It borrows an already-open
+//! directory and never closes it. The resolver value must remain live while the
+//! parser can resolve or close a source; the directory must remain open while it can
+//! resolve. System identifiers are treated as slash-separated relative paths.
+//! Schemes, absolute paths, fragments, backslashes, symlinks, directories, root
+//! escapes, and paths that cannot be opened component by component beneath the root
+//! are rejected.
 
 const std = @import("std");
 const encoding = @import("encoding.zig");
 
-/// Kind of external XML resource being requested.
 pub const EntityKind = enum {
     external_subset,
     parameter_entity,
     general_entity,
 };
 
-/// Source position at which an external resource was included.
 pub const InclusionLocation = struct {
     source_id: u32,
     byte_offset: u64,
 };
 
-/// One resolver request. All slices are borrowed for the callback duration.
 pub const Request = struct {
     kind: EntityKind,
     name: ?[]const u8 = null,
@@ -30,7 +41,6 @@ pub const Request = struct {
     inclusion: InclusionLocation,
 };
 
-/// Result of one stream read.
 pub const ReadResult = union(enum) {
     bytes: usize,
     end,
@@ -38,19 +48,16 @@ pub const ReadResult = union(enum) {
     cancelled,
 };
 
-/// Successfully acquired caller-owned external source.
 pub const Source = struct {
     context: ?*anyopaque,
-    /// Nonzero identifier unique among sources returned for one document parse.
     source_id: u32,
     base_id: ?[]const u8 = null,
     encoding_hint: ?encoding.SourceEncoding = null,
-    /// Decodes this source from byte zero and takes precedence over `encoding_hint`.
+    /// Must accept the source from byte zero; takes precedence over `encoding_hint`.
     transcoder: ?encoding.Transcoder = null,
     readFn: *const fn (?*anyopaque, []u8) ReadResult,
     closeFn: *const fn (?*anyopaque) void,
 
-    /// Reads into a nonempty bounded destination.
     pub fn read(self: Source, output: []u8) ReadResult {
         std.debug.assert(output.len != 0);
         const result = self.readFn(self.context, output);
@@ -60,13 +67,11 @@ pub const Source = struct {
         return result;
     }
 
-    /// Ends ownership of the source.
     pub fn close(self: Source) void {
         self.closeFn(self.context);
     }
 };
 
-/// Policy or acquisition outcome returned by a resolver.
 pub const Result = union(enum) {
     source: Source,
     not_found,
@@ -77,23 +82,15 @@ pub const Result = union(enum) {
     io_failure,
 };
 
-/// Caller-owned resolver callback.
 pub const Resolver = struct {
     context: ?*anyopaque,
     resolveFn: *const fn (?*anyopaque, Request) Result,
 
-    /// Resolves one request without granting the parser ambient authority.
     pub fn resolve(self: Resolver, request: Request) Result {
         return self.resolveFn(self.context, request);
     }
 };
 
-/// Optional filesystem resolver confined to one already-open directory.
-///
-/// System identifiers are interpreted as slash-separated relative paths. The
-/// resolver rejects schemes, absolute paths, fragments, backslashes,
-/// symlinks, directories, root escapes, and every path that cannot be opened
-/// component by component beneath `root`.
 pub const RootedFilesystem = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -123,12 +120,10 @@ pub const RootedFilesystem = struct {
         }
     };
 
-    /// Initializes a resolver over a caller-owned open root directory.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, root: std.Io.Dir) RootedFilesystem {
         return .{ .allocator = allocator, .io = io, .root = root };
     }
 
-    /// Returns the callback interface borrowed from this resolver.
     pub fn resolver(self: *RootedFilesystem) Resolver {
         return .{ .context = self, .resolveFn = resolve };
     }

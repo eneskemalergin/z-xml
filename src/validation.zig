@@ -1,4 +1,26 @@
-//! Compiles DTD declarations and tracks document-wide validity state.
+//! Compiles DTD element content models and tracks document validity for the Reader.
+//!
+//! Children content models become bounded DFA tables; mixed content remains a bounded
+//! name list. Per-element frames carry traversal state. The document state owns those
+//! tables, declaration issues, copied ID and IDREF bytes, the ID index, and all retained
+//! allocation capacity.
+//!
+//! Grammar names are `dtd.StoredString` offsets into a caller-owned `dtd.State` byte
+//! pool. A validation state must be used only with the declarations from which it was
+//! prepared. `copyCompiled` copies reusable external-subset tables and rebases their
+//! names to the destination declaration pool; it does not borrow the source validation
+//! state after returning.
+//!
+//! Before calling `prepare` on a state used for another document, call
+//! `clearRetainingCapacity`. `prepare` replaces grammar tables and declaration issues,
+//! but does not clear IDs, IDREFs, root progress, or comparison work. `copyCompiled`
+//! performs that reset itself. The caller owns the state and must deinitialize it with
+//! the allocator used for its storage.
+//!
+//! Validity violations produce or retain `Issue` values. `Error` is reserved for
+//! allocation failure and configured count, byte, table, comparison, or compilation
+//! ceilings. `max_errors` truncates retained declaration issues and sets
+//! `issues_truncated`; it does not convert validity problems into resource failures.
 
 const std = @import("std");
 const dtd = @import("dtd.zig");
@@ -326,7 +348,6 @@ pub const State = struct {
         }
     }
 
-    /// Copies immutable grammar tables and rebases their declaration strings.
     pub fn copyCompiled(
         self: *State,
         allocator: std.mem.Allocator,

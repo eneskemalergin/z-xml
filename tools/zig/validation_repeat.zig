@@ -1,4 +1,9 @@
-//! Repeated streaming validation adapter for fresh and compiled DTD comparisons.
+//! Measures repeated validating reads with either fresh or reused external DTD state.
+//!
+//! Each repetition opens the XML and streams it through a new Reader. The fresh build resolves and
+//! parses the document's external subset each time; the reused build compiles the supplied DTD once
+//! and passes it to every Reader. Each document must finish as valid, and output aggregates event
+//! counts and a checksum across all repetitions.
 
 const std = @import("std");
 const xml = @import("z_xml");
