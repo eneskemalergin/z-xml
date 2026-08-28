@@ -161,7 +161,6 @@ def generate_sequence(
     target_bytes: int,
     records: tuple[tuple[bytes, Callable[[Stats], None]], ...],
 ) -> None:
-    """Cycle through varied valid records without retaining the document."""
     begin_document(output, stats)
     remaining = target_bytes - DOCUMENT_OVERHEAD
     index = 0

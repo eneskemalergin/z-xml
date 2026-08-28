@@ -11,7 +11,6 @@
 //! parser state remain in `src/reader.zig`.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const xml = @import("z_xml");
 
 const CORE_CONFIG = xml.Configs.XML10_UTF8_NO_DTD;
@@ -10247,16 +10246,6 @@ fn boundedNormalFuzzOptions(
 }
 
 fn normalFuzzOutcome(source: xml.Source, options: xml.ReaderOptions) !NormalFuzzOutcome {
-    // HACK: Valgrind reports Zig's Debug stack probes for this Reader as invalid reads.
-    // Remove this path when Valgrind accepts the probes or Zig stops emitting them.
-    if (comptime builtin.valgrind_support) {
-        const reader = try std.testing.allocator.create(xml.Reader);
-        defer std.testing.allocator.destroy(reader);
-        reader.* = try xml.Reader.init(std.testing.allocator, source, options);
-        defer reader.deinit();
-        return drainNormalFuzzReader(reader);
-    }
-
     var reader = try xml.Reader.init(std.testing.allocator, source, options);
     defer reader.deinit();
     return drainNormalFuzzReader(&reader);

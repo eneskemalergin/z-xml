@@ -1,4 +1,6 @@
 #!/bin/sh
+# Fetches and verifies the pinned W3C XML Test Suite archive.
+
 set -eu
 
 archive_name=xmlts20130923.tar.gz
