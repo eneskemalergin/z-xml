@@ -1,6 +1,6 @@
 # Tools
 
-Status: **Active** (last updated: 2026-08-25)
+Status: **Active** (last updated: 2026-08-28)
 
 `tools/` contains development commands and parser adapters. It is excluded from the Zig package.
 
@@ -42,7 +42,8 @@ Standard test data:
 Measurement:
 
 - `tools/python/run-zebrac-aa.py` runs the same command under two names to measure machine noise.
-- `tools/python/run-zebrac-matrix.py` measures parser and workload pairs that passed their required checks.
+- `tools/python/run-zebrac-matrix.py` measures parser and workload pairs that passed their required checks. Repeated `--targets` and `--bin-dir` pairs place z-xml and peer binaries in the same changing-order Zebrac rounds. Shared `--program-arg` values support the persistent protocol.
+- `tools/python/summarize-zebrac.py` calculates per-workload and per-lane timing, RSS, fault, and hardware-counter metrics from saved matrix results. It does not combine different lanes into one score.
 - `tools/python/run-valgrind.py` checks correctness-passing corpus cases or an explicit standalone test executable for memory errors and leaked file descriptors. Tracked fixture cases keep companion external sources beside the selected XML file.
 
 `bench/` and `data/` are ignored. `bench/` contains local plans and small benchmark inputs. `data/` contains generated XML, downloaded test suites, and results. Benchmark results are local until the project has a stable way to reproduce and compare them.
@@ -78,12 +79,12 @@ tools/python/run-valgrind.py \
 
 Standalone mode writes `standalone.log`. Corpus mode keeps its existing metadata and result files.
 
-The Reader audit runs all 67 tests under Memcheck. Its fuzz helper uses heap storage for the Reader in this build because Valgrind reports Zig's Debug stack page probes as invalid reads. Normal tests and fuzz campaigns keep stack storage.
+The Reader audit runs all 67 tests under Memcheck with the same stack-based Reader storage used by normal tests and fuzz campaigns.
 
 The development build installs adapters under `tools/zig-out/bin` by default.
 
 ## Target lists
 
-`tools/targets.tsv` lists the z-xml reader configurations used by the fixture checker. `ref/targets.tsv` lists the reference parsers and the XML features each one supports. `ref/persistent-targets.tsv` lists the parsers used for repeated-input checks.
+`tools/targets.tsv` lists the z-xml reader configurations used by the fixture checker. `tools/persistent-targets.tsv` and `ref/persistent-targets.tsv` list the z-xml and peer parsers used for repeated-input checks. `ref/targets.tsv` lists the reference parsers and the XML features each one supports.
 
 The measurement scripts use `zebrac` from `PATH` by default. Pass `--zebrac PATH` to use another executable. `ref/build.sh` downloads and builds reference parsers in its local cache when needed.

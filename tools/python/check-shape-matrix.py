@@ -8,7 +8,6 @@ import csv
 import sys
 from pathlib import Path
 
-
 SCHEMA = "z-xml-shape-matrix-v1"
 FIXTURE_SCHEMA = "z-xml-fixtures-v2"
 EXPECTED_COLUMNS = [
@@ -26,8 +25,15 @@ EXPECTED_COLUMNS = [
     "notes",
 ]
 ORACLE_COLUMNS = ["id", "lane", "format", "fields", "status", "notes"]
-VALID_LANES = {"event", "dom", "validated", "event,dom", "event,dom,validated"}
-VALID_EXPECTATIONS = {"accept", "reject", "resource-limit"}
+VALID_LANES = {
+    "event",
+    "dom",
+    "validated",
+    "writer",
+    "event,dom",
+    "event,dom,validated",
+}
+VALID_EXPECTATIONS = {"accept", "reject", "resource-limit", "emit"}
 VALID_STATUSES = {"ready", "planned"}
 
 
@@ -64,7 +70,9 @@ def read_fixture_manifest(path: Path) -> dict[str, Path]:
         raise ValueError(f"{path}: missing fixture manifest header")
     if not any(line.strip() == f"# {FIXTURE_SCHEMA}" for line in lines):
         raise ValueError(f"{path}: missing {FIXTURE_SCHEMA} marker")
-    data_lines = [header] + [line for line in lines if line.strip() and not line.startswith("#")]
+    data_lines = [header] + [
+        line for line in lines if line.strip() and not line.startswith("#")
+    ]
     rows = csv.DictReader(data_lines, delimiter="\t")
     if rows.fieldnames != [
         "id",
@@ -83,7 +91,9 @@ def read_fixture_manifest(path: Path) -> dict[str, Path]:
         try:
             fixture_path.relative_to(path.parent.resolve())
         except ValueError as error:
-            raise ValueError(f"{path}:{line_number}: fixture path escapes root") from error
+            raise ValueError(
+                f"{path}:{line_number}: fixture path escapes root"
+            ) from error
         if not fixture_path.is_file():
             raise ValueError(f"{path}:{line_number}: missing {fixture_path}")
         fixtures[fixture_id] = fixture_path
@@ -95,10 +105,18 @@ def read_fixture_manifest(path: Path) -> dict[str, Path]:
 def validate_size_plan(value: str, label: str) -> None:
     if value in {"-", "depth:limit-1,limit,limit+1", "bytes:limit-1,limit,limit+1"}:
         return
-    if value.startswith("depth:"):
-        values = value.removeprefix("depth:").split(",")
+    count_prefix = next(
+        (
+            prefix
+            for prefix in ("depth:", "attributes:", "documents:")
+            if value.startswith(prefix)
+        ),
+        None,
+    )
+    if count_prefix is not None:
+        values = value.removeprefix(count_prefix).split(",")
         if not values or any(not item.isdigit() or int(item) <= 0 for item in values):
-            raise ValueError(f"{label}: invalid depth plan")
+            raise ValueError(f"{label}: invalid count plan")
         return
     elif value.startswith("bytes:"):
         values = value.removeprefix("bytes:").split(",")
@@ -125,7 +143,8 @@ def read_oracles(path: Path) -> dict[str, str]:
     if header is None:
         raise ValueError(f"{path}: missing oracle manifest header")
     rows = csv.DictReader(
-        [header] + [line for line in lines if line.strip() and not line.startswith("#")],
+        [header]
+        + [line for line in lines if line.strip() and not line.startswith("#")],
         delimiter="\t",
     )
     if rows.fieldnames != ORACLE_COLUMNS:
@@ -176,7 +195,9 @@ def validate(matrix: Path, fixtures_path: Path, oracles_path: Path) -> int:
         if row["oracle"] not in oracles:
             errors.append(f"{label}: unknown oracle {row['oracle']!r}")
         elif row["status"] == "ready" and oracles[row["oracle"]] != "ready":
-            errors.append(f"{label}: ready row uses an unready oracle {row['oracle']!r}")
+            errors.append(
+                f"{label}: ready row uses an unready oracle {row['oracle']!r}"
+            )
         try:
             validate_size_plan(row["size_plan"], label)
         except ValueError as error:
@@ -189,7 +210,10 @@ def validate(matrix: Path, fixtures_path: Path, oracles_path: Path) -> int:
             errors.append(f"{label}: seed-only ready row has no seed fixture")
         if row["expected"] == "reject" and row["oracle"] == "common-summary-v1":
             errors.append(f"{label}: rejection cannot use common-summary-v1")
-        if row["expected"] == "resource-limit" and row["oracle"] != "limit-diagnostic-v1":
+        if (
+            row["expected"] == "resource-limit"
+            and row["oracle"] != "limit-diagnostic-v1"
+        ):
             errors.append(f"{label}: resource-limit needs limit-diagnostic-v1")
     ids = [row["id"] for row in rows]
     for duplicate in sorted({item for item in ids if ids.count(item) > 1}):

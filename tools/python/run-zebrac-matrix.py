@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import fnmatch
+import hashlib
 import json
 import os
 import platform
@@ -17,7 +18,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMAS = {"z-xml-generated-v2", "z-xml-generated-v3"}
+GENERATED_SCHEMAS = {"z-xml-generated-v2", "z-xml-generated-v3"}
+NAMESPACE_SCHEMA = "z-xml-namespace-benchmark-v1"
 MAX_WORKLOAD_BYTES = 1024 * 1024 * 1024
 ELIGIBILITY_FIELDS = {"target", "workload", "verdict"}
 
@@ -43,8 +45,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--eligibility", type=Path, action="append", required=True)
-    parser.add_argument("--targets", type=Path, default=root / "ref" / "targets.tsv")
-    parser.add_argument("--bin-dir", type=Path, required=True)
+    parser.add_argument("--targets", type=Path, action="append", default=[])
+    parser.add_argument("--bin-dir", type=Path, action="append", required=True)
     parser.add_argument(
         "--zebrac",
         type=Path,
@@ -56,11 +58,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target", action="append", default=[])
     parser.add_argument("--lane", action="append", default=[])
+    parser.add_argument("--program-arg", action="append", default=[])
+    parser.add_argument("--work-multiplier", type=int, default=1)
+    parser.add_argument("--case", default="end-to-end")
     parser.add_argument("--max-bytes", type=int, default=64 * 1024 * 1024)
     parser.add_argument("--duration-ms", type=int, default=5000)
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true")
+    parser.set_defaults(default_targets=root / "ref" / "targets.tsv")
     return parser.parse_args()
 
 
@@ -88,26 +94,25 @@ def read_targets(path: Path, bin_dir: Path) -> dict[str, Target]:
     return targets
 
 
-def read_workloads(path: Path) -> dict[str, dict[str, str]]:
+def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
     root = path.parent.resolve()
     with path.open(encoding="utf-8", newline="") as stream:
         lines = list(stream)
     comments = {line[1:].strip() for line in lines if line.startswith("#")}
-    if not SCHEMAS.intersection(comments):
+    generated_schema = GENERATED_SCHEMAS.intersection(comments)
+    namespace_schema = NAMESPACE_SCHEMA in comments
+    if not generated_schema and not namespace_schema:
         raise ValueError(f"{path}: unsupported generated-corpus schema")
-    if f"size ceiling: {MAX_WORKLOAD_BYTES} bytes" not in comments:
+    if generated_schema and f"size ceiling: {MAX_WORKLOAD_BYTES} bytes" not in comments:
         raise ValueError(f"{path}: unexpected workload ceiling")
+    schema = NAMESPACE_SCHEMA if namespace_schema else max(generated_schema)
     workloads: dict[str, dict[str, str]] = {}
     rows = csv.DictReader(
         (line for line in lines if not line.startswith("#")), delimiter="\t"
     )
-    required = {
-        "id",
-        "path",
-        "target_bytes",
-        "actual_bytes",
-        "classification",
-    }
+    required = {"id", "path", "actual_bytes", "classification"}
+    if generated_schema:
+        required.add("target_bytes")
     if rows.fieldnames is None or required.difference(rows.fieldnames):
         raise ValueError(f"{path}: incomplete generated manifest")
     for row in rows:
@@ -130,7 +135,7 @@ def read_workloads(path: Path) -> dict[str, dict[str, str]]:
         seen_paths.add(resolved)
         actual = resolved.stat().st_size
         manifest_size = int(workload["actual_bytes"])
-        target_size = int(workload["target_bytes"])
+        target_size = int(workload.get("target_bytes", manifest_size))
         if actual != manifest_size:
             raise ValueError(f"{workload['id']}: size differs from manifest")
         if target_size and actual != target_size:
@@ -140,14 +145,47 @@ def read_workloads(path: Path) -> dict[str, dict[str, str]]:
         if workload["classification"] not in {"benchmark-valid", "not-well-formed"}:
             raise ValueError(f"{workload['id']}: unsupported classification")
         workload["resolved_path"] = str(resolved)
-    return workloads
+    return workloads, schema
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def source_information(root: Path) -> dict[str, object]:
+    revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    status = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    return {
+        "revision": revision.stdout.strip() if revision.returncode == 0 else None,
+        "tracked_dirty": bool(status.stdout) if status.returncode == 0 else None,
+    }
 
 
 def read_eligibility(path: Path) -> dict[tuple[str, str], str]:
     verdicts: dict[tuple[str, str], str] = {}
     with path.open(encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream, delimiter="\t")
-        if reader.fieldnames is None or ELIGIBILITY_FIELDS.difference(reader.fieldnames):
+        if reader.fieldnames is None or ELIGIBILITY_FIELDS.difference(
+            reader.fieldnames
+        ):
             raise ValueError(f"{path}: incomplete eligibility report")
         for line_number, row in enumerate(reader, 2):
             target = row.get("target", "")
@@ -236,12 +274,38 @@ def host_information() -> dict[str, object]:
     except (OSError, ValueError):
         pass
     libc_name, libc_version = platform.libc_ver()
+    affinity = (
+        sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
+    )
+    governors: set[str] = set()
+    for cpu in affinity:
+        try:
+            governors.add(
+                Path(f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_governor")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+        except OSError:
+            pass
+    perf_event_paranoid = None
+    try:
+        perf_event_paranoid = int(
+            Path("/proc/sys/kernel/perf_event_paranoid")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+    except (OSError, ValueError):
+        pass
     return {
         "system": platform.system(),
         "kernel": platform.release(),
         "machine": platform.machine(),
         "cpu_model": cpu_model,
         "logical_cpu_count": os.cpu_count(),
+        "cpu_affinity": affinity,
+        "cpu_governors": sorted(governors),
+        "load_average": list(os.getloadavg()),
+        "perf_event_paranoid": perf_event_paranoid,
         "memory_kib": memory_kib,
         "libc": libc_name,
         "libc_version": libc_version,
@@ -255,6 +319,8 @@ def main() -> int:
         or args.duration_ms <= 0
         or args.samples <= 0
         or args.warmups < 0
+        or args.work_multiplier <= 0
+        or not args.case
     ):
         print(
             "numeric limits must be positive, except warmups may be zero",
@@ -262,8 +328,21 @@ def main() -> int:
         )
         return 64
     try:
-        targets = read_targets(args.targets, args.bin_dir.resolve())
-        workloads = read_workloads(args.manifest)
+        target_paths = args.targets or [args.default_targets]
+        if len(target_paths) != len(args.bin_dir):
+            raise ValueError("each --targets needs one --bin-dir in the same position")
+        target_sets = list(zip(target_paths, args.bin_dir, strict=True))
+        targets: dict[str, Target] = {}
+        for target_path, bin_dir in target_sets:
+            current = read_targets(target_path, bin_dir.resolve())
+            duplicates = targets.keys() & current.keys()
+            if duplicates:
+                raise ValueError(
+                    "duplicate targets across manifests: "
+                    + ",".join(sorted(duplicates))
+                )
+            targets.update(current)
+        workloads, manifest_schema = read_workloads(args.manifest)
         verdicts: dict[tuple[str, str], str] = {}
         for eligibility_path in args.eligibility:
             verdicts.update(read_eligibility(eligibility_path))
@@ -335,7 +414,13 @@ def main() -> int:
                 )
                 return 1
             commands = [
-                shlex.join([str(target.executable), workload["resolved_path"]])
+                shlex.join(
+                    [
+                        str(target.executable),
+                        *args.program_arg,
+                        workload["resolved_path"],
+                    ]
+                )
                 for target in eligible
             ]
             groups.append(
@@ -389,12 +474,6 @@ def main() -> int:
         print("unable to query zebrac version", file=sys.stderr)
         return 1
     version_text = version.stdout.strip()
-    profile_stamp = (
-        args.bin_dir.resolve().parent.parent
-        / "build"
-        / args.bin_dir.resolve().name
-        / ".release-profile"
-    )
     participating_targets = {
         target.name for group in groups for target in group["targets"]
     }
@@ -402,6 +481,9 @@ def main() -> int:
         target.name: {
             "path": str(target.executable),
             "size": target.executable.stat().st_size,
+            "mtime_ns": target.executable.stat().st_mtime_ns,
+            "sha256": sha256(target.executable),
+            "processor_class": target.processor_class,
             "lane": target.work_lane,
             "input_model": target.input_model,
         }
@@ -409,19 +491,26 @@ def main() -> int:
         if target.name in participating_targets and target.executable.is_file()
     }
     index: dict[str, object] = {
-        "schema": "z-xml-zebrac-matrix-v2",
+        "schema": "z-xml-zebrac-matrix-v3",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "manifest": str(args.manifest.resolve()),
+        "manifest_schema": manifest_schema,
         "eligibility": [str(path.resolve()) for path in args.eligibility],
-        "bin_dir": str(args.bin_dir.resolve()),
         "zebrac": str(zebrac),
         "zebrac_version": version_text,
-        "targets_manifest": str(args.targets.resolve()),
-        "build_profile": profile_stamp.read_text(encoding="utf-8")
-        if profile_stamp.is_file()
-        else None,
+        "target_sets": [
+            {
+                "targets_manifest": str(target_path.resolve()),
+                "bin_dir": str(bin_dir.resolve()),
+            }
+            for target_path, bin_dir in target_sets
+        ],
+        "source": source_information(Path(__file__).resolve().parents[2]),
         "host": host_information(),
         "target_binaries": selected_binary_metadata,
+        "measurement_case": args.case,
+        "program_arguments": args.program_arg,
+        "work_multiplier": args.work_multiplier,
         "sampling": {
             "duration_ms": args.duration_ms,
             "samples": args.samples,
@@ -462,6 +551,7 @@ def main() -> int:
         run = {
             "workload": workload["id"],
             "bytes": int(workload["actual_bytes"]),
+            "work_bytes": int(workload["actual_bytes"]) * args.work_multiplier,
             "classification": workload["classification"],
             "lane": lane,
             "targets": [target.name for target in group["targets"]],
