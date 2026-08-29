@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import os
 import subprocess
@@ -17,10 +18,25 @@ from typing import BinaryIO, Callable
 FNV_OFFSET = 14695981039346656037
 FNV_PRIME = 1099511628211
 SCHEMA = "z-xml-generated-v3"
-ACCEPTED_SCHEMAS = {SCHEMA, "z-xml-generated-v2"}
 PLAN_SCHEMA = "z-xml-benchmark-plan-v1"
 DOCUMENT_OVERHEAD = len(b"<root></root>")
 MAX_TARGET_BYTES = 1024 * 1024 * 1024
+MANIFEST_COLUMNS = [
+    "id",
+    "path",
+    "shape",
+    "target_bytes",
+    "actual_bytes",
+    "classification",
+    "feature_checks",
+    "rejection_fraction",
+    "fatal_offset",
+    "fatal_fraction",
+    "elements",
+    "attributes",
+    "normalized_text_bytes",
+    "expected_summary",
+]
 
 
 def fnv_update(value: int, data: bytes) -> int:
@@ -73,13 +89,21 @@ class Stats:
         expected = {"elements", "attributes", "text_bytes", "checksum"}
         if set(value) != expected:
             raise ValueError("summary output has unexpected fields")
+        if (
+            type(value["elements"]) is not int
+            or type(value["attributes"]) is not int
+            or type(value["text_bytes"]) is not int
+            or not isinstance(value["checksum"], str)
+            or len(value["checksum"]) != 16
+        ):
+            raise ValueError("summary output has invalid values")
         try:
             checksum = int(value["checksum"], 16)
-            elements = int(value["elements"])
-            attributes = int(value["attributes"])
-            text_bytes = int(value["text_bytes"])
-        except (TypeError, ValueError) as error:
+        except ValueError as error:
             raise ValueError("summary output has invalid values") from error
+        elements = value["elements"]
+        attributes = value["attributes"]
+        text_bytes = value["text_bytes"]
         if (
             min(checksum, elements, attributes, text_bytes) < 0
             or checksum > 0xFFFFFFFFFFFFFFFF
@@ -105,6 +129,20 @@ class Output:
             count -= records_per_block
         if count:
             self.write(record * count)
+
+
+class ComparingOutput(Output):
+    def __init__(self, stream: BinaryIO):
+        super().__init__(stream)
+        self.matches = True
+
+    def write(self, data: bytes) -> None:
+        if self.stream.read(len(data)) != data:
+            self.matches = False
+        self.size += len(data)
+
+    def finish(self) -> bool:
+        return self.matches and self.stream.read(1) == b""
 
 
 def begin_document(output: Output, stats: Stats | None) -> None:
@@ -459,17 +497,38 @@ def generate_rejection(output: Output, target_bytes: int, fraction: int) -> int:
     return fatal_offset
 
 
+def generated_bytes_match(path: Path, row: dict[str, str]) -> bool:
+    with path.open("rb") as stream:
+        output = ComparingOutput(stream)
+        if row["shape"] == "rejection":
+            generate_rejection(
+                output,
+                int(row["target_bytes"]),
+                int(row["rejection_fraction"]),
+            )
+        elif row["shape"] == "deep":
+            depth = int(row["id"].removeprefix("deep-"))
+            generate_deep(output, Stats(), depth)
+        else:
+            generate_shape(output, None, row["shape"], int(row["target_bytes"]))
+        return output.finish()
+
+
 def atomic_generate(
     path: Path, generator: Callable[[Output], Stats | None]
 ) -> tuple[int, Stats | None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("wb") as stream:
-        output = Output(stream)
-        stats = generator(output)
-        stream.flush()
-        os.fsync(stream.fileno())
-    temporary.replace(path)
+    try:
+        with temporary.open("wb") as stream:
+            output = Output(stream)
+            stats = generator(output)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
     return output.size, stats
 
 
@@ -493,15 +552,20 @@ def collect_summary(program: Path, path: Path) -> Stats:
 
 
 def parse_positive_csv(value: str, label: str) -> list[int]:
+    items = value.split(",")
+    if any(not item for item in items):
+        raise argparse.ArgumentTypeError(f"{label} values must not be empty")
     try:
-        values = [int(item) for item in value.split(",") if item]
+        values = [int(item) for item in items]
     except ValueError as error:
         raise argparse.ArgumentTypeError(
             f"{label} must be comma-separated integers"
         ) from error
     if not values or any(item <= 0 for item in values):
         raise argparse.ArgumentTypeError(f"{label} values must be positive")
-    return sorted(set(values))
+    if len(values) != len(set(values)):
+        raise argparse.ArgumentTypeError(f"{label} values must not repeat")
+    return sorted(values)
 
 
 def validate_sizes_mib(values: list[int], label: str) -> None:
@@ -519,19 +583,25 @@ def read_plan(path: Path) -> tuple[dict[str, list[int]], dict[int, list[int]]]:
     rejection_sizes: dict[int, list[int]] = {}
     with path.open(encoding="utf-8", newline="") as stream:
         comments: list[str] = []
-        data_lines: list[str] = []
-        for line in stream:
+        data_entries: list[tuple[int, str]] = []
+        for line_number, line in enumerate(stream, 1):
             if line.startswith("#"):
                 comments.append(line[1:].strip())
             elif line.strip():
-                data_lines.append(line)
-    if PLAN_SCHEMA not in comments:
-        raise ValueError(f"{path}: missing {PLAN_SCHEMA} marker")
+                data_entries.append((line_number, line))
+    if comments.count(PLAN_SCHEMA) != 1:
+        raise ValueError(f"{path}: expected one {PLAN_SCHEMA} marker")
+    data_lines = [line for _, line in data_entries]
     reader = csv.DictReader(data_lines, delimiter="\t")
     if reader.fieldnames != ["shape", "sizes_mib", "rejection_fractions"]:
         raise ValueError(f"{path}: unexpected plan columns")
-    for line_number, row in enumerate(reader, 2):
+    for row_index, row in enumerate(reader, 1):
+        line_number = data_entries[row_index][0]
+        if None in row or any(value is None for value in row.values()):
+            raise ValueError(f"{path}:{line_number}: wrong plan field count")
         shape = row["shape"]
+        if not shape:
+            raise ValueError(f"{path}:{line_number}: empty shape")
         if shape in shape_sizes or (shape == "rejection" and rejection_sizes):
             raise ValueError(f"{path}:{line_number}: duplicate shape {shape}")
         try:
@@ -582,7 +652,116 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def verify(output_dir: Path, plan: Path | None) -> int:
+def select_workloads(
+    args: argparse.Namespace,
+) -> tuple[
+    dict[str, list[tuple[str, int]]],
+    dict[tuple[str, int], list[int]],
+    list[int],
+]:
+    depths = parse_positive_csv(args.depths, "depths")
+    if args.plan:
+        if args.sizes_kib is not None:
+            raise ValueError("--sizes-kib cannot be combined with --plan")
+        shape_sizes_mib, rejection_sizes_mib = read_plan(args.plan)
+        if args.no_rejection:
+            rejection_sizes_mib = {}
+        shape_targets = {
+            shape: [(f"{size}m", size * 1024 * 1024) for size in sizes]
+            for shape, sizes in shape_sizes_mib.items()
+        }
+        rejection_targets = {
+            (f"{size}m", size * 1024 * 1024): fractions
+            for size, fractions in rejection_sizes_mib.items()
+        }
+    else:
+        if args.sizes_kib is not None:
+            sizes_kib = parse_positive_csv(args.sizes_kib, "sizes-kib")
+            validate_sizes_kib(sizes_kib, "sizes-kib")
+            targets = [(f"{size}k", size * 1024) for size in sizes_kib]
+        else:
+            sizes_mib = parse_positive_csv(args.sizes_mib, "sizes-mib")
+            validate_sizes_mib(sizes_mib, "sizes-mib")
+            targets = [(f"{size}m", size * 1024 * 1024) for size in sizes_mib]
+        shapes = args.shapes.split(",")
+        if not shapes or any(not shape for shape in shapes):
+            raise ValueError("shapes must not be empty")
+        if len(shapes) != len(set(shapes)):
+            raise ValueError("shapes must not repeat")
+        unknown_shapes = sorted(set(shapes).difference(SHAPES))
+        if unknown_shapes:
+            raise ValueError("unknown shapes: " + ",".join(unknown_shapes))
+        shape_targets = {shape: targets for shape in shapes}
+        rejection_targets = (
+            {} if args.no_rejection else {target: [1, 50, 99] for target in targets}
+        )
+    return shape_targets, rejection_targets, depths
+
+
+def expected_layout(
+    shape_targets: dict[str, list[tuple[str, int]]],
+    rejection_targets: dict[tuple[str, int], list[int]],
+    depths: list[int],
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for shape, targets in shape_targets.items():
+        for size_label, target_bytes in targets:
+            item_id = f"{shape}-{size_label}"
+            rows.append(
+                {
+                    "id": item_id,
+                    "path": str(Path("valid") / f"{item_id}.xml"),
+                    "shape": shape,
+                    "target_bytes": str(target_bytes),
+                    "actual_bytes": str(target_bytes),
+                    "classification": "benchmark-valid",
+                    "feature_checks": SHAPE_FEATURES[shape],
+                    "rejection_fraction": "-",
+                    "fatal_offset": "-",
+                    "fatal_fraction": "-",
+                }
+            )
+    for (size_label, target_bytes), fractions in rejection_targets.items():
+        for fraction in fractions:
+            item_id = f"reject-{fraction:02d}-{size_label}"
+            rows.append(
+                {
+                    "id": item_id,
+                    "path": str(Path("invalid") / f"{item_id}.xml"),
+                    "shape": "rejection",
+                    "target_bytes": str(target_bytes),
+                    "actual_bytes": str(target_bytes),
+                    "classification": "not-well-formed",
+                    "feature_checks": "check_element_matching",
+                    "rejection_fraction": str(fraction),
+                }
+            )
+    for depth in depths:
+        item_id = f"deep-{depth}"
+        rows.append(
+            {
+                "id": item_id,
+                "path": str(Path("valid") / f"{item_id}.xml"),
+                "shape": "deep",
+                "target_bytes": "0",
+                "actual_bytes": str(depth * 7 + 1),
+                "classification": "benchmark-valid",
+                "feature_checks": f"document,element_matching,depth_{depth}",
+                "rejection_fraction": "-",
+                "fatal_offset": "-",
+                "fatal_fraction": "-",
+            }
+        )
+    return rows
+
+
+def verify(
+    output_dir: Path,
+    plan: Path | None,
+    shape_targets: dict[str, list[tuple[str, int]]],
+    rejection_targets: dict[tuple[str, int], list[int]],
+    depths: list[int],
+) -> int:
     manifest = output_dir / "manifest.tsv"
     if not manifest.is_file():
         print(f"missing generated manifest: {manifest}", file=sys.stderr)
@@ -593,29 +772,92 @@ def verify(output_dir: Path, plan: Path | None) -> int:
     except OSError as error:
         print(error, file=sys.stderr)
         return 1
-    comments = {line[1:].strip() for line in lines if line.startswith("#")}
-    if not ACCEPTED_SCHEMAS.intersection(comments):
-        errors.append("manifest has an unsupported generated-corpus schema")
-    if f"size ceiling: {MAX_TARGET_BYTES} bytes" not in comments:
+    comments = [line[1:].strip() for line in lines if line.startswith("#")]
+    schema_markers = [comment for comment in comments if comment.startswith("z-xml-generated-")]
+    if schema_markers != [SCHEMA]:
+        errors.append(f"manifest must contain exactly one {SCHEMA} marker")
+    if comments.count(f"size ceiling: {MAX_TARGET_BYTES} bytes") != 1:
         errors.append("manifest has an unexpected size ceiling")
     if plan is not None:
-        if f"plan_name: {plan.name}" not in comments:
+        if comments.count(f"plan_name: {plan.name}") != 1:
             errors.append("manifest plan name differs")
-    rows = list(
-        csv.DictReader(
-            (line for line in lines if not line.startswith("#")), delimiter="\t"
-        )
-    )
+    elif any(comment.startswith("plan_name:") for comment in comments):
+        errors.append("manifest unexpectedly names a plan")
+    summary_comments = [
+        comment for comment in comments if comment.startswith("summary_program:")
+    ]
+    if len(summary_comments) > 1:
+        errors.append("manifest names more than one summary program")
+    elif summary_comments and not summary_comments[0].removeprefix(
+        "summary_program:"
+    ).strip():
+        errors.append("manifest has an empty summary program")
+    expected_comments = [SCHEMA, f"size ceiling: {MAX_TARGET_BYTES} bytes"]
+    if plan is not None:
+        expected_comments.append(f"plan_name: {plan.name}")
+    if summary_comments:
+        expected_comments.append(summary_comments[0])
+    if comments != expected_comments:
+        errors.append("manifest comments differ")
+    data_entries = [
+        (line_number, line)
+        for line_number, line in enumerate(lines, 1)
+        if line.strip() and not line.startswith("#")
+    ]
+    data_lines = [line for _, line in data_entries]
+    reader = csv.DictReader(data_lines, delimiter="\t")
+    if reader.fieldnames != MANIFEST_COLUMNS:
+        errors.append("manifest has unexpected columns")
+        print("\n".join(errors), file=sys.stderr)
+        return 1
+    rows = list(reader)
     if not rows:
         errors.append("manifest has no workloads")
+    for row_index, row in enumerate(rows, 1):
+        if None in row or any(value is None for value in row.values()):
+            errors.append(
+                f"manifest:{data_entries[row_index][0]}: wrong field count"
+            )
+    if errors:
+        print("\n".join(errors), file=sys.stderr)
+        return 1
+    canonical_data = io.StringIO(newline="")
+    canonical_writer = csv.DictWriter(
+        canonical_data,
+        fieldnames=MANIFEST_COLUMNS,
+        delimiter="\t",
+        lineterminator="\n",
+    )
+    canonical_writer.writeheader()
+    canonical_writer.writerows(rows)
+    canonical_manifest = "".join(
+        f"# {comment}\n" for comment in expected_comments
+    ) + canonical_data.getvalue()
+    if "".join(lines) != canonical_manifest:
+        print("manifest is not in canonical form", file=sys.stderr)
+        return 1
+    expected_rows = expected_layout(shape_targets, rejection_targets, depths)
+    if [row["id"] for row in rows] != [row["id"] for row in expected_rows]:
+        errors.append("manifest workload rows differ from the requested configuration")
     seen_ids: set[str] = set()
     expected_paths: set[Path] = set()
     root = output_dir.resolve()
+    expected_by_id = {row["id"]: row for row in expected_rows}
     for row in rows:
         item_id = row.get("id", "<missing-id>")
         if item_id in seen_ids:
             errors.append(f"{item_id}: duplicate workload ID")
         seen_ids.add(item_id)
+        expected = expected_by_id.get(item_id)
+        if expected is None:
+            continue
+        for field, value in expected.items():
+            dynamic_rejection_field = (
+                expected["classification"] == "not-well-formed"
+                and field in {"fatal_offset", "fatal_fraction"}
+            )
+            if not dynamic_rejection_field and row[field] != value:
+                errors.append(f"{item_id}: {field} differs")
         try:
             path = (root / row["path"]).resolve()
             path.relative_to(root)
@@ -635,7 +877,34 @@ def verify(output_dir: Path, plan: Path | None) -> int:
             errors.append(f"{item_id}: generated size differs from target")
         if data_size > MAX_TARGET_BYTES:
             errors.append(f"{item_id}: exceeds the 1 GiB ceiling")
-        if row.get("classification") == "not-well-formed":
+        try:
+            if not generated_bytes_match(path, row):
+                errors.append(f"{item_id}: generated bytes differ")
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            errors.append(f"{item_id}: cannot verify generated bytes: {error}")
+        if row["classification"] == "benchmark-valid":
+            try:
+                summary = Stats.from_json(json.loads(row["expected_summary"]))
+                if (
+                    row["elements"] != str(summary.elements)
+                    or row["attributes"] != str(summary.attributes)
+                    or row["normalized_text_bytes"] != str(summary.text_bytes)
+                    or row["expected_summary"] != summary.compact_json()
+                ):
+                    raise ValueError("summary columns disagree")
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                errors.append(f"{item_id}: invalid semantic summary: {error}")
+        elif row["classification"] == "not-well-formed":
+            if any(
+                row[field] != "-"
+                for field in (
+                    "elements",
+                    "attributes",
+                    "normalized_text_bytes",
+                    "expected_summary",
+                )
+            ):
+                errors.append(f"{item_id}: rejection has semantic summary fields")
             try:
                 requested_fraction = int(row["rejection_fraction"])
                 fatal_offset = int(row["fatal_offset"])
@@ -655,16 +924,20 @@ def verify(output_dir: Path, plan: Path | None) -> int:
                     or fatal_offset + len(b"</bad>") > data_size
                     or abs(declared_fraction - actual_fraction) > 0.000001
                     or fatal_offset != expected_offset
+                    or row["fatal_offset"] != str(expected_offset)
+                    or row["fatal_fraction"] != f"{actual_fraction:.6f}"
                     or fatal_construct != b"</bad>"
                 ):
                     errors.append(f"{item_id}: rejection position differs")
+        else:
+            errors.append(f"{item_id}: unsupported classification")
     actual_paths = {
         path.resolve().relative_to(root)
-        for path in output_dir.rglob("*.xml")
-        if path.is_file()
+        for path in output_dir.rglob("*")
+        if path.is_file() and path.resolve() != manifest.resolve()
     }
     for unexpected in sorted(actual_paths.difference(expected_paths)):
-        errors.append(f"unexpected generated XML file: {unexpected}")
+        errors.append(f"unexpected generated file: {unexpected}")
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
@@ -674,41 +947,8 @@ def verify(output_dir: Path, plan: Path | None) -> int:
 
 def main() -> int:
     args = parse_args()
-    if args.check:
-        return verify(args.output_dir, args.plan)
     try:
-        depths = parse_positive_csv(args.depths, "depths")
-        if args.plan:
-            if args.sizes_kib is not None:
-                raise ValueError("--sizes-kib cannot be combined with --plan")
-            shape_sizes_mib, rejection_sizes_mib = read_plan(args.plan)
-            if args.no_rejection:
-                rejection_sizes_mib = {}
-            shape_targets = {
-                shape: [(f"{size}m", size * 1024 * 1024) for size in sizes]
-                for shape, sizes in shape_sizes_mib.items()
-            }
-            rejection_targets = {
-                (f"{size}m", size * 1024 * 1024): fractions
-                for size, fractions in rejection_sizes_mib.items()
-            }
-        else:
-            if args.sizes_kib is not None:
-                sizes_kib = parse_positive_csv(args.sizes_kib, "sizes-kib")
-                validate_sizes_kib(sizes_kib, "sizes-kib")
-                targets = [(f"{size}k", size * 1024) for size in sizes_kib]
-            else:
-                sizes_mib = parse_positive_csv(args.sizes_mib, "sizes-mib")
-                validate_sizes_mib(sizes_mib, "sizes-mib")
-                targets = [(f"{size}m", size * 1024 * 1024) for size in sizes_mib]
-            shapes = args.shapes.split(",")
-            unknown_shapes = sorted(set(shapes).difference(SHAPES))
-            if unknown_shapes:
-                raise ValueError("unknown shapes: " + ",".join(unknown_shapes))
-            shape_targets = {shape: targets for shape in shapes}
-            rejection_targets = (
-                {} if args.no_rejection else {target: [1, 50, 99] for target in targets}
-            )
+        shape_targets, rejection_targets, depths = select_workloads(args)
         if args.summary_program:
             args.summary_program = args.summary_program.resolve()
             if not args.summary_program.is_file():
@@ -716,6 +956,14 @@ def main() -> int:
     except (argparse.ArgumentTypeError, OSError, ValueError) as error:
         print(error, file=sys.stderr)
         return 64
+    if args.check:
+        return verify(
+            args.output_dir,
+            args.plan,
+            shape_targets,
+            rejection_targets,
+            depths,
+        )
 
     rows: list[dict[str, str | int]] = []
     for shape, targets in shape_targets.items():
@@ -822,23 +1070,32 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest = args.output_dir / "manifest.tsv"
     temporary = manifest.with_name(manifest.name + ".tmp")
-    fieldnames = list(rows[0])
-    with temporary.open("w", encoding="utf-8", newline="") as stream:
-        stream.write(f"# {SCHEMA}\n")
-        stream.write(f"# size ceiling: {MAX_TARGET_BYTES} bytes\n")
-        if args.plan:
-            stream.write(f"# plan_name: {args.plan.name}\n")
-        if args.summary_program:
-            stream.write(f"# summary_program: {args.summary_program.name}\n")
-        writer = csv.DictWriter(
-            stream, fieldnames=fieldnames, delimiter="\t", lineterminator="\n"
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-    temporary.replace(manifest)
+    fieldnames = MANIFEST_COLUMNS
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as stream:
+            stream.write(f"# {SCHEMA}\n")
+            stream.write(f"# size ceiling: {MAX_TARGET_BYTES} bytes\n")
+            if args.plan:
+                stream.write(f"# plan_name: {args.plan.name}\n")
+            if args.summary_program:
+                stream.write(f"# summary_program: {args.summary_program.name}\n")
+            writer = csv.DictWriter(
+                stream, fieldnames=fieldnames, delimiter="\t", lineterminator="\n"
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+        temporary.replace(manifest)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
     print(f"generated {len(rows)} workloads at {args.output_dir}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        status = main()
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print(error, file=sys.stderr)
+        status = 1
+    raise SystemExit(status)
