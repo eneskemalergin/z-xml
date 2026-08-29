@@ -1,4 +1,4 @@
-# z-xml-fixtures-v2
+# z-xml-fixtures-v3
 # id	path	classification	recommendation	feature_checks	description
 core-declaration	valid/core/declaration.xml	well-formed	XML1.0-5e	document,xml_declaration	XML declaration with UTF-8 and standalone
 core-mixed	valid/core/mixed_content.xml	well-formed	XML1.0-5e	document	Mixed text and element content
@@ -111,24 +111,24 @@ dtd-bad-element-text	invalid/dtd/element_content_text.xml	dtd-invalid	XML1.0-5e	
 dtd-bad-external	invalid/dtd/external_wrong_content.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	External DTD content model violation
 external-entity-unclosed	invalid/not_well_formed/external_entity_unclosed.xml	not-well-formed	XML1.0-5e	dtd,external_general_entities,check_element_matching	External parsed entity leaves an element open across its boundary
 dtd-bad-undeclared-root	invalid/dtd/undeclared_root.xml	dtd-invalid	XML1.0-5e	dtd	Document element has no declaration
-dtd-bad-nondeterministic	invalid/dtd/nondeterministic_content_model.xml	dtd-invalid	XML1.0-5e	dtd	Content model permits one child to match two particles
+dtd-bad-nondeterministic	invalid/dtd/nondeterministic_content_model.xml	dtd-invalid	XML1.0-5e	dtd,validation_deterministic_content_model	Content model permits one child to match two particles
 dtd-bad-duplicate-element	invalid/dtd/duplicate_element_declaration.xml	dtd-invalid	XML1.0-5e	dtd	Element type is declared twice
 dtd-bad-multiple-id	invalid/dtd/multiple_id_declarations.xml	dtd-invalid	XML1.0-5e	dtd	Element type declares two ID attributes
 dtd-bad-id-default	invalid/dtd/id_default_value.xml	dtd-invalid	XML1.0-5e	dtd	ID attribute has a literal default
 dtd-bad-duplicate-mixed-name	invalid/dtd/duplicate_mixed_name.xml	dtd-invalid	XML1.0-5e	dtd	Mixed content names one child type twice
 dtd-bad-notation-empty	invalid/dtd/notation_on_empty_element.xml	dtd-invalid	XML1.0-5e	dtd	EMPTY element declares a NOTATION attribute
-dtd-bad-multiple-notation	invalid/dtd/multiple_notation_declarations.xml	dtd-invalid	XML1.0-5e	dtd	Element type declares two NOTATION attributes
-dtd-bad-undeclared-notation	invalid/dtd/undeclared_notation.xml	dtd-invalid	XML1.0-5e	dtd	NOTATION attribute names an undeclared notation
+dtd-bad-multiple-notation	invalid/dtd/multiple_notation_declarations.xml	dtd-invalid	XML1.0-5e	dtd,validation_single_notation_attribute	Element type declares two NOTATION attributes
+dtd-bad-undeclared-notation	invalid/dtd/undeclared_notation.xml	dtd-invalid	XML1.0-5e	dtd,validation_declared_notation	NOTATION attribute names an undeclared notation
 dtd-bad-duplicate-enumeration	invalid/dtd/duplicate_enumeration_token.xml	dtd-invalid	XML1.0-5e	dtd	Enumeration repeats one token
 dtd-bad-entity-attribute	invalid/dtd/entity_attribute_value.xml	dtd-invalid	XML1.0-5e	dtd	ENTITY attribute names a parsed entity
 dtd-bad-nmtokens	invalid/dtd/nmtokens_value.xml	dtd-invalid	XML1.0-5e	dtd	NMTOKENS attribute contains non-name punctuation
 dtd-bad-empty-comment	invalid/dtd/empty_contains_comment.xml	dtd-invalid	XML1.0-5e	dtd	EMPTY element contains a comment
 dtd-bad-element-cdata-space	invalid/dtd/element_content_cdata_whitespace.xml	dtd-invalid	XML1.0-5e	dtd	Element-only content contains CDATA whitespace
-dtd-bad-element-reference-space	invalid/dtd/element_content_reference_whitespace.xml	dtd-invalid	XML1.0-5e	dtd	Element-only content contains referenced whitespace
+dtd-bad-element-reference-space	invalid/dtd/element_content_reference_whitespace.xml	dtd-invalid	XML1.0-5e	dtd,validation_element_content_whitespace	Element-only content contains referenced whitespace
 dtd-bad-missing-doctype	valid/core/mixed_content.xml	dtd-invalid	XML1.0-5e	dtd	Document has no document type declaration
-dtd-bad-xml-space	invalid/dtd/xml_space_declaration.xml	dtd-invalid	XML1.0-5e	dtd	xml:space declaration contains an unsupported token
+dtd-bad-xml-space	invalid/dtd/xml_space_declaration.xml	dtd-invalid	XML1.0-5e	dtd,validation_xml_space_values	xml:space declaration contains an unsupported token
 dtd-bad-undeclared-attribute	invalid/dtd/undeclared_attribute.xml	dtd-invalid	XML1.0-5e	dtd	Element specifies an undeclared attribute
-dtd-bad-duplicate-notation	invalid/dtd/duplicate_notation_declaration.xml	dtd-invalid	XML1.0-5e	dtd	Notation name is declared twice
+dtd-bad-duplicate-notation	invalid/dtd/duplicate_notation_declaration.xml	dtd-invalid	XML1.0-5e	dtd,validation_unique_notation_declarations	Notation name is declared twice
 dtd-bad-standalone-default	invalid/dtd/standalone_default.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	Standalone document depends on an external default attribute
 dtd-bad-standalone-normalization	invalid/dtd/standalone_normalization.xml	dtd-invalid	XML1.0-5e	dtd,external_dtd	Standalone document depends on external tokenized normalization
 dtd-wf-standalone-entity	invalid/dtd/standalone_entity.xml	not-well-formed	XML1.0-5e	dtd,external_dtd,check_declared_entities	Standalone document references an externally declared entity

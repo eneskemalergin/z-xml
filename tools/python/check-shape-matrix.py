@@ -11,7 +11,7 @@ from pathlib import Path
 SCHEMA = "z-xml-shape-matrix-v1"
 ORACLE_SCHEMA = "z-xml-oracles-v1"
 PLAN_SCHEMA = "z-xml-benchmark-plan-v1"
-FIXTURE_SCHEMA = "z-xml-fixtures-v2"
+FIXTURE_SCHEMA = "z-xml-fixtures-v3"
 WRITER_TARGET_SCHEMA = "z-xml-writer-targets-v1"
 EXPECTED_COLUMNS = [
     "id",

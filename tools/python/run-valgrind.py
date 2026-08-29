@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import cast
 
 GENERATED_SCHEMA = "z-xml-generated-v3"
-FIXTURE_SCHEMA = "z-xml-fixtures-v2"
+FIXTURE_SCHEMA = "z-xml-fixtures-v3"
 TARGET_SCHEMAS = {"z-xml-targets-v1", "z-xml-targets-v2"}
 TARGET_HEADER = "name\texecutable\tprocessor_class\tfeatures\twork_lane\tinput_model"
 MAX_CONTROL_BYTES = 16 * 1024 * 1024

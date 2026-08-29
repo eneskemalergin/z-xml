@@ -1,10 +1,14 @@
 # XML Fixtures
 
-Status: **Active** (last updated: 2026-08-28)
+Status: **Active** (last updated: 2026-08-29)
 
 `fixture/` contains XML files used to check parser behavior. These files are tracked in the repository but are not included in the Zig package.
 
-`manifest.tsv` lists each test file, its expected XML classification, and the parser features needed to check it. Accepted files can cover several related rules at once. Rejected files usually cover one error because parsing stops at the first fatal error.
+`manifest.tsv` uses schema `z-xml-fixtures-v3`. It lists each test file, its expected XML classification, and the parser features needed to check it. Accepted files can cover several related rules at once. Rejected files usually cover one error because parsing stops at the first fatal error.
+
+Feature names beginning with `validation_` apply only to the validated work lane. A full validating processor claims every such constraint. A partial validator declares the individual constraints it enforces.
+
+The `recommendation` field names the specification used to classify a fixture. It is not a minimum-edition selector. Edition-specific applicability belongs in `feature_checks`.
 
 The manifest entry defines the expected result. One file may serve more than one entry when the same bytes have different results under different parser modes.
 
