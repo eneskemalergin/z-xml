@@ -1,0 +1,3 @@
+# z-xml-writer-targets-v1
+# name	executable	processor_class	features	work_lane	input_model
+z-xml-writer	z-xml-writer	writer	writer_protocol,manifest_shapes,exact_output_tests,reader_oracle,sink_calls,memory_report,buffered_sink,short_sink	writer	manifest-selected

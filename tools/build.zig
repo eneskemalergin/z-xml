@@ -44,6 +44,10 @@ pub fn build(b: *std.Build) void {
         "persistent-adapters",
         "Build and install the qualified persistent adapters",
     );
+    const writer_adapter_step = b.step(
+        "writer-adapter",
+        "Build and install the manifest-driven Writer adapter",
+    );
     const tools_step = b.step("tools", "Build and install all adapter tools");
 
     const reader_audit_module = b.createModule(.{
@@ -170,6 +174,20 @@ pub fn build(b: *std.Build) void {
         );
     }
 
+    const writer_module = b.createModule(.{
+        .root_source_file = b.path("zig/writer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = optimize == .ReleaseFast,
+    });
+    writer_module.addImport("z_xml", z_xml);
+    const writer_adapter = b.addExecutable(.{
+        .name = "z-xml-writer",
+        .root_module = writer_module,
+    });
+    writer_adapter_step.dependOn(&b.addInstallArtifact(writer_adapter, .{}).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = writer_module })).step);
+
     const layout_module = b.createModule(.{
         .root_source_file = b.path("zig/layout_probe.zig"),
         .target = target,
@@ -188,6 +206,7 @@ pub fn build(b: *std.Build) void {
     tools_step.dependOn(corpus_adapters_step);
     tools_step.dependOn(validation_bench_step);
     tools_step.dependOn(persistent_adapters_step);
+    tools_step.dependOn(writer_adapter_step);
     b.getInstallStep().dependOn(tools_step);
     b.default_step = test_step;
 }
