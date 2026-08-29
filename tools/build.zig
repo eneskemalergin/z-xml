@@ -171,7 +171,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const layout_module = b.createModule(.{
-        .root_source_file = b.path("../src/layout_probe.zig"),
+        .root_source_file = b.path("zig/layout_probe.zig"),
         .target = target,
         .optimize = optimize,
         .strip = optimize == .ReleaseFast,

@@ -1,8 +1,8 @@
 # z-xml
 
-Status: **Active** (last updated: 2026-08-24)
+Status: **Active** (last updated: 2026-08-28)
 
-`z-xml` is an XML parser for Zig. You can read XML as events or parse one complete source into an immutable owned document. Caller-set limits keep input-driven memory use bounded.
+`z-xml` is a Zig library for reading and writing XML. You can read XML as events, parse one complete source into an immutable owned document, or write UTF-8 XML to a caller-owned sink. Caller-set limits keep input-driven memory use bounded.
 
 ## XML support
 
@@ -18,20 +18,28 @@ Normal code calls `Reader.init(allocator, source, options)`. XML version and UTF
 
 Code that needs retained XML calls `parseDocument(allocator, source, options)`. It returns one `Document` type regardless of Reader options. The Document owns its retained strings and releases them through `deinit`.
 
+Code that writes XML calls `Writer.init(allocator, sink, options)`. The Writer checks structure, names, namespaces, characters, and escaping. It does not own or flush the sink.
+
 Package tests and development tools that still need a compile-time parser shape use `ReaderFor(config)` and `Configs`.
 
-The parser never opens files or uses the network on its own. External DTDs and entities require a caller-provided `Resolver`. A validating reader can also reuse a compiled `dtd.ExternalSubset` across documents instead of parsing the same external declarations again.
+The Reader never opens files or uses the network on its own. External DTDs and entities require a caller-provided `Resolver`. A validating reader can also reuse a compiled `dtd.ExternalSubset` across documents instead of parsing the same external declarations again.
 
 ## Package
 
 The public `z_xml` module starts at [`src/root.zig`](src/root.zig). The Zig package contains the library and its self-contained tests. It does not include the development fixtures, tools, benchmark inputs, or downloaded data.
 
-Run the package tests with Zig from `PATH`:
+Run the package tests for the supported execution target with Zig from `PATH`:
 
 ```sh
-zig build test
-zig build test -Doptimize=ReleaseFast
+zig build test -Dtarget=x86_64-linux --summary all
+zig build test -Dtarget=x86_64-linux -Doptimize=ReleaseFast --summary all
 ```
+
+## Target support
+
+The package currently supports execution on `x86_64-linux`. Both package test commands above must pass. No compile-only target is claimed, and no support claim is made for another architecture or operating system.
+
+The benchmark host is also Linux x86_64, but benchmark results describe only the recorded host. Development tools, reference parsers, and benchmark adapters do not define package target support.
 
 ## Development checks
 
