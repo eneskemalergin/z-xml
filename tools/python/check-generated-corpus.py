@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qualify event and owned-document adapters against generated XML."""
+"""Qualify common-summary and owned-document adapters against generated XML."""
 
 from __future__ import annotations
 
@@ -39,9 +39,21 @@ MANIFEST_COLUMNS = [
 ]
 EXPECTED_SUMMARY_FIELDS = {"elements", "attributes", "text_bytes", "checksum"}
 PROCESSOR_CLASSES = {"wf", "partial", "subset", "lexical", "index", "validating"}
-WORK_LANES = {"event", "dom", "subset", "lexical", "structural-index", "validated"}
+WORK_LANES = {
+    "event",
+    "dom",
+    "partial-dom",
+    "subset",
+    "lexical",
+    "structural-index",
+    "validated",
+}
 INPUT_MODELS = {"streaming-reader", "file-reader", "whole-file"}
-EVENT_PROCESSOR_CLASSES = {"wf", "partial"}
+SUMMARY_LANES = {
+    "event": {"wf", "partial"},
+    "partial-dom": {"partial"},
+    "subset": {"partial", "subset"},
+}
 DOCUMENT_SUMMARY_COLUMNS = [
     "nodes",
     "elements",
@@ -107,6 +119,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--target", action="append", default=[])
+    parser.add_argument(
+        "--summary-lane",
+        action="append",
+        choices=sorted(SUMMARY_LANES),
+        default=[],
+    )
     parser.add_argument("--document-oracle", type=Path)
     parser.add_argument("--shape", action="append", default=[])
     parser.add_argument("--max-bytes", type=int, default=MAX_WORKLOAD_BYTES)
@@ -148,7 +166,11 @@ def decode_json(value: str | bytes) -> object:
 
 
 def read_targets(
-    path: Path, bin_dir: Path, selected: set[str], document_mode: bool
+    path: Path,
+    bin_dir: Path,
+    selected: set[str],
+    document_mode: bool,
+    summary_lanes: set[str],
 ) -> list[Target]:
     with path.open(encoding="utf-8") as stream:
         lines = list(stream)
@@ -193,13 +215,18 @@ def read_targets(
         lane_matches = (
             work_lane == "dom"
             if document_mode
-            else processor_class in EVENT_PROCESSOR_CLASSES and work_lane == "event"
+            else work_lane in summary_lanes
+            and processor_class in SUMMARY_LANES[work_lane]
         )
         if not lane_matches:
             if selected:
-                expected_lane = "document" if document_mode else "event"
+                lane = (
+                    "document"
+                    if document_mode
+                    else " or ".join(sorted(summary_lanes)) + " summary"
+                )
                 raise ValueError(
-                    f"{name}: target does not declare a {expected_lane} input lane"
+                    f"{name}: target is not declared for the {lane} input lane"
                 )
             continue
         program = (bin_root / executable).resolve()
@@ -225,7 +252,11 @@ def read_targets(
     if unknown:
         raise ValueError("unknown targets: " + ",".join(sorted(unknown)))
     if not targets:
-        lane = "document" if document_mode else "event"
+        lane = (
+            "document"
+            if document_mode
+            else " or ".join(sorted(summary_lanes)) + " summary"
+        )
         raise ValueError(f"{path}: no {lane} targets selected")
     return targets
 
@@ -836,6 +867,7 @@ def check_documents(
 def main() -> int:
     args = parse_args()
     document_mode = args.document_oracle is not None
+    summary_lanes = set(args.summary_lane or ["event"])
     if shutil.which("prlimit") is None:
         print(
             "generated corpus check requires prlimit from util-linux", file=sys.stderr
@@ -852,7 +884,9 @@ def main() -> int:
         or args.max_bytes > MAX_WORKLOAD_BYTES
         or len(args.target) != len(set(args.target))
         or len(args.shape) != len(set(args.shape))
+        or (args.summary_lane and len(args.summary_lane) != len(summary_lanes))
         or (document_mode and (not args.target or not args.shape))
+        or (document_mode and bool(args.summary_lane))
         or (not document_mode and bool(args.shape))
     ):
         print("invalid limits, timeout, target, or shape selection", file=sys.stderr)
@@ -889,7 +923,11 @@ def main() -> int:
         return 1
     try:
         targets = read_targets(
-            args.targets, args.bin_dir, set(args.target), document_mode
+            args.targets,
+            args.bin_dir,
+            set(args.target),
+            document_mode,
+            summary_lanes,
         )
         workloads = read_workloads(args.manifest, args.max_bytes, set(args.shape))
         if document_mode and any(

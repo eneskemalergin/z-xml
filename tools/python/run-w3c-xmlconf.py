@@ -29,7 +29,15 @@ KNOWN_PROCESSOR_CLASSES = {
     "lexical",
     "index",
 }
-WORK_LANES = {"event", "dom", "subset", "lexical", "structural-index", "validated"}
+WORK_LANES = {
+    "event",
+    "dom",
+    "partial-dom",
+    "subset",
+    "lexical",
+    "structural-index",
+    "validated",
+}
 INPUT_MODELS = {"streaming-reader", "file-reader", "whole-file"}
 CASE_TYPES = {"valid", "invalid", "not-wf", "error"}
 ENTITY_MODES = {"none", "general", "parameter", "both"}
