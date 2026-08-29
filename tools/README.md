@@ -49,7 +49,7 @@ Correctness and conformance:
 
 - `python/check-persistent-adapters.py` owns the small repeated-input protocol smoke check. It accepts z-xml artifacts, peer artifacts, or both; checks one resident schedule and three distinct stream schedules for both consumers; enforces input, output, and time limits; and writes no file. `make -C ref check-persistent` calls the peer selection through `ref/build.sh`.
 - `python/check-generated-corpus.py` owns single-document event qualification. It requires an exact generated-corpus schema and declared event targets, checks every manifest file before applying the byte selection, bounds each adapter process, and publishes its result TSV only when every executed row passes.
-- `python/check-generated-persistent.py` owns repeated-input and scale qualification for one declared persistent target. It checks the target lane, input model, consumer features, corpus identity, source schedules, semantic output, process limits, and optional memory report. It publishes its result TSV only when the complete run passes.
+- `python/check-generated-persistent.py` owns repeated-input and scale qualification for one declared persistent target. It checks the target lane, input model, consumer features, corpus identity, source schedules, semantic output, minimal and full consumer parity, process limits, and optional memory report. It publishes its result TSV only when the complete run passes.
 - `fetch-w3c-xmlconf.sh` owns the pinned W3C suite download and extraction under ignored `data/conformance/`. It checks the cached or downloaded archive, rejects unsafe archive paths, extracts through a temporary directory, and compares an existing destination with the pinned archive before reuse. `make -C ref fetch-xmlconf` calls it.
 - `python/run-w3c-xmlconf.py` owns W3C catalog selection and parser-result classification. It follows the 21 manifests declared by the pinned root catalog and writes schema `z-xml-w3c-results-v1`. An absent W3C `VERSION` or `EDITION` is recorded as `all`. Every selected target and case has one `pass`, `fail`, `skip`, `mismatch`, `timeout`, or `tool-error` row. A skip keeps the W3C applicability class and gives a reason. External paths above the adapter's configured root require `external_parent_paths`. A complete report replaces the prior result atomically. Structural failures remove stale results. The command returns zero only when it records no failure, mismatch, timeout, or tool error. `make -C ref check-xmlconf` writes peer results; `make -C ref check-reader-conformance` writes separate z-xml results.
 
@@ -69,9 +69,11 @@ Build the required z-xml adapters, verify the existing generated inputs without 
 ```sh
 make -C ref check-generated
 make -C ref check-generated-persistent
+make -C ref check-peer-events
+make -C ref check-peer-persistent
 ```
 
-The first command checks the four declared z-xml event modes. The second checks the raw-name, default, and namespace-aware persistent modes. Peer qualification belongs to Stage 38B.
+The first two commands check the declared z-xml event and persistent modes. The last two rebuild and check the peer event and persistent modes. Each command publishes results only after every executed row passes its exact oracle; unsupported feature rows remain recorded exclusions.
 
 These safe commands must return nonzero because the selected target declares the wrong lane. Neither command publishes the requested result file:
 

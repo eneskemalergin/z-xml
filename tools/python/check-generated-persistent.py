@@ -110,6 +110,14 @@ RESULT_FIELDS = [
     "prefix_bytes",
     "accumulator",
 ]
+CONSUMER_PARITY_FIELDS = (
+    "elements",
+    "attributes",
+    "text_bytes",
+    "name_bytes",
+    "value_bytes",
+    "fragments",
+)
 
 
 @dataclass(frozen=True)
@@ -594,6 +602,34 @@ def observe(
     return "pass", "-", observed
 
 
+def check_consumer_parity(
+    samples: list[dict[str, object]], namespace: bool
+) -> list[str]:
+    groups: dict[tuple[str, str, int], dict[str, dict[str, object]]] = {}
+    for sample in samples:
+        key = (
+            str(sample["workload"]),
+            str(sample["input"]),
+            int(sample["chunk_bytes"]),
+        )
+        groups.setdefault(key, {})[str(sample["consumer"])] = sample
+
+    fields = [*CONSUMER_PARITY_FIELDS]
+    if namespace:
+        fields.extend(sorted(NAMESPACE_FIELDS))
+    errors: list[str] = []
+    for key, by_consumer in sorted(groups.items()):
+        if set(by_consumer) != {"minimal", "full"}:
+            continue
+        minimal = by_consumer["minimal"]
+        full = by_consumer["full"]
+        for field in fields:
+            if minimal[field] != full[field]:
+                label = "/".join(map(str, key))
+                errors.append(f"{label}: {field} differs between consumers")
+    return errors
+
+
 def check_scale(samples: list[dict[str, object]]) -> list[str]:
     if not samples:
         return ["scale check has no passing samples"]
@@ -727,8 +763,10 @@ def main() -> int:
     failures = 0
     unsupported = 0
     failure_reasons: Counter[str] = Counter()
+    consumer_samples: list[dict[str, object]] = []
     scale_samples: list[dict[str, object]] = []
     temporary_path: Path | None = None
+    consumer_errors: list[str] = []
     scale_errors: list[str] = []
     try:
         with tempfile.NamedTemporaryFile(
@@ -782,6 +820,16 @@ def main() -> int:
                                     observed_fields[field] = (
                                         "null" if value is None else value
                                     )
+                            if verdict == "pass":
+                                consumer_samples.append(
+                                    {
+                                        "workload": workload["id"],
+                                        "input": input_model,
+                                        "consumer": consumer,
+                                        "chunk_bytes": chunk_bytes,
+                                        **observed,
+                                    }
+                                )
                             if verdict == "pass" and args.check_scale:
                                 scale_samples.append(
                                     {
@@ -807,8 +855,10 @@ def main() -> int:
                                 **observed_fields,
                             }
                         )
+        if {"minimal", "full"}.issubset(consumers):
+            consumer_errors = check_consumer_parity(consumer_samples, args.namespace)
         scale_errors = check_scale(scale_samples) if args.check_scale else []
-        if failures or scale_errors or not passes:
+        if failures or consumer_errors or scale_errors or not passes:
             temporary_path.unlink(missing_ok=True)
         else:
             temporary_path.replace(results)
@@ -817,14 +867,20 @@ def main() -> int:
             temporary_path.unlink(missing_ok=True)
         print(error, file=sys.stderr)
         return 1
-    print(f"{target.name}: {passes} pass, {unsupported} unsupported, {failures} fail")
+    total_failures = failures + len(consumer_errors)
+    print(
+        f"{target.name}: {passes} pass, {unsupported} unsupported, "
+        f"{total_failures} fail"
+    )
     for reason, count in sorted(failure_reasons.items()):
         print(f"failure {reason}: {count}", file=sys.stderr)
+    for error in consumer_errors:
+        print(f"failure consumer-parity: {error}", file=sys.stderr)
     if args.check_scale and not scale_errors:
         print(f"{target.name} streaming scale: {len(scale_samples)} samples pass")
     for error in scale_errors:
         print(error, file=sys.stderr)
-    if failures or scale_errors or not passes:
+    if failures or consumer_errors or scale_errors or not passes:
         print("results not published", file=sys.stderr)
         return 1
     print(f"results: {results}")
