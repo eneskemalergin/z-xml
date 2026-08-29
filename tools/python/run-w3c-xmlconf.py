@@ -21,8 +21,9 @@ XML_BASE = "{http://www.w3.org/XML/1998/namespace}base"
 RESULT_SCHEMA = "z-xml-w3c-results-v1"
 TARGET_SCHEMAS = {"z-xml-targets-v1", "z-xml-targets-v2"}
 TARGET_HEADER = "name\texecutable\tprocessor_class\tfeatures\twork_lane\tinput_model"
-SUPPORTED_PROCESSOR_CLASSES = {"wf", "validating"}
-KNOWN_PROCESSOR_CLASSES = SUPPORTED_PROCESSOR_CLASSES | {
+KNOWN_PROCESSOR_CLASSES = {
+    "wf",
+    "validating",
     "partial",
     "subset",
     "lexical",
@@ -158,7 +159,7 @@ def read_targets(path: Path, bin_dir: Path, selected: set[str]) -> list[Target]:
     root = bin_dir.resolve()
     targets: list[Target] = []
     seen: set[str] = set()
-    selected_classes: dict[str, str] = {}
+    selected_profiles: dict[str, tuple[str, str]] = {}
     for line_number, line in enumerate(lines[2:], 3):
         if not line.strip():
             continue
@@ -184,17 +185,21 @@ def read_targets(path: Path, bin_dir: Path, selected: set[str]) -> list[Target]:
             or input_model not in INPUT_MODELS
         ):
             raise ValueError(f"{path}:{line_number}: invalid target declaration")
+        if processor_class == "wf" and work_lane != "event":
+            raise ValueError(f"{path}:{line_number}: {name}: wf requires event lane")
+        if processor_class == "validating" and work_lane != "validated":
+            raise ValueError(
+                f"{path}:{line_number}: {name}: validating requires validated lane"
+            )
+        supports_profile = processor_class in {"wf", "validating"} or (
+            processor_class == "partial" and work_lane == "validated"
+        )
         if selected and name in selected:
-            selected_classes[name] = processor_class
+            selected_profiles[name] = (processor_class, work_lane)
         if selected and name not in selected:
             continue
-        if processor_class not in SUPPORTED_PROCESSOR_CLASSES:
+        if not supports_profile:
             continue
-        expected_lane = "validated" if processor_class == "validating" else "event"
-        if work_lane != expected_lane:
-            raise ValueError(
-                f"{path}:{line_number}: {name}: {processor_class} requires {expected_lane} lane"
-            )
         program = (root / executable).resolve()
         try:
             program.relative_to(root)
@@ -216,14 +221,17 @@ def read_targets(path: Path, bin_dir: Path, selected: set[str]) -> list[Target]:
     if unknown:
         raise ValueError("unknown targets: " + ",".join(sorted(unknown)))
     unsupported = {
-        name: processor_class
-        for name, processor_class in selected_classes.items()
-        if processor_class not in SUPPORTED_PROCESSOR_CLASSES
+        name: profile
+        for name, profile in selected_profiles.items()
+        if not (
+            profile[0] in {"wf", "validating"}
+            or (profile[0] == "partial" and profile[1] == "validated")
+        )
     }
     if unsupported:
         details = ",".join(
-            f"{name}:{processor_class}"
-            for name, processor_class in sorted(unsupported.items())
+            f"{name}:{profile[0]}:{profile[1]}"
+            for name, profile in sorted(unsupported.items())
         )
         raise ValueError(f"targets do not declare a W3C processor profile: {details}")
     if not targets:
@@ -493,18 +501,24 @@ def expectation(
         for edition in case.edition.split()
     ):
         return "out-of-profile", "xml-edition"
+    if (
+        target.processor_class == "partial"
+        and target.work_lane == "validated"
+        and case.case_type != "valid"
+    ):
+        return "out-of-profile", "partial-validation"
     needed, reason = requirements(target, case, encoding, text)
     if reason is not None:
         if reason == "optional-error":
             return "optional", reason
         return "out-of-profile", reason
-    if target.processor_class == "validating" and "dtd" not in needed:
+    if target.work_lane == "validated" and "dtd" not in needed:
         return "out-of-profile", "validating-adapter-requires-dtd"
     missing = needed.difference(target.features)
     if missing:
         return "unsupported-feature", "missing:" + ",".join(sorted(missing))
     if case.case_type == "invalid":
-        expected = "reject" if target.processor_class == "validating" else "accept"
+        expected = "reject" if target.work_lane == "validated" else "accept"
         return expected, ""
     if case.case_type == "not-wf":
         return "reject", ""

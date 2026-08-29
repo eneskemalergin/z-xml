@@ -51,7 +51,7 @@ Correctness and conformance:
 - `python/check-generated-corpus.py` owns single-document event qualification. It requires an exact generated-corpus schema and declared event targets, checks every manifest file before applying the byte selection, bounds each adapter process, and publishes its result TSV only when every executed row passes.
 - `python/check-generated-persistent.py` owns repeated-input and scale qualification for one declared persistent target. It checks the target lane, input model, consumer features, corpus identity, source schedules, semantic output, minimal and full consumer parity, process limits, and optional memory report. It publishes its result TSV only when the complete run passes.
 - `fetch-w3c-xmlconf.sh` owns the pinned W3C suite download and extraction under ignored `data/conformance/`. It checks the cached or downloaded archive, rejects unsafe archive paths, extracts through a temporary directory, and compares an existing destination with the pinned archive before reuse. `make -C ref fetch-xmlconf` calls it.
-- `python/run-w3c-xmlconf.py` owns W3C catalog selection and parser-result classification. It follows the 21 manifests declared by the pinned root catalog and writes schema `z-xml-w3c-results-v1`. An absent W3C `VERSION` or `EDITION` is recorded as `all`. Every selected target and case has one `pass`, `fail`, `skip`, `mismatch`, `timeout`, or `tool-error` row. A skip keeps the W3C applicability class and gives a reason. External paths above the adapter's configured root require `external_parent_paths`. A complete report replaces the prior result atomically. Structural failures remove stale results. The command returns zero only when it records no failure, mismatch, timeout, or tool error. `make -C ref check-xmlconf` writes peer results; `make -C ref check-reader-conformance` writes separate z-xml results.
+- `python/run-w3c-xmlconf.py` owns W3C catalog selection and parser-result classification. It follows the 21 manifests declared by the pinned root catalog and writes schema `z-xml-w3c-results-v1`. An absent W3C `VERSION` or `EDITION` is recorded as `all`. Every selected target and case has one `pass`, `fail`, `skip`, `mismatch`, `timeout`, or `tool-error` row. A skip keeps the W3C applicability class and gives a reason. A partial target in the validated lane admits valid DTD documents only; invalid and not-well-formed cases remain explicit `partial-validation` exclusions. External paths above the adapter's configured root require `external_parent_paths`. A complete report replaces the prior result atomically. Structural failures remove stale results. The command returns zero only when it records no failure, mismatch, timeout, or tool error. `make -C ref check-xmlconf` writes peer results; `make -C ref check-reader-conformance` writes separate z-xml results.
 
 Resource and measurement commands:
 
@@ -93,6 +93,16 @@ python3 tools/python/check-generated-persistent.py \
     --engine z-xml-ns \
     --results /tmp/z-xml-wrong-persistent-lane.tsv
 ```
+
+## DTD peer correctness
+
+Run the DTD peer gate with:
+
+```sh
+make -C ref check-peer-validation
+```
+
+The command rebuilds libxml2 and Xerces, checks their declared focused validation constraints, and runs their W3C valid-DTD profiles. It writes separate focused and W3C results under `ref/build/`. Both peers are partial validators: unsupported validity constraints, XML editions, and external-resource modes remain recorded exclusions and are not eligible for timing. This gate does not claim complete DTD conformance.
 
 ## Build commands
 
