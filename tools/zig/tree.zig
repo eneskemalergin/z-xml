@@ -1,8 +1,9 @@
 //! Builds and traverses the public owned Document for correctness and measurement.
 //!
 //! Input uses a bounded stream, raw names, and DTD rejection. Normal output keeps a Reader-compatible
-//! checksum separate from one that also covers comments and processing instructions. Timing reports
-//! construction and traversal separately; memory reporting checks retained Document capacity and
+//! checksum separate from one that also covers comments and processing instructions. Construction
+//! timing includes file opening, input reading, parsing, and owned Document creation; traversal
+//! timing starts immediately before traversal. Memory mode checks retained Document capacity and
 //! measures traversal scratch allocation with an independent tracker.
 
 const std = @import("std");
@@ -80,15 +81,15 @@ fn run(init: std.process.Init) !u8 {
     }
 
     const input_path = args[if (report_memory or report_timing) 2 else 1];
+    const build_start = std.Io.Clock.awake.now(init.io);
     const file = try std.Io.Dir.cwd().openFile(init.io, input_path, .{});
     defer file.close(init.io);
     var input_buffer: [INPUT_BUFFER_SIZE]u8 = undefined;
     var file_reader = file.reader(init.io, &input_buffer);
     var tracking: TrackingAllocator = .{ .child = init.gpa };
     var diagnostic: DiagnosticCapture = .{};
-    const build_start = std.Io.Clock.awake.now(init.io);
     var document = xml.parseDocument(
-        tracking.allocator(),
+        if (report_memory) tracking.allocator() else init.gpa,
         .{ .stream = &file_reader.interface },
         .{ .reader = .{
             .namespaces = .raw,
@@ -119,18 +120,32 @@ fn run(init: std.process.Init) !u8 {
             else => err,
         };
     };
-    defer document.deinit();
+    var document_live = true;
+    defer if (document_live) document.deinit();
     const build_end = std.Io.Clock.awake.now(init.io);
-    const owned_memory = document.memoryUsage();
-    if (tracking.live_bytes != owned_memory.total_capacity_bytes)
-        return error.InvalidDocumentMemoryReport;
-    const construction_peak = tracking.peak_live_bytes;
-    const allocator_operations = tracking.allocs + tracking.resizes + tracking.remaps;
 
     var stats: Stats = .{};
+    var owned_nodes: usize = 0;
+    var owned_attributes: usize = 0;
+    var owned_namespace_declarations: usize = 0;
+    var owned_string_bytes: usize = 0;
+    var retained_capacity: usize = 0;
+    var construction_peak: usize = 0;
+    var construction_allocator_operations: u64 = 0;
     var traversal_peak: usize = 0;
     var traversal_allocator_operations: u64 = 0;
+    const traversal_start = std.Io.Clock.awake.now(init.io);
     if (report_memory) {
+        const owned_memory = document.memoryUsage();
+        if (tracking.live_bytes != owned_memory.total_capacity_bytes)
+            return error.InvalidDocumentMemoryReport;
+        owned_nodes = owned_memory.node_count;
+        owned_attributes = owned_memory.attribute_count;
+        owned_namespace_declarations = owned_memory.namespace_declaration_count;
+        owned_string_bytes = owned_memory.string_bytes;
+        retained_capacity = owned_memory.total_capacity_bytes;
+        construction_peak = tracking.peak_live_bytes;
+        construction_allocator_operations = tracking.allocs + tracking.resizes + tracking.remaps;
         var traversal_tracking: TrackingAllocator = .{ .child = init.gpa };
         try traverse(false, traversal_tracking.allocator(), &document, &stats);
         if (traversal_tracking.live_bytes != 0) return error.TraversalMemoryLeak;
@@ -143,6 +158,9 @@ fn run(init: std.process.Init) !u8 {
         try traverse(true, init.gpa, &document, &stats);
     }
     const traversal_end = std.Io.Clock.awake.now(init.io);
+    document.deinit();
+    document_live = false;
+    if (report_memory and tracking.live_bytes != 0) return error.DocumentMemoryLeak;
     var output_buffer: [256]u8 = undefined;
     var output_file = std.Io.File.stdout().writer(init.io, &output_buffer);
     const output = &output_file.interface;
@@ -155,13 +173,13 @@ fn run(init: std.process.Init) !u8 {
                 "\"traversal_scratch_peak_bytes\":{d}," ++
                 "\"traversal_allocator_operations\":{d}}}\n",
             .{
-                owned_memory.node_count,
-                owned_memory.attribute_count,
-                owned_memory.namespace_declaration_count,
-                owned_memory.string_bytes,
-                owned_memory.total_capacity_bytes,
+                owned_nodes,
+                owned_attributes,
+                owned_namespace_declarations,
+                owned_string_bytes,
+                retained_capacity,
                 construction_peak,
-                allocator_operations,
+                construction_allocator_operations,
                 traversal_peak,
                 traversal_allocator_operations,
             },
@@ -171,7 +189,7 @@ fn run(init: std.process.Init) !u8 {
             "{{\"build_ns\":{d},\"traversal_ns\":{d},\"elements\":{d},\"checksum\":\"{x:0>16}\"}}\n",
             .{
                 build_start.durationTo(build_end).nanoseconds,
-                build_end.durationTo(traversal_end).nanoseconds,
+                traversal_start.durationTo(traversal_end).nanoseconds,
                 stats.elements,
                 stats.traversal_checksum,
             },
