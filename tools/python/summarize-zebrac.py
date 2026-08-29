@@ -12,7 +12,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-MATRIX_SCHEMAS = {"z-xml-zebrac-matrix-v2", "z-xml-zebrac-matrix-v3"}
+MATRIX_SCHEMA = "z-xml-zebrac-matrix-v4"
+MAX_RESULT_BYTES = 64 * 1024 * 1024
 METRIC_UNITS = {
     "wall_time": "nanoseconds",
     "peak_rss": "bytes",
@@ -103,8 +104,28 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_json(path: Path) -> object:
-    with path.open(encoding="utf-8") as stream:
-        return json.load(stream)
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        decoded: dict[str, object] = {}
+        for key, value in pairs:
+            if key in decoded:
+                raise ValueError(f"{path}: duplicate JSON field {key}")
+            decoded[key] = value
+        return decoded
+
+    def reject_constant(value: str) -> object:
+        raise ValueError(f"{path}: invalid JSON number {value}")
+
+    if not path.is_file():
+        raise ValueError(f"{path}: expected a regular file")
+    with path.open("rb") as stream:
+        data = stream.read(MAX_RESULT_BYTES + 1)
+    if len(data) > MAX_RESULT_BYTES:
+        raise ValueError(f"{path}: exceeds the {MAX_RESULT_BYTES}-byte result limit")
+    return json.loads(
+        data,
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
 
 
 def read_baselines(values: list[str]) -> dict[str, str]:
@@ -126,11 +147,22 @@ def metric(
     if not isinstance(value, dict) or value.get("unit") != METRIC_UNITS[name]:
         raise ValueError(f"invalid {name} metric")
     required = ("mean", "std_dev", "min", "max")
-    if any(type(value.get(field)) not in (int, float) for field in required):
-        raise ValueError(f"incomplete {name} metric")
+    measurements: dict[str, float] = {}
+    for field in required:
+        item = value.get(field)
+        if type(item) not in (int, float) or not math.isfinite(float(item)):
+            raise ValueError(f"invalid {name} {field}")
+        measurements[field] = float(item)
     if value.get("sample_count") != expected_samples:
         raise ValueError(f"{name} sample count differs")
-    return {field: float(value[field]) for field in required}
+    if (
+        measurements["std_dev"] < 0
+        or measurements["min"] < 0
+        or measurements["min"] > measurements["mean"]
+        or measurements["mean"] > measurements["max"]
+    ):
+        raise ValueError(f"inconsistent {name} metric")
+    return measurements
 
 
 def ratio(left: float, right: float) -> float | None:
@@ -148,27 +180,53 @@ def collect_rows(index_paths: list[Path]) -> list[dict[str, object]]:
     identities: set[tuple[str, str, str, str]] = set()
     for index_path in index_paths:
         index = read_json(index_path)
-        if not isinstance(index, dict) or index.get("schema") not in MATRIX_SCHEMAS:
+        if not isinstance(index, dict) or index.get("schema") != MATRIX_SCHEMA:
             raise ValueError(f"{index_path}: unsupported matrix schema")
-        case = str(index.get("measurement_case", "end-to-end"))
-        multiplier = int(index.get("work_multiplier", 1))
+        case = index.get("measurement_case")
+        multiplier = index.get("work_multiplier")
         target_metadata = index.get("target_binaries")
         program_arguments = index.get("program_arguments", [])
+        sampling = index.get("sampling")
         runs = index.get("runs")
         if (
-            multiplier <= 0
+            not isinstance(case, str)
+            or not case
+            or type(multiplier) is not int
+            or multiplier <= 0
             or not isinstance(target_metadata, dict)
             or not isinstance(program_arguments, list)
+            or any(not isinstance(argument, str) for argument in program_arguments)
+            or not isinstance(sampling, dict)
+            or type(sampling.get("duration_ms")) is not int
+            or sampling["duration_ms"] <= 0
+            or type(sampling.get("samples")) is not int
+            or sampling["samples"] <= 1
+            or type(sampling.get("warmups")) is not int
+            or sampling["warmups"] < 0
             or not isinstance(runs, list)
+            or not runs
         ):
             raise ValueError(f"{index_path}: incomplete matrix index")
-        for run in runs:
-            if not isinstance(run, dict) or run.get("status") != 0:
+        for run_index, run in enumerate(runs):
+            if (
+                not isinstance(run, dict)
+                or type(run.get("status")) is not int
+                or run["status"] != 0
+                or run.get("result") != "pass"
+            ):
                 raise ValueError(f"{index_path}: contains an unsuccessful matrix run")
-            raw_path = index_path.parent / str(run["zebrac_json"])
+            raw_name = run.get("zebrac_json")
+            if (
+                not isinstance(raw_name, str)
+                or not raw_name
+                or Path(raw_name).name != raw_name
+            ):
+                raise ValueError(f"{index_path}: invalid Zebrac result path")
+            raw_path = index_path.parent / raw_name
             raw = read_json(raw_path)
             if not isinstance(raw, dict) or raw.get("schema_version") != 1:
                 raise ValueError(f"{raw_path}: unsupported Zebrac schema")
+            config = raw.get("config")
             results = raw.get("results")
             targets = run.get("targets")
             input_models = run.get("input_models")
@@ -182,15 +240,56 @@ def collect_rows(index_paths: list[Path]) -> list[dict[str, object]]:
             assert isinstance(targets, list)
             assert isinstance(input_models, list)
             assert isinstance(commands, list)
-            if not (len(results) == len(targets) == len(input_models) == len(commands)):
+            if (
+                not results
+                or not (
+                    len(results) == len(targets) == len(input_models) == len(commands)
+                )
+                or any(not isinstance(target, str) or not target for target in targets)
+                or any(
+                    not isinstance(input_model, str) or not input_model
+                    for input_model in input_models
+                )
+                or any(
+                    not isinstance(command, str) or not command for command in commands
+                )
+                or len({str(target) for target in targets}) != len(targets)
+            ):
                 raise ValueError(f"{index_path}: run list lengths differ")
-            classification = str(run["classification"])
-            input_bytes = int(run["bytes"])
-            work_bytes = int(run.get("work_bytes", input_bytes * multiplier))
+            classification = run.get("classification")
+            lane = run.get("lane")
+            workload = run.get("workload")
+            input_bytes = run.get("bytes")
+            work_bytes = run.get("work_bytes")
+            input_metadata = run.get("input")
+            timeout = sampling.get("timeout_seconds")
             if (
                 classification not in {"benchmark-valid", "not-well-formed"}
+                or not isinstance(lane, str)
+                or not lane
+                or not isinstance(workload, str)
+                or not workload
+                or type(input_bytes) is not int
                 or input_bytes <= 0
+                or type(work_bytes) is not int
                 or work_bytes != input_bytes * multiplier
+                or work_bytes > 2**63 - 1
+                or not isinstance(input_metadata, dict)
+                or not isinstance(input_metadata.get("path"), str)
+                or not input_metadata["path"]
+                or input_metadata.get("size") != input_bytes
+                or type(input_metadata.get("mtime_ns")) is not int
+                or input_metadata["mtime_ns"] < 0
+                or type(timeout) not in (int, float)
+                or not math.isfinite(float(timeout))
+                or timeout <= 0
+                or not isinstance(config, dict)
+                or config.get("duration_ms") != sampling["duration_ms"]
+                or config.get("min_samples") != sampling["samples"]
+                or config.get("max_samples") != sampling["samples"]
+                or config.get("warmup") != sampling["warmups"]
+                or config.get("allow_failures")
+                is not (classification == "not-well-formed")
             ):
                 raise ValueError(f"{index_path}: invalid run work metadata")
             for target, input_model, command, result in zip(
@@ -203,6 +302,7 @@ def collect_rows(index_paths: list[Path]) -> list[dict[str, object]]:
                 if (
                     type(samples) is not int
                     or samples <= 0
+                    or samples != sampling["samples"]
                     or type(failed_samples) is not int
                     or failed_samples < 0
                     or failed_samples > samples
@@ -216,11 +316,26 @@ def collect_rows(index_paths: list[Path]) -> list[dict[str, object]]:
                 metadata = target_metadata.get(str(target))
                 if not isinstance(metadata, dict):
                     raise TypeError(f"{index_path}: missing metadata for {target}")
-                identity = (case, str(run["lane"]), str(run["workload"]), str(target))
+                declared_input = metadata.get("input_model")
+                processor_class = metadata.get("processor_class")
+                if (
+                    metadata.get("lane") != lane
+                    or not isinstance(processor_class, str)
+                    or not processor_class
+                ):
+                    raise ValueError(f"{index_path}: target lane metadata differs")
+                if (
+                    declared_input != input_model
+                    and declared_input != "resident-or-stream"
+                ):
+                    raise ValueError(f"{index_path}: target input model differs")
+                identity = (case, lane, workload, str(target))
                 if identity in identities:
                     raise ValueError(f"duplicate result for {'/'.join(identity)}")
                 identities.add(identity)
                 wall = metric(result, "wall_time", samples)
+                if wall["mean"] <= 0:
+                    raise ValueError(f"{raw_path}: invalid wall time")
                 rss = metric(result, "peak_rss", samples)
                 minor = metric(result, "minor_faults", samples)
                 major = metric(result, "major_faults", samples)
@@ -238,13 +353,12 @@ def collect_rows(index_paths: list[Path]) -> list[dict[str, object]]:
                 rows.append(
                     {
                         "case": case,
-                        "lane": str(run["lane"]),
-                        "workload": str(run["workload"]),
+                        "_run_identity": (str(index_path), run_index),
+                        "lane": lane,
+                        "workload": workload,
                         "classification": classification,
                         "target": str(target),
-                        "processor_class": str(
-                            metadata.get("processor_class", "unknown")
-                        ),
+                        "processor_class": processor_class,
                         "input_model": str(input_model),
                         "program_arguments": shlex.join(
                             [str(argument) for argument in program_arguments]
@@ -301,10 +415,15 @@ def add_baseline_ratios(
     missing = observed_lanes.difference(baselines)
     if missing:
         raise ValueError("missing baselines for lanes: " + ",".join(sorted(missing)))
+    extra = baselines.keys() - observed_lanes
+    if extra:
+        raise ValueError("unused baselines for lanes: " + ",".join(sorted(extra)))
     by_identity = {
         (
+            row["_run_identity"],
             str(row["case"]),
             str(row["lane"]),
+            str(row["classification"]),
             str(row["workload"]),
             str(row["target"]),
         ): row
@@ -313,8 +432,10 @@ def add_baseline_ratios(
     for row in rows:
         baseline = by_identity.get(
             (
+                row["_run_identity"],
                 str(row["case"]),
                 str(row["lane"]),
+                str(row["classification"]),
                 str(row["workload"]),
                 baselines[str(row["lane"])],
             )
@@ -327,7 +448,10 @@ def add_baseline_ratios(
         row["cache_misses_vs_baseline"] = None
         row["branch_misses_vs_baseline"] = None
         if baseline is None:
-            continue
+            raise ValueError(
+                "missing matched baseline for "
+                f"{row['case']}/{row['lane']}/{row['workload']}"
+            )
         row["wall_vs_baseline"] = ratio(
             float(row["wall_mean_ns"]), float(baseline["wall_mean_ns"])
         )
@@ -373,8 +497,9 @@ def field_values(
     values = []
     for workload in workloads:
         value = rows[workload].get(field)
-        if value is not None:
-            values.append(float(value))
+        if value is None:
+            return []
+        values.append(float(value))
     return values
 
 
@@ -398,6 +523,8 @@ def aggregate(
         target_by_workload = {str(row["workload"]): row for row in target_rows}
         baseline_by_workload = {str(row["workload"]): row for row in baseline_rows}
         shared = sorted(target_by_workload.keys() & baseline_by_workload.keys())
+        complete_coverage = set(target_by_workload) == set(baseline_by_workload)
+        ratio_workloads = shared if complete_coverage else []
 
         aggregates.append(
             {
@@ -409,29 +536,46 @@ def aggregate(
                 "target_workloads": len(target_by_workload),
                 "baseline_workloads": len(baseline_by_workload),
                 "compared_workloads": len(shared),
-                "complete_coverage": set(target_by_workload)
-                == set(baseline_by_workload),
+                "complete_coverage": complete_coverage,
                 "wall_geomean_vs_baseline": geomean(
-                    field_values(target_by_workload, shared, "wall_vs_baseline")
+                    field_values(
+                        target_by_workload, ratio_workloads, "wall_vs_baseline"
+                    )
                 ),
                 "throughput_geomean_vs_baseline": geomean(
-                    field_values(target_by_workload, shared, "throughput_vs_baseline")
+                    field_values(
+                        target_by_workload,
+                        ratio_workloads,
+                        "throughput_vs_baseline",
+                    )
                 ),
                 "rss_geomean_vs_baseline": geomean(
-                    field_values(target_by_workload, shared, "rss_vs_baseline")
+                    field_values(target_by_workload, ratio_workloads, "rss_vs_baseline")
                 ),
                 "cycles_geomean_vs_baseline": geomean(
-                    field_values(target_by_workload, shared, "cycles_vs_baseline")
+                    field_values(
+                        target_by_workload, ratio_workloads, "cycles_vs_baseline"
+                    )
                 ),
                 "instructions_geomean_vs_baseline": geomean(
-                    field_values(target_by_workload, shared, "instructions_vs_baseline")
+                    field_values(
+                        target_by_workload,
+                        ratio_workloads,
+                        "instructions_vs_baseline",
+                    )
                 ),
                 "cache_misses_geomean_vs_baseline": geomean(
-                    field_values(target_by_workload, shared, "cache_misses_vs_baseline")
+                    field_values(
+                        target_by_workload,
+                        ratio_workloads,
+                        "cache_misses_vs_baseline",
+                    )
                 ),
                 "branch_misses_geomean_vs_baseline": geomean(
                     field_values(
-                        target_by_workload, shared, "branch_misses_vs_baseline"
+                        target_by_workload,
+                        ratio_workloads,
+                        "branch_misses_vs_baseline",
                     )
                 ),
                 "max_peak_rss_mean_mib": max(
@@ -501,15 +645,33 @@ def write_text_report(path: Path, aggregates: list[dict[str, object]]) -> None:
 
 def main() -> int:
     args = parse_args()
+    output_dir = args.output_dir.resolve()
+    outputs = {
+        "rows": output_dir / "rows.tsv",
+        "aggregates": output_dir / "aggregates.tsv",
+        "json": output_dir / "report.json",
+        "text": output_dir / "report.txt",
+    }
     try:
+        if args.output_dir.is_symlink():
+            raise ValueError("output directory may not be a symlink")
+        index_paths = [path.resolve() for path in args.index]
+        if set(index_paths) & set(outputs.values()):
+            raise ValueError("output path overlaps a matrix index")
+        if any(output_dir == path.parent for path in index_paths):
+            raise ValueError("output directory overlaps matrix results")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for path in outputs.values():
+            path.unlink(missing_ok=True)
         baselines = read_baselines(args.baseline)
-        rows = collect_rows([path.resolve() for path in args.index])
+        rows = collect_rows(index_paths)
         add_baseline_ratios(rows, baselines)
         aggregates = aggregate(rows, baselines)
+        for row in rows:
+            row.pop("_run_identity")
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
         print(error, file=sys.stderr)
         return 1
-    args.output_dir.mkdir(parents=True, exist_ok=True)
     rows.sort(
         key=lambda row: (
             str(row["case"]),
@@ -519,22 +681,28 @@ def main() -> int:
             str(row["target"]),
         )
     )
-    write_tsv(args.output_dir / "rows.tsv", ROW_FIELDS, rows)
-    write_tsv(args.output_dir / "aggregates.tsv", AGGREGATE_FIELDS, aggregates)
     report = {
         "schema": "z-xml-zebrac-summary-v1",
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "indexes": [str(path.resolve()) for path in args.index],
+        "indexes": [str(path) for path in index_paths],
         "baselines": baselines,
         "rows": rows,
         "aggregates": aggregates,
     }
-    (args.output_dir / "report.json").write_text(
-        json.dumps(report, indent=2) + "\n", encoding="utf-8"
-    )
-    write_text_report(args.output_dir / "report.txt", aggregates)
+    try:
+        write_tsv(outputs["rows"], ROW_FIELDS, rows)
+        write_tsv(outputs["aggregates"], AGGREGATE_FIELDS, aggregates)
+        outputs["json"].write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8"
+        )
+        write_text_report(outputs["text"], aggregates)
+    except OSError as error:
+        for path in outputs.values():
+            path.unlink(missing_ok=True)
+        print(error, file=sys.stderr)
+        return 1
     print(f"summarized {len(rows)} target results into {len(aggregates)} groups")
-    print(f"results: {args.output_dir}")
+    print(f"results: {output_dir}")
     return 0
 
 
