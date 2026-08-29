@@ -2,4 +2,5 @@
 # name	executable	processor_class	features	work_lane	input_model
 z-xml-persistent	z-xml-persistent	wf	persistent_protocol,event_counts,fragment_counts,minimal_consumer,full_consumer,memory_report	event-persistent	resident-or-stream
 z-xml-default-persistent	z-xml-default-persistent	wf	persistent_protocol,event_counts,fragment_counts,minimal_consumer,full_consumer,memory_report,namespaces,dtd	event-persistent	resident-or-stream
+z-xml-default-ns-persistent	z-xml-default-ns-persistent	wf	persistent_protocol,event_counts,fragment_counts,minimal_consumer,full_consumer,memory_report,namespaces,dtd	event-persistent-namespace	resident-or-stream
 z-xml-ns-persistent	z-xml-ns-persistent	wf	persistent_protocol,event_counts,fragment_counts,minimal_consumer,full_consumer,memory_report,namespaces	event-persistent-namespace	resident-or-stream

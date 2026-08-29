@@ -162,6 +162,12 @@ pub fn build(b: *std.Build) void {
             .default_options = true,
             .namespace_summary = false,
         },
+        .{
+            .name = "z-xml-default-ns-persistent",
+            .namespaces = true,
+            .default_options = true,
+            .namespace_summary = true,
+        },
     }) |adapter| {
         addPersistentAdapter(
             b,

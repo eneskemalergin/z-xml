@@ -82,6 +82,7 @@ READY_GENERATORS = {
     "escaped",
     "markup",
     "mixed",
+    "namespace-churn",
     "records",
     "rejection",
     "text",
