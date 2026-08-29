@@ -86,6 +86,7 @@ READY_GENERATORS = {
     "rejection",
     "text",
     "unicode",
+    "utf16-text",
     "validation-identifiers",
     "validation-models",
 } | set(WRITER_SHAPES)

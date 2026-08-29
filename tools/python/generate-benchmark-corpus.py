@@ -171,6 +171,38 @@ def generate_text(output: Output, stats: Stats | None, target_bytes: int) -> Non
     end_document(output, stats)
 
 
+def generate_utf16_text(output: Output, stats: Stats | None, target_bytes: int) -> None:
+    prefix = b"\xff\xfe" + "<root>".encode("utf-16-le")
+    suffix = "</root>".encode("utf-16-le")
+    text = "aéλ🙂\n"
+    encoded = text.encode("utf-16-le")
+    logical = text.encode()
+    available = target_bytes - len(prefix) - len(suffix)
+    count, remainder = divmod(available, len(encoded))
+    if available < 0 or remainder % 2 != 0:
+        raise ValueError("utf16-text target cannot preserve complete UTF-16 units")
+    filler = remainder // 2
+    output.write(prefix)
+    if stats is not None:
+        stats.start(b"root")
+    output.write_repeated(encoded, count)
+    if filler:
+        output.write(b"x\x00" * filler)
+    if stats is not None:
+        records_per_block = max(1, (1024 * 1024) // len(logical))
+        block = logical * records_per_block
+        while count >= records_per_block:
+            stats.text(block)
+            count -= records_per_block
+        if count:
+            stats.text(logical * count)
+        if filler:
+            stats.text(b"x" * filler)
+    output.write(suffix)
+    if stats is not None:
+        stats.end(b"root")
+
+
 def generate_repeated(
     output: Output,
     stats: Stats | None,
@@ -413,6 +445,7 @@ SHAPES: dict[str, tuple[bytes, Callable[[Stats], None]] | None] = {
     ),
     "escaped": (b"&amp;&#x3bb;&lt;&gt;&quot;&apos;", escaped_event),
     "unicode": ("a\u00e9\u03bb\U0001f642".encode(), unicode_event),
+    "utf16-text": None,
     "validation-models": None,
     "validation-identifiers": None,
 }
@@ -427,6 +460,7 @@ SHAPE_FEATURES = {
     "mixed": "document,attributes,element_matching,cdata,comments,pi",
     "escaped": "document,predefined_entities,numeric_references",
     "unicode": "document,utf8",
+    "utf16-text": "document,utf16",
     "validation-models": "document,dtd",
     "validation-identifiers": "document,dtd",
 }
@@ -435,6 +469,9 @@ SHAPE_FEATURES = {
 def generate_shape(
     output: Output, stats: Stats | None, shape: str, target_bytes: int
 ) -> None:
+    if shape == "utf16-text":
+        generate_utf16_text(output, stats, target_bytes)
+        return
     if shape == "records":
         generate_sequence(output, stats, target_bytes, RECORDS)
         return
@@ -644,7 +681,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sizes-mib", default="1")
     parser.add_argument("--sizes-kib")
     parser.add_argument("--depths", default="16,256,2048")
-    parser.add_argument("--shapes", default=",".join(SHAPES))
+    parser.add_argument(
+        "--shapes",
+        default=",".join(shape for shape in SHAPES if shape != "utf16-text"),
+    )
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--summary-program", type=Path)
     parser.add_argument("--no-rejection", action="store_true")
