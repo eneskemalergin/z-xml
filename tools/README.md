@@ -11,7 +11,7 @@ Files are grouped by language. The Python commands are called through their conf
 - `python/` contains checks, generators, and measurement commands called through Python.
 - `targets.tsv` describes the z-xml adapter capabilities used by fixture checks.
 - `dtd-targets.tsv` declares the DTD baseline and no-DTD control commands.
-- `validation-targets.tsv` declares the internal and caller-resolved fresh-validation commands.
+- `validation-targets.tsv` declares fresh single-document and repeated-validation commands.
 - `writer-targets.tsv` declares the one manifest-driven Writer adapter.
 - `fetch-w3c-xmlconf.sh` downloads the pinned W3C suite. It stays at the root because it is the only shell command.
 
@@ -27,7 +27,7 @@ Build and declarations:
 - `build.zig` owns the Zig tool build. Its callers are the documented `zig build --build-file tools/build.zig` commands. It imports the package module and the Zig tool sources, then installs adapters under `tools/zig-out/bin` or runs the layout probe and tool tests.
 - `targets.tsv` declares the six z-xml Reader profiles used by `ref/check-corpus.sh`, `run-w3c-xmlconf.py`, `run-valgrind.py`, and `run-zebrac-matrix.py`. It has no output of its own.
 - `dtd-targets.tsv` assigns the DTD processing adapter and the process and reject no-DTD controls to separate measurement lanes. It has no output of its own.
-- `validation-targets.tsv` assigns the internal and caller-resolved adapters to the fresh-validation lane. It has no output of its own.
+- `validation-targets.tsv` assigns internal and caller-resolved adapters to fresh validation, then assigns fresh and reusable external-subset adapters to repeated validation. It has no output of its own.
 - `persistent-targets.tsv` declares the protocol, consumer, memory, timing, transition, release, namespace, lane, and input-model support of the four z-xml resident or streamed adapters. It has no output of its own.
 - `writer-targets.tsv` declares the protocol, oracle, sink, and memory-report support of `z-xml-writer`. `check-shape-matrix.py` checks its schema and exact target row.
 
@@ -37,9 +37,9 @@ Zig sources:
 - `zig/persistent.zig` owns Reader work over resident or streamed input. The `persistent-adapters` step builds raw-name, namespace-aware, default-Reader, and default-Reader namespace-summary executables. One Reader handles every iteration. `--next-file` and `--next-iterations` add a second input without replacing it. Optional timing, memory, and release reports separate source setup, Reader initialization, first and reset documents, parser allocation work, retained capacity, explicit release, and caller-owned input storage. The executable writes one JSON result.
 - `zig/tree.zig` owns public `Document` construction and traversal measurement. The `tree-adapter` step builds `z-xml-tree`. Normal output reports node counts, depth, and common and complete-traversal checksums. `--timing` separates construction and traversal time. `--memory` separates retained Document capacity, construction allocation work, and traversal scratch allocation work. Each mode writes one JSON result.
 - `zig/writer.zig` owns manifest-selected public Writer work. The `writer-adapter` step builds `z-xml-writer`. It runs the attributes, unchanged-text, escaped-text, fragmented-text, namespace-depth, short-sink, and repeated-document shapes declared in `bench/shapes.tsv`. Each run writes one JSON result. `--verify` retains output for exact or Reader checks before measurement.
-- `zig/validation_repeat.zig` owns fresh-versus-reused external DTD validation. The `validation-bench` step builds both modes. Each executable accepts a DTD path, XML path, and repetition count and writes one JSON result.
+- `zig/validation_repeat.zig` owns fresh-versus-reused external DTD validation. The `validation-bench` step builds both modes. One Reader handles fixed repeated or large-then-small streamed schedules. Optional reports separate subset setup, document phases, immutable subset memory, Reader memory, resolver memory, release, and deinitialization. Each executable writes one JSON result.
 - `zig/layout_probe.zig` owns development-only Reader and Document type-size output. The `layout` step runs it and prints tab-separated rows to standard error; it does not install an adapter.
-- `zig/tracking_allocator.zig` is shared implementation for `persistent.zig`, `tree.zig`, and `writer.zig`. It has no command or build step of its own.
+- `zig/tracking_allocator.zig` is shared implementation for `persistent.zig`, `tree.zig`, `validation_repeat.zig`, and `writer.zig`. It has no command or build step of its own.
 
 Generated inputs and declarations:
 
@@ -50,6 +50,7 @@ Generated inputs and declarations:
 - `python/generate-namespace-benchmark.py` owns the namespace-churn XML and manifest under the selected ignored output directory. Check mode regenerates the requested corpus in a temporary directory and compares every file without rewriting the selected output. `make -C ref generate-namespace-corpus` generates it and `make -C ref verify-namespace-corpus` checks it.
 - `python/generate-dtd-benchmark.py` owns the deterministic DTD processing corpus and exact result manifest under `data/generated/z-xml-dtd-generated-v1/`. It writes internal declarations, internal entities, resolved external sources, a no-DTD control, malformed and recursive inputs, resolver failures, and DTD, expansion, and external-source byte boundaries. Check mode regenerates the complete corpus in a temporary directory and compares its file set and bytes.
 - `python/generate-validation-benchmark.py` owns the deterministic fresh-validation corpus and exact result manifest under `data/generated/z-xml-validation-generated-v1/`. It writes content-model, identity, caller-resolved external, invalid-finding, nondeterministic, malformed, unavailable-source, and content-position-limit workloads. Check mode regenerates the complete corpus in a temporary directory and compares its file set and bytes.
+- `python/generate-validation-reuse.py` owns the deterministic repeated-validation corpus and exact result manifest under `data/generated/z-xml-validation-reuse-v1/`. It writes exact 16 KiB, 64 MiB, large-then-small, and invalid-finding schedules. Check mode regenerates the complete corpus in a temporary directory and compares its file set and bytes.
 
 Correctness and conformance:
 
@@ -58,6 +59,7 @@ Correctness and conformance:
 - `python/check-generated-persistent.py` owns repeated-input, transition, and scale qualification for one declared persistent target. It checks the target lane, input model, consumer features, corpus identity, source schedules, semantic output, minimal and full consumer parity, process limits, optional phase timing, parser memory, caller input storage, and explicit release. It publishes its result TSV only when the complete run passes.
 - `python/check-dtd-benchmark.py` owns DTD baseline qualification. It runs every exact command declared by the generated DTD manifest, checks semantic and memory reports separately, requires the expected status and complete JSON field set, checks Reader and caller-source cleanup, and publishes one event eligibility TSV only after all commands pass.
 - `python/check-validation-benchmark.py` owns fresh-validation qualification. It bounds and runs every command declared by the validation manifest with and without memory reporting, checks exact validity, finding order, events, diagnostics, source results, identity counts, complete Reader memory accounting, and cleanup, then publishes one validation eligibility TSV only after all commands pass.
+- `python/check-validation-reuse.py` owns repeated-validation qualification. It bounds and runs both fresh and reusable adapters for every fixed schedule, checks exact parity across iterations and modes, and verifies subset, Reader, resolver, timing, retained-capacity, release, and deinitialization fields before publishing eligibility.
 - `fetch-w3c-xmlconf.sh` owns the pinned W3C suite download and extraction under ignored `data/conformance/`. It checks the cached or downloaded archive, rejects unsafe archive paths, extracts through a temporary directory, and compares an existing destination with the pinned archive before reuse. `make -C ref fetch-xmlconf` calls it.
 - `python/run-w3c-xmlconf.py` owns W3C catalog selection and parser-result classification. It follows the 21 manifests declared by the pinned root catalog and writes schema `z-xml-w3c-results-v1`. An absent W3C `VERSION` or `EDITION` is recorded as `all`. Every selected target and case has one `pass`, `fail`, `skip`, `mismatch`, `timeout`, or `tool-error` row. A skip keeps the W3C applicability class and gives a reason. A partial target in the validated lane admits valid DTD documents only; invalid and not-well-formed cases remain explicit `partial-validation` exclusions. External paths above the adapter's configured root require `external_parent_paths`. A complete report replaces the prior result atomically. Structural failures remove stale results. The command returns zero only when it records no failure, mismatch, timeout, or tool error. `make -C ref check-xmlconf` writes peer results; `make -C ref check-reader-conformance` writes separate z-xml results.
 
@@ -184,6 +186,25 @@ python3 tools/python/run-zebrac-aa.py \
 ```
 
 Use the same target with `run-zebrac-matrix.py` for the content-model and identity baselines. Use `z-xml-validation-external` for `external-64m`. Invalid findings, nondeterministic models, malformed syntax, unavailable sources, and content-position limits are correctness and bounded-resource checks, not speed rankings.
+
+## Validation reuse baseline
+
+Generate or verify the repeated-validation corpus, build both adapters, and qualify every fixed schedule with:
+
+```sh
+python3 tools/python/generate-validation-reuse.py
+python3 tools/python/generate-validation-reuse.py --check
+zig build --build-file tools/build.zig validation-bench \
+    -Dtarget=x86_64-linux -Doptimize=ReleaseFast \
+    --prefix tmp/validation-reuse-build
+python3 tools/python/check-validation-reuse.py \
+    --manifest data/generated/z-xml-validation-reuse-v1/manifest.tsv \
+    --targets tools/validation-targets.tsv \
+    --bin-dir tmp/validation-reuse-build/bin \
+    --results data/results/validation-reuse/eligibility.tsv
+```
+
+The manifest fixes the DTD name, document order, iteration counts, companion paths, and exact semantic results. The qualifier reruns each command with memory, timing, and explicit release enabled. Timing commands omit those reporting flags. Use the qualified program arguments unchanged with `run-zebrac-aa.py` or `run-zebrac-matrix.py`; pass work multipliers 4,096 for the small schedule, 8 for the large schedule, and 2 for the large-then-small schedule.
 
 ## Build commands
 
