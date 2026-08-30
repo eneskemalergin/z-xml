@@ -23,6 +23,8 @@ from pathlib import Path
 GENERATED_SCHEMAS = {"z-xml-generated-v3"}
 NAMESPACE_SCHEMA = "z-xml-namespace-benchmark-v1"
 DTD_SCHEMA = "z-xml-dtd-generated-v1"
+VALIDATION_SCHEMA = "z-xml-validation-generated-v1"
+RESOURCE_SCHEMAS = {DTD_SCHEMA, VALIDATION_SCHEMA}
 TARGET_SCHEMAS = {
     "z-xml-targets-v1",
     "z-xml-targets-v2",
@@ -179,7 +181,9 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
     comments = {line[1:].strip() for line in lines if line.startswith("#")}
     generated_schema = GENERATED_SCHEMAS.intersection(comments)
     named_schemas = {
-        schema for schema in (NAMESPACE_SCHEMA, DTD_SCHEMA) if schema in comments
+        schema
+        for schema in (NAMESPACE_SCHEMA, DTD_SCHEMA, VALIDATION_SCHEMA)
+        if schema in comments
     }
     if len(generated_schema) + len(named_schemas) != 1:
         raise ValueError(f"{path}: unsupported or ambiguous corpus schema")
@@ -193,7 +197,7 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
     required = {"id", "path", "actual_bytes", "classification"}
     if generated_schema:
         required.add("target_bytes")
-    if schema == DTD_SCHEMA:
+    if schema in RESOURCE_SCHEMAS:
         required.add("resource_paths")
     if rows.fieldnames is None or required.difference(rows.fieldnames):
         raise ValueError(f"{path}: incomplete generated manifest")
@@ -231,7 +235,7 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
         workload["resolved_path"] = str(resolved)
         workload["source_mtime_ns"] = str(resolved.stat().st_mtime_ns)
         resources: list[Path] = []
-        if schema == DTD_SCHEMA and workload["resource_paths"] != "-":
+        if schema in RESOURCE_SCHEMAS and workload["resource_paths"] != "-":
             for value in workload["resource_paths"].split(","):
                 resource = (root / value).resolve()
                 if not resource.is_relative_to(root) or not resource.is_file():

@@ -29,7 +29,9 @@ CORPUS_SCHEMAS = {
     "z-xml-generated-v3",
     "z-xml-namespace-benchmark-v1",
     "z-xml-dtd-generated-v1",
+    "z-xml-validation-generated-v1",
 }
+RESOURCE_SCHEMAS = {"z-xml-dtd-generated-v1", "z-xml-validation-generated-v1"}
 MAX_CONTROL_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 ELIGIBILITY_FIELDS = {"target", "workload", "classification", "verdict"}
@@ -175,8 +177,8 @@ def read_workload(path: Path, selected: str) -> dict[str, object]:
     required = {"id", "path", "actual_bytes", "classification"}
     if rows.fieldnames is None or required.difference(rows.fieldnames):
         raise ValueError(f"{manifest}: incomplete corpus manifest")
-    if schema == "z-xml-dtd-generated-v1" and "resource_paths" not in rows.fieldnames:
-        raise ValueError(f"{manifest}: DTD manifest lacks resource paths")
+    if schema in RESOURCE_SCHEMAS and "resource_paths" not in rows.fieldnames:
+        raise ValueError(f"{manifest}: resource manifest lacks resource paths")
     match: dict[str, object] | None = None
     seen: set[str] = set()
     for line_number, row in enumerate(rows, 2):
