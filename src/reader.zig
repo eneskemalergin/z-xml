@@ -7424,9 +7424,11 @@ pub fn Reader(comptime config: Config) type {
                         .declared_type = record.declared_type,
                     });
                 }
-                self.namespace_state.expanded_indices.appendAssumeCapacity(
-                    self.event_attributes.items.len - 1,
-                );
+                if (parts.prefix != null) {
+                    self.namespace_state.expanded_indices.appendAssumeCapacity(
+                        self.event_attributes.items.len - 1,
+                    );
+                }
                 self.namespace_state.event_attribute_locations.appendAssumeCapacity(record.start);
             }
             try self.rejectDuplicateExpandedAttributes();
@@ -7651,9 +7653,12 @@ pub fn Reader(comptime config: Config) type {
 
         fn rejectDuplicateExpandedAttributes(self: *Self) ReadError!void {
             const attributes = self.event_attributes.items;
-            if (attributes.len <= linear_duplicate_threshold) {
-                for (attributes, 0..) |attribute, index| {
-                    for (attributes[0..index], 0..) |previous, previous_index| {
+            const indices = self.namespace_state.expanded_indices.items;
+            if (indices.len <= linear_duplicate_threshold) {
+                for (indices, 0..) |index, position| {
+                    const attribute = attributes[index];
+                    for (indices[0..position]) |previous_index| {
+                        const previous = attributes[previous_index];
                         try self.chargeNamespaceComparison(
                             expandedComparisonCost(attribute.name, previous.name),
                             self.currentLocation(),
@@ -7671,14 +7676,13 @@ pub fn Reader(comptime config: Config) type {
                 return;
             }
 
-            try self.ensureExpandedSortWork(attributes);
+            try self.ensureExpandedSortWork(attributes, indices);
             std.sort.heap(
                 usize,
-                self.namespace_state.expanded_indices.items,
+                indices,
                 self,
                 expandedAttributeIndexLessThan,
             );
-            const indices = self.namespace_state.expanded_indices.items;
             for (indices[1..], indices[0 .. indices.len - 1]) |index, previous_index| {
                 const attribute = attributes[index];
                 const previous = attributes[previous_index];
@@ -7714,10 +7718,12 @@ pub fn Reader(comptime config: Config) type {
         fn ensureExpandedSortWork(
             self: *Self,
             attributes: []const Attribute(config),
+            indices: []const usize,
         ) ReadError!void {
             var max_uri_len: usize = 0;
             var max_local_len: usize = 0;
-            for (attributes) |attribute| {
+            for (indices) |index| {
+                const attribute = attributes[index];
                 max_uri_len = @max(
                     max_uri_len,
                     optionalBytesLength(attribute.name.namespace_uri),
@@ -7725,10 +7731,10 @@ pub fn Reader(comptime config: Config) type {
                 max_local_len = @max(max_local_len, attribute.name.local.len);
             }
             var levels: usize = 1;
-            var width = attributes.len;
+            var width = indices.len;
             while (width > 1) : (levels +|= 1) width = (width + 1) / 2;
             // This conservative preflight bound must dominate heap-sort and adjacency work.
-            const comparison_bound = 8 *| attributes.len *| levels +| attributes.len;
+            const comparison_bound = 8 *| indices.len *| levels +| indices.len;
             const cost_bound = 2 *| max_uri_len +| 2 *| max_local_len +| 2;
             const work_bound = comparison_bound *| cost_bound;
             const remaining = self.options.namespace_limits.max_comparison_work -|

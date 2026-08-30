@@ -11241,13 +11241,13 @@ test "[property] - [namespace scope]: deep rebinding churn rolls back under targ
 test "[property] - [expanded attributes]: sorted duplicate path preserves source order" {
     var storage: [16 * 1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&storage);
-    try writer.writeAll("<r xmlns:a='u' xmlns:b='u'");
+    try writer.writeAll("<r xmlns:a='u' xmlns:b='u' plain='0'");
     for (0..65) |index| try writer.print(" a:x{d}='{d}'", .{ index, index });
     try writer.writeAll("/>");
     const valid = writer.buffered();
     const valid_parts = [_][]const u8{valid};
     const summary = try parseParts(NS_CONFIG, std.testing.allocator, .{}, &valid_parts);
-    try std.testing.expectEqual(@as(usize, 65), summary.attributes);
+    try std.testing.expectEqual(@as(usize, 66), summary.attributes);
     var limited_options: xml.OptionsFor(NS_CONFIG) = .{};
     limited_options.namespace_limits.max_comparison_work = 1000;
     try expectProfileFailureParts(
@@ -11261,7 +11261,7 @@ test "[property] - [expanded attributes]: sorted duplicate path preserves source
     );
 
     writer = std.Io.Writer.fixed(&storage);
-    try writer.writeAll("<r xmlns:a='u' xmlns:b='u'");
+    try writer.writeAll("<r xmlns:a='u' xmlns:b='u' plain='0'");
     for (0..65) |index| try writer.print(" a:x{d}='{d}'", .{ index, index });
     try writer.writeAll(" b:x0='duplicate'/>");
     const invalid = writer.buffered();
@@ -11274,6 +11274,27 @@ test "[property] - [expanded attributes]: sorted duplicate path preserves source
         .duplicate_expanded_attribute,
         std.mem.indexOf(u8, invalid, "b:x0").?,
         std.mem.indexOf(u8, invalid, "a:x0").?,
+    );
+}
+
+test "[edge] - [expanded attributes]: unprefixed names skip comparisons without hiding duplicates" {
+    const input = "<r first='1' second='2' third='3'/>";
+    var options: xml.OptionsFor(NS_CONFIG) = .{};
+    options.namespace_limits.max_comparison_work = 1;
+    const parts = [_][]const u8{input};
+    const summary = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
+    try std.testing.expectEqual(@as(usize, 3), summary.attributes);
+
+    const duplicate = "<r xmlns:a='u' xmlns:b='u' plain='0' a:x='1' other='2' b:x='3'/>";
+    const duplicate_parts = [_][]const u8{duplicate};
+    try expectProfileFailureParts(
+        NS_CONFIG,
+        .{},
+        &duplicate_parts,
+        error.InvalidXml,
+        .duplicate_expanded_attribute,
+        std.mem.indexOf(u8, duplicate, "b:x").?,
+        std.mem.indexOf(u8, duplicate, "a:x").?,
     );
 }
 
