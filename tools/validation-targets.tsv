@@ -2,3 +2,5 @@
 # name	executable	processor_class	features	work_lane	input_model
 z-xml-validation-internal	z-xml-validation-internal-check	validating	xml1_0_5e,namespaces,dtd,validation	validation	streaming-reader
 z-xml-validation-external	z-xml-validation-external-check	validating	xml1_0_5e,namespaces,dtd,validation,external_dtd,external_general_entities,external_parameter_entities	validation	streaming-reader
+z-xml-validation-fresh	z-xml-validation-fresh	validating	xml1_0_5e,namespaces,dtd,validation,external_dtd,reader_reset,validation_reuse_protocol,memory_report,timing_report	validation-reuse	streaming-reader
+z-xml-validation-reused	z-xml-validation-reused	validating	xml1_0_5e,namespaces,dtd,validation,reusable_external_subset,reader_reset,validation_reuse_protocol,memory_report,timing_report	validation-reuse	streaming-reader
