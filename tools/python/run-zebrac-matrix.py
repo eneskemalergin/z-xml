@@ -22,6 +22,7 @@ from pathlib import Path
 
 GENERATED_SCHEMAS = {"z-xml-generated-v3"}
 NAMESPACE_SCHEMA = "z-xml-namespace-benchmark-v1"
+DTD_SCHEMA = "z-xml-dtd-generated-v1"
 TARGET_SCHEMAS = {
     "z-xml-targets-v1",
     "z-xml-targets-v2",
@@ -177,12 +178,14 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
     lines = read_limited(path).decode("utf-8").splitlines(keepends=True)
     comments = {line[1:].strip() for line in lines if line.startswith("#")}
     generated_schema = GENERATED_SCHEMAS.intersection(comments)
-    namespace_schema = NAMESPACE_SCHEMA in comments
-    if len(generated_schema) + int(namespace_schema) != 1:
+    named_schemas = {
+        schema for schema in (NAMESPACE_SCHEMA, DTD_SCHEMA) if schema in comments
+    }
+    if len(generated_schema) + len(named_schemas) != 1:
         raise ValueError(f"{path}: unsupported or ambiguous corpus schema")
     if generated_schema and f"size ceiling: {MAX_WORKLOAD_BYTES} bytes" not in comments:
         raise ValueError(f"{path}: unexpected workload ceiling")
-    schema = NAMESPACE_SCHEMA if namespace_schema else max(generated_schema)
+    schema = next(iter(named_schemas)) if named_schemas else max(generated_schema)
     workloads: dict[str, dict[str, str]] = {}
     rows = csv.DictReader(
         (line for line in lines if not line.startswith("#")), delimiter="\t"
@@ -190,6 +193,8 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
     required = {"id", "path", "actual_bytes", "classification"}
     if generated_schema:
         required.add("target_bytes")
+    if schema == DTD_SCHEMA:
+        required.add("resource_paths")
     if rows.fieldnames is None or required.difference(rows.fieldnames):
         raise ValueError(f"{path}: incomplete generated manifest")
     for row in rows:
@@ -209,7 +214,7 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
             raise ValueError(f"{workload['id']}: path escapes corpus") from error
         if not resolved.is_file():
             raise ValueError(f"{workload['id']}: missing {resolved}")
-        if resolved in seen_paths:
+        if resolved in seen_paths and schema != DTD_SCHEMA:
             raise ValueError(f"{workload['id']}: duplicate workload path")
         seen_paths.add(resolved)
         actual = resolved.stat().st_size
@@ -225,6 +230,17 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
             raise ValueError(f"{workload['id']}: unsupported classification")
         workload["resolved_path"] = str(resolved)
         workload["source_mtime_ns"] = str(resolved.stat().st_mtime_ns)
+        resources: list[Path] = []
+        if schema == DTD_SCHEMA and workload["resource_paths"] != "-":
+            for value in workload["resource_paths"].split(","):
+                resource = (root / value).resolve()
+                if not resource.is_relative_to(root) or not resource.is_file():
+                    raise ValueError(f"{workload['id']}: invalid resource path")
+                resources.append(resource)
+        workload["resolved_resources"] = resources
+        workload["resource_mtime_ns"] = str(
+            max((resource.stat().st_mtime_ns for resource in resources), default=0)
+        )
     return workloads, schema
 
 
@@ -367,14 +383,24 @@ def eligibility_match(
             target.manifest_mtime_ns,
             target.executable.stat().st_mtime_ns,
             int(workload["source_mtime_ns"]),
+            int(workload["resource_mtime_ns"]),
         )
         if item.mtime_ns <= newest_input:
             matches.append((False, "stale-eligibility", target.input_model))
             continue
         if item.kind == "event":
-            if program_arguments or work_multiplier != 1:
+            qualified_arguments = row.get("program_args")
+            if work_multiplier != 1 or (
+                qualified_arguments is None and program_arguments
+            ):
                 matches.append(
                     (False, "unqualified-program-arguments", target.input_model)
+                )
+            elif qualified_arguments is not None and qualified_arguments != (
+                " ".join(program_arguments) or "-"
+            ):
+                matches.append(
+                    (False, "program-arguments-mismatch", target.input_model)
                 )
             elif row["work_lane"] != target.work_lane:
                 matches.append((False, "lane-mismatch", target.input_model))
@@ -922,6 +948,15 @@ def main() -> int:
                 "mtime_ns": zebrac_stat.st_mtime_ns,
             },
         }
+        resource_metadata = {
+            path: {
+                "path": str(path),
+                "size": path.stat().st_size,
+                "mtime_ns": path.stat().st_mtime_ns,
+            }
+            for group in groups
+            for path in group["workload"]["resolved_resources"]
+        }
         if manifest_stat.st_mtime_ns != manifest_mtime_ns:
             raise ValueError("corpus manifest changed before measurement")
         target_manifest_mtimes = {
@@ -968,6 +1003,7 @@ def main() -> int:
         *(target.manifest for target in targets.values()),
         *(target.executable for group in groups for target in group["targets"]),
         *(Path(group["workload"]["resolved_path"]) for group in groups),
+        *resource_metadata,
     }
     if planned_outputs & input_paths:
         print("output path overlaps an input", file=sys.stderr)
@@ -1002,6 +1038,9 @@ def main() -> int:
         "source": source_information(Path(__file__).resolve().parents[2]),
         "host": host_information(),
         "target_binaries": selected_binary_metadata,
+        "resources": [
+            resource_metadata[path] for path in sorted(resource_metadata, key=str)
+        ],
         "measurement_case": args.case,
         "program_arguments": args.program_arg,
         "work_multiplier": args.work_multiplier,
@@ -1067,6 +1106,9 @@ def main() -> int:
                 "size": int(workload["actual_bytes"]),
                 "mtime_ns": int(workload["source_mtime_ns"]),
             },
+            "resources": [
+                resource_metadata[path] for path in workload["resolved_resources"]
+            ],
             "bytes": int(workload["actual_bytes"]),
             "work_bytes": int(workload["actual_bytes"]) * args.work_multiplier,
             "classification": workload["classification"],
@@ -1161,6 +1203,13 @@ def main() -> int:
                 workload["actual_bytes"]
             ) or path.stat().st_mtime_ns != int(workload["source_mtime_ns"]):
                 raise ValueError(f"workload changed during measurement: {path}")
+        for metadata in resource_metadata.values():
+            path = Path(str(metadata["path"]))
+            if (
+                path.stat().st_size != metadata["size"]
+                or path.stat().st_mtime_ns != metadata["mtime_ns"]
+            ):
+                raise ValueError(f"resource changed during measurement: {path}")
         temporary = output_dir / "index.json.tmp"
         temporary.write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
         temporary.replace(output_dir / "index.json")

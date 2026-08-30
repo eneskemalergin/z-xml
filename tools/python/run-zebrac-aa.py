@@ -25,7 +25,11 @@ TARGET_SCHEMAS = {
     "z-xml-persistent-targets-v1",
 }
 TARGET_HEADER = "name\texecutable\tprocessor_class\tfeatures\twork_lane\tinput_model"
-CORPUS_SCHEMAS = {"z-xml-generated-v3", "z-xml-namespace-benchmark-v1"}
+CORPUS_SCHEMAS = {
+    "z-xml-generated-v3",
+    "z-xml-namespace-benchmark-v1",
+    "z-xml-dtd-generated-v1",
+}
 MAX_CONTROL_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 ELIGIBILITY_FIELDS = {"target", "workload", "classification", "verdict"}
@@ -171,6 +175,8 @@ def read_workload(path: Path, selected: str) -> dict[str, object]:
     required = {"id", "path", "actual_bytes", "classification"}
     if rows.fieldnames is None or required.difference(rows.fieldnames):
         raise ValueError(f"{manifest}: incomplete corpus manifest")
+    if schema == "z-xml-dtd-generated-v1" and "resource_paths" not in rows.fieldnames:
+        raise ValueError(f"{manifest}: DTD manifest lacks resource paths")
     match: dict[str, object] | None = None
     seen: set[str] = set()
     for line_number, row in enumerate(rows, 2):
@@ -190,9 +196,18 @@ def read_workload(path: Path, selected: str) -> dict[str, object]:
         classification = row["classification"]
         if classification not in {"benchmark-valid", "not-well-formed"}:
             raise ValueError(f"{selected}: unsupported classification")
+        resources: list[Path] = []
+        resource_paths = row.get("resource_paths", "-")
+        if resource_paths != "-":
+            for value in resource_paths.split(","):
+                resource = (root / value).resolve()
+                if not resource.is_relative_to(root) or not resource.is_file():
+                    raise ValueError(f"{selected}: invalid resource path")
+                resources.append(resource)
         match = {
             "name": name,
             "source": source,
+            "resources": tuple(resources),
             "classification": classification,
             "schema": schema,
         }
@@ -294,8 +309,12 @@ def check_eligibility(
     if row["classification"] != workload["classification"]:
         raise ValueError("eligibility classification differs from the workload")
     if EVENT_ELIGIBILITY_FIELDS.issubset(row):
-        if arguments:
-            raise ValueError("event eligibility does not qualify program arguments")
+        qualified_arguments = row.get("program_args")
+        if qualified_arguments is None:
+            if arguments:
+                raise ValueError("event eligibility does not qualify program arguments")
+        elif qualified_arguments != (" ".join(arguments) or "-"):
+            raise ValueError("eligibility program arguments differ from the command")
         if row.get("work_lane") != target["lane"]:
             raise ValueError("eligibility lane differs from the target")
         if row.get("input_model") != target["input_model"]:
@@ -547,6 +566,8 @@ def main() -> int:
             extra_input_paths(args.program_arg, manifest.parent)
         ):
             identities[f"extra_input_{index}"] = file_information(path)
+        for index, path in enumerate(workload["resources"]):
+            identities[f"resource_{index}"] = file_information(path)
         eligibility_mtime = int(identities["eligibility"]["mtime_ns"])
         if eligibility_mtime <= max(
             int(value["mtime_ns"])
