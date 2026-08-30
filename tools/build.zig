@@ -7,6 +7,8 @@ const CheckAdapter = struct {
     namespaces: bool,
     dtd: bool,
     validating: bool,
+    validation_report: bool = false,
+    resolve_external: bool = false,
 };
 
 const PersistentAdapter = struct {
@@ -116,6 +118,21 @@ pub fn build(b: *std.Build) void {
             .namespaces = true,
             .dtd = true,
             .validating = true,
+        },
+        .{
+            .name = "z-xml-validation-internal-check",
+            .namespaces = true,
+            .dtd = true,
+            .validating = true,
+            .validation_report = true,
+        },
+        .{
+            .name = "z-xml-validation-external-check",
+            .namespaces = true,
+            .dtd = true,
+            .validating = true,
+            .validation_report = true,
+            .resolve_external = true,
         },
     }) |adapter| {
         addCheckAdapter(
@@ -243,6 +260,8 @@ fn addCheckAdapter(
     options.addOption(bool, "namespaces", adapter.namespaces);
     options.addOption(bool, "dtd", adapter.dtd);
     options.addOption(bool, "validating", adapter.validating);
+    options.addOption(bool, "validation_report", adapter.validation_report);
+    options.addOption(bool, "resolve_external", adapter.resolve_external);
     module.addOptions("check_options", options);
 
     const executable = b.addExecutable(.{

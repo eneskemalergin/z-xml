@@ -1,0 +1,4 @@
+# z-xml-targets-v1
+# name	executable	processor_class	features	work_lane	input_model
+z-xml-validation-internal	z-xml-validation-internal-check	validating	xml1_0_5e,namespaces,dtd,validation	validation	streaming-reader
+z-xml-validation-external	z-xml-validation-external-check	validating	xml1_0_5e,namespaces,dtd,validation,external_dtd,external_general_entities,external_parameter_entities	validation	streaming-reader

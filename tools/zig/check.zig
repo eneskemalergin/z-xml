@@ -8,6 +8,11 @@
 //! stream source while making external-resource policy explicit. Its result includes exact event,
 //! source, diagnostic, and optional Reader-owned memory fields. Parser failures retain their
 //! normal nonzero status after the result is written.
+//!
+//! Validation baseline builds select their report by default. They add final validity, ordered
+//! finding codes and byte locations, validation state, and grammar or per-document memory without
+//! exposing private declarations. Internal and external builds differ only in their default
+//! external-source policy.
 
 const std = @import("std");
 const xml = @import("z_xml");
@@ -26,11 +31,14 @@ const ExternalMode = enum {
 
 const Options = struct {
     dtd_report: bool = false,
+    validation_report: bool = check_options.validation_report,
     report_memory: bool = false,
     external: ?ExternalMode = null,
     max_dtd_bytes: ?usize = null,
     max_dtd_expanded_bytes: ?usize = null,
     max_external_source_bytes: ?usize = null,
+    max_validation_content_positions: ?usize = null,
+    max_validation_ids: ?usize = null,
     path: []const u8 = "",
 };
 
@@ -46,6 +54,7 @@ const Stats = struct {
     checksum: u64 = 14695981039346656037,
     semantic_match: bool = true,
     content: ?xml.DocumentContent = null,
+    validity: ?xml.DtdValidity = null,
 
     fn bytes(self: *Stats, value: []const u8) void {
         for (value) |byte| {
@@ -104,6 +113,7 @@ const Stats = struct {
             .document_end => |result| {
                 self.document_ends +|= 1;
                 self.content = result.content;
+                self.validity = result.dtd_validity;
                 if (!check_options.validating and result.dtd_validity != .not_requested) {
                     self.semantic_match = false;
                 }
@@ -122,6 +132,61 @@ const Stats = struct {
     fn complete(self: Stats) bool {
         return self.semantic_match and self.document_starts == 1 and
             self.document_ends == 1 and self.elements == self.end_elements;
+    }
+};
+
+const FindingStats = struct {
+    count: u64 = 0,
+    checksum: u64 = 14695981039346656037,
+    first: ?xml.DiagnosticCode = null,
+    last: ?xml.DiagnosticCode = null,
+    first_primary: ?xml.Location = null,
+    last_primary: ?xml.Location = null,
+
+    fn sink(self: *FindingStats) xml.dtd.FindingSink {
+        return .{ .context = self, .report_fn = report };
+    }
+
+    fn report(context: ?*anyopaque, finding: xml.dtd.Finding) xml.dtd.FindingAction {
+        const self: *FindingStats = @ptrCast(@alignCast(context.?));
+        const code = @tagName(finding.code);
+        self.count += 1;
+        if (self.first == null) {
+            self.first = finding.code;
+            self.first_primary = finding.primary;
+        }
+        self.last = finding.code;
+        self.last_primary = finding.primary;
+        for (code) |byte| self.hashByte(byte);
+        self.hashByte(0);
+        self.hashLocation(finding.primary);
+        if (finding.related) |related| {
+            self.hashByte(1);
+            self.hashLocation(related);
+        } else {
+            self.hashByte(0);
+        }
+        self.hashNumber(finding.inclusion_trace.len);
+        for (finding.inclusion_trace) |location| self.hashLocation(location);
+        return .continue_validation;
+    }
+
+    fn hashLocation(self: *FindingStats, location: xml.Location) void {
+        self.hashNumber(location.source_id);
+        self.hashNumber(location.byte_offset);
+    }
+
+    fn hashNumber(self: *FindingStats, value: u64) void {
+        var remaining = value;
+        for (0..8) |_| {
+            self.hashByte(@truncate(remaining));
+            remaining >>= 8;
+        }
+    }
+
+    fn hashByte(self: *FindingStats, byte: u8) void {
+        self.checksum ^= byte;
+        self.checksum *%= 1099511628211;
     }
 };
 
@@ -234,6 +299,24 @@ const MemoryStats = struct {
     caller_external_live_after_deinit: usize,
 };
 
+const ValidationMemoryStats = struct {
+    allocator_operations: u64,
+    requested_bytes: u64,
+    peak_live_bytes: usize,
+    dtd_capacity: usize,
+    content_model_capacity: usize,
+    grammar_capacity: usize,
+    identity_capacity: usize,
+    identity_bytes: usize,
+    document_capacity: usize,
+    retained_capacity: usize,
+    live_bytes_before_deinit: usize,
+    live_bytes_after_deinit: usize,
+    caller_root_storage_bytes: usize,
+    caller_external_peak_bytes: usize,
+    caller_external_live_after_deinit: usize,
+};
+
 pub fn main(init: std.process.Init) u8 {
     return run(init) catch |err| {
         std.debug.print("z-xml-check: {s}\n", .{@errorName(err)});
@@ -245,15 +328,18 @@ fn run(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const command = parseOptions(args) orelse {
         std.debug.print(
-            "usage: z-xml-check [--dtd-report --external=forbid|skip|resolve|" ++
-                "unavailable|failure] [--report-memory] " ++
+            "usage: z-xml-check [--dtd-report|--validation-report] " ++
+                "[--external=forbid|skip|resolve|unavailable|failure] " ++
+                "[--report-memory] " ++
                 "[--max-dtd-bytes=N] [--max-dtd-expanded-bytes=N] " ++
-                "[--max-external-source-bytes=N] FILE\n",
+                "[--max-external-source-bytes=N] " ++
+                "[--max-validation-content-positions=N] " ++
+                "[--max-validation-ids=N] FILE\n",
             .{},
         );
         return 64;
     };
-    if (command.dtd_report) return runDtdReport(init, command);
+    if (command.dtd_report or command.validation_report) return runDetailedReport(init, command);
 
     const file = try std.Io.Dir.cwd().openFile(init.io, command.path, .{});
     defer file.close(init.io);
@@ -329,7 +415,7 @@ fn run(init: std.process.Init) !u8 {
     return 0;
 }
 
-fn runDtdReport(init: std.process.Init, command: Options) !u8 {
+fn runDetailedReport(init: std.process.Init, command: Options) !u8 {
     const file = try std.Io.Dir.cwd().openFile(init.io, command.path, .{});
     defer file.close(init.io);
 
@@ -352,6 +438,7 @@ fn runDtdReport(init: std.process.Init, command: Options) !u8 {
         .mode = external,
         .inner = if (external == .resolve) filesystem_resolver.resolver() else null,
     };
+    var findings: FindingStats = .{};
     var input_buffer: [INPUT_BUFFER_SIZE]u8 = undefined;
     var file_reader = file.reader(init.io, &input_buffer);
     var reader_options: xml.ReaderOptions = .{
@@ -375,6 +462,15 @@ fn runDtdReport(init: std.process.Init, command: Options) !u8 {
         reader_options.limits.max_dtd_entity_replacement_bytes = 64 * 1024 * 1024;
         reader_options.limits.max_dtd_expansion_ratio = 1000;
     }
+    if (comptime check_options.validating) {
+        reader_options.limits.max_validation_ids = 8 * 1024 * 1024;
+        reader_options.limits.max_validation_idrefs = 8 * 1024 * 1024;
+        reader_options.limits.max_validation_identity_bytes = 256 * 1024 * 1024;
+        reader_options.limits.max_validation_comparison_work = 512 * 1024 * 1024;
+        if (command.validation_report) {
+            reader_options.dtd.validate.finding_sink = findings.sink();
+        }
+    }
     if (external == .resolve or external == .unavailable or external == .failure) {
         reader_options.resolver = measured_resolver.resolver();
         reader_options.document_base_id = std.fs.path.basename(command.path);
@@ -385,6 +481,12 @@ fn runDtdReport(init: std.process.Init, command: Options) !u8 {
     }
     if (command.max_external_source_bytes) |value| {
         reader_options.limits.max_external_source_bytes = value;
+    }
+    if (command.max_validation_content_positions) |value| {
+        reader_options.limits.max_validation_content_positions = value;
+    }
+    if (command.max_validation_ids) |value| {
+        reader_options.limits.max_validation_ids = value;
     }
 
     var reader = try xml.Reader.init(
@@ -442,13 +544,44 @@ fn runDtdReport(init: std.process.Init, command: Options) !u8 {
     var complete_memory = memory;
     complete_memory.live_bytes_after_deinit = reader_tracking.live_bytes;
     complete_memory.caller_external_live_after_deinit = source_tracking.live_bytes;
-    try printDtdResult(
-        init.io,
-        stats,
-        measured_resolver.stats,
-        failure,
-        if (command.report_memory) complete_memory else null,
-    );
+    if (command.validation_report) {
+        const grammar_capacity = usage.dtd_capacity +| usage.content_model_capacity;
+        const validation_memory: ValidationMemoryStats = .{
+            .allocator_operations = complete_memory.allocator_operations,
+            .requested_bytes = complete_memory.requested_bytes,
+            .peak_live_bytes = complete_memory.peak_live_bytes,
+            .dtd_capacity = usage.dtd_capacity,
+            .content_model_capacity = usage.content_model_capacity,
+            .grammar_capacity = grammar_capacity,
+            .identity_capacity = usage.identity_capacity,
+            .identity_bytes = usage.identity_bytes,
+            .document_capacity = usage.retained_capacity -| grammar_capacity,
+            .retained_capacity = usage.retained_capacity,
+            .live_bytes_before_deinit = complete_memory.live_bytes_before_deinit,
+            .live_bytes_after_deinit = complete_memory.live_bytes_after_deinit,
+            .caller_root_storage_bytes = complete_memory.caller_root_storage_bytes,
+            .caller_external_peak_bytes = complete_memory.caller_external_peak_bytes,
+            .caller_external_live_after_deinit = complete_memory.caller_external_live_after_deinit,
+        };
+        try printValidationResult(
+            init.io,
+            stats,
+            measured_resolver.stats,
+            failure,
+            findings,
+            usage.id_count,
+            usage.idref_count,
+            if (command.report_memory) validation_memory else null,
+        );
+    } else {
+        try printDtdResult(
+            init.io,
+            stats,
+            measured_resolver.stats,
+            failure,
+            if (command.report_memory) complete_memory else null,
+        );
+    }
     return if (failure) |value| statusForErrorName(value.error_name) else 0;
 }
 
@@ -458,6 +591,9 @@ fn parseOptions(args: []const []const u8) ?Options {
         if (std.mem.eql(u8, argument, "--dtd-report")) {
             if (options.dtd_report) return null;
             options.dtd_report = true;
+        } else if (std.mem.eql(u8, argument, "--validation-report")) {
+            if (options.validation_report) return null;
+            options.validation_report = true;
         } else if (std.mem.eql(u8, argument, "--report-memory")) {
             if (options.report_memory) return null;
             options.report_memory = true;
@@ -480,6 +616,16 @@ fn parseOptions(args: []const []const u8) ?Options {
             options.max_external_source_bytes = parsePositive(
                 argument["--max-external-source-bytes=".len..],
             ) orelse return null;
+        } else if (std.mem.startsWith(u8, argument, "--max-validation-content-positions=")) {
+            if (options.max_validation_content_positions != null) return null;
+            options.max_validation_content_positions = parsePositive(
+                argument["--max-validation-content-positions=".len..],
+            ) orelse return null;
+        } else if (std.mem.startsWith(u8, argument, "--max-validation-ids=")) {
+            if (options.max_validation_ids != null) return null;
+            options.max_validation_ids = parsePositive(
+                argument["--max-validation-ids=".len..],
+            ) orelse return null;
         } else if (argument.len == 0 or argument[0] == '-' or options.path.len != 0) {
             return null;
         } else {
@@ -487,15 +633,27 @@ fn parseOptions(args: []const []const u8) ?Options {
         }
     }
     if (options.path.len == 0) return null;
-    if (!options.dtd_report) {
+    if (options.dtd_report and options.validation_report) return null;
+    if (!options.dtd_report and !options.validation_report) {
         if (options.report_memory or options.external != null or options.max_dtd_bytes != null or
-            options.max_dtd_expanded_bytes != null or options.max_external_source_bytes != null)
+            options.max_dtd_expanded_bytes != null or options.max_external_source_bytes != null or
+            options.max_validation_content_positions != null or options.max_validation_ids != null)
         {
             return null;
         }
         return options;
     }
-    if (options.external == null) return null;
+    if (options.validation_report and !check_options.validating) return null;
+    if (!options.validation_report and
+        (options.max_validation_content_positions != null or
+            options.max_validation_ids != null))
+    {
+        return null;
+    }
+    if (options.external == null) {
+        if (!options.validation_report) return null;
+        options.external = if (check_options.resolve_external) .resolve else .forbid;
+    }
     if (!check_options.dtd and options.external.? != .forbid) return null;
     return options;
 }
@@ -575,6 +733,131 @@ fn printDtdResult(
                 value.requested_bytes,
                 value.peak_live_bytes,
                 value.dtd_capacity,
+                value.document_capacity,
+                value.retained_capacity,
+                value.live_bytes_before_deinit,
+                value.live_bytes_after_deinit,
+                value.caller_root_storage_bytes,
+                value.caller_external_peak_bytes,
+                value.caller_external_live_after_deinit,
+            },
+        );
+    }
+    try output.writeAll("}\n");
+    try output.flush();
+}
+
+fn printValidationResult(
+    io: std.Io,
+    stats: Stats,
+    resolver: ResolverStats,
+    failure: ?Failure,
+    findings: FindingStats,
+    id_count: usize,
+    idref_count: usize,
+    memory: ?ValidationMemoryStats,
+) !void {
+    var output_buffer: [4096]u8 = undefined;
+    var output_file = std.Io.File.stdout().writer(io, &output_buffer);
+    const output = &output_file.interface;
+    try output.writeAll("{\"outcome\":");
+    try printOptionalString(output, if (failure == null) "success" else "failure");
+    try output.writeAll(",\"error\":");
+    try printOptionalString(output, if (failure) |value| value.error_name else null);
+    try output.writeAll(",\"diagnostic\":");
+    try printOptionalString(output, if (failure) |value| value.diagnostic else null);
+    try output.writeAll(",\"source_id\":");
+    try printOptionalNumber(output, if (failure) |value| value.source_id else null);
+    try output.writeAll(",\"offset\":");
+    try printOptionalNumber(output, if (failure) |value| value.offset else null);
+    try output.writeAll(",\"related_source_id\":");
+    try printOptionalNumber(output, if (failure) |value| value.related_source_id else null);
+    try output.writeAll(",\"related_offset\":");
+    try printOptionalNumber(output, if (failure) |value| value.related_offset else null);
+    try output.print(
+        ",\"inclusion_depth\":{d},\"elements\":{d},\"attributes\":{d}," ++
+            "\"defaulted_attributes\":{d},\"text_bytes\":{d}," ++
+            "\"event_checksum\":\"{x:0>16}\",\"content\":",
+        .{
+            if (failure) |value| value.inclusion_depth else 0,
+            stats.elements,
+            stats.attributes,
+            stats.defaulted_attributes,
+            stats.text_bytes,
+            stats.checksum,
+        },
+    );
+    try printOptionalString(output, if (stats.content) |value| @tagName(value) else null);
+    try output.writeAll(",\"validity\":");
+    try printOptionalString(output, if (stats.validity) |value| @tagName(value) else null);
+    try output.print(
+        ",\"findings\":{d},\"findings_checksum\":\"{x:0>16}\"," ++
+            "\"id_count\":{d},\"idref_count\":{d}," ++
+            "\"first_finding\":",
+        .{ findings.count, findings.checksum, id_count, idref_count },
+    );
+    try printOptionalString(output, if (findings.first) |value| @tagName(value) else null);
+    try output.writeAll(",\"first_finding_source_id\":");
+    try printOptionalNumber(
+        output,
+        if (findings.first_primary) |value| value.source_id else null,
+    );
+    try output.writeAll(",\"first_finding_offset\":");
+    try printOptionalNumber(
+        output,
+        if (findings.first_primary) |value| value.byte_offset else null,
+    );
+    try output.writeAll(",\"last_finding\":");
+    try printOptionalString(output, if (findings.last) |value| @tagName(value) else null);
+    try output.writeAll(",\"last_finding_source_id\":");
+    try printOptionalNumber(
+        output,
+        if (findings.last_primary) |value| value.source_id else null,
+    );
+    try output.writeAll(",\"last_finding_offset\":");
+    try printOptionalNumber(
+        output,
+        if (findings.last_primary) |value| value.byte_offset else null,
+    );
+    try output.print(
+        ",\"resolver_calls\":{d},\"resolved_sources\":{d}," ++
+            "\"closed_sources\":{d},\"unavailable_results\":{d}," ++
+            "\"failure_results\":{d},\"external_subset_sources\":{d}," ++
+            "\"parameter_entity_sources\":{d},\"general_entity_sources\":{d}," ++
+            "\"skipped_sources\":{d},\"source_bytes\":{d}",
+        .{
+            resolver.calls,
+            resolver.resolved_sources,
+            resolver.closed_sources,
+            resolver.unavailable_results,
+            resolver.failure_results,
+            resolver.external_subset_sources,
+            resolver.parameter_entity_sources,
+            resolver.general_entity_sources,
+            stats.skipped_sources,
+            resolver.source_bytes,
+        },
+    );
+    if (memory) |value| {
+        try output.print(
+            ",\"allocator_operations\":{d},\"requested_bytes\":{d}," ++
+                "\"peak_live_bytes\":{d},\"dtd_capacity\":{d}," ++
+                "\"content_model_capacity\":{d},\"grammar_capacity\":{d}," ++
+                "\"identity_capacity\":{d},\"identity_bytes\":{d}," ++
+                "\"document_capacity\":{d}," ++
+                "\"retained_capacity\":{d},\"live_bytes_before_deinit\":{d}," ++
+                "\"live_bytes_after_deinit\":{d},\"caller_root_storage_bytes\":{d}," ++
+                "\"caller_external_peak_bytes\":{d}," ++
+                "\"caller_external_live_after_deinit\":{d}",
+            .{
+                value.allocator_operations,
+                value.requested_bytes,
+                value.peak_live_bytes,
+                value.dtd_capacity,
+                value.content_model_capacity,
+                value.grammar_capacity,
+                value.identity_capacity,
+                value.identity_bytes,
                 value.document_capacity,
                 value.retained_capacity,
                 value.live_bytes_before_deinit,
@@ -675,7 +958,21 @@ test "[unit] - [corpus adapter]: requires one balanced document" {
 test "[unit] - [corpus adapter options]: keeps legacy and DTD commands distinct" {
     const legacy = parseOptions(&.{ "z-xml-check", "input.xml" }).?;
     try std.testing.expect(!legacy.dtd_report);
+    try std.testing.expectEqual(check_options.validation_report, legacy.validation_report);
     try std.testing.expectEqualStrings("input.xml", legacy.path);
+
+    if (comptime check_options.validation_report) {
+        try std.testing.expectEqual(
+            if (check_options.resolve_external) ExternalMode.resolve else ExternalMode.forbid,
+            legacy.external.?,
+        );
+        try std.testing.expect(parseOptions(&.{
+            "z-xml-check",
+            "--validation-report",
+            "input.xml",
+        }) == null);
+        return;
+    }
 
     const dtd = parseOptions(&.{
         "z-xml-check",
@@ -695,7 +992,26 @@ test "[unit] - [corpus adapter options]: keeps legacy and DTD commands distinct"
         "z-xml-check",
         "--dtd-report",
         "--external=forbid",
+        "--max-validation-ids=7",
+        "x",
+    }) == null);
+    try std.testing.expect(parseOptions(&.{
+        "z-xml-check",
+        "--dtd-report",
+        "--external=forbid",
         "--max-dtd-bytes=0",
         "x",
     }) == null);
+
+    if (comptime check_options.validating) {
+        const validation = parseOptions(&.{
+            "z-xml-check",
+            "--validation-report",
+            "--max-validation-ids=7",
+            "input.xml",
+        }).?;
+        try std.testing.expect(validation.validation_report);
+        try std.testing.expectEqual(ExternalMode.forbid, validation.external.?);
+        try std.testing.expectEqual(@as(?usize, 7), validation.max_validation_ids);
+    }
 }

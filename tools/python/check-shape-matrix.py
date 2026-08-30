@@ -89,6 +89,7 @@ READY_GENERATORS = {
     "text",
     "unicode",
     "utf16-text",
+    "validation-benchmark",
     "validation-identifiers",
     "validation-models",
 } | set(WRITER_SHAPES)
