@@ -270,6 +270,21 @@ def persistent_arguments(arguments: list[str]) -> tuple[dict[str, str], list[str
     return values, extra
 
 
+def extra_input_paths(arguments: list[str], corpus_root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for argument in arguments:
+        if not argument.startswith("--next-file="):
+            continue
+        value = argument.removeprefix("--next-file=")
+        if not value or paths:
+            raise ValueError("invalid or duplicate --next-file")
+        path = Path(value).resolve()
+        if not path.is_relative_to(corpus_root) or not path.is_file():
+            raise ValueError("next input is outside the selected corpus or missing")
+        paths.append(path)
+    return paths
+
+
 def check_eligibility(
     row: dict[str, str],
     target: dict[str, object],
@@ -528,6 +543,10 @@ def main() -> int:
             "input": file_information(input_path),
             "zebrac": file_information(zebrac),
         }
+        for index, path in enumerate(
+            extra_input_paths(args.program_arg, manifest.parent)
+        ):
+            identities[f"extra_input_{index}"] = file_information(path)
         eligibility_mtime = int(identities["eligibility"]["mtime_ns"])
         if eligibility_mtime <= max(
             int(value["mtime_ns"])
@@ -565,14 +584,8 @@ def main() -> int:
         "index": output_dir / "index.json",
         "temporary": output_dir / "index.json.tmp",
     }
-    if args.output_dir.is_symlink() or set(paths.values()) & {
-        manifest,
-        eligibility_path,
-        targets_path,
-        program,
-        input_path,
-        zebrac,
-    }:
+    measured_files = {Path(str(value["path"])) for value in identities.values()}
+    if args.output_dir.is_symlink() or set(paths.values()) & measured_files:
         print("output path overlaps an input or uses a symlink", file=sys.stderr)
         return 1
     try:

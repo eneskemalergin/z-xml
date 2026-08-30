@@ -80,6 +80,42 @@ MEMORY_FIELDS = {
     "retained_capacity",
     "live_bytes_before_deinit",
     "live_bytes_after_deinit",
+    "caller_input_storage_bytes",
+}
+TRANSITION_FIELDS = {
+    "next_iterations",
+    "next_input_bytes",
+    "next_elements",
+    "next_attributes",
+    "next_text_bytes",
+    "next_name_bytes",
+    "next_value_bytes",
+    "next_fragments",
+    "next_accumulator",
+}
+TRANSITION_NAMESPACE_FIELDS = {
+    "next_namespace_declarations",
+    "next_namespace_uri_bytes",
+    "next_local_name_bytes",
+    "next_prefix_bytes",
+}
+TRANSITION_MEMORY_FIELDS = {
+    "primary_warm_allocator_operations",
+    "next_allocator_operations",
+}
+RELEASE_MEMORY_FIELDS = {
+    "release_allocator_operations",
+    "live_bytes_before_release",
+    "retained_capacity_after_release",
+    "live_bytes_after_release",
+}
+TIMING_FIELDS = {
+    "source_setup_ns",
+    "reader_init_ns",
+    "first_document_ns",
+    "primary_warm_ns",
+    "next_documents_ns",
+    "release_ns",
 }
 FLAT_MEMORY_FIELDS = {
     "first_allocator_operations",
@@ -138,6 +174,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--program", type=Path, required=True)
     parser.add_argument("--engine", required=True)
     parser.add_argument("--program-arg", action="append", default=[])
+    parser.add_argument("--next-workload")
+    parser.add_argument("--next-iterations", type=int)
     parser.add_argument("--namespace", action="store_true")
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--workload", action="append", default=[])
@@ -153,6 +191,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--open-files", type=int, default=64)
     parser.add_argument("--max-output-bytes", type=int, default=64 * 1024)
     parser.add_argument("--report-memory", action="store_true")
+    parser.add_argument("--report-timing", action="store_true")
+    parser.add_argument("--release-memory", action="store_true")
     parser.add_argument("--check-scale", action="store_true")
     return parser.parse_args()
 
@@ -468,6 +508,8 @@ def observe(
     engine: str,
     program_args: list[str],
     workload: dict[str, object],
+    next_workload: dict[str, object] | None,
+    next_iterations: int,
     input_model: str,
     consumer: str,
     chunk_bytes: int,
@@ -489,6 +531,17 @@ def observe(
     ]
     if args.report_memory:
         command.append("--report-memory")
+    if args.report_timing:
+        command.append("--report-timing")
+    if args.release_memory:
+        command.append("--release-memory")
+    if next_workload is not None:
+        command.extend(
+            [
+                f"--next-file={next_workload['resolved_path']}",
+                f"--next-iterations={next_iterations}",
+            ]
+        )
     command.append(str(workload["resolved_path"]))
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -527,6 +580,23 @@ def observe(
         EXPECTED_FIELDS
         | (NAMESPACE_FIELDS if args.namespace else set())
         | (MEMORY_FIELDS if args.report_memory else set())
+        | (TRANSITION_FIELDS if next_workload is not None else set())
+        | (
+            TRANSITION_NAMESPACE_FIELDS
+            if next_workload is not None and args.namespace
+            else set()
+        )
+        | (
+            TRANSITION_MEMORY_FIELDS
+            if next_workload is not None and args.report_memory
+            else set()
+        )
+        | (
+            RELEASE_MEMORY_FIELDS
+            if args.release_memory and args.report_memory
+            else set()
+        )
+        | (TIMING_FIELDS if args.report_timing else set())
     )
     if not isinstance(observed, dict) or set(observed) != expected_output_fields:
         return "error", "unexpected-fields", None
@@ -567,8 +637,41 @@ def observe(
     accumulator = expected["checksum"] if consumer == "full" else None
     if observed["accumulator"] != accumulator:
         return "fail", "accumulator-mismatch", observed
+    if next_workload is not None:
+        next_expected = next_workload["expected"]
+        assert isinstance(next_expected, dict)
+        next_numeric_fields = (
+            TRANSITION_FIELDS
+            | (TRANSITION_NAMESPACE_FIELDS if args.namespace else set())
+        ) - {"next_accumulator"}
+        if any(
+            type(observed[field]) is not int or observed[field] < 0
+            for field in next_numeric_fields
+        ):
+            return "error", "invalid-next-counter", observed
+        next_metadata = {
+            "next_iterations": next_iterations,
+            "next_input_bytes": int(next_workload["actual_bytes"]),
+        }
+        if any(observed[field] != value for field, value in next_metadata.items()):
+            return "fail", "next-metadata-mismatch", observed
+        next_counters = ["elements", "attributes", "text_bytes"]
+        if args.namespace:
+            next_counters.extend(
+                ["name_bytes", "value_bytes", *sorted(NAMESPACE_FIELDS)]
+            )
+        for field in next_counters:
+            if observed[f"next_{field}"] != next_expected[field]:
+                return "fail", f"next-{field.replace('_', '-')}-mismatch", observed
+        next_accumulator = next_expected["checksum"] if consumer == "full" else None
+        if observed["next_accumulator"] != next_accumulator:
+            return "fail", "next-accumulator-mismatch", observed
     if args.report_memory:
-        integer_fields = MEMORY_FIELDS - {"parser_storage"}
+        integer_fields = (
+            MEMORY_FIELDS
+            | (TRANSITION_MEMORY_FIELDS if next_workload is not None else set())
+            | (RELEASE_MEMORY_FIELDS if args.release_memory else set())
+        ) - {"parser_storage"}
         if any(
             type(observed[field]) is not int or observed[field] < 0
             for field in integer_fields
@@ -597,8 +700,54 @@ def observe(
             return "fail", "live-bytes-after-deinit", observed
         if observed["live_bytes_before_deinit"] > observed["peak_live_bytes"]:
             return "fail", "live-bytes-exceed-peak", observed
-        if observed["retained_capacity"] > observed["live_bytes_before_deinit"]:
+        if (
+            not args.release_memory
+            and observed["retained_capacity"] > observed["live_bytes_before_deinit"]
+        ):
             return "fail", "retained-capacity-exceeds-live-bytes", observed
+        expected_storage_bytes = (
+            int(workload["actual_bytes"])
+            + (int(next_workload["actual_bytes"]) if next_workload is not None else 0)
+            if input_model == "resident"
+            else chunk_bytes
+        )
+        if observed["caller_input_storage_bytes"] != expected_storage_bytes:
+            return "fail", "caller-input-storage-mismatch", observed
+        if (
+            next_workload is not None
+            and observed["primary_warm_allocator_operations"]
+            + observed["next_allocator_operations"]
+            != observed["warm_allocator_operations"]
+        ):
+            return "fail", "warm-phase-operations-mismatch", observed
+        if args.release_memory:
+            if (
+                observed["live_bytes_before_release"] > observed["peak_live_bytes"]
+                or observed["retained_capacity"] > observed["live_bytes_before_release"]
+            ):
+                return "fail", "release-memory-boundary-mismatch", observed
+            if any(
+                observed[field] != 0
+                for field in (
+                    "release_allocator_operations",
+                    "retained_capacity_after_release",
+                    "live_bytes_after_release",
+                    "live_bytes_before_deinit",
+                )
+            ):
+                return "fail", "release-memory-not-empty", observed
+    if args.report_timing:
+        if any(
+            type(observed[field]) is not int or observed[field] < 0
+            for field in TIMING_FIELDS
+        ):
+            return "error", "invalid-timing-field", observed
+        if (
+            (args.iterations == 1 and observed["primary_warm_ns"] != 0)
+            or (next_workload is None and observed["next_documents_ns"] != 0)
+            or (not args.release_memory and observed["release_ns"] != 0)
+        ):
+            return "fail", "inactive-timing-phase-not-zero", observed
     return "pass", "-", observed
 
 
@@ -617,6 +766,10 @@ def check_consumer_parity(
     fields = [*CONSUMER_PARITY_FIELDS]
     if namespace:
         fields.extend(sorted(NAMESPACE_FIELDS))
+    if samples and "next_elements" in samples[0]:
+        fields.extend(f"next_{field}" for field in CONSUMER_PARITY_FIELDS)
+        if namespace:
+            fields.extend(sorted(TRANSITION_NAMESPACE_FIELDS))
     errors: list[str] = []
     for key, by_consumer in sorted(groups.items()):
         if set(by_consumer) != {"minimal", "full"}:
@@ -694,6 +847,12 @@ def main() -> int:
         or not args.engine
         or (args.check_scale and not args.report_memory)
         or (args.check_scale and inputs != ["stream"])
+        or (args.next_workload is None) != (args.next_iterations is None)
+        or (args.next_iterations is not None and args.next_iterations <= 0)
+        or (args.next_workload is not None and (len(args.workload) != 1 or args.shape))
+        or (args.next_workload is not None and args.next_workload in args.workload)
+        or (args.next_workload is not None and args.check_scale)
+        or (args.release_memory and not args.report_memory)
     ):
         print("invalid limits, selections, or scale-check options", file=sys.stderr)
         return 64
@@ -730,22 +889,70 @@ def main() -> int:
             consumers,
             args.report_memory,
         )
+        required_tool_features: set[str] = set()
+        if args.next_workload is not None:
+            required_tool_features.add("transition_schedule")
+        if args.report_timing:
+            required_tool_features.add("timing_report")
+        if args.release_memory:
+            required_tool_features.add("release_report")
+        missing_tool_features = sorted(
+            required_tool_features.difference(target.features)
+        )
+        if missing_tool_features:
+            raise ValueError(
+                f"{target.name}: missing target features: "
+                + ",".join(missing_tool_features)
+            )
+        selected_ids = set(args.workload)
+        if args.next_workload is not None:
+            selected_ids.add(args.next_workload)
         workloads = read_workloads(
             args.manifest,
             args.max_bytes,
-            set(args.workload),
+            selected_ids,
             set(args.shape),
             args.namespace,
         )
+        by_id = {str(workload["id"]): workload for workload in workloads}
+        next_workload = by_id.pop(args.next_workload, None)
+        if args.next_workload is not None and next_workload is None:
+            raise ValueError(f"{args.manifest}: next workload is above the byte limit")
+        workloads = list(by_id.values())
+        if next_workload is not None and (
+            next_workload["expected"] is None
+            or any(workload["expected"] is None for workload in workloads)
+        ):
+            raise ValueError("transition workloads must be benchmark-valid")
     except (OSError, ValueError) as error:
         print(error, file=sys.stderr)
         return 1
 
-    result_fields = (
-        [*RESULT_FIELDS, *sorted(MEMORY_FIELDS)]
-        if args.report_memory
-        else RESULT_FIELDS
+    result_fields = [*RESULT_FIELDS]
+    if args.next_workload is not None:
+        result_fields.extend(
+            sorted(
+                (TRANSITION_FIELDS - {"next_iterations"})
+                | (TRANSITION_NAMESPACE_FIELDS if args.namespace else set())
+            )
+        )
+    if args.report_memory:
+        result_fields.extend(sorted(MEMORY_FIELDS))
+        if args.next_workload is not None:
+            result_fields.extend(sorted(TRANSITION_MEMORY_FIELDS))
+        if args.release_memory:
+            result_fields.extend(sorted(RELEASE_MEMORY_FIELDS))
+    if args.report_timing:
+        result_fields.extend(sorted(TIMING_FIELDS))
+    transition_program_args = (
+        [
+            f"--next-file={next_workload['resolved_path']}",
+            f"--next-iterations={args.next_iterations}",
+        ]
+        if next_workload is not None
+        else []
     )
+    effective_program_args = [*args.program_arg, *transition_program_args]
     fieldnames = [
         "target",
         "workload",
@@ -754,6 +961,7 @@ def main() -> int:
         "consumer",
         "chunk_bytes",
         "iterations",
+        *(["next_workload", "next_iterations"] if next_workload is not None else []),
         "program_args",
         "verdict",
         "reason",
@@ -789,6 +997,15 @@ def main() -> int:
                         required_profile = set(
                             str(workload.get("feature_checks", "")).split(",")
                         ) & {"dtd", "namespaces"}
+                        if next_workload is not None:
+                            required_profile.update(
+                                set(
+                                    str(next_workload.get("feature_checks", "")).split(
+                                        ","
+                                    )
+                                )
+                                & {"dtd", "namespaces"}
+                            )
                         missing = sorted(required_profile.difference(target.features))
                         if missing:
                             verdict = "unsupported-feature"
@@ -800,6 +1017,8 @@ def main() -> int:
                                 args.engine,
                                 args.program_arg,
                                 workload,
+                                next_workload,
+                                args.next_iterations or 0,
                                 input_model,
                                 consumer,
                                 chunk_bytes,
@@ -849,7 +1068,15 @@ def main() -> int:
                                 "consumer": consumer,
                                 "chunk_bytes": chunk_bytes,
                                 "iterations": args.iterations,
-                                "program_args": " ".join(args.program_arg) or "-",
+                                **(
+                                    {
+                                        "next_workload": next_workload["id"],
+                                        "next_iterations": args.next_iterations,
+                                    }
+                                    if next_workload is not None
+                                    else {}
+                                ),
+                                "program_args": " ".join(effective_program_args) or "-",
                                 "verdict": verdict,
                                 "reason": reason,
                                 **observed_fields,
