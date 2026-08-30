@@ -19,6 +19,8 @@ const PersistentAdapter = struct {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Override debug-info stripping") orelse
+        (optimize == .ReleaseFast);
 
     const z_xml = b.createModule(.{
         .root_source_file = b.path("../src/root.zig"),
@@ -68,7 +70,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("zig/tree.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize == .ReleaseFast,
+        .strip = strip,
     });
     tree_module.addImport("z_xml", z_xml);
     const tree_adapter = b.addExecutable(.{
@@ -121,6 +123,7 @@ pub fn build(b: *std.Build) void {
             z_xml,
             target,
             optimize,
+            strip,
             test_step,
             corpus_adapters_step,
             adapter,
@@ -136,6 +139,7 @@ pub fn build(b: *std.Build) void {
             z_xml,
             target,
             optimize,
+            strip,
             test_step,
             validation_bench_step,
             adapter[0],
@@ -174,6 +178,7 @@ pub fn build(b: *std.Build) void {
             z_xml,
             target,
             optimize,
+            strip,
             test_step,
             persistent_adapters_step,
             adapter,
@@ -184,7 +189,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("zig/writer.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize == .ReleaseFast,
+        .strip = strip,
     });
     writer_module.addImport("z_xml", z_xml);
     const writer_adapter = b.addExecutable(.{
@@ -198,7 +203,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("zig/layout_probe.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize == .ReleaseFast,
+        .strip = strip,
     });
     layout_module.addImport("z_xml", z_xml);
     const layout_probe = b.addExecutable(.{
@@ -222,6 +227,7 @@ fn addCheckAdapter(
     z_xml: *std.Build.Module,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    strip: bool,
     test_step: *std.Build.Step,
     install_step: *std.Build.Step,
     adapter: CheckAdapter,
@@ -230,7 +236,7 @@ fn addCheckAdapter(
         .root_source_file = b.path("zig/check.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize == .ReleaseFast,
+        .strip = strip,
     });
     module.addImport("z_xml", z_xml);
     const options = b.addOptions();
@@ -252,6 +258,7 @@ fn addValidationAdapter(
     z_xml: *std.Build.Module,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    strip: bool,
     test_step: *std.Build.Step,
     install_step: *std.Build.Step,
     name: []const u8,
@@ -261,7 +268,7 @@ fn addValidationAdapter(
         .root_source_file = b.path("zig/validation_repeat.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize == .ReleaseFast,
+        .strip = strip,
     });
     module.addImport("z_xml", z_xml);
     const options = b.addOptions();
@@ -281,6 +288,7 @@ fn addPersistentAdapter(
     z_xml: *std.Build.Module,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    strip: bool,
     test_step: *std.Build.Step,
     install_step: *std.Build.Step,
     adapter: PersistentAdapter,
@@ -289,7 +297,7 @@ fn addPersistentAdapter(
         .root_source_file = b.path("zig/persistent.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize == .ReleaseFast,
+        .strip = strip,
     });
     module.addImport("z_xml", z_xml);
     const options = b.addOptions();

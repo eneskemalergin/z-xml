@@ -124,6 +124,8 @@ zig build --build-file tools/build.zig reader-audit -Doptimize=Debug
 zig build --build-file tools/build.zig layout -Doptimize=ReleaseFast
 ```
 
+ReleaseFast adapters are stripped by default. Pass `-Dstrip=false` only when a profiler needs symbols.
+
 Check the benchmark plans and the z-xml repeated-input protocol with:
 
 ```sh
