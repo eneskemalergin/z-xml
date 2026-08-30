@@ -1,0 +1,5 @@
+# z-xml-targets-v1
+# name	executable	processor_class	features	work_lane	input_model
+z-xml-dtd-process	z-xml-namespace-process-check	wf	xml1_0_5e,namespaces,dtd,external_dtd,external_general_entities,external_parameter_entities	dtd	streaming-reader
+z-xml-dtd-process-control	z-xml-namespace-process-check	wf	xml1_0_5e,namespaces,dtd	dtd-control	streaming-reader
+z-xml-dtd-reject-control	z-xml-namespace-reject-check	wf	xml1_0_5e,namespaces	dtd-control	streaming-reader

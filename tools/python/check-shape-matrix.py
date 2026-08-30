@@ -79,6 +79,7 @@ WRITER_SHAPES = {
 READY_GENERATORS = {
     "attributes-varied",
     "deep",
+    "dtd-benchmark",
     "escaped",
     "markup",
     "mixed",
@@ -487,10 +488,10 @@ def validate(
             errors.append(f"{label}: seed-only ready row has no seed fixture")
         if row["expected"] == "reject" and row["oracle"] == "common-summary-v1":
             errors.append(f"{label}: rejection cannot use common-summary-v1")
-        if (
-            row["expected"] == "resource-limit"
-            and row["oracle"] != "limit-diagnostic-v1"
-        ):
+        if row["expected"] == "resource-limit" and row["oracle"] not in {
+            "limit-diagnostic-v1",
+            "dtd-limit-diagnostic-v1",
+        }:
             errors.append(f"{label}: resource-limit needs limit-diagnostic-v1")
     ids = [row["id"] for row in rows]
     for duplicate in sorted({item for item in ids if ids.count(item) > 1}):
