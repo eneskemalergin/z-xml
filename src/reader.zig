@@ -10807,34 +10807,46 @@ pub const NormalReader = struct {
                     .system_id = value.system_id,
                 } } };
             },
-            .document_start => |value| self.convertCommonEvent(
+            .document_start => |value| self.convertSelectedCommonEvent(
                 config,
                 span,
                 .{ .document_start = value },
             ),
-            .start_element => |value| self.convertCommonEvent(
+            .start_element => |value| self.convertSelectedCommonEvent(
                 config,
                 span,
                 .{ .start_element = value },
             ),
-            .end_element => |value| self.convertCommonEvent(
+            .end_element => |value| self.convertSelectedCommonEvent(
                 config,
                 span,
                 .{ .end_element = value },
             ),
-            .text => |value| self.convertCommonEvent(config, span, .{ .text = value }),
-            .comment => |value| self.convertCommonEvent(config, span, .{ .comment = value }),
-            .processing_instruction => |value| self.convertCommonEvent(
+            .text => |value| self.convertSelectedCommonEvent(config, span, .{ .text = value }),
+            .comment => |value| self.convertSelectedCommonEvent(config, span, .{ .comment = value }),
+            .processing_instruction => |value| self.convertSelectedCommonEvent(
                 config,
                 span,
                 .{ .processing_instruction = value },
             ),
-            .document_end => |value| self.convertCommonEvent(
+            .document_end => |value| self.convertSelectedCommonEvent(
                 config,
                 span,
                 .{ .document_end = value },
             ),
         };
+    }
+
+    inline fn convertSelectedCommonEvent(
+        self: *Self,
+        comptime config: Config,
+        span: NormalSourceSpan,
+        payload: NoDtdEventPayload(config),
+    ) NormalReadError!?NormalEvent {
+        if (comptime std.meta.eql(config, normal_namespace_config)) {
+            return @call(.always_inline, convertCommonEvent, .{ self, config, span, payload });
+        }
+        return self.convertCommonEvent(config, span, payload);
     }
 
     fn convertCommonEvent(
