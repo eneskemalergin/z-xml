@@ -30,8 +30,13 @@ CORPUS_SCHEMAS = {
     "z-xml-namespace-benchmark-v1",
     "z-xml-dtd-generated-v1",
     "z-xml-validation-generated-v1",
+    "z-xml-validation-reuse-v1",
 }
-RESOURCE_SCHEMAS = {"z-xml-dtd-generated-v1", "z-xml-validation-generated-v1"}
+RESOURCE_SCHEMAS = {
+    "z-xml-dtd-generated-v1",
+    "z-xml-validation-generated-v1",
+    "z-xml-validation-reuse-v1",
+}
 MAX_CONTROL_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 ELIGIBILITY_FIELDS = {"target", "workload", "classification", "verdict"}
@@ -287,7 +292,9 @@ def persistent_arguments(arguments: list[str]) -> tuple[dict[str, str], list[str
     return values, extra
 
 
-def extra_input_paths(arguments: list[str], corpus_root: Path) -> list[Path]:
+def extra_input_paths(
+    arguments: list[str], corpus_root: Path, input_parent: Path
+) -> list[Path]:
     paths: list[Path] = []
     for argument in arguments:
         if not argument.startswith("--next-file="):
@@ -295,7 +302,10 @@ def extra_input_paths(arguments: list[str], corpus_root: Path) -> list[Path]:
         value = argument.removeprefix("--next-file=")
         if not value or paths:
             raise ValueError("invalid or duplicate --next-file")
-        path = Path(value).resolve()
+        selected = Path(value)
+        path = (
+            selected if selected.is_absolute() else input_parent / selected
+        ).resolve()
         if not path.is_relative_to(corpus_root) or not path.is_file():
             raise ValueError("next input is outside the selected corpus or missing")
         paths.append(path)
@@ -565,7 +575,7 @@ def main() -> int:
             "zebrac": file_information(zebrac),
         }
         for index, path in enumerate(
-            extra_input_paths(args.program_arg, manifest.parent)
+            extra_input_paths(args.program_arg, manifest.parent, input_path.parent)
         ):
             identities[f"extra_input_{index}"] = file_information(path)
         for index, path in enumerate(workload["resources"]):

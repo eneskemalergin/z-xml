@@ -24,7 +24,8 @@ GENERATED_SCHEMAS = {"z-xml-generated-v3"}
 NAMESPACE_SCHEMA = "z-xml-namespace-benchmark-v1"
 DTD_SCHEMA = "z-xml-dtd-generated-v1"
 VALIDATION_SCHEMA = "z-xml-validation-generated-v1"
-RESOURCE_SCHEMAS = {DTD_SCHEMA, VALIDATION_SCHEMA}
+VALIDATION_REUSE_SCHEMA = "z-xml-validation-reuse-v1"
+RESOURCE_SCHEMAS = {DTD_SCHEMA, VALIDATION_SCHEMA, VALIDATION_REUSE_SCHEMA}
 TARGET_SCHEMAS = {
     "z-xml-targets-v1",
     "z-xml-targets-v2",
@@ -182,7 +183,12 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
     generated_schema = GENERATED_SCHEMAS.intersection(comments)
     named_schemas = {
         schema
-        for schema in (NAMESPACE_SCHEMA, DTD_SCHEMA, VALIDATION_SCHEMA)
+        for schema in (
+            NAMESPACE_SCHEMA,
+            DTD_SCHEMA,
+            VALIDATION_SCHEMA,
+            VALIDATION_REUSE_SCHEMA,
+        )
         if schema in comments
     }
     if len(generated_schema) + len(named_schemas) != 1:
@@ -218,7 +224,10 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
             raise ValueError(f"{workload['id']}: path escapes corpus") from error
         if not resolved.is_file():
             raise ValueError(f"{workload['id']}: missing {resolved}")
-        if resolved in seen_paths and schema != DTD_SCHEMA:
+        if resolved in seen_paths and schema not in {
+            DTD_SCHEMA,
+            VALIDATION_REUSE_SCHEMA,
+        }:
             raise ValueError(f"{workload['id']}: duplicate workload path")
         seen_paths.add(resolved)
         actual = resolved.stat().st_size
@@ -394,7 +403,7 @@ def eligibility_match(
             continue
         if item.kind == "event":
             qualified_arguments = row.get("program_args")
-            if work_multiplier != 1 or (
+            if (work_multiplier != 1 and target.work_lane != "validation-reuse") or (
                 qualified_arguments is None and program_arguments
             ):
                 matches.append(
@@ -473,6 +482,46 @@ def eligibility_match(
     if eligibility[0].kind == "persistent":
         return False, "no-matching-persistent-qualification", target.input_model
     return matches[0]
+
+
+def validation_reuse_multiplier(
+    arguments: list[str], workload: dict[str, object]
+) -> int:
+    values: dict[str, str] = {}
+    for argument in arguments:
+        if not argument.startswith("--") or "=" not in argument:
+            raise ValueError("invalid validation reuse program argument")
+        name, value = argument[2:].split("=", 1)
+        if name not in {"dtd", "iterations", "next-file", "next-iterations"}:
+            raise ValueError("unsupported validation reuse program argument")
+        if not value or name in values:
+            raise ValueError("invalid validation reuse program argument")
+        values[name] = value
+    if set(values) not in (
+        {"dtd", "iterations"},
+        {"dtd", "iterations", "next-file", "next-iterations"},
+    ):
+        raise ValueError("incomplete validation reuse program arguments")
+    iterations = int(values["iterations"])
+    if iterations <= 0:
+        raise ValueError("invalid validation reuse iteration count")
+    input_bytes = int(workload["actual_bytes"])
+    work_bytes = input_bytes * iterations
+    if "next-file" in values:
+        next_iterations = int(values["next-iterations"])
+        if next_iterations <= 0:
+            raise ValueError("invalid validation reuse transition count")
+        resources = workload["resolved_resources"]
+        if not isinstance(resources, list):
+            raise TypeError("invalid validation reuse resources")
+        matches = [path for path in resources if path.name == values["next-file"]]
+        if len(matches) != 1:
+            raise ValueError("validation reuse transition input differs")
+        work_bytes += matches[0].stat().st_size * next_iterations
+    multiplier, remainder = divmod(work_bytes, input_bytes)
+    if remainder or multiplier <= 0:
+        raise ValueError("validation reuse work is not an exact input multiple")
+    return multiplier
 
 
 def run_process(
@@ -762,6 +811,16 @@ def main() -> int:
             if size > args.max_bytes:
                 skipped.append({"workload": workload["id"], "reason": "max-bytes"})
                 continue
+            if any(
+                target.name in selected_targets
+                and target.work_lane == "validation-reuse"
+                for target in targets.values()
+            ) and args.work_multiplier != validation_reuse_multiplier(
+                args.program_arg, workload
+            ):
+                raise ValueError(
+                    f"{workload['id']}: validation reuse work multiplier differs"
+                )
             if size * args.work_multiplier > 2**63 - 1:
                 raise ValueError(f"{workload['id']}: work byte count exceeds i64")
             lanes = sorted({target.work_lane for target in targets.values()})
