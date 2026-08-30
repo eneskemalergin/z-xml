@@ -7774,8 +7774,9 @@ pub fn Reader(comptime config: Config) type {
 
         fn applyDtdAttributes(self: *Self) ReadError!void {
             const declarations = &self.dtd_state.declarations;
-            if (declarations.root_name == null) return;
+            if (declarations.attributes.items.len == 0) return;
             const element_name = self.open_names.items[self.open_names.items.len - self.token_name_len ..];
+            const element_name_hash: u32 = @truncate(std.hash.Wyhash.hash(0, element_name));
 
             var source_index: usize = 0;
             while (source_index < self.attribute_records.items.len) : (source_index += 1) {
@@ -7795,10 +7796,12 @@ pub fn Reader(comptime config: Config) type {
             }
 
             for (declarations.attributes.items, 0..) |declaration, declaration_index| {
-                const applies = declarations.equalStored(
+                const applies = declarations.equalStoredHashed(
                     self.options.dtd_limits,
                     declaration.element_name,
+                    declaration.element_name_hash,
                     element_name,
+                    element_name_hash,
                 ) catch |err| return self.mapDtdError(err, .malformed_attribute);
                 if (!applies or declaration.default_value == null) continue;
                 const name = declarations.string(declaration.name);

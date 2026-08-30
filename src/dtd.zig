@@ -196,6 +196,7 @@ pub const ElementDeclaration = struct {
 
 pub const AttributeDeclaration = struct {
     element_name: StoredString,
+    element_name_hash: u32,
     name: StoredString,
     attribute_type: AttributeType,
     default_kind: DefaultKind,
@@ -549,6 +550,18 @@ pub const State = struct {
         return std.mem.eql(u8, self.string(stored), bytes);
     }
 
+    pub inline fn equalStoredHashed(
+        self: *State,
+        limits: Limits,
+        stored: StoredString,
+        stored_hash: u32,
+        bytes: []const u8,
+        bytes_hash: u32,
+    ) ParseError!bool {
+        try self.chargeComparison(limits, stored.len +| bytes.len +| 1, 0);
+        return stored_hash == bytes_hash and std.mem.eql(u8, self.string(stored), bytes);
+    }
+
     pub fn appendDoctypeByte(
         self: *State,
         allocator: std.mem.Allocator,
@@ -736,6 +749,7 @@ pub const State = struct {
             )) continue;
             try self.attributes.append(allocator, .{
                 .element_name = shifted(attribute.element_name, byte_base),
+                .element_name_hash = attribute.element_name_hash,
                 .name = shifted(attribute.name, byte_base),
                 .attribute_type = attribute.attribute_type,
                 .default_kind = attribute.default_kind,
@@ -1571,6 +1585,7 @@ const Parser = struct {
         const element_name = scanName(source, cursor) orelse
             return self.invalid(.malformed_attribute_list, self.sourceOffset(source_index, cursor.*));
         const stored_element_name = try self.state.store(self.allocator, element_name);
+        const element_name_hash: u32 = @truncate(std.hash.Wyhash.hash(0, element_name));
         while (true) {
             skipWhitespace(source, cursor);
             if (cursor.* >= source.len) {
@@ -1616,6 +1631,7 @@ const Parser = struct {
             const stored_name = try self.state.store(self.allocator, name);
             try self.state.attributes.append(self.allocator, .{
                 .element_name = stored_element_name,
+                .element_name_hash = element_name_hash,
                 .name = stored_name,
                 .attribute_type = parsed_type.attribute_type,
                 .default_kind = default.kind,

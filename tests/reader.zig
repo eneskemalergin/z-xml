@@ -4332,6 +4332,28 @@ test "[integration] - [Reader DTD processing]: applies declarations without vali
     try std.testing.expect(reader.memoryUsage().dtd_capacity > 0);
 }
 
+test "[edge] - [Reader DTD processing]: hash collisions still require exact element names" {
+    const first_hash: u32 = @truncate(std.hash.Wyhash.hash(0, "n313"));
+    const second_hash: u32 = @truncate(std.hash.Wyhash.hash(0, "n1449c"));
+    try std.testing.expectEqual(first_hash, second_hash);
+
+    const input = "<!DOCTYPE n1449c [" ++
+        "<!ATTLIST n313 value CDATA 'wrong'>" ++
+        "<!ATTLIST n1449c value CDATA 'right'>]><n1449c/>";
+    var reader = try xml.Reader.init(std.testing.allocator, .{ .slice = input }, .{});
+    defer reader.deinit();
+
+    var saw_start = false;
+    while (try reader.next()) |event| switch (event.data) {
+        .start_element => |start| {
+            saw_start = true;
+            try std.testing.expectEqualStrings("right", start.attributeRaw("value").?.value);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_start);
+}
+
 test "[integration] - [Reader DTD processing]: standalone ignores external declarations" {
     const resources = [_]TestExternalResource{
         .{
