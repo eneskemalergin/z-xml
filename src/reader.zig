@@ -1712,7 +1712,7 @@ pub fn Reader(comptime config: Config) type {
         reference_token_bytes: usize = 0,
         reference_name: [5]u8 = @splat(0),
         reference_name_len: usize = 0,
-        document_start_resume: VerticalState = .before_root,
+        document_start_resume: VerticalState = .detect_bom,
         document_start_span: Location(config) = .{},
         declared_version_offset: usize = 0,
         declared_version_len: usize = 0,
@@ -1836,7 +1836,7 @@ pub fn Reader(comptime config: Config) type {
                 self.dtd_state.reference_name.clearRetainingCapacity();
                 self.dtd_state.current_is_replacement = false;
             }
-            self.document_start_resume = .before_root;
+            self.document_start_resume = .detect_bom;
             self.document_start_span = .{};
             self.declared_version_offset = 0;
             self.declared_version_len = 0;
@@ -3545,6 +3545,12 @@ pub fn Reader(comptime config: Config) type {
             return if (comptime config.profile.isXml11()) self.effective_version else .xml10;
         }
 
+        fn sourceNormalizationActive(self: *const Self) bool {
+            if (comptime !config.profile.isXml11()) return false;
+            return self.document_start_resume == .detect_bom or
+                self.normalization_status != .unchecked;
+        }
+
         fn activateNormalization(self: *Self) ReadError!void {
             if (comptime !config.profile.isXml11()) unreachable;
             if (self.options.normalization == .unchecked or self.xmlVersion() != .xml11) return;
@@ -3643,6 +3649,7 @@ pub fn Reader(comptime config: Config) type {
             source_width: u64,
         ) ReadError!void {
             if (comptime !config.profile.isXml11()) return;
+            if (!self.sourceNormalizationActive()) return;
             const normalization = &self.source_state.normalization;
             if (normalization.definite_issue != null) return;
             const line = normalization.line;
@@ -3672,6 +3679,7 @@ pub fn Reader(comptime config: Config) type {
             source_advance: u64,
         ) ReadError!void {
             if (comptime !config.profile.isXml11()) return;
+            if (!self.sourceNormalizationActive()) return;
             const normalization = &self.source_state.normalization;
             if (normalization.utf8_len == 0) {
                 if (byte < 0x80) {
@@ -3713,6 +3721,7 @@ pub fn Reader(comptime config: Config) type {
 
         fn scanSourceRawUtf8Byte(self: *Self, byte: u8, byte_offset: u64) ReadError!void {
             if (comptime !config.profile.isXml11()) return;
+            if (!self.sourceNormalizationActive()) return;
             const normalization = &self.source_state.normalization;
             if (byte_offset < normalization.scanned_raw_offset) return;
             normalization.scanned_raw_offset = byte_offset + 1;
@@ -8768,9 +8777,11 @@ pub fn Reader(comptime config: Config) type {
             if (source.signature_len != 0) {
                 self.input = source.signature_bytes[0..source.signature_len];
                 if (comptime config.profile.isXml11()) {
-                    const base = source.raw_offset - source.signature_len;
-                    for (self.input, 0..) |byte, index| {
-                        try self.scanSourceRawUtf8Byte(byte, base + @as(u64, @intCast(index)));
+                    if (self.sourceNormalizationActive()) {
+                        const base = source.raw_offset - source.signature_len;
+                        for (self.input, 0..) |byte, index| {
+                            try self.scanSourceRawUtf8Byte(byte, base + @as(u64, @intCast(index)));
+                        }
                     }
                 }
                 source.signature_len = 0;
@@ -8791,8 +8802,10 @@ pub fn Reader(comptime config: Config) type {
                 const start = source.raw_offset;
                 self.input = source.raw_input[source.raw_cursor..];
                 if (comptime config.profile.isXml11()) {
-                    for (self.input, 0..) |byte, index| {
-                        try self.scanSourceRawUtf8Byte(byte, start + @as(u64, @intCast(index)));
+                    if (self.sourceNormalizationActive()) {
+                        for (self.input, 0..) |byte, index| {
+                            try self.scanSourceRawUtf8Byte(byte, start + @as(u64, @intCast(index)));
+                        }
                     }
                 }
                 source.raw_offset += self.input.len;
@@ -8904,7 +8917,9 @@ pub fn Reader(comptime config: Config) type {
                     const low_value = @as(u32, unit) - 0xdc00;
                     const codepoint: u21 = @intCast(0x10000 + (high_value << 10) + low_value);
                     source.high_surrogate = null;
-                    try self.scanSourceScalar(codepoint, source.high_surrogate_offset, 4);
+                    if (self.sourceNormalizationActive()) {
+                        try self.scanSourceScalar(codepoint, source.high_surrogate_offset, 4);
+                    }
                     self.appendDecodedScalar(codepoint, 4);
                 } else if (unit >= 0xd800 and unit <= 0xdbff) {
                     source.high_surrogate = unit;
@@ -8913,7 +8928,9 @@ pub fn Reader(comptime config: Config) type {
                     source.failure = .{ .code = .malformed_encoding, .offset = unit_offset };
                     return;
                 } else {
-                    try self.scanSourceScalar(@intCast(unit), unit_offset, 2);
+                    if (self.sourceNormalizationActive()) {
+                        try self.scanSourceScalar(@intCast(unit), unit_offset, 2);
+                    }
                     self.appendDecodedScalar(@intCast(unit), 2);
                 }
             }
@@ -8960,13 +8977,15 @@ pub fn Reader(comptime config: Config) type {
                         source.decoded.items.len += progress.produced;
                         source.source_advances.items.len = old_len + progress.produced;
                         if (comptime config.profile.isXml11()) {
-                            var mapped_offset = raw_start;
-                            for (
-                                source.decoded.items[old_len..][0..progress.produced],
-                                source.source_advances.items[old_len..][0..progress.produced],
-                            ) |byte, advance| {
-                                try self.scanSourceUtf8Byte(byte, mapped_offset, advance);
-                                mapped_offset += advance;
+                            if (self.sourceNormalizationActive()) {
+                                var mapped_offset = raw_start;
+                                for (
+                                    source.decoded.items[old_len..][0..progress.produced],
+                                    source.source_advances.items[old_len..][0..progress.produced],
+                                ) |byte, advance| {
+                                    try self.scanSourceUtf8Byte(byte, mapped_offset, advance);
+                                    mapped_offset += advance;
+                                }
                             }
                         }
                     },
