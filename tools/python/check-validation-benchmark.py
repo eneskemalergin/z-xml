@@ -183,9 +183,10 @@ def read_targets(path: Path, bin_dir: Path) -> dict[str, Target]:
             raise ValueError(f"{path}:{line_number}: invalid target fields")
         name, executable, processor, feature_text, work_lane, input_model = fields
         features = frozenset(feature_text.split(","))
+        if work_lane != "validation":
+            continue
         if (
             processor != "validating"
-            or work_lane != "validation"
             or input_model != "streaming-reader"
             or not {"xml1_0_5e", "namespaces", "dtd", "validation"}.issubset(features)
         ):
