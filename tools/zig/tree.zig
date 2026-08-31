@@ -2,10 +2,12 @@
 //!
 //! Input uses a bounded stream and DTD rejection. Raw-name mode keeps a Reader-compatible checksum
 //! separate from one that also covers comments and processing instructions. Namespace mode also
-//! fingerprints retained declarations and expanded names. Construction timing includes file
-//! opening, input reading, parsing, owned Document creation, deinitialization, and result output;
-//! traversal timing remains separate. Memory mode reports Document storage, allocation work, an
-//! independent Reader-only pass, caller input storage, traversal scratch, and cleanup.
+//! fingerprints retained declarations and expanded names. Whole-process construction measurements
+//! include file opening, input reading, parsing, owned Document creation, deinitialization, and
+//! result output. Reported traversal timing starts after construction and ends before destruction.
+//! Timing can repeat the same complete traversal after one build for profile attribution. Memory
+//! mode reports Document storage, allocation work, an independent Reader-only pass, caller input
+//! storage, traversal scratch, and cleanup.
 
 const std = @import("std");
 const xml = @import("z_xml");
@@ -23,6 +25,7 @@ const Mode = enum {
 const Options = struct {
     mode: Mode = .summary,
     namespaces: bool = false,
+    iterations: usize = 1,
     path: []const u8,
 };
 
@@ -122,7 +125,7 @@ fn run(init: std.process.Init) !u8 {
     const options = parseOptions(args) orelse {
         std.debug.print(
             "usage: z-xml-tree [--construction|--memory|--timing] " ++
-                "[--namespaces=process] FILE\n",
+                "[--iterations=N] [--namespaces=process] FILE\n",
             .{},
         );
         return 64;
@@ -213,7 +216,10 @@ fn run(init: std.process.Init) !u8 {
             owned_memory.total_capacity_bytes;
         reader_memory = try auditReaderMemory(init, options);
     } else if (report_timing) {
-        try traverse(false, options.namespaces, init.gpa, &document, &stats);
+        for (0..options.iterations) |_| {
+            stats = .{};
+            try traverse(false, options.namespaces, init.gpa, &document, &stats);
+        }
     } else {
         try traverse(true, options.namespaces, init.gpa, &document, &stats);
     }
@@ -279,10 +285,12 @@ fn run(init: std.process.Init) !u8 {
         );
     } else if (report_timing) {
         try output.print(
-            "{{\"build_ns\":{d},\"traversal_ns\":{d},\"elements\":{d},\"checksum\":\"{x:0>16}\"}}\n",
+            "{{\"build_ns\":{d},\"traversal_ns\":{d},\"iterations\":{d}," ++
+                "\"elements\":{d},\"checksum\":\"{x:0>16}\"}}\n",
             .{
                 build_start.durationTo(build_end).nanoseconds,
                 traversal_start.durationTo(traversal_end).nanoseconds,
+                options.iterations,
                 stats.elements,
                 stats.traversal_checksum,
             },
@@ -339,6 +347,8 @@ fn parseOptions(args: []const []const u8) ?Options {
     var mode: Mode = .summary;
     var mode_set = false;
     var namespaces = false;
+    var iterations: usize = 1;
+    var iterations_set = false;
     var path: ?[]const u8 = null;
     for (args[1..]) |argument| {
         if (std.mem.eql(u8, argument, "--construction") or
@@ -356,13 +366,28 @@ fn parseOptions(args: []const []const u8) ?Options {
         } else if (std.mem.eql(u8, argument, "--namespaces=process")) {
             if (namespaces) return null;
             namespaces = true;
+        } else if (std.mem.startsWith(u8, argument, "--iterations=")) {
+            if (iterations_set) return null;
+            iterations_set = true;
+            iterations = std.fmt.parseInt(
+                usize,
+                argument["--iterations=".len..],
+                10,
+            ) catch return null;
+            if (iterations == 0) return null;
         } else if (std.mem.startsWith(u8, argument, "--") or path != null) {
             return null;
         } else {
             path = argument;
         }
     }
-    return .{ .mode = mode, .namespaces = namespaces, .path = path orelse return null };
+    if (iterations_set and mode != .timing) return null;
+    return .{
+        .mode = mode,
+        .namespaces = namespaces,
+        .iterations = iterations,
+        .path = path orelse return null,
+    };
 }
 
 fn auditReaderMemory(init: std.process.Init, options: Options) !ReaderMemory {
@@ -602,4 +627,29 @@ test "[unit] - [document adapter]: fingerprints retained namespace data" {
     try traverse(true, true, std.testing.allocator, &document, &stats);
     try std.testing.expectEqual(@as(u64, 1), stats.namespace_declarations);
     try std.testing.expectEqual(@as(u64, 0x9de0595931a6a17c), stats.expanded_name_checksum);
+}
+
+test "[unit] - [document adapter options]: accepts positive timing iterations only" {
+    const options = parseOptions(&.{
+        "z-xml-tree",
+        "--timing",
+        "--iterations=8",
+        "--namespaces=process",
+        "input.xml",
+    }).?;
+    try std.testing.expectEqual(Mode.timing, options.mode);
+    try std.testing.expectEqual(@as(usize, 8), options.iterations);
+    try std.testing.expect(options.namespaces);
+    try std.testing.expectEqualStrings("input.xml", options.path);
+    try std.testing.expect(parseOptions(&.{ "z-xml-tree", "--iterations=8", "x" }) == null);
+    try std.testing.expect(parseOptions(&.{ "z-xml-tree", "--timing", "--iterations=0", "x" }) == null);
+    try std.testing.expect(parseOptions(&.{ "z-xml-tree", "--timing", "--iterations=-1", "x" }) == null);
+    try std.testing.expect(parseOptions(&.{ "z-xml-tree", "--timing", "--iterations=x", "x" }) == null);
+    try std.testing.expect(parseOptions(&.{
+        "z-xml-tree",
+        "--timing",
+        "--iterations=2",
+        "--iterations=3",
+        "x",
+    }) == null);
 }

@@ -13,6 +13,7 @@ import platform
 import shlex
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -84,19 +85,23 @@ def read_limited(path: Path, limit: int = MAX_CONTROL_BYTES) -> bytes:
 
 
 def read_json(path: Path, limit: int) -> object:
+    return decode_json(read_limited(path, limit).decode("utf-8"))
+
+
+def decode_json(value: str) -> object:
     def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
         decoded: dict[str, object] = {}
-        for key, value in pairs:
+        for key, item in pairs:
             if key in decoded:
                 raise ValueError(f"duplicate JSON field {key}")
-            decoded[key] = value
+            decoded[key] = item
         return decoded
 
     def reject_constant(value: str) -> object:
         raise ValueError(f"invalid JSON number {value}")
 
     return json.loads(
-        read_limited(path, limit),
+        value,
         object_pairs_hook=unique_object,
         parse_constant=reject_constant,
     )
@@ -121,6 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target", action="append", default=[])
     parser.add_argument("--lane", action="append", default=[])
     parser.add_argument("--program-arg", action="append", default=[])
+    parser.add_argument("--reported-traversal-time", action="store_true")
     parser.add_argument("--work-multiplier", type=int, default=1)
     parser.add_argument("--case", default="end-to-end")
     parser.add_argument("--max-bytes", type=int, default=64 * 1024 * 1024)
@@ -632,6 +638,109 @@ def safe_name(value: str) -> str:
     )
 
 
+def reported_summary(values: list[int]) -> dict[str, object]:
+    return {
+        "mean": statistics.fmean(values),
+        "std_dev": statistics.pstdev(values),
+        "min": min(values),
+        "max": max(values),
+        "values": values,
+    }
+
+
+def measure_reported_traversal(
+    group: dict[str, object], args: argparse.Namespace
+) -> dict[str, object]:
+    commands = [shlex.split(command) for command in group["commands"]]
+    targets = [target.name for target in group["targets"]]
+    build_values = [[] for _ in commands]
+    traversal_values = [[] for _ in commands]
+    guard: tuple[int, str] | None = None
+    rounds = args.warmups + args.samples
+    for round_index in range(rounds):
+        order = [
+            (round_index + offset) % len(commands) for offset in range(len(commands))
+        ]
+        for index in order:
+            completed = run_process(
+                commands[index], args.timeout, args.max_output_bytes
+            )
+            if completed[3]:
+                raise ValueError(f"reported traversal timed out for {targets[index]}")
+            if completed[4]:
+                raise ValueError(
+                    f"reported traversal output exceeded the limit for {targets[index]}"
+                )
+            if completed[0] != 0:
+                raise ValueError(
+                    f"reported traversal returned status {completed[0]} for "
+                    f"{targets[index]}"
+                )
+            if completed[2]:
+                raise ValueError(
+                    f"reported traversal wrote stderr for {targets[index]}"
+                )
+            result = decode_json(completed[1])
+            fields = {"build_ns", "traversal_ns", "iterations", "elements", "checksum"}
+            if not isinstance(result, dict) or set(result) != fields:
+                raise ValueError(
+                    f"invalid reported traversal fields for {targets[index]}"
+                )
+            if any(
+                type(result[field]) is not int or result[field] < 0
+                for field in ("build_ns", "traversal_ns", "iterations", "elements")
+            ):
+                raise ValueError(
+                    f"invalid reported traversal values for {targets[index]}"
+                )
+            checksum = result["checksum"]
+            if (
+                result["iterations"] != 1
+                or result["elements"] <= 0
+                or not isinstance(checksum, str)
+                or len(checksum) != 16
+            ):
+                raise ValueError(
+                    f"invalid reported traversal guard for {targets[index]}"
+                )
+            try:
+                checksum_value = int(checksum, 16)
+            except ValueError as error:
+                raise ValueError(
+                    f"invalid reported traversal checksum for {targets[index]}"
+                ) from error
+            if checksum != f"{checksum_value:016x}":
+                raise ValueError(
+                    f"invalid reported traversal checksum for {targets[index]}"
+                )
+            current_guard = (result["elements"], checksum)
+            if guard is None:
+                guard = current_guard
+            elif current_guard != guard:
+                raise ValueError("reported traversal guards differ")
+            if round_index >= args.warmups:
+                build_values[index].append(result["build_ns"])
+                traversal_values[index].append(result["traversal_ns"])
+    assert guard is not None
+    return {
+        "schema": "z-xml-reported-traversal-v1",
+        "unit": "ns",
+        "iterations_per_sample": 1,
+        "warmups": args.warmups,
+        "samples": args.samples,
+        "order": "rotating",
+        "guard": {"elements": guard[0], "checksum": guard[1]},
+        "targets": [
+            {
+                "target": target,
+                "build_ns": reported_summary(build_values[index]),
+                "traversal_ns": reported_summary(traversal_values[index]),
+            }
+            for index, target in enumerate(targets)
+        ],
+    }
+
+
 def host_information() -> dict[str, object]:
     cpu_model = "unknown"
     memory_kib = 0
@@ -704,9 +813,19 @@ def main() -> int:
         or args.max_output_bytes <= 0
         or args.max_output_bytes > MAX_OUTPUT_BYTES
         or not args.case
+        or (
+            args.reported_traversal_time
+            and (
+                args.program_arg.count("--timing") != 1
+                or any(
+                    argument.startswith("--iterations=")
+                    for argument in args.program_arg
+                )
+            )
+        )
     ):
         print(
-            "numeric limits must be positive, except warmups may be zero",
+            "invalid numeric limits or reported traversal arguments",
             file=sys.stderr,
         )
         return 64
@@ -1090,7 +1209,11 @@ def main() -> int:
         return 1
 
     index: dict[str, object] = {
-        "schema": "z-xml-zebrac-matrix-v4",
+        "schema": (
+            "z-xml-zebrac-matrix-v5"
+            if args.reported_traversal_time
+            else "z-xml-zebrac-matrix-v4"
+        ),
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "manifest": {**input_metadata["manifest"], "schema": manifest_schema},
         "eligibility": [
@@ -1222,6 +1345,17 @@ def main() -> int:
             )
             break
         else:
+            if args.reported_traversal_time:
+                try:
+                    run["reported_traversal"] = measure_reported_traversal(group, args)
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    print(
+                        f"reported traversal failed for {workload['id']} [{lane}]: "
+                        f"{error}",
+                        file=sys.stderr,
+                    )
+                    had_error = True
+                    break
             index["runs"].append(run)
             print(f"measured {workload['id']} [{lane}]")
     if had_error:

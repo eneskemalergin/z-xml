@@ -77,7 +77,13 @@ NAMESPACE_DOCUMENT_SUMMARY_COLUMNS = [
     "traversal_checksum",
 ]
 NAMESPACE_DOCUMENT_SUMMARY_FIELDS = set(NAMESPACE_DOCUMENT_SUMMARY_COLUMNS)
-DOCUMENT_TIMING_FIELDS = {"build_ns", "traversal_ns", "elements", "checksum"}
+DOCUMENT_TIMING_FIELDS = {
+    "build_ns",
+    "traversal_ns",
+    "iterations",
+    "elements",
+    "checksum",
+}
 CONSTRUCTION_FIELDS = {"constructed"}
 Z_XML_MEMORY_COLUMNS = [
     "nodes",
@@ -158,6 +164,11 @@ def parse_args() -> argparse.Namespace:
         default=[],
     )
     parser.add_argument("--document-oracle", type=Path)
+    parser.add_argument(
+        "--document-operation",
+        choices=("construction", "traversal"),
+        default="construction",
+    )
     parser.add_argument("--namespace", action="store_true")
     parser.add_argument("--shape", action="append", default=[])
     parser.add_argument("--max-bytes", type=int, default=MAX_WORKLOAD_BYTES)
@@ -768,9 +779,11 @@ def validate_document_timing(
         return "timing-fields"
     if any(
         type(timing[field]) is not int or timing[field] < 0
-        for field in ("build_ns", "traversal_ns", "elements")
+        for field in ("build_ns", "traversal_ns", "iterations", "elements")
     ):
         return "timing-values"
+    if timing["iterations"] != 1:
+        return "timing-iterations"
     if timing["elements"] != summary["elements"]:
         return "timing-elements"
     if timing["checksum"] != summary["traversal_checksum"]:
@@ -935,16 +948,18 @@ def write_document_row(
     verdict: str,
     reason: str,
     namespace: bool,
+    operation: str,
 ) -> None:
+    program_args = "--construction" if operation == "construction" else "--timing"
+    if namespace:
+        program_args += " --namespaces=process"
     row: dict[str, object] = {
         "target": target.name,
         "work_lane": target.work_lane,
         "input_model": target.input_model,
         "workload": workload["id"],
         "classification": workload["classification"],
-        "program_args": (
-            "--construction --namespaces=process" if namespace else "--construction"
-        ),
+        "program_args": program_args,
         "verdict": verdict,
         "reason": reason,
     }
@@ -1047,6 +1062,7 @@ def check_documents(
                         verdict,
                         reason,
                         args.namespace,
+                        args.document_operation,
                     )
                 print(
                     f"{target.name}: pass={counts['pass']} fail={counts['fail']} "
@@ -1096,6 +1112,7 @@ def main() -> int:
         or (document_mode and bool(args.summary_lane))
         or (not document_mode and bool(args.shape))
         or (args.namespace and not document_mode)
+        or (not document_mode and args.document_operation != "construction")
     ):
         print("invalid limits, timeout, target, or shape selection", file=sys.stderr)
         return 64

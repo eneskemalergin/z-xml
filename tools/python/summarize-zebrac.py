@@ -8,11 +8,12 @@ import csv
 import json
 import math
 import shlex
+import statistics
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-MATRIX_SCHEMA = "z-xml-zebrac-matrix-v4"
+MATRIX_SCHEMAS = {"z-xml-zebrac-matrix-v4", "z-xml-zebrac-matrix-v5"}
 MAX_RESULT_BYTES = 64 * 1024 * 1024
 METRIC_UNITS = {
     "wall_time": "nanoseconds",
@@ -165,6 +166,98 @@ def metric(
     return measurements
 
 
+def reported_metric(value: object, expected_samples: int, index_path: Path) -> None:
+    fields = {"mean", "std_dev", "min", "max", "values"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError(f"{index_path}: invalid reported traversal metric")
+    values = value["values"]
+    if (
+        not isinstance(values, list)
+        or len(values) != expected_samples
+        or any(type(item) is not int or item < 0 for item in values)
+    ):
+        raise ValueError(f"{index_path}: invalid reported traversal samples")
+    mean = value["mean"]
+    std_dev = value["std_dev"]
+    if (
+        type(mean) not in (int, float)
+        or type(std_dev) not in (int, float)
+        or not math.isfinite(float(mean))
+        or not math.isfinite(float(std_dev))
+        or std_dev < 0
+        or type(value["min"]) is not int
+        or type(value["max"]) is not int
+        or value["min"] != min(values)
+        or value["max"] != max(values)
+        or not math.isclose(float(mean), statistics.fmean(values), rel_tol=1e-12)
+        or not math.isclose(float(std_dev), statistics.pstdev(values), rel_tol=1e-12)
+    ):
+        raise ValueError(f"{index_path}: inconsistent reported traversal metric")
+
+
+def validate_reported_traversal(
+    value: object,
+    targets: list[object],
+    sampling: dict[str, object],
+    index_path: Path,
+) -> None:
+    fields = {
+        "schema",
+        "unit",
+        "iterations_per_sample",
+        "warmups",
+        "samples",
+        "order",
+        "guard",
+        "targets",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError(f"{index_path}: invalid reported traversal record")
+    guard = value["guard"]
+    reported_targets = value["targets"]
+    if (
+        value["schema"] != "z-xml-reported-traversal-v1"
+        or value["unit"] != "ns"
+        or type(value["iterations_per_sample"]) is not int
+        or value["iterations_per_sample"] != 1
+        or type(value["warmups"]) is not int
+        or value["warmups"] != sampling["warmups"]
+        or type(value["samples"]) is not int
+        or value["samples"] != sampling["samples"]
+        or value["order"] != "rotating"
+        or not isinstance(guard, dict)
+        or set(guard) != {"elements", "checksum"}
+        or type(guard["elements"]) is not int
+        or guard["elements"] <= 0
+        or not isinstance(guard["checksum"], str)
+        or len(guard["checksum"]) != 16
+        or not isinstance(reported_targets, list)
+        or len(reported_targets) != len(targets)
+    ):
+        raise ValueError(f"{index_path}: invalid reported traversal contract")
+    try:
+        checksum = int(guard["checksum"], 16)
+    except ValueError as error:
+        raise ValueError(
+            f"{index_path}: invalid reported traversal checksum"
+        ) from error
+    if guard["checksum"] != f"{checksum:016x}":
+        raise ValueError(f"{index_path}: invalid reported traversal checksum")
+    for expected_target, reported_target in zip(targets, reported_targets, strict=True):
+        if (
+            not isinstance(reported_target, dict)
+            or set(reported_target) != {"target", "build_ns", "traversal_ns"}
+            or reported_target["target"] != expected_target
+        ):
+            raise ValueError(f"{index_path}: reported traversal target differs")
+        reported_metric(
+            reported_target["build_ns"], int(sampling["samples"]), index_path
+        )
+        reported_metric(
+            reported_target["traversal_ns"], int(sampling["samples"]), index_path
+        )
+
+
 def ratio(left: float, right: float) -> float | None:
     return left / right if right > 0 else None
 
@@ -180,8 +273,9 @@ def collect_rows(index_paths: list[Path]) -> list[dict[str, object]]:
     identities: set[tuple[str, str, str, str]] = set()
     for index_path in index_paths:
         index = read_json(index_path)
-        if not isinstance(index, dict) or index.get("schema") != MATRIX_SCHEMA:
+        if not isinstance(index, dict) or index.get("schema") not in MATRIX_SCHEMAS:
             raise ValueError(f"{index_path}: unsupported matrix schema")
+        schema = index["schema"]
         case = index.get("measurement_case")
         multiplier = index.get("work_multiplier")
         target_metadata = index.get("target_binaries")
@@ -256,6 +350,14 @@ def collect_rows(index_paths: list[Path]) -> list[dict[str, object]]:
                 or len({str(target) for target in targets}) != len(targets)
             ):
                 raise ValueError(f"{index_path}: run list lengths differ")
+            if schema == "z-xml-zebrac-matrix-v5":
+                validate_reported_traversal(
+                    run.get("reported_traversal"), targets, sampling, index_path
+                )
+            elif "reported_traversal" in run:
+                raise ValueError(
+                    f"{index_path}: matrix-v4 contains reported traversal data"
+                )
             classification = run.get("classification")
             lane = run.get("lane")
             workload = run.get("workload")
