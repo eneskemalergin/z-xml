@@ -19,6 +19,7 @@ from pathlib import Path
 
 MAX_WORKLOAD_BYTES = 1024 * 1024 * 1024
 CORPUS_SCHEMA = "z-xml-generated-v3"
+NAMESPACE_SCHEMA = "z-xml-namespace-benchmark-v1"
 TARGET_SCHEMAS = {"z-xml-targets-v1", "z-xml-targets-v2"}
 TARGET_HEADER = "name\texecutable\tprocessor_class\tfeatures\twork_lane\tinput_model"
 MANIFEST_COLUMNS = [
@@ -67,18 +68,54 @@ DOCUMENT_SUMMARY_COLUMNS = [
     "traversal_checksum",
 ]
 DOCUMENT_SUMMARY_FIELDS = set(DOCUMENT_SUMMARY_COLUMNS)
+NAMESPACE_DOCUMENT_SUMMARY_COLUMNS = [
+    *DOCUMENT_SUMMARY_COLUMNS[:7],
+    "namespace_declarations",
+    "max_depth",
+    "common_checksum",
+    "expanded_name_checksum",
+    "traversal_checksum",
+]
+NAMESPACE_DOCUMENT_SUMMARY_FIELDS = set(NAMESPACE_DOCUMENT_SUMMARY_COLUMNS)
 DOCUMENT_TIMING_FIELDS = {"build_ns", "traversal_ns", "elements", "checksum"}
-Z_XML_MEMORY_FIELDS = {
+CONSTRUCTION_FIELDS = {"constructed"}
+Z_XML_MEMORY_COLUMNS = [
     "nodes",
     "attributes",
     "namespace_declarations",
     "string_bytes",
+    "node_capacity_bytes",
+    "attribute_capacity_bytes",
+    "namespace_declaration_capacity_bytes",
+    "string_capacity_bytes",
+    "metadata_capacity_bytes",
+    "active_owned_bytes",
+    "growth_slack_bytes",
     "retained_capacity_bytes",
+    "construction_requested_bytes",
+    "construction_temporary_bytes",
     "construction_peak_bytes",
     "construction_allocator_operations",
+    "reader_requested_bytes",
+    "reader_temporary_bytes",
+    "reader_peak_bytes",
+    "reader_retained_bytes",
+    "reader_allocator_operations",
+    "reader_live_after_deinit_bytes",
+    "caller_input_storage_bytes",
     "traversal_scratch_peak_bytes",
     "traversal_allocator_operations",
-}
+    "traversal_live_after_deinit_bytes",
+    "live_after_deinit_bytes",
+]
+Z_XML_MEMORY_FIELDS = set(Z_XML_MEMORY_COLUMNS)
+Z_XML_RESULT_MEMORY_COLUMNS = [
+    "owned_nodes",
+    "owned_attributes",
+    "owned_namespace_declarations",
+    "owned_string_bytes",
+    *Z_XML_MEMORY_COLUMNS[4:],
+]
 PEER_MEMORY_FIELDS = {
     "nodes",
     "attributes",
@@ -104,12 +141,7 @@ class Target:
 @dataclass(frozen=True)
 class DocumentObservation:
     summary: dict[str, object]
-    retained_bytes: int
-    construction_peak_bytes: int
-    construction_allocator_operations: int
-    traversal_scratch_peak_bytes: int
-    traversal_allocator_operations: int
-    live_after_deinit_bytes: int | None
+    memory: dict[str, int]
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,6 +158,7 @@ def parse_args() -> argparse.Namespace:
         default=[],
     )
     parser.add_argument("--document-oracle", type=Path)
+    parser.add_argument("--namespace", action="store_true")
     parser.add_argument("--shape", action="append", default=[])
     parser.add_argument("--max-bytes", type=int, default=MAX_WORKLOAD_BYTES)
     parser.add_argument("--timeout", type=float, default=30.0)
@@ -262,8 +295,13 @@ def read_targets(
 
 
 def read_workloads(
-    manifest: Path, max_bytes: int, selected_shapes: set[str]
+    manifest: Path,
+    max_bytes: int,
+    selected_shapes: set[str],
+    namespace: bool,
 ) -> list[dict[str, str]]:
+    if namespace:
+        return read_namespace_workloads(manifest, max_bytes, selected_shapes)
     with manifest.open(encoding="utf-8", newline="") as stream:
         lines = list(stream)
     comments = [line[1:].strip() for line in lines if line.startswith("#")]
@@ -432,6 +470,109 @@ def read_workloads(
     return selected_rows
 
 
+def read_namespace_workloads(
+    manifest: Path, max_bytes: int, selected_shapes: set[str]
+) -> list[dict[str, str]]:
+    with manifest.open(encoding="utf-8", newline="") as stream:
+        lines = list(stream)
+    comments = [line[1:].strip() for line in lines if line.startswith("#")]
+    if comments != [NAMESPACE_SCHEMA]:
+        raise ValueError(f"{manifest}: invalid namespace-corpus identity")
+    reader = csv.DictReader(
+        (line for line in lines if not line.startswith("#")), delimiter="\t"
+    )
+    columns = [
+        "id",
+        "path",
+        "shape",
+        "actual_bytes",
+        "classification",
+        "expected_summary",
+    ]
+    if reader.fieldnames != columns:
+        raise ValueError(f"{manifest}: invalid namespace-corpus columns")
+    rows = list(reader)
+    if not rows:
+        raise ValueError(f"{manifest}: namespace manifest is empty")
+
+    root = manifest.parent.resolve()
+    selected_rows: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    seen_paths: set[Path] = set()
+    expected_fields = {
+        "elements",
+        "attributes",
+        "text_bytes",
+        "name_bytes",
+        "value_bytes",
+        "namespace_declarations",
+        "namespace_uri_bytes",
+        "local_name_bytes",
+        "prefix_bytes",
+        "checksum",
+    }
+    for line_number, row in enumerate(rows, 3):
+        if None in row or any(value is None or value == "" for value in row.values()):
+            raise ValueError(f"{manifest}:{line_number}: invalid workload row")
+        item_id = row["id"]
+        if item_id in seen_ids:
+            raise ValueError(
+                f"{manifest}:{line_number}: duplicate workload ID {item_id}"
+            )
+        seen_ids.add(item_id)
+        path = (root / row["path"]).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError(f"{item_id}: path escapes namespace corpus")
+        if path in seen_paths:
+            raise ValueError(f"{item_id}: duplicate workload path")
+        seen_paths.add(path)
+        try:
+            actual_bytes = int(row["actual_bytes"])
+            expected = decode_json(row["expected_summary"])
+        except ValueError as error:
+            raise ValueError(f"{item_id}: invalid namespace metadata") from error
+        if (
+            actual_bytes <= 0
+            or actual_bytes > MAX_WORKLOAD_BYTES
+            or not path.is_file()
+            or path.stat().st_size != actual_bytes
+            or row["shape"] != "namespace-churn"
+            or row["classification"] != "benchmark-valid"
+            or not isinstance(expected, dict)
+            or set(expected) != expected_fields
+        ):
+            raise ValueError(f"{item_id}: invalid namespace workload")
+        integer_fields = expected_fields.difference({"checksum"})
+        if any(
+            type(expected[field]) is not int or expected[field] < 0
+            for field in integer_fields
+        ):
+            raise ValueError(f"{item_id}: invalid namespace summary values")
+        checksum = expected["checksum"]
+        if not isinstance(checksum, str) or len(checksum) != 16:
+            raise ValueError(f"{item_id}: invalid namespace checksum")
+        try:
+            checksum_value = int(checksum, 16)
+        except ValueError as error:
+            raise ValueError(f"{item_id}: invalid namespace checksum") from error
+        if checksum != f"{checksum_value:016x}":
+            raise ValueError(f"{item_id}: invalid namespace checksum")
+        if actual_bytes <= max_bytes and (
+            not selected_shapes or row["shape"] in selected_shapes
+        ):
+            row["feature_checks"] = "document,namespaces,attributes"
+            row["resolved_path"] = str(path)
+            selected_rows.append(row)
+    if not selected_rows:
+        raise ValueError(f"{manifest}: no workloads are at or below --max-bytes")
+    missing_shapes = selected_shapes.difference(row["shape"] for row in selected_rows)
+    if missing_shapes:
+        raise ValueError(
+            f"{manifest}: missing selected shapes: " + ",".join(sorted(missing_shapes))
+        )
+    return selected_rows
+
+
 def observe(
     target: Target, workload: dict[str, str], args: argparse.Namespace
 ) -> tuple[str, str]:
@@ -503,11 +644,10 @@ def observe(
 
 def run_json_adapter(
     executable: Path,
-    mode: str | None,
+    adapter_args: list[str],
     workload: dict[str, str],
     args: argparse.Namespace,
 ) -> tuple[dict[str, object] | None, str]:
-    adapter_args = [] if mode is None else [mode]
     command = [
         "prlimit",
         f"--as={args.address_space_mib * 1024 * 1024}",
@@ -555,19 +695,21 @@ def run_json_adapter(
 
 
 def validate_document_summary(
-    summary: dict[str, object], workload: dict[str, str]
+    summary: dict[str, object], workload: dict[str, str], namespace: bool
 ) -> str | None:
-    if set(summary) != DOCUMENT_SUMMARY_FIELDS:
+    fields = NAMESPACE_DOCUMENT_SUMMARY_FIELDS if namespace else DOCUMENT_SUMMARY_FIELDS
+    if set(summary) != fields:
         return "summary-fields"
-    integer_fields = DOCUMENT_SUMMARY_FIELDS.difference(
-        {"common_checksum", "traversal_checksum"}
-    )
+    checksum_fields = {"common_checksum", "traversal_checksum"}
+    if namespace:
+        checksum_fields.add("expanded_name_checksum")
+    integer_fields = fields.difference(checksum_fields)
     if any(
         type(summary[field]) is not int or summary[field] < 0
         for field in integer_fields
     ):
         return "summary-values"
-    for field in ("common_checksum", "traversal_checksum"):
+    for field in checksum_fields:
         checksum = summary[field]
         if not isinstance(checksum, str) or len(checksum) != 16:
             return "summary-checksum"
@@ -593,13 +735,29 @@ def validate_document_summary(
     expected = decode_json(workload["expected_summary"])
     if not isinstance(expected, dict):
         return "manifest-summary"
-    if (
-        summary["elements"] != expected["elements"]
-        or summary["attributes"] != expected["attributes"]
-        or summary["text_bytes"] != expected["text_bytes"]
-        or summary["common_checksum"] != expected["checksum"]
-    ):
+    if namespace:
+        matches = (
+            summary["elements"] == expected["elements"]
+            and summary["attributes"] == expected["attributes"]
+            and summary["text_bytes"] == expected["text_bytes"]
+            and summary["namespace_declarations"] == expected["namespace_declarations"]
+            and summary["expanded_name_checksum"] == expected["checksum"]
+        )
+    else:
+        matches = (
+            summary["elements"] == expected["elements"]
+            and summary["attributes"] == expected["attributes"]
+            and summary["text_bytes"] == expected["text_bytes"]
+            and summary["common_checksum"] == expected["checksum"]
+        )
+    if not matches:
         return "common-summary-mismatch"
+    return None
+
+
+def validate_construction(value: dict[str, object]) -> str | None:
+    if set(value) != CONSTRUCTION_FIELDS or value["constructed"] is not True:
+        return "construction-result"
     return None
 
 
@@ -631,25 +789,55 @@ def validate_z_xml_memory(
         return None, "memory-nodes"
     if memory["attributes"] != summary["attributes"]:
         return None, "memory-attributes"
-    if memory["namespace_declarations"] != 0:
+    expected_namespaces = summary.get("namespace_declarations", 0)
+    if memory["namespace_declarations"] != expected_namespaces:
         return None, "memory-namespaces"
-    if memory["retained_capacity_bytes"] <= 0:
+    capacity_sum = (
+        memory["node_capacity_bytes"]
+        + memory["attribute_capacity_bytes"]
+        + memory["namespace_declaration_capacity_bytes"]
+        + memory["string_capacity_bytes"]
+        + memory["metadata_capacity_bytes"]
+    )
+    if capacity_sum != memory["retained_capacity_bytes"]:
+        return None, "memory-capacity-sum"
+    if (
+        memory["retained_capacity_bytes"] <= 0
+        or memory["active_owned_bytes"] <= 0
+        or memory["active_owned_bytes"] + memory["growth_slack_bytes"]
+        != memory["retained_capacity_bytes"]
+        or memory["string_bytes"] > memory["string_capacity_bytes"]
+    ):
         return None, "memory-retained"
     if memory["construction_peak_bytes"] < memory["retained_capacity_bytes"]:
         return None, "memory-construction-peak"
     if memory["construction_allocator_operations"] <= 0:
         return None, "memory-construction-operations"
+    if (
+        memory["construction_requested_bytes"]
+        != memory["retained_capacity_bytes"] + memory["construction_temporary_bytes"]
+        or memory["reader_requested_bytes"]
+        != memory["reader_retained_bytes"] + memory["reader_temporary_bytes"]
+        or memory["reader_peak_bytes"] < memory["reader_retained_bytes"]
+        or memory["reader_allocator_operations"] <= 0
+        or memory["caller_input_storage_bytes"] != 64 * 1024
+        or memory["reader_live_after_deinit_bytes"] != 0
+        or memory["traversal_live_after_deinit_bytes"] != 0
+        or memory["live_after_deinit_bytes"] != 0
+    ):
+        return None, "memory-lifecycle"
+    normalized = {
+        "retained_bytes": memory["retained_capacity_bytes"],
+        "owned_nodes": memory["nodes"],
+        "owned_attributes": memory["attributes"],
+        "owned_namespace_declarations": memory["namespace_declarations"],
+        "owned_string_bytes": memory["string_bytes"],
+        **{field: memory[field] for field in Z_XML_MEMORY_COLUMNS[4:]},
+    }
     return (
         DocumentObservation(
             summary=summary,
-            retained_bytes=memory["retained_capacity_bytes"],
-            construction_peak_bytes=memory["construction_peak_bytes"],
-            construction_allocator_operations=memory[
-                "construction_allocator_operations"
-            ],
-            traversal_scratch_peak_bytes=memory["traversal_scratch_peak_bytes"],
-            traversal_allocator_operations=memory["traversal_allocator_operations"],
-            live_after_deinit_bytes=None,
+            memory=normalized,
         ),
         "-",
     )
@@ -682,14 +870,18 @@ def validate_peer_memory(
     return (
         DocumentObservation(
             summary=summary,
-            retained_bytes=memory["retained_library_bytes"],
-            construction_peak_bytes=memory["construction_peak_library_bytes"],
-            construction_allocator_operations=memory[
-                "construction_allocator_operations"
-            ],
-            traversal_scratch_peak_bytes=memory["traversal_scratch_peak_bytes"],
-            traversal_allocator_operations=memory["traversal_allocator_operations"],
-            live_after_deinit_bytes=memory["live_after_deinit_bytes"],
+            memory={
+                "retained_bytes": memory["retained_library_bytes"],
+                "construction_peak_bytes": memory["construction_peak_library_bytes"],
+                "construction_allocator_operations": memory[
+                    "construction_allocator_operations"
+                ],
+                "traversal_scratch_peak_bytes": memory["traversal_scratch_peak_bytes"],
+                "traversal_allocator_operations": memory[
+                    "traversal_allocator_operations"
+                ],
+                "live_after_deinit_bytes": memory["live_after_deinit_bytes"],
+            },
         ),
         "-",
     )
@@ -700,20 +892,34 @@ def observe_document(
     workload: dict[str, str],
     args: argparse.Namespace,
     peer: bool,
+    namespace: bool,
 ) -> tuple[DocumentObservation | None, str]:
-    summary, reason = run_json_adapter(executable, None, workload, args)
+    namespace_args = ["--namespaces=process"] if namespace else []
+    summary, reason = run_json_adapter(executable, namespace_args, workload, args)
     if summary is None:
         return None, f"summary-{reason}"
-    reason = validate_document_summary(summary, workload)
+    reason = validate_document_summary(summary, workload, namespace)
     if reason is not None:
         return None, reason
-    timing, reason = run_json_adapter(executable, "--timing", workload, args)
+    construction, reason = run_json_adapter(
+        executable, ["--construction", *namespace_args], workload, args
+    )
+    if construction is None:
+        return None, f"construction-{reason}"
+    reason = validate_construction(construction)
+    if reason is not None:
+        return None, reason
+    timing, reason = run_json_adapter(
+        executable, ["--timing", *namespace_args], workload, args
+    )
     if timing is None:
         return None, f"timing-{reason}"
     reason = validate_document_timing(timing, summary)
     if reason is not None:
         return None, reason
-    memory, reason = run_json_adapter(executable, "--memory", workload, args)
+    memory, reason = run_json_adapter(
+        executable, ["--memory", *namespace_args], workload, args
+    )
     if memory is None:
         return None, f"memory-{reason}"
     if peer:
@@ -728,31 +934,23 @@ def write_document_row(
     observation: DocumentObservation | None,
     verdict: str,
     reason: str,
+    namespace: bool,
 ) -> None:
     row: dict[str, object] = {
         "target": target.name,
         "work_lane": target.work_lane,
         "input_model": target.input_model,
         "workload": workload["id"],
+        "classification": workload["classification"],
+        "program_args": (
+            "--construction --namespaces=process" if namespace else "--construction"
+        ),
         "verdict": verdict,
         "reason": reason,
     }
     if observation is not None:
         row.update(observation.summary)
-        row.update(
-            {
-                "retained_bytes": observation.retained_bytes,
-                "construction_peak_bytes": observation.construction_peak_bytes,
-                "construction_allocator_operations": observation.construction_allocator_operations,
-                "traversal_scratch_peak_bytes": observation.traversal_scratch_peak_bytes,
-                "traversal_allocator_operations": observation.traversal_allocator_operations,
-                "live_after_deinit_bytes": (
-                    ""
-                    if observation.live_after_deinit_bytes is None
-                    else observation.live_after_deinit_bytes
-                ),
-            }
-        )
+        row.update(observation.memory)
     writer.writerow(row)
 
 
@@ -765,7 +963,7 @@ def check_documents(
     oracle_observations: dict[str, DocumentObservation] = {}
     for workload in workloads:
         observation, reason = observe_document(
-            args.document_oracle, workload, args, peer=False
+            args.document_oracle, workload, args, peer=False, namespace=args.namespace
         )
         if observation is None:
             print(f"document oracle {workload['id']}: {reason}", file=sys.stderr)
@@ -773,20 +971,23 @@ def check_documents(
             return 1
         oracle_observations[workload["id"]] = observation
 
+    summary_columns = (
+        NAMESPACE_DOCUMENT_SUMMARY_COLUMNS
+        if args.namespace
+        else DOCUMENT_SUMMARY_COLUMNS
+    )
     fieldnames = [
         "target",
         "work_lane",
         "input_model",
         "workload",
+        "classification",
+        "program_args",
         "verdict",
         "reason",
-        *DOCUMENT_SUMMARY_COLUMNS,
+        *summary_columns,
         "retained_bytes",
-        "construction_peak_bytes",
-        "construction_allocator_operations",
-        "traversal_scratch_peak_bytes",
-        "traversal_allocator_operations",
-        "live_after_deinit_bytes",
+        *Z_XML_RESULT_MEMORY_COLUMNS,
     ]
     totals: Counter[str] = Counter()
     failure_reasons: Counter[str] = Counter()
@@ -816,8 +1017,13 @@ def check_documents(
                         verdict = "fail"
                         reason = "missing:" + ",".join(missing)
                     else:
+                        peer = not target.executable.samefile(args.document_oracle)
                         observation, reason = observe_document(
-                            target.executable, workload, args, peer=True
+                            target.executable,
+                            workload,
+                            args,
+                            peer=peer,
+                            namespace=args.namespace,
                         )
                         if observation is None:
                             verdict = "error"
@@ -840,6 +1046,7 @@ def check_documents(
                         observation,
                         verdict,
                         reason,
+                        args.namespace,
                     )
                 print(
                     f"{target.name}: pass={counts['pass']} fail={counts['fail']} "
@@ -888,6 +1095,7 @@ def main() -> int:
         or (document_mode and (not args.target or not args.shape))
         or (document_mode and bool(args.summary_lane))
         or (not document_mode and bool(args.shape))
+        or (args.namespace and not document_mode)
     ):
         print("invalid limits, timeout, target, or shape selection", file=sys.stderr)
         return 64
@@ -929,7 +1137,9 @@ def main() -> int:
             document_mode,
             summary_lanes,
         )
-        workloads = read_workloads(args.manifest, args.max_bytes, set(args.shape))
+        workloads = read_workloads(
+            args.manifest, args.max_bytes, set(args.shape), args.namespace
+        )
         if document_mode and any(
             workload["classification"] != "benchmark-valid" for workload in workloads
         ):
