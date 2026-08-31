@@ -10,7 +10,7 @@ Files are grouped by language. The Python commands are called through their conf
 - `zig/` contains adapter source code compiled by `build.zig`.
 - `python/` contains checks, generators, and measurement commands called through Python.
 - `targets.tsv` describes the z-xml adapter capabilities used by fixture checks.
-- `document-targets.tsv` declares the owned-Document construction command.
+- `document-targets.tsv` declares the owned-Document construction and traversal commands.
 - `dtd-targets.tsv` declares the DTD baseline and no-DTD control commands.
 - `validation-targets.tsv` declares fresh single-document and repeated-validation commands.
 - `writer-targets.tsv` declares the one manifest-driven Writer adapter.
@@ -27,7 +27,7 @@ Build and declarations:
 - `README.md` owns this command and file map. `plan/AGENTS.md` and `plan/ROADMAP.md` point developers here instead of duplicating tool details.
 - `build.zig` owns the Zig tool build. Its callers are the documented `zig build --build-file tools/build.zig` commands. It imports the package module and the Zig tool sources, then installs adapters under `tools/zig-out/bin` or runs the layout probe and tool tests.
 - `targets.tsv` declares the six z-xml Reader profiles used by `ref/check-corpus.sh`, `run-w3c-xmlconf.py`, `run-valgrind.py`, and `run-zebrac-matrix.py`. It has no output of its own.
-- `document-targets.tsv` assigns the public owned-Document adapter to the streamed DOM lane and fixes the command used by correctness and Zebrac checks. It has no output of its own.
+- `document-targets.tsv` assigns the public owned-Document adapter to the streamed DOM lane. Document qualification fixes the exact construction or traversal command used by measurement. The target file has no output of its own.
 - `dtd-targets.tsv` assigns the DTD processing adapter and the process and reject no-DTD controls to separate measurement lanes. It has no output of its own.
 - `validation-targets.tsv` assigns internal and caller-resolved adapters to fresh validation, then assigns fresh and reusable external-subset adapters to repeated validation. It has no output of its own.
 - `persistent-targets.tsv` declares the protocol, consumer, memory, timing, transition, release, namespace, lane, and input-model support of the four z-xml resident or streamed adapters. It has no output of its own.
@@ -37,7 +37,7 @@ Zig sources:
 
 - `zig/check.zig` owns the single-file event-summary protocol. The `corpus-adapters` step builds six raw-name or namespace-aware DTD modes plus two fresh-validation baseline modes. Corpus and conformance commands pass an XML path; DTD modes resolve companion sources from that path. `--dtd-report` adds exact partial events, diagnostics, source results, and optional Reader and caller-source memory. Validation modes add validity, ordered finding work, identity counts, and grammar or per-document memory. The Reader and 64 KiB stream source remain unchanged. Each executable writes one JSON result to standard output.
 - `zig/persistent.zig` owns Reader work over resident or streamed input. The `persistent-adapters` step builds raw-name, namespace-aware, default-Reader, and default-Reader namespace-summary executables. One Reader handles every iteration. `--next-file` and `--next-iterations` add a second input without replacing it. Optional timing, memory, and release reports separate source setup, Reader initialization, first and reset documents, parser allocation work, retained capacity, explicit release, and caller-owned input storage. The executable writes one JSON result.
-- `zig/tree.zig` owns public `Document` construction and traversal measurement over a 64 KiB stream. The `tree-adapter` step builds `z-xml-tree`. Normal output reports node counts, depth, and common and complete-traversal checksums. `--namespaces=process` adds retained declarations and an expanded-name checksum. `--construction` builds and releases the Document without traversal. `--timing` separates construction and traversal time. `--memory` reports active and retained Document storage, growth slack, construction allocation work, an independent Reader-only pass, caller input storage, traversal scratch, and cleanup. Each mode writes one JSON result.
+- `zig/tree.zig` owns public `Document` construction and traversal measurement over a 64 KiB stream. The `tree-adapter` step builds `z-xml-tree`. Normal output reports node counts, depth, and common and complete-traversal checksums. `--namespaces=process` adds retained declarations and an expanded-name checksum. `--construction` builds and releases the Document without traversal. `--timing` starts traversal timing after construction; `--iterations=N` repeats that complete traversal after one build for profile attribution. `--memory` reports active and retained Document storage, growth slack, construction allocation work, an independent Reader-only pass, caller input storage, traversal scratch, and cleanup. Each mode writes one JSON result.
 - `zig/writer.zig` owns manifest-selected public Writer work. The `writer-adapter` step builds `z-xml-writer`. It runs the attributes, unchanged-text, escaped-text, fragmented-text, namespace-depth, short-sink, and repeated-document shapes declared in `bench/shapes.tsv`. Each run writes one JSON result. `--verify` retains output for exact or Reader checks before measurement.
 - `zig/validation_repeat.zig` owns fresh-versus-reused external DTD validation. The `validation-bench` step builds both modes. One Reader handles fixed repeated or large-then-small streamed schedules. Optional reports separate subset setup, document phases, immutable subset memory, Reader memory, resolver memory, release, and deinitialization. Each executable writes one JSON result.
 - `zig/layout_probe.zig` owns development-only Reader and Document type-size output. The `layout` step runs it and prints tab-separated rows to standard error; it does not install an adapter.
@@ -57,7 +57,7 @@ Generated inputs and declarations:
 Correctness and conformance:
 
 - `python/check-persistent-adapters.py` owns the small repeated-input protocol smoke check. It accepts z-xml artifacts, peer artifacts, or both; checks one resident schedule and three distinct stream schedules for both consumers; enforces input, output, and time limits; and writes no file. `make -C ref check-persistent` calls the peer selection through `ref/build.sh`.
-- `python/check-generated-corpus.py` owns common-summary and owned-Document qualification. Its default mode checks declared event targets against the generated common summary. Explicit `--summary-lane subset` and `--summary-lane partial-dom` selections check reduced-work adapters without admitting them to the event or Document lane. Document mode requires named DOM targets, selected valid shapes, and the z-xml Document oracle. It checks complete traversal summaries, construction-only execution, timing agreement, retained-memory reports, and allocator closure. `--namespace` checks the namespace generator's independent counts and expanded-name checksum. Every mode checks each manifest file before applying the selection, bounds each adapter process, and publishes a result TSV only when every executed row passes.
+- `python/check-generated-corpus.py` owns common-summary and owned-Document qualification. Its default mode checks declared event targets against the generated common summary. Explicit `--summary-lane subset` and `--summary-lane partial-dom` selections check reduced-work adapters without admitting them to the event or Document lane. Document mode requires named DOM targets, selected valid shapes, and the z-xml Document oracle. It checks complete traversal summaries, construction-only execution, one-traversal timing agreement, retained-memory reports, and allocator closure. `--document-operation` publishes the exact construction or traversal command accepted for later measurement. `--namespace` checks the namespace generator's independent counts and expanded-name checksum. Every mode checks each manifest file before applying the selection, bounds each adapter process, and publishes a result TSV only when every executed row passes.
 - `python/check-generated-persistent.py` owns repeated-input, transition, and scale qualification for one declared persistent target. It checks the target lane, input model, consumer features, corpus identity, source schedules, semantic output, minimal and full consumer parity, process limits, optional phase timing, parser memory, caller input storage, and explicit release. It publishes its result TSV only when the complete run passes.
 - `python/check-dtd-benchmark.py` owns DTD baseline qualification. It runs every exact command declared by the generated DTD manifest, checks semantic and memory reports separately, requires the expected status and complete JSON field set, checks Reader and caller-source cleanup, and publishes one event eligibility TSV only after all commands pass.
 - `python/check-validation-benchmark.py` owns fresh-validation qualification. It bounds and runs every command declared by the validation manifest with and without memory reporting, checks exact validity, finding order, events, diagnostics, source results, identity counts, complete Reader memory accounting, and cleanup, then publishes one validation eligibility TSV only after all commands pass.
@@ -69,8 +69,8 @@ Resource and measurement commands:
 
 - `python/run-valgrind.py` owns bounded Memcheck execution. Standalone mode checks one executable with an expected zero status. Corpus mode requires every selected target and case to have an exact passing correctness row. Both modes write logs and `metadata.json`; corpus mode also writes `results.tsv`. Metadata records the executable path and size, case, expected and observed status, semantic result, Valgrind result and error count, and descriptor counts. It does not report parser-owned memory or timing RSS.
 - `python/run-zebrac-aa.py` owns A/A host-noise measurement for one exact qualified command. It derives the executable, primary input, and any companion DTD or validation sources from their manifests, requires one fresh matching correctness row including exact program arguments, and writes raw output, logs, and schema `z-xml-zebrac-aa-v3` under `--output-dir`.
-- `python/run-zebrac-matrix.py` owns correctness-qualified matched measurement. Repeated `--targets` and `--bin-dir` pairs place z-xml and peer commands in the same workload and lane group. It requires fresh common-summary, DTD, validation, or exact persistent qualification, records companion DTD or validation sources as measured inputs, bounds Zebrac time and output, and writes schema `z-xml-zebrac-matrix-v4` only after every selected run passes.
-- `python/summarize-zebrac.py` owns result calculation. It reads one or more matrix-v4 indexes plus one baseline per lane, then writes row, aggregate, JSON, and text reports under `--output-dir`. It rejects failed rows, unmatched work, lane drift, missing metrics, and wrong units. It does not combine different lanes or measurement cases, and it does not calculate aggregate ratios from incomplete workload coverage.
+- `python/run-zebrac-matrix.py` owns correctness-qualified matched measurement. Repeated `--targets` and `--bin-dir` pairs place z-xml and peer commands in the same workload and lane group. It requires fresh common-summary, DTD, validation, or exact persistent qualification, records companion DTD or validation sources as measured inputs, and bounds Zebrac time and output. Normal runs write schema `z-xml-zebrac-matrix-v4`. `--reported-traversal-time` also runs the exact qualified timing commands in rotating order, requires one equal traversal result per sample, and writes schema `z-xml-zebrac-matrix-v5` with the post-build timing samples.
+- `python/summarize-zebrac.py` owns whole-process Zebrac result calculation. It reads one or more matrix-v4 or matrix-v5 indexes plus one baseline per lane, validates matrix-v5 traversal records, then writes row, aggregate, JSON, and text reports under `--output-dir`. It rejects failed rows, unmatched work, lane drift, missing metrics, and wrong units. It does not turn adapter-reported traversal timing into process metrics, combine different lanes or measurement cases, or calculate aggregate ratios from incomplete workload coverage.
 
 Generation, correctness, conformance, resource checking, and timing remain separate because they produce different evidence. `bench/` and `data/` are ignored. `bench/` contains local plans and small benchmark inputs. `data/` contains generated XML, downloaded test suites, and results. Benchmark results remain local until the reproduction and comparison commands are qualified.
 
@@ -248,6 +248,26 @@ python3 tools/python/run-zebrac-matrix.py \
 ```
 
 Namespace construction also passes `--program-arg=--namespaces=process` and uses `ref/build/z-xml-document-namespace-results.tsv`. `make -C ref check-peer-document` qualifies normal and compact pugixml against the same raw retained summary and traversal preparation. Pugixml remains a separate whole-file diagnostic; its source model does not match z-xml's streamed input.
+
+## Document traversal baseline
+
+Use the same generated Document inputs and oracle checks. Add `--document-operation traversal` when producing the traversal eligibility files. The qualified program arguments are `--timing` for raw documents and `--timing --namespaces=process` for the namespace document.
+
+Run `run-zebrac-aa.py` on each z-xml priority command. Run `run-zebrac-matrix.py` with `--reported-traversal-time` for the matched baseline:
+
+```sh
+python3 tools/python/run-zebrac-matrix.py \
+    --manifest data/generated/z-xml-generated-v3-document/manifest.tsv \
+    --eligibility data/results/document-traversal/eligibility.tsv \
+    --targets tools/document-targets.tsv \
+    --bin-dir tools/zig-out/bin \
+    --target z-xml-document --lane dom \
+    --workload attributes-varied-64m \
+    --program-arg=--timing --reported-traversal-time \
+    --output-dir data/results/document-traversal/baseline
+```
+
+Zebrac metrics cover the complete command because Zebrac has no setup boundary. The matrix-v5 `reported_traversal` field is the post-build traversal baseline. Each reported sample performs one traversal and checks the exact element count and checksum. Use `--timing --iterations=N` only to make traversal dominate a profile after one build; it is not an accepted one-traversal baseline command.
 
 ## Build commands
 
