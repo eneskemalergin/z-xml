@@ -159,8 +159,40 @@ const Group = struct {
 const IdRecord = struct {
     offset: usize,
     len: usize,
-    location: SourceLocation,
+    byte_offset: u64,
+    line: u64,
+    byte_column: u64,
     hash: u64,
+    source_id: u32,
+    slot: u32,
+
+    fn init(
+        offset: usize,
+        len: usize,
+        location: SourceLocation,
+        hash: u64,
+        slot: u32,
+    ) IdRecord {
+        return .{
+            .offset = offset,
+            .len = len,
+            .byte_offset = location.byte_offset,
+            .line = location.line,
+            .byte_column = location.byte_column,
+            .hash = hash,
+            .source_id = location.source_id,
+            .slot = slot,
+        };
+    }
+
+    fn sourceLocation(self: IdRecord) SourceLocation {
+        return .{
+            .source_id = self.source_id,
+            .byte_offset = self.byte_offset,
+            .line = self.line,
+            .byte_column = self.byte_column,
+        };
+    }
 };
 
 pub const Frame = struct {
@@ -213,9 +245,9 @@ pub const State = struct {
         self.transitions.clearRetainingCapacity();
         self.mixed_names.clearRetainingCapacity();
         self.issues.clearRetainingCapacity();
+        for (self.ids.items) |record| self.id_slots.items[record.slot] = 0;
         self.id_bytes.clearRetainingCapacity();
         self.ids.clearRetainingCapacity();
-        @memset(self.id_slots.items, 0);
         self.idrefs.clearRetainingCapacity();
         self.compilation_work = 0;
         self.comparison_work = 0;
@@ -553,12 +585,10 @@ pub const State = struct {
         const offset = self.id_bytes.items.len;
         errdefer self.id_bytes.items.len = offset;
         try self.id_bytes.appendSlice(allocator, value);
-        try self.ids.append(allocator, .{
-            .offset = offset,
-            .len = value.len,
-            .location = location,
-            .hash = hash,
-        });
+        try self.ids.append(
+            allocator,
+            IdRecord.init(offset, value.len, location, hash, @intCast(slot)),
+        );
         self.id_slots.items[slot] = @intCast(self.ids.items.len);
         return null;
     }
@@ -580,12 +610,10 @@ pub const State = struct {
         }
         const offset = self.id_bytes.items.len;
         try self.id_bytes.appendSlice(allocator, value);
-        try self.idrefs.append(allocator, .{
-            .offset = offset,
-            .len = value.len,
-            .location = location,
-            .hash = std.hash.Wyhash.hash(0, value),
-        });
+        try self.idrefs.append(
+            allocator,
+            IdRecord.init(offset, value.len, location, std.hash.Wyhash.hash(0, value), 0),
+        );
     }
 
     pub fn unresolvedIdref(self: *State, limits: Limits, start: usize) Error!?usize {
@@ -600,7 +628,7 @@ pub const State = struct {
     }
 
     pub fn idrefLocation(self: *const State, index: usize) SourceLocation {
-        return self.idrefs.items[index].location;
+        return self.idrefs.items[index].sourceLocation();
     }
 
     fn idValue(self: *const State, record: IdRecord) []const u8 {
@@ -619,14 +647,16 @@ pub const State = struct {
         else
             std.math.mul(usize, self.id_slots.items.len, 2) catch
                 return error.IdLimit;
+        if (new_len - 1 > std.math.maxInt(u32)) return error.IdLimit;
         var replacement: std.ArrayList(u32) = .empty;
         errdefer replacement.deinit(allocator);
         try replacement.resize(allocator, new_len);
         @memset(replacement.items, 0);
-        for (self.ids.items, 0..) |record, index| {
+        for (self.ids.items, 0..) |*record, index| {
             var slot: usize = @intCast(record.hash & @as(u64, @intCast(new_len - 1)));
             while (replacement.items[slot] != 0) slot = (slot + 1) & (new_len - 1);
             replacement.items[slot] = @intCast(index + 1);
+            record.slot = @intCast(slot);
         }
         self.id_slots.deinit(allocator);
         self.id_slots = replacement;
@@ -1268,4 +1298,48 @@ fn tokenListIsLexical(
         count += 1;
     }
     return count != 0 and (!exactly_one or count == 1);
+}
+
+// --- Tests ---
+
+test "[unit] - [validation identity index]: retained clear removes rehashed slots" {
+    var state: State = .{};
+    defer state.deinit(std.testing.allocator);
+
+    const values = [_][]const u8{
+        "id-a", "id-b", "id-c", "id-d", "id-e", "id-f", "id-g",
+        "id-h", "id-i", "id-j", "id-k", "id-l", "id-m",
+    };
+    for (values) |value| {
+        try std.testing.expectEqual(
+            @as(?Issue, null),
+            try state.addId(std.testing.allocator, .{}, value, .{}),
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 32), state.id_slots.items.len);
+    var moved_during_growth = false;
+    for (state.ids.items, 0..) |record, index| {
+        if (index < 12 and record.slot >= 16) moved_during_growth = true;
+        try std.testing.expectEqual(
+            @as(u32, @intCast(index + 1)),
+            state.id_slots.items[record.slot],
+        );
+    }
+    try std.testing.expect(moved_during_growth);
+    const id_capacity = state.ids.capacity;
+    const index_capacity = state.id_slots.capacity;
+
+    state.clearRetainingCapacity();
+
+    try std.testing.expectEqual(@as(usize, 0), state.ids.items.len);
+    try std.testing.expectEqual(id_capacity, state.ids.capacity);
+    try std.testing.expectEqual(index_capacity, state.id_slots.capacity);
+    for (state.id_slots.items) |slot| try std.testing.expectEqual(@as(u32, 0), slot);
+
+    for (values) |value| {
+        try std.testing.expectEqual(
+            @as(?Issue, null),
+            try state.addId(std.testing.allocator, .{}, value, .{}),
+        );
+    }
 }
