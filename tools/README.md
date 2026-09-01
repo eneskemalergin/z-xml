@@ -1,6 +1,6 @@
 # Tools
 
-Status: **Active** (last updated: 2026-08-31)
+Status: **Active** (last updated: 2026-09-01)
 
 `tools/` contains development commands and XML adapters. It is excluded from the Zig package.
 
@@ -322,7 +322,8 @@ zig build --build-file tools/build.zig tree-adapter -Doptimize=ReleaseFast
 zig build --build-file tools/build.zig writer-adapter \
     -Dtarget=x86_64-linux -Doptimize=ReleaseFast
 zig build --build-file tools/build.zig validation-bench -Doptimize=ReleaseFast
-zig build --build-file tools/build.zig reader-audit -Doptimize=Debug
+zig build --build-file tools/build.zig reader-audit \
+    -Dtarget=x86_64-linux -Doptimize=ReleaseFast
 zig build --build-file tools/build.zig layout -Doptimize=ReleaseFast
 ```
 
@@ -345,6 +346,8 @@ python3 tools/python/run-valgrind.py \
     --output-dir data/results/reader-audit \
     --standalone tools/zig-out/bin/z-xml-reader-audit
 ```
+
+Use the stripped ReleaseFast audit built above. Unstripped Zig debug information can overflow the bounded log with decoder warnings, and Debug stack probes can be reported as invalid reads before the tested function adjusts its stack pointer.
 
 Run one correctness-qualified external-DTD case with:
 
@@ -373,7 +376,7 @@ python3 tools/python/run-valgrind.py \
     --standalone /usr/bin/false
 ```
 
-The Reader audit runs all 67 tests under Memcheck with the same stack-based Reader storage used by normal tests and fuzz campaigns.
+The Reader audit runs the 68 tests selected by its `[Reader` filter under Memcheck with the same stack-based Reader storage used by normal tests and fuzz campaigns.
 
 The development build installs adapters under `tools/zig-out/bin` by default.
 

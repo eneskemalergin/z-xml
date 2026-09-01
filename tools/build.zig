@@ -58,6 +58,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("../tests/reader.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .valgrind = true,
     });
     reader_audit_module.addImport("z_xml", z_xml);
