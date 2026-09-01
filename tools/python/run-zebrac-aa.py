@@ -23,6 +23,7 @@ TARGET_SCHEMAS = {
     "z-xml-targets-v1",
     "z-xml-targets-v2",
     "z-xml-persistent-targets-v1",
+    "z-xml-writer-targets-v1",
 }
 TARGET_HEADER = "name\texecutable\tprocessor_class\tfeatures\twork_lane\tinput_model"
 CORPUS_SCHEMAS = {
@@ -32,6 +33,7 @@ CORPUS_SCHEMAS = {
     "z-xml-validation-generated-v1",
     "z-xml-validation-reuse-v1",
     "z-xml-document-repeat-v1",
+    "z-xml-shape-matrix-v1",
 }
 RESOURCE_SCHEMAS = {
     "z-xml-dtd-generated-v1",
@@ -109,7 +111,7 @@ def read_limited(path: Path, limit: int = MAX_CONTROL_BYTES) -> bytes:
     return data
 
 
-def read_json(path: Path, limit: int) -> object:
+def decode_json(data: bytes | str) -> object:
     def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
         decoded: dict[str, object] = {}
         for key, value in pairs:
@@ -122,10 +124,14 @@ def read_json(path: Path, limit: int) -> object:
         raise ValueError(f"invalid JSON number {value}")
 
     return json.loads(
-        read_limited(path, limit),
+        data,
         object_pairs_hook=unique_object,
         parse_constant=reject_constant,
     )
+
+
+def read_json(path: Path, limit: int) -> object:
+    return decode_json(read_limited(path, limit))
 
 
 def read_target(path: Path, bin_dir: Path, selected: str) -> dict[str, object]:
@@ -181,6 +187,51 @@ def read_workload(path: Path, selected: str) -> dict[str, object]:
     rows = csv.DictReader(
         (line for line in lines if not line.startswith("#")), delimiter="\t"
     )
+    if schema == "z-xml-shape-matrix-v1":
+        required = {
+            "id",
+            "lane",
+            "profile",
+            "input_models",
+            "generator",
+            "size_plan",
+            "expected",
+            "oracle",
+            "status",
+        }
+        if rows.fieldnames is None or required.difference(rows.fieldnames):
+            raise ValueError(f"{manifest}: incomplete shape matrix")
+        match: dict[str, object] | None = None
+        seen: set[str] = set()
+        for line_number, row in enumerate(rows, 2):
+            name = row.get("id", "")
+            if not name or name in seen:
+                raise ValueError(f"{manifest}:{line_number}: invalid shape ID")
+            seen.add(name)
+            if name != selected:
+                continue
+            if (
+                row["lane"] != "writer"
+                or row["profile"] != "writer-xml10-namespaces"
+                or row["generator"] != name
+                or row["expected"] != "emit"
+                or row["status"] != "ready"
+            ):
+                raise ValueError(f"{selected}: invalid Writer shape")
+            match = {
+                "name": name,
+                "source": manifest,
+                "resources": (),
+                "classification": "benchmark-valid",
+                "schema": schema,
+                "size_plan": row["size_plan"],
+                "input_models": row["input_models"],
+                "command_model": "writer-manifest",
+            }
+        if match is None:
+            raise ValueError(f"{manifest}: unknown workload {selected}")
+        return match
+
     required = {"id", "path", "actual_bytes", "classification"}
     if rows.fieldnames is None or required.difference(rows.fieldnames):
         raise ValueError(f"{manifest}: incomplete corpus manifest")
@@ -246,10 +297,6 @@ def read_eligibility(path: Path, target: str, workload: str) -> list[dict[str, s
                 raise ValueError(f"{path}:{line_number}: incomplete eligibility row")
             if row.get("target") != target or row.get("workload") != workload:
                 continue
-            if matches and event:
-                raise ValueError(
-                    f"{path}:{line_number}: duplicate eligibility for {target}/{workload}"
-                )
             if row in matches:
                 raise ValueError(
                     f"{path}:{line_number}: duplicate eligibility row for "
@@ -359,6 +406,37 @@ def check_eligibility(
         raise ValueError("eligibility extra arguments differ from the command")
 
 
+def writer_command(
+    target: dict[str, object],
+    workload: dict[str, object],
+    arguments: list[str],
+) -> list[str]:
+    if target["lane"] != "writer" or target["input_model"] != "manifest-selected":
+        raise ValueError("Writer shape does not match the selected target")
+    if len(arguments) != 2:
+        raise ValueError("Writer measurement needs VALUE and SINK program arguments")
+    value, sink = arguments
+    shape = str(workload["name"])
+    prefixes = {
+        "writer-attributes": "attributes:",
+        "writer-namespace-depth": "depth:",
+        "writer-repeated-documents": "documents:",
+    }
+    size_plan = str(workload["size_plan"])
+    prefix = prefixes.get(shape, "")
+    if prefix and not size_plan.startswith(prefix):
+        raise ValueError("Writer shape has an invalid size plan")
+    values = size_plan.removeprefix(prefix).split(",")
+    sinks = str(workload["input_models"]).split(",")
+    if value not in values or sink not in sinks:
+        raise ValueError("Writer VALUE or SINK is not declared by the shape")
+    program = target["program"]
+    manifest = workload["source"]
+    assert isinstance(program, Path)
+    assert isinstance(manifest, Path)
+    return [str(program), str(manifest), shape, value, sink]
+
+
 def run_process(
     command: list[str], timeout: float, max_output_bytes: int
 ) -> tuple[int, str, str, bool, bool]:
@@ -406,6 +484,54 @@ def run_process(
         timed_out,
         overflow,
     )
+
+
+def verify_writer_command(
+    command: list[str], timeout: float, max_output_bytes: int
+) -> None:
+    verification = run_process(
+        [command[0], "--verify", *command[1:]], timeout, max_output_bytes
+    )
+    if verification[3]:
+        raise ValueError("Writer verification timed out")
+    if verification[4]:
+        raise ValueError("Writer verification output exceeded the limit")
+    if verification[0] != 0:
+        raise ValueError(f"Writer verification returned status {verification[0]}")
+    if verification[2]:
+        raise ValueError("Writer verification wrote to stderr")
+    try:
+        result = decode_json(verification[1])
+    except ValueError as error:
+        raise ValueError(f"invalid Writer verification JSON: {error}") from error
+    expected = {
+        "schema": "z-xml-writer-result-v1",
+        "target": "z-xml-writer",
+        "shape": command[2],
+        "value": command[3],
+        "sink": command[4],
+        "verified": True,
+    }
+    if not isinstance(result, dict) or any(
+        result.get(field) != value for field, value in expected.items()
+    ):
+        raise ValueError("Writer verification result differs from the command")
+    output_bytes = result.get("output_bytes")
+    accepted_bytes = result.get("sink_accepted_bytes")
+    sink_flushes = result.get("sink_flushes")
+    live_bytes = result.get("writer_live_bytes_after_deinit")
+    if (
+        type(output_bytes) is not int
+        or output_bytes < 0
+        or type(accepted_bytes) is not int
+        or accepted_bytes < 0
+        or accepted_bytes != output_bytes
+        or type(sink_flushes) is not int
+        or sink_flushes != 1
+        or type(live_bytes) is not int
+        or live_bytes != 0
+    ):
+        raise ValueError("Writer verification result is incomplete")
 
 
 def validate_zebrac_results(
@@ -546,6 +672,11 @@ def main() -> int:
     try:
         target = read_target(targets_path, args.bin_dir, args.target)
         workload = read_workload(manifest, args.workload)
+        writer_arguments = (
+            writer_command(target, workload, args.program_arg)
+            if workload.get("command_model") == "writer-manifest"
+            else None
+        )
         eligibility = read_eligibility(eligibility_path, args.target, args.workload)
         matched_rows = 0
         for row in eligibility:
@@ -576,10 +707,11 @@ def main() -> int:
             "input": file_information(input_path),
             "zebrac": file_information(zebrac),
         }
-        for index, path in enumerate(
-            extra_input_paths(args.program_arg, manifest.parent, input_path.parent)
-        ):
-            identities[f"extra_input_{index}"] = file_information(path)
+        if writer_arguments is None:
+            for index, path in enumerate(
+                extra_input_paths(args.program_arg, manifest.parent, input_path.parent)
+            ):
+                identities[f"extra_input_{index}"] = file_information(path)
         for index, path in enumerate(workload["resources"]):
             identities[f"resource_{index}"] = file_information(path)
         eligibility_mtime = int(identities["eligibility"]["mtime_ns"])
@@ -602,7 +734,11 @@ def main() -> int:
         print(error, file=sys.stderr)
         return 1
 
-    canonical = [str(program), *args.program_arg, str(input_path)]
+    canonical = (
+        writer_arguments
+        if writer_arguments is not None
+        else [str(program), *args.program_arg, str(input_path)]
+    )
     if args.dry_run:
         print(shlex.join(canonical))
         print(
@@ -627,6 +763,8 @@ def main() -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
         for path in paths.values():
             path.unlink(missing_ok=True)
+        if writer_arguments is not None:
+            verify_writer_command(canonical, args.timeout, args.max_output_bytes)
         version = run_process(
             [str(zebrac), "--version"], args.timeout, args.max_output_bytes
         )
@@ -645,8 +783,8 @@ def main() -> int:
             left.symlink_to(program)
             right.symlink_to(program)
             commands = [
-                shlex.join([str(left), *args.program_arg, str(input_path)]),
-                shlex.join([str(right), *args.program_arg, str(input_path)]),
+                shlex.join([str(left), *canonical[1:]]),
+                shlex.join([str(right), *canonical[1:]]),
             ]
             command = [
                 str(zebrac),
