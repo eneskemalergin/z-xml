@@ -1891,10 +1891,16 @@ const DocumentBuilder = struct {
     }
 
     fn copyName(self: *Self, value: reader.NormalName) BuildError!DocumentNameRecord {
-        var result: DocumentNameRecord = .{ .raw = try self.copy(value.raw) };
+        const raw = try self.copy(value.raw);
+        var result: DocumentNameRecord = .{ .raw = raw };
         if (value.expanded) |expanded| {
-            result.prefix = try self.copyOptional(expanded.prefix);
-            result.local = try self.copy(expanded.local);
+            if (expanded.prefix) |prefix| {
+                result.prefix = .{ .offset = raw.offset, .len = @intCast(prefix.len) };
+            }
+            result.local = .{
+                .offset = raw.offset + raw.len - @as(u32, @intCast(expanded.local.len)),
+                .len = @intCast(expanded.local.len),
+            };
             result.namespace_uri = try self.copyOptional(expanded.namespace_uri);
         }
         return result;
