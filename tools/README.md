@@ -379,7 +379,7 @@ The development build installs adapters under `tools/zig-out/bin` by default.
 
 ## Writer measurement
 
-The Writer adapter accepts `MANIFEST SHAPE VALUE SINK`. The selected row must be a ready Writer row, the value must occur in its size plan, and the sink must occur in its input models. Run the same selection with `--verify` before measuring it:
+The Writer adapter accepts `MANIFEST SHAPE VALUE SINK`. The selected row must be a ready Writer row, the value must occur in its size plan, and the sink must occur in its input models. `writer-repeated-documents` uses its selected value as the number of fresh Writer instances. `writer-unchanged-text` accepts `--repeat=N` and an optional complete `--next-value=VALUE --next-repeat=N` transition. No other shape accepts repeat options. Run the same selection with `--verify` before measuring it:
 
 ```sh
 zig build --build-file tools/build.zig writer-adapter \
@@ -388,13 +388,21 @@ tools/zig-out/bin/z-xml-writer --verify \
     bench/shapes.tsv writer-attributes 16 unbuffered-sink
 tools/zig-out/bin/z-xml-writer \
     bench/shapes.tsv writer-unchanged-text 1m buffered-sink
+
+tools/zig-out/bin/z-xml-writer --verify \
+    bench/shapes.tsv writer-repeated-documents 4096 buffered-sink
+tools/zig-out/bin/z-xml-writer --verify \
+    bench/shapes.tsv writer-unchanged-text 64m buffered-sink --repeat=8
+tools/zig-out/bin/z-xml-writer --verify \
+    bench/shapes.tsv writer-unchanged-text 64m buffered-sink \
+    --repeat=1 --next-value=16k --next-repeat=4096
 ```
 
-`buffered-sink` provides a 64 KiB caller-owned buffer; `unbuffered-sink` provides none. `one-byte-sink` and `short-sink` provide no buffer and accept at most one or seven bytes from each drain call. The adapter flushes the sink after each document. Normal runs discard accepted output. `--verify` stores it in a caller-owned capture buffer.
+`buffered-sink` provides a 64 KiB caller-owned buffer; `unbuffered-sink` provides none. `one-byte-sink` and `short-sink` provide no buffer and accept at most one or seven bytes from each drain call. The adapter flushes the sink after each document. Normal runs discard accepted output. Single-document `--verify` runs store the complete output in a caller-owned capture buffer. Repeated runs reuse one capture buffer sized for the largest single document and verify each document before the next Writer starts.
 
-The JSON result records the selected shape, value, sink, semantic counts, output bytes, accepted bytes, sink calls, flushes, Writer allocation work, peak live Writer bytes, retained Writer capacity, caller input bytes, caller sink storage, and verification capture storage. `caller_oracle_storage_bytes` is the size of that output-capture buffer. Writer allocation fields exclude caller input, sink storage, and output capture. The adapter does not calculate checksums or write output files.
+The normal JSON schema is `z-xml-writer-result-v1`. It records the selected shape, value, sink, semantic counts, output bytes, accepted bytes, sink calls, flushes, Writer allocation work, peak live Writer bytes, retained Writer capacity, caller input bytes, caller sink storage, and verification capture storage. Repeated runs use `z-xml-writer-repeat-result-v1`, split a large-then-small schedule into primary and next phases, and add retained-capacity total. `caller_oracle_storage_bytes` is the size of the output-capture buffer. Writer allocation fields exclude caller input, sink storage, and output capture. The adapter does not calculate checksums or write output files.
 
-`run-zebrac-aa.py` accepts the Writer target and shape matrix. Pass the selected value and sink as two program arguments. The eligibility report uses the event columns plus `program_args`; one shape may have several rows when the exact value or sink differs. Publish a row only after the same selection passes `--verify`, and write the report after the shape matrix, target declaration, and executable are final. Before starting Zebrac, the wrapper reruns that exact selection with `--verify` and checks its result. A `pass` row alone cannot admit incorrect Writer output.
+`run-zebrac-aa.py` accepts the Writer target and shape matrix. Pass the selected value and sink as the first two program arguments, followed by any repeat options. The eligibility report uses the event columns plus `program_args`; one shape may have several rows when the exact schedule differs. Publish a row only after the same selection passes `--verify`, and write the report after the shape matrix, target declaration, and executable are final. Before starting Zebrac, the wrapper reruns that exact selection with `--verify` and checks its result. A `pass` row alone cannot admit incorrect Writer output.
 
 ```sh
 python3 tools/python/run-zebrac-aa.py \
