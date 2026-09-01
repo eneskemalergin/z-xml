@@ -413,9 +413,10 @@ def writer_command(
 ) -> list[str]:
     if target["lane"] != "writer" or target["input_model"] != "manifest-selected":
         raise ValueError("Writer shape does not match the selected target")
-    if len(arguments) != 2:
+    if len(arguments) < 2:
         raise ValueError("Writer measurement needs VALUE and SINK program arguments")
-    value, sink = arguments
+    value, sink = arguments[:2]
+    repeat_arguments = arguments[2:]
     shape = str(workload["name"])
     prefixes = {
         "writer-attributes": "attributes:",
@@ -430,11 +431,71 @@ def writer_command(
     sinks = str(workload["input_models"]).split(",")
     if value not in values or sink not in sinks:
         raise ValueError("Writer VALUE or SINK is not declared by the shape")
+    writer_repeat_protocol(shape, value, repeat_arguments, set(values))
     program = target["program"]
     manifest = workload["source"]
     assert isinstance(program, Path)
     assert isinstance(manifest, Path)
-    return [str(program), str(manifest), shape, value, sink]
+    return [str(program), str(manifest), shape, value, sink, *repeat_arguments]
+
+
+def writer_repeat_protocol(
+    shape: str,
+    value: str,
+    arguments: list[str],
+    allowed_values: set[str] | None = None,
+) -> dict[str, object] | None:
+    if shape == "writer-repeated-documents":
+        if arguments:
+            raise ValueError("repeated-document shape does not accept repeat options")
+        return {
+            "primary_documents": int(value),
+            "next_value": None,
+            "next_documents": 0,
+        }
+    if not arguments:
+        return None
+    if shape != "writer-unchanged-text":
+        raise ValueError("repeat options require unchanged text")
+
+    values: dict[str, str] = {}
+    for argument in arguments:
+        for prefix, field in (
+            ("--repeat=", "primary_documents"),
+            ("--next-value=", "next_value"),
+            ("--next-repeat=", "next_documents"),
+        ):
+            if argument.startswith(prefix):
+                option_value = argument.removeprefix(prefix)
+                if field in values or not option_value:
+                    raise ValueError(f"invalid or duplicate {prefix[:-1]}")
+                values[field] = option_value
+                break
+        else:
+            raise ValueError(f"unsupported Writer repeat argument: {argument}")
+
+    if "primary_documents" not in values:
+        raise ValueError("Writer repeat schedule lacks --repeat")
+    if ("next_value" in values) != ("next_documents" in values):
+        raise ValueError("Writer transition needs next value and repeat count")
+    for field in ("primary_documents", "next_documents"):
+        count = values.get(field)
+        if count is None:
+            continue
+        if not count.isascii() or not count.isdecimal() or not 1 <= int(count) <= 4096:
+            raise ValueError("Writer repeat count must be between 1 and 4096")
+    next_value = values.get("next_value")
+    if (
+        next_value is not None
+        and allowed_values is not None
+        and next_value not in allowed_values
+    ):
+        raise ValueError("Writer next value is not declared by the shape")
+    return {
+        "primary_documents": int(values["primary_documents"]),
+        "next_value": next_value,
+        "next_documents": int(values.get("next_documents", "0")),
+    }
 
 
 def run_process(
@@ -504,18 +565,27 @@ def verify_writer_command(
         result = decode_json(verification[1])
     except ValueError as error:
         raise ValueError(f"invalid Writer verification JSON: {error}") from error
+    repeat = writer_repeat_protocol(command[2], command[3], command[5:])
     expected = {
-        "schema": "z-xml-writer-result-v1",
+        "schema": (
+            "z-xml-writer-repeat-result-v1"
+            if repeat is not None
+            else "z-xml-writer-result-v1"
+        ),
         "target": "z-xml-writer",
         "shape": command[2],
-        "value": command[3],
         "sink": command[4],
         "verified": True,
     }
+    if repeat is None:
+        expected["value"] = command[3]
     if not isinstance(result, dict) or any(
         result.get(field) != value for field, value in expected.items()
     ):
         raise ValueError("Writer verification result differs from the command")
+    if repeat is not None:
+        verify_writer_repeat_result(result, command, repeat)
+        return
     output_bytes = result.get("output_bytes")
     accepted_bytes = result.get("sink_accepted_bytes")
     sink_flushes = result.get("sink_flushes")
@@ -532,6 +602,85 @@ def verify_writer_command(
         or live_bytes != 0
     ):
         raise ValueError("Writer verification result is incomplete")
+
+
+def verify_writer_repeat_result(
+    result: dict[str, object], command: list[str], repeat: dict[str, object]
+) -> None:
+    if "next" not in result:
+        raise ValueError("Writer verification lacks a next-phase result")
+    verify_writer_repeat_phase(
+        result.get("primary"), command[3], int(repeat["primary_documents"])
+    )
+    next_value = repeat["next_value"]
+    if next_value is None:
+        if result.get("next") is not None:
+            raise ValueError("Writer verification has an unexpected next phase")
+    else:
+        verify_writer_repeat_phase(
+            result.get("next"), str(next_value), int(repeat["next_documents"])
+        )
+    sink_storage = result.get("caller_sink_storage_bytes")
+    oracle_storage = result.get("caller_oracle_storage_bytes")
+    expected_sink_storage = 64 * 1024 if command[4] == "buffered-sink" else 0
+    if (
+        type(sink_storage) is not int
+        or sink_storage != expected_sink_storage
+        or type(oracle_storage) is not int
+        or oracle_storage <= 0
+    ):
+        raise ValueError("Writer repeat caller storage is incomplete")
+
+
+def verify_writer_repeat_phase(phase: object, value: str, documents: int) -> None:
+    if type(phase) is not dict:
+        raise ValueError("Writer repeat phase is missing")
+    if (
+        phase.get("value") != value
+        or type(phase.get("documents")) is not int
+        or phase.get("documents") != documents
+    ):
+        raise ValueError("Writer repeat phase differs from the command")
+    integer_fields = (
+        "elements",
+        "attributes",
+        "namespace_declarations",
+        "text_input_bytes",
+        "text_fragments",
+        "output_bytes",
+        "sink_accepted_bytes",
+        "sink_calls",
+        "sink_flushes",
+        "writer_peak_open_elements",
+        "writer_peak_namespace_bindings",
+        "writer_peak_pending_start_tag_bytes",
+        "writer_peak_retained_capacity_bytes",
+        "writer_final_retained_capacity_bytes",
+        "writer_retained_capacity_total_bytes",
+        "writer_allocator_allocs",
+        "writer_allocator_resizes",
+        "writer_allocator_remaps",
+        "writer_requested_bytes",
+        "writer_peak_live_bytes",
+        "writer_live_bytes_before_deinit",
+        "writer_live_bytes_after_deinit",
+        "caller_input_bytes",
+    )
+    if any(
+        type(phase.get(field)) is not int or phase[field] < 0
+        for field in integer_fields
+    ):
+        raise ValueError("Writer repeat phase has invalid metrics")
+    if (
+        phase["output_bytes"] <= 0
+        or phase["sink_calls"] <= 0
+        or phase["output_bytes"] != phase["sink_accepted_bytes"]
+        or phase["sink_flushes"] != documents
+        or phase["writer_live_bytes_after_deinit"] != 0
+        or phase["writer_retained_capacity_total_bytes"]
+        != phase["writer_final_retained_capacity_bytes"] * documents
+    ):
+        raise ValueError("Writer repeat phase is incomplete")
 
 
 def validate_zebrac_results(
