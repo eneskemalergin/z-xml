@@ -12,6 +12,7 @@ const TrackingAllocator = @import("tracking_allocator.zig").TrackingAllocator;
 
 const MANIFEST_SCHEMA = "z-xml-shape-matrix-v1";
 const RESULT_SCHEMA = "z-xml-writer-result-v1";
+const REPEAT_RESULT_SCHEMA = "z-xml-writer-repeat-result-v1";
 const MAX_MANIFEST_BYTES = 256 * 1024;
 const MAX_TEXT_BYTES = 64 * 1024 * 1024;
 const MAX_ATTRIBUTES = 256;
@@ -98,6 +99,16 @@ const Options = struct {
     value: []const u8,
     sink_name: []const u8,
     verify: bool,
+    repeat: ?usize,
+    next_value: ?[]const u8,
+    next_repeat: ?usize,
+};
+
+const RepeatSchedule = struct {
+    primary: Selection,
+    primary_documents: usize,
+    next: ?Selection = null,
+    next_documents: usize = 0,
 };
 
 const Result = struct {
@@ -116,6 +127,7 @@ const Result = struct {
     writer_peak_pending_start_tag_bytes: usize = 0,
     writer_peak_retained_capacity_bytes: usize = 0,
     writer_final_retained_capacity_bytes: usize = 0,
+    writer_retained_capacity_total_bytes: u64 = 0,
     writer_allocator_allocs: u64 = 0,
     writer_allocator_resizes: u64 = 0,
     writer_allocator_remaps: u64 = 0,
@@ -126,6 +138,13 @@ const Result = struct {
     caller_input_bytes: usize = 0,
     caller_sink_storage_bytes: usize = 0,
     caller_oracle_storage_bytes: usize = 0,
+};
+
+const RepeatResult = struct {
+    primary: Result,
+    next: ?Result,
+    caller_sink_storage_bytes: usize,
+    caller_oracle_storage_bytes: usize,
 };
 
 const Execution = struct {
@@ -233,7 +252,8 @@ fn run(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const options = parseOptions(args) orelse {
         std.debug.print(
-            "usage: z-xml-writer [--verify] MANIFEST SHAPE VALUE SINK\n",
+            "usage: z-xml-writer [--verify] [--repeat=N " ++
+                "[--next-value=VALUE --next-repeat=N]] MANIFEST SHAPE VALUE SINK\n",
             .{},
         );
         return 64;
@@ -248,6 +268,11 @@ fn run(init: std.process.Init) !u8 {
         options.value,
         sink_model,
     );
+    if (try repeatSchedule(manifest, options, selection)) |schedule| {
+        const result = try executeRepeated(init.gpa, schedule, options.verify);
+        try printRepeatResult(init.io, schedule, options.verify, result);
+        return 0;
+    }
     var execution = try execute(init.gpa, selection, options.verify);
     defer execution.deinit();
     try printResult(init.io, selection, options.verify, execution.result);
@@ -258,10 +283,22 @@ fn parseOptions(args: []const []const u8) ?Options {
     var positional: [4][]const u8 = undefined;
     var positional_count: usize = 0;
     var verify = false;
+    var repeat: ?usize = null;
+    var next_value: ?[]const u8 = null;
+    var next_repeat: ?usize = null;
     for (args[1..]) |argument| {
         if (std.mem.eql(u8, argument, "--verify")) {
             if (verify) return null;
             verify = true;
+        } else if (std.mem.startsWith(u8, argument, "--repeat=")) {
+            if (repeat != null) return null;
+            repeat = parseRepeatCount(argument["--repeat=".len..]) orelse return null;
+        } else if (std.mem.startsWith(u8, argument, "--next-value=")) {
+            if (next_value != null or argument.len == "--next-value=".len) return null;
+            next_value = argument["--next-value=".len..];
+        } else if (std.mem.startsWith(u8, argument, "--next-repeat=")) {
+            if (next_repeat != null) return null;
+            next_repeat = parseRepeatCount(argument["--next-repeat=".len..]) orelse return null;
         } else if (argument.len == 0 or argument[0] == '-' or positional_count == positional.len) {
             return null;
         } else {
@@ -270,13 +307,23 @@ fn parseOptions(args: []const []const u8) ?Options {
         }
     }
     if (positional_count != positional.len) return null;
+    if ((next_value == null) != (next_repeat == null) or
+        (next_value != null and repeat == null)) return null;
     return .{
         .manifest = positional[0],
         .shape_id = positional[1],
         .value = positional[2],
         .sink_name = positional[3],
         .verify = verify,
+        .repeat = repeat,
+        .next_value = next_value,
+        .next_repeat = next_repeat,
     };
+}
+
+fn parseRepeatCount(value: []const u8) ?usize {
+    const count = std.fmt.parseInt(usize, value, 10) catch return null;
+    return if (count == 0 or count > MAX_DOCUMENTS) null else count;
 }
 
 fn readManifest(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -342,6 +389,34 @@ fn selectManifest(
     }
     if (schema_count != 1 or !header_seen) return error.InvalidManifest;
     return selected orelse error.InvalidSelection;
+}
+
+fn repeatSchedule(
+    manifest: []const u8,
+    options: Options,
+    primary: Selection,
+) !?RepeatSchedule {
+    if (primary.shape == .repeated_documents) {
+        if (options.repeat != null or options.next_value != null) {
+            return error.InvalidSelection;
+        }
+        return .{
+            .primary = primary,
+            .primary_documents = primary.amount,
+        };
+    }
+    const primary_documents = options.repeat orelse return null;
+    if (primary.shape != .unchanged_text) return error.InvalidSelection;
+    const next = if (options.next_value) |value|
+        try selectManifest(manifest, primary.shape.id(), value, primary.sink)
+    else
+        null;
+    return .{
+        .primary = primary,
+        .primary_documents = primary_documents,
+        .next = next,
+        .next_documents = options.next_repeat orelse 0,
+    };
 }
 
 fn splitFields(line: []const u8, fields: *[12][]const u8) bool {
@@ -445,7 +520,7 @@ fn execute(allocator: std.mem.Allocator, selection: Selection, verify: bool) !Ex
     else
         1;
     for (0..document_count) |_| {
-        try writeDocument(&sink, &tracking, selection, input, &result);
+        _ = try writeDocument(&sink, &tracking, selection, input, &result);
     }
     result.sink_accepted_bytes = sink.accepted_bytes;
     result.sink_calls = sink.drain_calls;
@@ -463,6 +538,121 @@ fn execute(allocator: std.mem.Allocator, selection: Selection, verify: bool) !Ex
         .capture = capture,
         .result = result,
     };
+}
+
+fn executeRepeated(
+    allocator: std.mem.Allocator,
+    schedule: RepeatSchedule,
+    verify: bool,
+) !RepeatResult {
+    const primary_capture = if (verify)
+        try documentCaptureUpperBound(schedule.primary)
+    else
+        0;
+    const next_capture = if (verify and schedule.next != null)
+        try documentCaptureUpperBound(schedule.next.?)
+    else
+        0;
+    const capture_len = @max(primary_capture, next_capture);
+    const capture: []u8 = if (capture_len == 0)
+        @constCast(&.{})
+    else
+        try allocator.alloc(u8, capture_len);
+    defer if (capture.len != 0) allocator.free(capture);
+
+    var empty_sink_buffer: [0]u8 = .{};
+    const sink_buffer: []u8 = if (schedule.primary.sink == .buffered)
+        try allocator.alloc(u8, BUFFERED_SINK_BYTES)
+    else
+        &empty_sink_buffer;
+    defer if (sink_buffer.len != 0) allocator.free(sink_buffer);
+
+    const primary = try executeRepeatPhase(
+        allocator,
+        schedule.primary,
+        schedule.primary_documents,
+        verify,
+        sink_buffer,
+        capture,
+    );
+    const next = if (schedule.next) |selection|
+        try executeRepeatPhase(
+            allocator,
+            selection,
+            schedule.next_documents,
+            verify,
+            sink_buffer,
+            capture,
+        )
+    else
+        null;
+    return .{
+        .primary = primary,
+        .next = next,
+        .caller_sink_storage_bytes = sink_buffer.len,
+        .caller_oracle_storage_bytes = capture.len,
+    };
+}
+
+fn executeRepeatPhase(
+    allocator: std.mem.Allocator,
+    selection: Selection,
+    documents: usize,
+    verify: bool,
+    sink_buffer: []u8,
+    capture: []u8,
+) !Result {
+    const input_len = switch (selection.shape) {
+        .unchanged_text, .escaped_text, .short_sink => selection.amount,
+        .fragmented_text => @min(selection.amount, TEXT_FRAGMENT_BYTES),
+        else => 0,
+    };
+    var empty_input: [0]u8 = .{};
+    const input: []u8 = if (input_len == 0) &empty_input else try allocator.alloc(u8, input_len);
+    defer if (input.len != 0) allocator.free(input);
+    fillInput(selection.shape, input);
+
+    var sink = CountingSink.init(sink_buffer, capture, selection.sink.maxWriteBytes());
+    var tracking: TrackingAllocator = .{ .child = allocator };
+    var result: Result = .{ .caller_input_bytes = input.len };
+    var expected_retained_capacity: ?usize = null;
+    for (0..documents) |_| {
+        if (verify) sink.capture_len = 0;
+        const retained_capacity = try writeDocument(
+            &sink,
+            &tracking,
+            selection,
+            input,
+            &result,
+        );
+        if (expected_retained_capacity) |expected| {
+            if (retained_capacity != expected) return error.WriterInstanceDrift;
+        } else {
+            expected_retained_capacity = retained_capacity;
+        }
+        if (verify) {
+            try verifyDocument(
+                allocator,
+                selection,
+                input,
+                capture[0..sink.capture_len],
+            );
+        }
+    }
+    result.sink_accepted_bytes = sink.accepted_bytes;
+    result.sink_calls = sink.drain_calls;
+    result.sink_flushes = sink.flush_calls;
+    result.writer_allocator_allocs = tracking.allocs;
+    result.writer_allocator_resizes = tracking.resizes;
+    result.writer_allocator_remaps = tracking.remaps;
+    result.writer_requested_bytes = tracking.requested_bytes;
+    result.writer_peak_live_bytes = tracking.peak_live_bytes;
+    result.writer_live_bytes_after_deinit = tracking.live_bytes;
+    try validateResult(result);
+    if (result.documents != documents or result.sink_flushes != documents) {
+        return error.InvalidSinkResult;
+    }
+    return result;
 }
 
 fn validateResult(result: Result) !void {
@@ -497,13 +687,20 @@ fn captureUpperBound(selection: Selection) !usize {
     return total;
 }
 
+fn documentCaptureUpperBound(selection: Selection) !usize {
+    if (selection.shape == .repeated_documents) {
+        return DECLARATION.len + "<root/>".len;
+    }
+    return captureUpperBound(selection);
+}
+
 fn writeDocument(
     sink: *CountingSink,
     tracking: *TrackingAllocator,
     selection: Selection,
     input: []const u8,
     result: *Result,
-) !void {
+) !usize {
     const accepted_before = sink.accepted_bytes;
     var writer = try xml.Writer.init(tracking.allocator(), &sink.interface, .{});
     var writer_live = true;
@@ -542,7 +739,13 @@ fn writeDocument(
     const offset = writer.byteOffset() orelse return error.InvalidSinkResult;
     result.output_bytes = std.math.add(u64, result.output_bytes, offset) catch
         return error.InvalidSinkResult;
-    result.writer_final_retained_capacity_bytes = writer.memoryUsage().retained_capacity_bytes;
+    const retained_capacity = writer.memoryUsage().retained_capacity_bytes;
+    result.writer_final_retained_capacity_bytes = retained_capacity;
+    result.writer_retained_capacity_total_bytes = std.math.add(
+        u64,
+        result.writer_retained_capacity_total_bytes,
+        @as(u64, @intCast(retained_capacity)),
+    ) catch return error.InvalidSinkResult;
     result.writer_live_bytes_before_deinit = @max(
         result.writer_live_bytes_before_deinit,
         tracking.live_bytes,
@@ -553,6 +756,7 @@ fn writeDocument(
     sink.interface.flush() catch return error.SinkFailure;
     if (sink.accepted_bytes - accepted_before != offset) return error.InvalidSinkResult;
     result.documents += 1;
+    return retained_capacity;
 }
 
 fn writeAttributes(writer: *xml.Writer, count: usize, result: *Result) !void {
@@ -759,6 +963,21 @@ fn verifyOutput(
     }
 }
 
+fn verifyDocument(
+    allocator: std.mem.Allocator,
+    selection: Selection,
+    input: []const u8,
+    output: []const u8,
+) !void {
+    if (selection.shape == .repeated_documents) {
+        if (!std.mem.eql(u8, output, DECLARATION ++ "<root/>")) {
+            return error.OracleMismatch;
+        }
+        return;
+    }
+    try verifyOutput(allocator, selection, input, output);
+}
+
 fn expectedTextByte(shape: Shape, input: []const u8, position: usize) ?u8 {
     return switch (shape) {
         .fragmented_text => input[position % input.len],
@@ -848,6 +1067,89 @@ fn printResult(io: std.Io, selection: Selection, verified: bool, result: Result)
     try output.flush();
 }
 
+fn printRepeatResult(
+    io: std.Io,
+    schedule: RepeatSchedule,
+    verified: bool,
+    result: RepeatResult,
+) !void {
+    var output_buffer: [4096]u8 = undefined;
+    var output_file = std.Io.File.stdout().writer(io, &output_buffer);
+    const output = &output_file.interface;
+    try output.print(
+        "{{\"schema\":\"{s}\",\"target\":\"z-xml-writer\"," ++
+            "\"shape\":\"{s}\",\"sink\":\"{s}\",\"verified\":{},\"primary\":",
+        .{
+            REPEAT_RESULT_SCHEMA,
+            schedule.primary.shape.id(),
+            schedule.primary.sink.manifestName(),
+            verified,
+        },
+    );
+    try printRepeatPhase(output, schedule.primary, result.primary);
+    try output.writeAll(",\"next\":");
+    if (schedule.next) |selection| {
+        try printRepeatPhase(output, selection, result.next.?);
+    } else {
+        try output.writeAll("null");
+    }
+    try output.print(
+        ",\"caller_sink_storage_bytes\":{d}," ++
+            "\"caller_oracle_storage_bytes\":{d}}}\n",
+        .{ result.caller_sink_storage_bytes, result.caller_oracle_storage_bytes },
+    );
+    try output.flush();
+}
+
+fn printRepeatPhase(output: *std.Io.Writer, selection: Selection, result: Result) !void {
+    try output.print(
+        "{{\"value\":\"{s}\",\"documents\":{d},\"elements\":{d}," ++
+            "\"attributes\":{d},\"namespace_declarations\":{d}," ++
+            "\"text_input_bytes\":{d},\"text_fragments\":{d}," ++
+            "\"output_bytes\":{d},\"sink_accepted_bytes\":{d}," ++
+            "\"sink_calls\":{d},\"sink_flushes\":{d}," ++
+            "\"writer_peak_open_elements\":{d}," ++
+            "\"writer_peak_namespace_bindings\":{d}," ++
+            "\"writer_peak_pending_start_tag_bytes\":{d}," ++
+            "\"writer_peak_retained_capacity_bytes\":{d}," ++
+            "\"writer_final_retained_capacity_bytes\":{d}," ++
+            "\"writer_retained_capacity_total_bytes\":{d}," ++
+            "\"writer_allocator_allocs\":{d},\"writer_allocator_resizes\":{d}," ++
+            "\"writer_allocator_remaps\":{d},\"writer_requested_bytes\":{d}," ++
+            "\"writer_peak_live_bytes\":{d}," ++
+            "\"writer_live_bytes_before_deinit\":{d}," ++
+            "\"writer_live_bytes_after_deinit\":{d}," ++
+            "\"caller_input_bytes\":{d}}}",
+        .{
+            selection.value,
+            result.documents,
+            result.elements,
+            result.attributes,
+            result.namespace_declarations,
+            result.text_input_bytes,
+            result.text_fragments,
+            result.output_bytes,
+            result.sink_accepted_bytes,
+            result.sink_calls,
+            result.sink_flushes,
+            result.writer_peak_open_elements,
+            result.writer_peak_namespace_bindings,
+            result.writer_peak_pending_start_tag_bytes,
+            result.writer_peak_retained_capacity_bytes,
+            result.writer_final_retained_capacity_bytes,
+            result.writer_retained_capacity_total_bytes,
+            result.writer_allocator_allocs,
+            result.writer_allocator_resizes,
+            result.writer_allocator_remaps,
+            result.writer_requested_bytes,
+            result.writer_peak_live_bytes,
+            result.writer_live_bytes_before_deinit,
+            result.writer_live_bytes_after_deinit,
+            result.caller_input_bytes,
+        },
+    );
+}
+
 // --- Tests ---
 
 const TEST_HEADER =
@@ -868,6 +1170,9 @@ test "[cli] - [writer adapter]: parses only the documented arguments" {
     try std.testing.expectEqualStrings("writer-attributes", options.shape_id);
     try std.testing.expectEqualStrings("16", options.value);
     try std.testing.expectEqualStrings("unbuffered-sink", options.sink_name);
+    try std.testing.expect(options.repeat == null);
+    try std.testing.expect(options.next_value == null);
+    try std.testing.expect(options.next_repeat == null);
     try std.testing.expect(parseOptions(&.{
         "z-xml-writer",
         "--verify",
@@ -891,6 +1196,53 @@ test "[cli] - [writer adapter]: parses only the documented arguments" {
         "writer-attributes",
         "16",
     }) == null);
+}
+
+test "[cli] - [writer adapter]: accepts complete repeated schedules" {
+    const manifest = TEST_HEADER ++
+        "writer-unchanged-text\tt\twriter\twriter-xml10-namespaces\tbuffered-sink\t-\twriter-unchanged-text\t2k,4k\temit\twriter-output-v1\tready\tt\n" ++
+        "writer-repeated-documents\tr\twriter\twriter-xml10-namespaces\tbuffered-sink\t-\twriter-repeated-documents\tdocuments:2\temit\twriter-output-v1\tready\tr\n";
+    const options = parseOptions(&.{
+        "z-xml-writer",
+        "bench/shapes.tsv",
+        "writer-unchanged-text",
+        "4k",
+        "buffered-sink",
+        "--repeat=1",
+        "--next-value=2k",
+        "--next-repeat=2",
+    }).?;
+    try std.testing.expectEqual(@as(?usize, 1), options.repeat);
+    try std.testing.expectEqualStrings("2k", options.next_value.?);
+    try std.testing.expectEqual(@as(?usize, 2), options.next_repeat);
+    const primary = try selectManifest(manifest, options.shape_id, options.value, .buffered);
+    const schedule = (try repeatSchedule(manifest, options, primary)).?;
+    try std.testing.expectEqual(@as(usize, 1), schedule.primary_documents);
+    try std.testing.expectEqual(@as(usize, 4096), schedule.primary.amount);
+    try std.testing.expectEqual(@as(usize, 2), schedule.next_documents);
+    try std.testing.expectEqual(@as(usize, 2048), schedule.next.?.amount);
+
+    const repeated_options = parseOptions(&.{
+        "z-xml-writer",
+        "bench/shapes.tsv",
+        "writer-repeated-documents",
+        "2",
+        "buffered-sink",
+    }).?;
+    const repeated = try selectManifest(manifest, repeated_options.shape_id, repeated_options.value, .buffered);
+    const repeated_schedule = (try repeatSchedule(manifest, repeated_options, repeated)).?;
+    try std.testing.expectEqual(@as(usize, 2), repeated_schedule.primary_documents);
+    try std.testing.expect(repeated_schedule.next == null);
+
+    inline for (.{
+        &.{ "z-xml-writer", "m", "s", "v", "k", "--repeat=0" },
+        &.{ "z-xml-writer", "m", "s", "v", "k", "--repeat=4097" },
+        &.{ "z-xml-writer", "m", "s", "v", "k", "--next-value=16k" },
+        &.{ "z-xml-writer", "m", "s", "v", "k", "--repeat=1", "--next-value=16k" },
+        &.{ "z-xml-writer", "m", "s", "v", "k", "--repeat=1", "--repeat=2" },
+    }) |arguments| {
+        try std.testing.expect(parseOptions(arguments) == null);
+    }
 }
 
 test "[unit] - [writer adapter manifest]: selects every retained shape and rejects drift" {
@@ -951,6 +1303,57 @@ test "[integration] - [writer adapter output]: verifies every shape and sink mod
         try std.testing.expectEqual(expected_sink_storage, execution.result.caller_sink_storage_bytes);
         try std.testing.expect(execution.result.caller_oracle_storage_bytes != 0);
     }
+}
+
+test "[integration] - [writer adapter repeat]: verifies independent construction schedules" {
+    const small = try executeRepeated(std.testing.allocator, .{
+        .primary = .{
+            .shape = .repeated_documents,
+            .value = "2",
+            .amount = 2,
+            .sink = .buffered,
+        },
+        .primary_documents = 2,
+    }, true);
+    try std.testing.expect(small.next == null);
+    try std.testing.expectEqual(@as(usize, 2), small.primary.documents);
+    try std.testing.expectEqual(@as(u64, 2), small.primary.sink_flushes);
+    try std.testing.expectEqual(@as(usize, BUFFERED_SINK_BYTES), small.caller_sink_storage_bytes);
+    try std.testing.expectEqual(
+        @as(usize, DECLARATION.len + "<root/>".len),
+        small.caller_oracle_storage_bytes,
+    );
+    try std.testing.expectEqual(
+        @as(u64, small.primary.writer_final_retained_capacity_bytes * 2),
+        small.primary.writer_retained_capacity_total_bytes,
+    );
+
+    const transition = try executeRepeated(std.testing.allocator, .{
+        .primary = .{
+            .shape = .unchanged_text,
+            .value = "4",
+            .amount = 4,
+            .sink = .buffered,
+        },
+        .primary_documents = 1,
+        .next = .{
+            .shape = .unchanged_text,
+            .value = "2",
+            .amount = 2,
+            .sink = .buffered,
+        },
+        .next_documents = 3,
+    }, true);
+    const next = transition.next.?;
+    try std.testing.expectEqual(@as(usize, 1), transition.primary.documents);
+    try std.testing.expectEqual(@as(usize, 3), next.documents);
+    try std.testing.expectEqual(@as(u64, 3), next.sink_flushes);
+    try std.testing.expectEqual(@as(usize, 0), transition.primary.writer_live_bytes_after_deinit);
+    try std.testing.expectEqual(@as(usize, 0), next.writer_live_bytes_after_deinit);
+    try std.testing.expectEqual(
+        @as(u64, next.writer_final_retained_capacity_bytes * 3),
+        next.writer_retained_capacity_total_bytes,
+    );
 }
 
 test "[integration] - [writer adapter exact output]: preserves compact syntax" {
