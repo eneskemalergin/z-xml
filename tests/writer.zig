@@ -393,6 +393,67 @@ test "[property] - [writer escaping]: preserves attribute text and CDATA values"
     try std.testing.expectEqualStrings(expected, output.buffered());
 }
 
+test "[property] - [writer text]: preserves plain-run boundaries and fallback output" {
+    const Case = struct {
+        version: xml.XmlVersion = .xml10,
+        input: []const u8,
+        expected: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .input = "xxxxxxxxxxxxxxx", .expected = "<r>xxxxxxxxxxxxxxx</r>" },
+        .{ .input = "xxxxxxxxxxxxxxxx", .expected = "<r>xxxxxxxxxxxxxxxx</r>" },
+        .{ .input = "xxxxxxxxxxxxxxxxx", .expected = "<r>xxxxxxxxxxxxxxxxx</r>" },
+        .{ .input = "xxxxxxxxxxxxxxxx&", .expected = "<r>xxxxxxxxxxxxxxxx&amp;</r>" },
+        .{ .input = "xxxxxxxxxxxxxxxx]]>", .expected = "<r>xxxxxxxxxxxxxxxx]]&gt;</r>" },
+        .{ .input = "xxxxxxxxxxxxxxxx\r", .expected = "<r>xxxxxxxxxxxxxxxx&#xD;</r>" },
+        .{ .input = "xxxxxxxxxxxxxxxxé", .expected = "<r>xxxxxxxxxxxxxxxxé</r>" },
+        .{
+            .version = .xml11,
+            .input = "xxxxxxxxxxxxxxxx\x7f",
+            .expected = "<r>xxxxxxxxxxxxxxxx&#x7F;</r>",
+        },
+    };
+
+    for (cases) |case| {
+        var output_buffer: [128]u8 = undefined;
+        var output = std.Io.Writer.fixed(&output_buffer);
+        var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+            .emit_declaration = false,
+            .version = case.version,
+        });
+        defer writer.deinit();
+
+        try writer.startDocument();
+        try writer.startElement("r");
+        try writer.text(case.input);
+        try writer.endElement();
+        try writer.endDocument();
+
+        try std.testing.expectEqualStrings(case.expected, output.buffered());
+        try std.testing.expectEqual(@as(?u64, case.expected.len), writer.byteOffset());
+    }
+
+    var output_buffer: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&output_buffer);
+    var writer = try xml.Writer.init(std.testing.allocator, &output, .{
+        .emit_declaration = false,
+    });
+    defer writer.deinit();
+
+    try writer.startDocument();
+    try writer.startElement("r");
+    try writer.text("]]");
+    try writer.text("xxxxxxxxxxxxxxxx");
+    try writer.text(">");
+    try writer.endElement();
+    try writer.endDocument();
+
+    try std.testing.expectEqualStrings(
+        "<r>]]xxxxxxxxxxxxxxxx></r>",
+        output.buffered(),
+    );
+}
+
 test "[edge] - [writer content]: empty calls close pending start tags" {
     const expected =
         "<root><text></text><cdata><![CDATA[]]></cdata>" ++
@@ -548,6 +609,8 @@ test "[failure] - [writer characters]: rejects malformed and forbidden XML chara
         "\x00",
         "\x01",
         "\xc0",
+        "xxxxxxxxxxxxxxxx\x01",
+        "xxxxxxxxxxxxxxxx\xc0",
         "\xef\xbf\xbe",
     };
 

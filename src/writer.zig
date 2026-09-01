@@ -491,7 +491,11 @@ pub const Writer = struct {
         try self.ensureOutputFits(output_len);
 
         if (self.lifecycle == .start_tag) try self.writePendingUnchecked(">");
-        try self.writeText(bytes);
+        if (analysis.output_len == bytes.len) {
+            try self.writeAccepted(bytes);
+        } else {
+            try self.writeText(bytes);
+        }
         self.text_trailing_brackets = analysis.trailing_brackets;
         self.lifecycle = .content;
     }
@@ -973,6 +977,10 @@ fn analyzeText(
     version: reader.XmlVersion,
     initial_trailing_brackets: u2,
 ) WriterError!TextAnalysis {
+    if (hasPlainTextPrefix(bytes) and isPlainText(bytes[16..])) {
+        return .{ .output_len = bytes.len, .trailing_brackets = 0 };
+    }
+
     var output_len: usize = 0;
     var trailing = initial_trailing_brackets;
     var index: usize = 0;
@@ -994,6 +1002,28 @@ fn analyzeText(
     return .{
         .output_len = output_len,
         .trailing_brackets = trailing,
+    };
+}
+
+fn hasPlainTextPrefix(bytes: []const u8) bool {
+    if (bytes.len < 16) return false;
+    for (bytes[0..16]) |byte| {
+        if (!isPlainTextByte(byte)) return false;
+    }
+    return true;
+}
+
+fn isPlainText(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (!isPlainTextByte(byte)) return false;
+    }
+    return true;
+}
+
+fn isPlainTextByte(byte: u8) bool {
+    return byte >= 0x20 and byte < 0x7f and switch (byte) {
+        '&', '<', ']', '>' => false,
+        else => true,
     };
 }
 
@@ -1162,6 +1192,11 @@ fn isNcName(bytes: []const u8) bool {
 }
 
 fn decodeCodepoint(bytes: []const u8, index: *usize) error{InvalidCharacter}!u21 {
+    if (bytes[index.*] < 0x80) {
+        const codepoint = bytes[index.*];
+        index.* += 1;
+        return codepoint;
+    }
     const length = std.unicode.utf8ByteSequenceLength(bytes[index.*]) catch
         return error.InvalidCharacter;
     if (length > bytes.len - index.*) return error.InvalidCharacter;
