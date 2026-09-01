@@ -1,3 +1,4 @@
 # z-xml-targets-v1
 # name	executable	processor_class	features	work_lane	input_model
 z-xml-document	z-xml-tree	partial	document,document_structure,element_matching,depth_16,depth_256,depth_2048,attribute_syntax,entity_references,numeric_references,cdata,comments,pi,xml_declaration,names,namespaces,utf8,predefined_entities,unicode_names,attributes	dom	streaming-reader
+z-xml-document-repeat	z-xml-tree	partial	document,document_repeat_protocol,memory_report,timing_report	document-repeat	streaming-reader

@@ -7,7 +7,8 @@
 //! result output. Reported traversal timing starts after construction and ends before destruction.
 //! Timing can repeat the same complete traversal after one build for profile attribution. Memory
 //! mode reports Document storage, allocation work, an independent Reader-only pass, caller input
-//! storage, traversal scratch, and cleanup.
+//! storage, traversal scratch, and cleanup. Repeated construction creates and destroys independent
+//! public Documents over fixed single-input or large-then-small schedules.
 
 const std = @import("std");
 const xml = @import("z_xml");
@@ -20,12 +21,23 @@ const Mode = enum {
     construction,
     timing,
     memory,
+    repeat,
+};
+
+const RepeatReport = enum {
+    summary,
+    verify,
+    memory,
+    timing,
 };
 
 const Options = struct {
     mode: Mode = .summary,
     namespaces: bool = false,
     iterations: usize = 1,
+    repeat_report: RepeatReport = .summary,
+    next_path: ?[]const u8 = null,
+    next_iterations: usize = 0,
     path: []const u8,
 };
 
@@ -113,6 +125,32 @@ const ReaderMemory = struct {
     live_after_deinit_bytes: usize,
 };
 
+const RepeatPhase = struct {
+    documents: usize,
+    input_bytes: u64,
+    guard: u64 = 0,
+    retained_capacity_bytes: usize = 0,
+    retained_capacity_total_bytes: u64 = 0,
+    elements: u64 = 0,
+    attributes: u64 = 0,
+    text_bytes: u64 = 0,
+    common_checksum: u64 = 0,
+    parse_requested_bytes: u64 = 0,
+    parse_temporary_bytes: u64 = 0,
+    parse_peak_live_bytes: usize = 0,
+    parse_allocator_operations: u64 = 0,
+    parse_live_after_deinit_bytes: usize = 0,
+    reader_requested_bytes: u64 = 0,
+    reader_temporary_bytes: u64 = 0,
+    reader_peak_live_bytes: usize = 0,
+    reader_allocator_operations: u64 = 0,
+    reader_live_after_deinit_bytes: usize = 0,
+    parse_ns: u64 = 0,
+    parse_deinit_ns: u64 = 0,
+    reader_ns: u64 = 0,
+    reader_deinit_ns: u64 = 0,
+};
+
 pub fn main(init: std.process.Init) u8 {
     return run(init) catch |err| {
         std.debug.print("z-xml-tree: {s}\n", .{@errorName(err)});
@@ -125,11 +163,15 @@ fn run(init: std.process.Init) !u8 {
     const options = parseOptions(args) orelse {
         std.debug.print(
             "usage: z-xml-tree [--construction|--memory|--timing] " ++
-                "[--iterations=N] [--namespaces=process] FILE\n",
+                "[--iterations=N] [--namespaces=process] FILE\n" ++
+                "       z-xml-tree --repeat=N [--next-file=FILE --next-repeat=N] " ++
+                "[--verify|--report-memory|--report-timing] FILE\n",
             .{},
         );
         return 64;
     };
+
+    if (options.mode == .repeat) return runRepeated(init, options);
 
     const report_memory = options.mode == .memory;
     const report_timing = options.mode == .timing;
@@ -349,6 +391,11 @@ fn parseOptions(args: []const []const u8) ?Options {
     var namespaces = false;
     var iterations: usize = 1;
     var iterations_set = false;
+    var repeat_report: RepeatReport = .summary;
+    var repeat_report_set = false;
+    var next_path: ?[]const u8 = null;
+    var next_iterations: usize = 0;
+    var next_iterations_set = false;
     var path: ?[]const u8 = null;
     for (args[1..]) |argument| {
         if (std.mem.eql(u8, argument, "--construction") or
@@ -366,6 +413,33 @@ fn parseOptions(args: []const []const u8) ?Options {
         } else if (std.mem.eql(u8, argument, "--namespaces=process")) {
             if (namespaces) return null;
             namespaces = true;
+        } else if (std.mem.startsWith(u8, argument, "--repeat=")) {
+            if (mode_set or iterations_set) return null;
+            mode_set = true;
+            mode = .repeat;
+            iterations_set = true;
+            iterations = parsePositiveCount(argument["--repeat=".len..]) orelse return null;
+        } else if (std.mem.startsWith(u8, argument, "--next-file=")) {
+            if (next_path != null or argument.len == "--next-file=".len) return null;
+            next_path = argument["--next-file=".len..];
+        } else if (std.mem.startsWith(u8, argument, "--next-repeat=")) {
+            if (next_iterations_set) return null;
+            next_iterations_set = true;
+            next_iterations = parsePositiveCount(
+                argument["--next-repeat=".len..],
+            ) orelse return null;
+        } else if (std.mem.eql(u8, argument, "--verify") or
+            std.mem.eql(u8, argument, "--report-memory") or
+            std.mem.eql(u8, argument, "--report-timing"))
+        {
+            if (repeat_report_set) return null;
+            repeat_report_set = true;
+            repeat_report = if (std.mem.eql(u8, argument, "--verify"))
+                .verify
+            else if (std.mem.eql(u8, argument, "--report-memory"))
+                .memory
+            else
+                .timing;
         } else if (std.mem.startsWith(u8, argument, "--iterations=")) {
             if (iterations_set) return null;
             iterations_set = true;
@@ -381,13 +455,336 @@ fn parseOptions(args: []const []const u8) ?Options {
             path = argument;
         }
     }
-    if (iterations_set and mode != .timing) return null;
+    if (mode == .repeat) {
+        if (!iterations_set or namespaces) return null;
+        if ((next_path != null) != next_iterations_set) return null;
+    } else if (iterations_set and mode != .timing) {
+        return null;
+    } else if (repeat_report_set or next_path != null or next_iterations_set) {
+        return null;
+    }
     return .{
         .mode = mode,
         .namespaces = namespaces,
         .iterations = iterations,
+        .repeat_report = repeat_report,
+        .next_path = next_path,
+        .next_iterations = next_iterations,
         .path = path orelse return null,
     };
+}
+
+fn parsePositiveCount(value: []const u8) ?usize {
+    const count = std.fmt.parseInt(usize, value, 10) catch return null;
+    return if (count == 0 or count > 1_000_000) null else count;
+}
+
+fn runRepeated(init: std.process.Init, options: Options) !u8 {
+    const primary = try runRepeatPhase(
+        init,
+        options.path,
+        options.iterations,
+        options.repeat_report,
+    );
+    const next_path = if (options.next_path) |path|
+        if (std.fs.path.isAbsolute(path))
+            path
+        else
+            try std.fs.path.resolve(
+                init.arena.allocator(),
+                &.{ std.fs.path.dirname(options.path) orelse ".", path },
+            )
+    else
+        null;
+    const next = if (next_path) |path|
+        try runRepeatPhase(init, path, options.next_iterations, options.repeat_report)
+    else
+        null;
+
+    var primary_with_reader = primary;
+    var next_with_reader = next;
+    if (options.repeat_report == .memory or options.repeat_report == .timing) {
+        try auditRepeatedReader(
+            init,
+            options.path,
+            options.iterations,
+            options.repeat_report,
+            &primary_with_reader,
+        );
+        if (next_path) |path| {
+            try auditRepeatedReader(
+                init,
+                path,
+                options.next_iterations,
+                options.repeat_report,
+                &next_with_reader.?,
+            );
+        }
+    }
+
+    var output_buffer: [4096]u8 = undefined;
+    var output_file = std.Io.File.stdout().writer(init.io, &output_buffer);
+    const output = &output_file.interface;
+    try output.print("{{\"mode\":\"{s}\",\"primary\":", .{@tagName(options.repeat_report)});
+    try writeRepeatPhase(output, primary_with_reader, options.repeat_report);
+    try output.writeAll(",\"next\":");
+    if (next_with_reader) |phase| {
+        try writeRepeatPhase(output, phase, options.repeat_report);
+    } else {
+        try output.writeAll("null");
+    }
+    try output.print(
+        ",\"total_documents\":{d},\"caller_input_storage_bytes\":{d}," ++
+            "\"live_after_deinit_bytes\":0}}\n",
+        .{ options.iterations + options.next_iterations, INPUT_BUFFER_SIZE },
+    );
+    try output.flush();
+    return 0;
+}
+
+fn runRepeatPhase(
+    init: std.process.Init,
+    path: []const u8,
+    documents: usize,
+    report: RepeatReport,
+) !RepeatPhase {
+    const file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
+    defer file.close(init.io);
+    const stat = try file.stat(init.io);
+    var input_buffer: [INPUT_BUFFER_SIZE]u8 = undefined;
+    var file_reader = file.reader(init.io, &input_buffer);
+    var tracking: TrackingAllocator = .{ .child = init.gpa };
+    const allocator = if (report == .memory) tracking.allocator() else init.gpa;
+    var result: RepeatPhase = .{ .documents = documents, .input_bytes = stat.size };
+    var retained_capacity: ?usize = null;
+    var expected_stats: ?Stats = null;
+
+    for (0..documents) |_| {
+        try file_reader.seekTo(0);
+        var diagnostic: DiagnosticCapture = .{};
+        const parse_start = if (report == .timing) std.Io.Clock.awake.now(init.io) else undefined;
+        var document = try xml.parseDocument(
+            allocator,
+            .{ .stream = &file_reader.interface },
+            .{ .reader = .{
+                .namespaces = .raw,
+                .dtd = .reject,
+                .track_lines = false,
+                .diagnostic_sink = diagnostic.sink(),
+                .limits = .{ .max_depth = 2_048 },
+            } },
+        );
+        var document_live = true;
+        defer if (document_live) document.deinit();
+        const parse_end = if (report == .timing) std.Io.Clock.awake.now(init.io) else undefined;
+        const memory = document.memoryUsage();
+        if (retained_capacity) |expected| {
+            if (expected != memory.total_capacity_bytes) return error.RepeatDocumentDrift;
+        } else {
+            retained_capacity = memory.total_capacity_bytes;
+        }
+        result.retained_capacity_total_bytes = std.math.add(
+            u64,
+            result.retained_capacity_total_bytes,
+            memory.total_capacity_bytes,
+        ) catch return error.DocumentMemoryOverflow;
+        var document_guard: u64 = 14695981039346656037;
+        hashRepeatMemory(&document_guard, memory);
+        if (result.guard == 0) {
+            result.guard = document_guard;
+        } else if (result.guard != document_guard) {
+            return error.RepeatDocumentDrift;
+        }
+        if (report == .verify) {
+            var stats: Stats = .{};
+            try traverse(true, false, init.gpa, &document, &stats);
+            if (expected_stats) |expected| {
+                if (!std.meta.eql(expected, stats)) return error.RepeatDocumentDrift;
+            } else {
+                expected_stats = stats;
+            }
+        }
+        if (report == .memory and tracking.live_bytes != memory.total_capacity_bytes)
+            return error.InvalidDocumentMemoryReport;
+        const deinit_start = if (report == .timing) std.Io.Clock.awake.now(init.io) else undefined;
+        document.deinit();
+        document_live = false;
+        const deinit_end = if (report == .timing) std.Io.Clock.awake.now(init.io) else undefined;
+        if (report == .memory and tracking.live_bytes != 0) return error.DocumentMemoryLeak;
+        if (report == .timing) {
+            result.parse_ns = try addNanoseconds(result.parse_ns, parse_start, parse_end);
+            result.parse_deinit_ns = try addNanoseconds(
+                result.parse_deinit_ns,
+                deinit_start,
+                deinit_end,
+            );
+        }
+    }
+
+    result.retained_capacity_bytes = retained_capacity orelse 0;
+    if (expected_stats) |stats| {
+        result.elements = stats.elements;
+        result.attributes = stats.attributes;
+        result.text_bytes = stats.text_bytes;
+        result.common_checksum = stats.common_checksum;
+    }
+    if (report == .memory) {
+        if (tracking.requested_bytes < result.retained_capacity_total_bytes)
+            return error.InvalidDocumentMemoryReport;
+        result.parse_requested_bytes = tracking.requested_bytes;
+        result.parse_temporary_bytes = tracking.requested_bytes -
+            result.retained_capacity_total_bytes;
+        result.parse_peak_live_bytes = tracking.peak_live_bytes;
+        result.parse_allocator_operations = tracking.allocs + tracking.resizes + tracking.remaps;
+        result.parse_live_after_deinit_bytes = tracking.live_bytes;
+    }
+    return result;
+}
+
+fn auditRepeatedReader(
+    init: std.process.Init,
+    path: []const u8,
+    documents: usize,
+    report: RepeatReport,
+    result: *RepeatPhase,
+) !void {
+    const file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
+    defer file.close(init.io);
+    var input_buffer: [INPUT_BUFFER_SIZE]u8 = undefined;
+    var file_reader = file.reader(init.io, &input_buffer);
+    var tracking: TrackingAllocator = .{ .child = init.gpa };
+    const allocator = if (report == .memory) tracking.allocator() else init.gpa;
+    var retained_total: u64 = 0;
+
+    for (0..documents) |_| {
+        try file_reader.seekTo(0);
+        const read_start = if (report == .timing) std.Io.Clock.awake.now(init.io) else undefined;
+        var reader = try xml.Reader.init(
+            allocator,
+            .{ .stream = &file_reader.interface },
+            .{
+                .namespaces = .raw,
+                .dtd = .reject,
+                .track_lines = false,
+                .limits = .{ .max_depth = 2_048 },
+            },
+        );
+        var reader_live = true;
+        defer if (reader_live) reader.deinit();
+        while (try reader.next()) |_| {}
+        const read_end = if (report == .timing) std.Io.Clock.awake.now(init.io) else undefined;
+        if (report == .memory) {
+            retained_total = std.math.add(u64, retained_total, tracking.live_bytes) catch
+                return error.DocumentMemoryOverflow;
+        }
+        const deinit_start = if (report == .timing) std.Io.Clock.awake.now(init.io) else undefined;
+        reader.deinit();
+        reader_live = false;
+        const deinit_end = if (report == .timing) std.Io.Clock.awake.now(init.io) else undefined;
+        if (report == .memory and tracking.live_bytes != 0) return error.ReaderMemoryLeak;
+        if (report == .timing) {
+            result.reader_ns = try addNanoseconds(result.reader_ns, read_start, read_end);
+            result.reader_deinit_ns = try addNanoseconds(
+                result.reader_deinit_ns,
+                deinit_start,
+                deinit_end,
+            );
+        }
+    }
+
+    if (report == .memory) {
+        if (tracking.requested_bytes < retained_total) return error.InvalidReaderMemoryReport;
+        result.reader_requested_bytes = tracking.requested_bytes;
+        result.reader_temporary_bytes = tracking.requested_bytes - retained_total;
+        result.reader_peak_live_bytes = tracking.peak_live_bytes;
+        result.reader_allocator_operations = tracking.allocs + tracking.resizes + tracking.remaps;
+        result.reader_live_after_deinit_bytes = tracking.live_bytes;
+    }
+}
+
+fn hashRepeatMemory(hash: *u64, memory: xml.DocumentMemoryUsage) void {
+    inline for (.{
+        memory.node_count,
+        memory.attribute_count,
+        memory.namespace_declaration_count,
+        memory.string_bytes,
+        memory.node_capacity_bytes,
+        memory.attribute_capacity_bytes,
+        memory.namespace_declaration_capacity_bytes,
+        memory.string_capacity_bytes,
+        memory.metadata_capacity_bytes,
+        memory.total_capacity_bytes,
+    }) |value| {
+        var remaining: u64 = @intCast(value);
+        for (0..8) |_| {
+            hash.* ^= @truncate(remaining);
+            hash.* *%= 1099511628211;
+            remaining >>= 8;
+        }
+    }
+}
+
+fn addNanoseconds(
+    total: u64,
+    start: std.Io.Timestamp,
+    end: std.Io.Timestamp,
+) !u64 {
+    const elapsed = std.math.cast(u64, start.durationTo(end).nanoseconds) orelse
+        return error.TimingOverflow;
+    return std.math.add(u64, total, elapsed) catch
+        error.TimingOverflow;
+}
+
+fn writeRepeatPhase(
+    output: *std.Io.Writer,
+    phase: RepeatPhase,
+    report: RepeatReport,
+) !void {
+    try output.print(
+        "{{\"documents\":{d},\"input_bytes\":{d},\"guard\":\"{x:0>16}\"," ++
+            "\"retained_capacity_bytes\":{d},\"retained_capacity_total_bytes\":{d}",
+        .{
+            phase.documents,
+            phase.input_bytes,
+            phase.guard,
+            phase.retained_capacity_bytes,
+            phase.retained_capacity_total_bytes,
+        },
+    );
+    switch (report) {
+        .summary => {},
+        .verify => try output.print(
+            ",\"elements\":{d},\"attributes\":{d},\"text_bytes\":{d}," ++
+                "\"common_checksum\":\"{x:0>16}\"",
+            .{ phase.elements, phase.attributes, phase.text_bytes, phase.common_checksum },
+        ),
+        .memory => try output.print(
+            ",\"parse_requested_bytes\":{d},\"parse_temporary_bytes\":{d}," ++
+                "\"parse_peak_live_bytes\":{d},\"parse_allocator_operations\":{d}," ++
+                "\"parse_live_after_deinit_bytes\":{d}," ++
+                "\"reader_requested_bytes\":{d},\"reader_temporary_bytes\":{d}," ++
+                "\"reader_peak_live_bytes\":{d},\"reader_allocator_operations\":{d}," ++
+                "\"reader_live_after_deinit_bytes\":{d}",
+            .{
+                phase.parse_requested_bytes,
+                phase.parse_temporary_bytes,
+                phase.parse_peak_live_bytes,
+                phase.parse_allocator_operations,
+                phase.parse_live_after_deinit_bytes,
+                phase.reader_requested_bytes,
+                phase.reader_temporary_bytes,
+                phase.reader_peak_live_bytes,
+                phase.reader_allocator_operations,
+                phase.reader_live_after_deinit_bytes,
+            },
+        ),
+        .timing => try output.print(
+            ",\"parse_ns\":{d},\"parse_deinit_ns\":{d}," ++
+                "\"reader_ns\":{d},\"reader_deinit_ns\":{d}",
+            .{ phase.parse_ns, phase.parse_deinit_ns, phase.reader_ns, phase.reader_deinit_ns },
+        ),
+    }
+    try output.writeByte('}');
 }
 
 fn auditReaderMemory(init: std.process.Init, options: Options) !ReaderMemory {
@@ -650,6 +1047,51 @@ test "[unit] - [document adapter options]: accepts positive timing iterations on
         "--timing",
         "--iterations=2",
         "--iterations=3",
+        "x",
+    }) == null);
+}
+
+test "[unit] - [document adapter options]: accepts complete repeated construction schedules" {
+    const options = parseOptions(&.{
+        "z-xml-tree",
+        "--repeat=2",
+        "--next-file=small.xml",
+        "--next-repeat=4096",
+        "--report-memory",
+        "large.xml",
+    }).?;
+    try std.testing.expectEqual(Mode.repeat, options.mode);
+    try std.testing.expectEqual(@as(usize, 2), options.iterations);
+    try std.testing.expectEqual(RepeatReport.memory, options.repeat_report);
+    try std.testing.expectEqualStrings("small.xml", options.next_path.?);
+    try std.testing.expectEqual(@as(usize, 4096), options.next_iterations);
+    try std.testing.expectEqualStrings("large.xml", options.path);
+
+    try std.testing.expect(parseOptions(&.{ "z-xml-tree", "--repeat=0", "x" }) == null);
+    try std.testing.expect(parseOptions(&.{ "z-xml-tree", "--repeat=1000001", "x" }) == null);
+    try std.testing.expect(parseOptions(&.{
+        "z-xml-tree",
+        "--repeat=1",
+        "--next-file=x",
+        "y",
+    }) == null);
+    try std.testing.expect(parseOptions(&.{
+        "z-xml-tree",
+        "--repeat=1",
+        "--next-repeat=1",
+        "y",
+    }) == null);
+    try std.testing.expect(parseOptions(&.{
+        "z-xml-tree",
+        "--repeat=1",
+        "--verify",
+        "--report-memory",
+        "x",
+    }) == null);
+    try std.testing.expect(parseOptions(&.{
+        "z-xml-tree",
+        "--repeat=1",
+        "--namespaces=process",
         "x",
     }) == null);
 }
