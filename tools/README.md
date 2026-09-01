@@ -319,7 +319,8 @@ Build only the adapters you need:
 zig build --build-file tools/build.zig corpus-adapters -Doptimize=ReleaseFast
 zig build --build-file tools/build.zig persistent-adapters -Doptimize=ReleaseFast
 zig build --build-file tools/build.zig tree-adapter -Doptimize=ReleaseFast
-zig build --build-file tools/build.zig writer-adapter -Doptimize=ReleaseFast
+zig build --build-file tools/build.zig writer-adapter \
+    -Dtarget=x86_64-linux -Doptimize=ReleaseFast
 zig build --build-file tools/build.zig validation-bench -Doptimize=ReleaseFast
 zig build --build-file tools/build.zig reader-audit -Doptimize=Debug
 zig build --build-file tools/build.zig layout -Doptimize=ReleaseFast
@@ -381,7 +382,8 @@ The development build installs adapters under `tools/zig-out/bin` by default.
 The Writer adapter accepts `MANIFEST SHAPE VALUE SINK`. The selected row must be a ready Writer row, the value must occur in its size plan, and the sink must occur in its input models. Run the same selection with `--verify` before measuring it:
 
 ```sh
-zig build --build-file tools/build.zig writer-adapter -Doptimize=ReleaseFast
+zig build --build-file tools/build.zig writer-adapter \
+    -Dtarget=x86_64-linux -Doptimize=ReleaseFast
 tools/zig-out/bin/z-xml-writer --verify \
     bench/shapes.tsv writer-attributes 16 unbuffered-sink
 tools/zig-out/bin/z-xml-writer \
@@ -390,7 +392,24 @@ tools/zig-out/bin/z-xml-writer \
 
 `buffered-sink` provides a 64 KiB caller-owned buffer; `unbuffered-sink` provides none. `one-byte-sink` and `short-sink` provide no buffer and accept at most one or seven bytes from each drain call. The adapter flushes the sink after each document. Normal runs discard accepted output. `--verify` stores it in a caller-owned capture buffer.
 
-The JSON result records the selected shape, value, sink, semantic counts, output bytes, accepted bytes, sink calls, flushes, Writer allocation work, peak live Writer bytes, retained Writer capacity, caller input bytes, caller sink storage, and verification capture storage. `caller_oracle_storage_bytes` is the size of that output-capture buffer. Writer allocation fields exclude caller input, sink storage, and output capture. The adapter does not calculate checksums or write output files. Current Zebrac wrappers do not qualify the Writer lane.
+The JSON result records the selected shape, value, sink, semantic counts, output bytes, accepted bytes, sink calls, flushes, Writer allocation work, peak live Writer bytes, retained Writer capacity, caller input bytes, caller sink storage, and verification capture storage. `caller_oracle_storage_bytes` is the size of that output-capture buffer. Writer allocation fields exclude caller input, sink storage, and output capture. The adapter does not calculate checksums or write output files.
+
+`run-zebrac-aa.py` accepts the Writer target and shape matrix. Pass the selected value and sink as two program arguments. The eligibility report uses the event columns plus `program_args`; one shape may have several rows when the exact value or sink differs. Publish a row only after the same selection passes `--verify`, and write the report after the shape matrix, target declaration, and executable are final. Before starting Zebrac, the wrapper reruns that exact selection with `--verify` and checks its result. A `pass` row alone cannot admit incorrect Writer output.
+
+```sh
+python3 tools/python/run-zebrac-aa.py \
+    --manifest bench/shapes.tsv \
+    --eligibility data/results/writer-baseline-2026-08-31/eligibility.tsv \
+    --targets tools/writer-targets.tsv \
+    --bin-dir tools/zig-out/bin \
+    --target z-xml-writer \
+    --workload writer-attributes \
+    --program-arg 256 \
+    --program-arg buffered-sink \
+    --output-dir data/results/writer-baseline-2026-08-31/aa/attributes-buffered
+```
+
+The A/A wrapper places the shape manifest before the selected shape, value, and sink, matching the adapter contract. The peer matrix remains file-input only. Writer has no eligible peer, so no unmatched matrix lane is added.
 
 ## Zebrac measurement
 
