@@ -1,6 +1,6 @@
 .{
     .name = .z_xml,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0x289b11f68fcb19e1,
     .minimum_zig_version = "0.16.0",
     .paths = .{
