@@ -26,7 +26,13 @@ NAMESPACE_SCHEMA = "z-xml-namespace-benchmark-v1"
 DTD_SCHEMA = "z-xml-dtd-generated-v1"
 VALIDATION_SCHEMA = "z-xml-validation-generated-v1"
 VALIDATION_REUSE_SCHEMA = "z-xml-validation-reuse-v1"
-RESOURCE_SCHEMAS = {DTD_SCHEMA, VALIDATION_SCHEMA, VALIDATION_REUSE_SCHEMA}
+DOCUMENT_REPEAT_SCHEMA = "z-xml-document-repeat-v1"
+RESOURCE_SCHEMAS = {
+    DTD_SCHEMA,
+    VALIDATION_SCHEMA,
+    VALIDATION_REUSE_SCHEMA,
+    DOCUMENT_REPEAT_SCHEMA,
+}
 TARGET_SCHEMAS = {
     "z-xml-targets-v1",
     "z-xml-targets-v2",
@@ -194,6 +200,7 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
             DTD_SCHEMA,
             VALIDATION_SCHEMA,
             VALIDATION_REUSE_SCHEMA,
+            DOCUMENT_REPEAT_SCHEMA,
         )
         if schema in comments
     }
@@ -233,6 +240,7 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
         if resolved in seen_paths and schema not in {
             DTD_SCHEMA,
             VALIDATION_REUSE_SCHEMA,
+            DOCUMENT_REPEAT_SCHEMA,
         }:
             raise ValueError(f"{workload['id']}: duplicate workload path")
         seen_paths.add(resolved)
@@ -409,9 +417,10 @@ def eligibility_match(
             continue
         if item.kind == "event":
             qualified_arguments = row.get("program_args")
-            if (work_multiplier != 1 and target.work_lane != "validation-reuse") or (
-                qualified_arguments is None and program_arguments
-            ):
+            if (
+                work_multiplier != 1
+                and target.work_lane not in {"validation-reuse", "document-repeat"}
+            ) or (qualified_arguments is None and program_arguments):
                 matches.append(
                     (False, "unqualified-program-arguments", target.input_model)
                 )
@@ -527,6 +536,45 @@ def validation_reuse_multiplier(
     multiplier, remainder = divmod(work_bytes, input_bytes)
     if remainder or multiplier <= 0:
         raise ValueError("validation reuse work is not an exact input multiple")
+    return multiplier
+
+
+def document_repeat_multiplier(
+    arguments: list[str], workload: dict[str, object]
+) -> int:
+    values: dict[str, str] = {}
+    for argument in arguments:
+        if not argument.startswith("--") or "=" not in argument:
+            raise ValueError("invalid repeated Document program argument")
+        name, value = argument[2:].split("=", 1)
+        if name not in {"repeat", "next-file", "next-repeat"}:
+            raise ValueError("unsupported repeated Document program argument")
+        if not value or name in values:
+            raise ValueError("invalid repeated Document program argument")
+        values[name] = value
+    if set(values) not in (
+        {"repeat"},
+        {"repeat", "next-file", "next-repeat"},
+    ):
+        raise ValueError("incomplete repeated Document program arguments")
+    iterations = int(values["repeat"])
+    if iterations <= 0:
+        raise ValueError("invalid repeated Document count")
+    input_bytes = int(workload["actual_bytes"])
+    work_bytes = input_bytes * iterations
+    if "next-file" in values:
+        next_iterations = int(values["next-repeat"])
+        if next_iterations <= 0:
+            raise ValueError("invalid repeated Document transition count")
+        source = Path(str(workload["resolved_path"]))
+        next_source = (source.parent / values["next-file"]).resolve()
+        resources = workload["resolved_resources"]
+        if not isinstance(resources, list) or next_source not in resources:
+            raise ValueError("repeated Document transition input differs")
+        work_bytes += next_source.stat().st_size * next_iterations
+    multiplier, remainder = divmod(work_bytes, input_bytes)
+    if remainder or multiplier <= 0:
+        raise ValueError("repeated Document work is not an exact input multiple")
     return multiplier
 
 
@@ -939,6 +987,16 @@ def main() -> int:
             ):
                 raise ValueError(
                     f"{workload['id']}: validation reuse work multiplier differs"
+                )
+            if any(
+                target.name in selected_targets
+                and target.work_lane == "document-repeat"
+                for target in targets.values()
+            ) and args.work_multiplier != document_repeat_multiplier(
+                args.program_arg, workload
+            ):
+                raise ValueError(
+                    f"{workload['id']}: repeated Document work multiplier differs"
                 )
             if size * args.work_multiplier > 2**63 - 1:
                 raise ValueError(f"{workload['id']}: work byte count exceeds i64")

@@ -31,11 +31,13 @@ CORPUS_SCHEMAS = {
     "z-xml-dtd-generated-v1",
     "z-xml-validation-generated-v1",
     "z-xml-validation-reuse-v1",
+    "z-xml-document-repeat-v1",
 }
 RESOURCE_SCHEMAS = {
     "z-xml-dtd-generated-v1",
     "z-xml-validation-generated-v1",
     "z-xml-validation-reuse-v1",
+    "z-xml-document-repeat-v1",
 }
 MAX_CONTROL_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
