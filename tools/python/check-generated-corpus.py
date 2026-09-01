@@ -48,6 +48,7 @@ WORK_LANES = {
     "lexical",
     "structural-index",
     "validated",
+    "document-repeat",
 }
 INPUT_MODELS = {"streaming-reader", "file-reader", "whole-file"}
 SUMMARY_LANES = {
