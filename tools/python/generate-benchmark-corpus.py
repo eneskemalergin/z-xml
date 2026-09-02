@@ -10,10 +10,10 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Callable
-
+from typing import BinaryIO
 
 FNV_OFFSET = 14695981039346656037
 FNV_PRIME = 1099511628211
@@ -85,7 +85,7 @@ class Stats:
     @classmethod
     def from_json(cls, value: object) -> Stats:
         if not isinstance(value, dict):
-            raise ValueError("summary output is not a JSON object")
+            raise TypeError("summary output is not a JSON object")
         expected = {"elements", "attributes", "text_bytes", "checksum"}
         if set(value) != expected:
             raise ValueError("summary output has unexpected fields")
@@ -344,7 +344,9 @@ def generate_validation_identifiers(
     sample = b'<item id="i0000000000" ref="i0000000000"/>'
     available = target_bytes - len(VALIDATION_ID_PREFIX) - len(suffix)
     if available < 0:
-        raise ValueError("validation-identifier target is smaller than its declarations")
+        raise ValueError(
+            "validation-identifier target is smaller than its declarations"
+        )
     count, filler = divmod(available, len(sample))
     output.write(VALIDATION_ID_PREFIX)
     if stats is not None:
@@ -393,9 +395,11 @@ def record_unicode_event(stats: Stats) -> None:
 RECORDS = (
     (b'<entry id="a" kind="short">alpha</entry>', record_short_event),
     (
-        b"<entry id='medium-id' kind='mixed'><title>Title &amp; &#x3bb;</title>"
-        b'<meta key="one" value="1"/><meta key=\'two\' value=\'2\'/>'
-        b"<![CDATA[tail <raw>]]></entry>",
+        (
+            b"<entry id='medium-id' kind='mixed'><title>Title &amp; &#x3bb;</title>"
+            b"<meta key=\"one\" value=\"1\"/><meta key='two' value='2'/>"
+            b"<![CDATA[tail <raw>]]></entry>"
+        ),
         record_mixed_event,
     ),
     (
@@ -573,8 +577,7 @@ def collect_summary(program: Path, path: Path) -> Stats:
     completed = subprocess.run(
         [program, path],
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         timeout=600,
         check=False,
     )
@@ -813,7 +816,9 @@ def verify(
         print(error, file=sys.stderr)
         return 1
     comments = [line[1:].strip() for line in lines if line.startswith("#")]
-    schema_markers = [comment for comment in comments if comment.startswith("z-xml-generated-")]
+    schema_markers = [
+        comment for comment in comments if comment.startswith("z-xml-generated-")
+    ]
     if schema_markers != [SCHEMA]:
         errors.append(f"manifest must contain exactly one {SCHEMA} marker")
     if comments.count(f"size ceiling: {MAX_TARGET_BYTES} bytes") != 1:
@@ -828,9 +833,10 @@ def verify(
     ]
     if len(summary_comments) > 1:
         errors.append("manifest names more than one summary program")
-    elif summary_comments and not summary_comments[0].removeprefix(
-        "summary_program:"
-    ).strip():
+    elif (
+        summary_comments
+        and not summary_comments[0].removeprefix("summary_program:").strip()
+    ):
         errors.append("manifest has an empty summary program")
     expected_comments = [SCHEMA, f"size ceiling: {MAX_TARGET_BYTES} bytes"]
     if plan is not None:
@@ -855,9 +861,7 @@ def verify(
         errors.append("manifest has no workloads")
     for row_index, row in enumerate(rows, 1):
         if None in row or any(value is None for value in row.values()):
-            errors.append(
-                f"manifest:{data_entries[row_index][0]}: wrong field count"
-            )
+            errors.append(f"manifest:{data_entries[row_index][0]}: wrong field count")
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
@@ -870,9 +874,10 @@ def verify(
     )
     canonical_writer.writeheader()
     canonical_writer.writerows(rows)
-    canonical_manifest = "".join(
-        f"# {comment}\n" for comment in expected_comments
-    ) + canonical_data.getvalue()
+    canonical_manifest = (
+        "".join(f"# {comment}\n" for comment in expected_comments)
+        + canonical_data.getvalue()
+    )
     if "".join(lines) != canonical_manifest:
         print("manifest is not in canonical form", file=sys.stderr)
         return 1
@@ -892,10 +897,9 @@ def verify(
         if expected is None:
             continue
         for field, value in expected.items():
-            dynamic_rejection_field = (
-                expected["classification"] == "not-well-formed"
-                and field in {"fatal_offset", "fatal_fraction"}
-            )
+            dynamic_rejection_field = expected[
+                "classification"
+            ] == "not-well-formed" and field in {"fatal_offset", "fatal_fraction"}
             if not dynamic_rejection_field and row[field] != value:
                 errors.append(f"{item_id}: {field} differs")
         try:
@@ -1055,7 +1059,6 @@ def main() -> int:
             ) -> None:
                 nonlocal fatal_offset
                 fatal_offset = generate_rejection(output, size, position)
-                return None
 
             actual, _ = atomic_generate(args.output_dir / relative, rejection_generator)
             rows.append(
@@ -1135,7 +1138,7 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         status = main()
-    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+    except (OSError, TypeError, ValueError, subprocess.TimeoutExpired) as error:
         print(error, file=sys.stderr)
         status = 1
     raise SystemExit(status)

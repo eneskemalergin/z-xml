@@ -19,6 +19,10 @@ pub const TrackingAllocator = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
+    pub fn operations(self: TrackingAllocator) u64 {
+        return self.allocs + self.resizes + self.remaps;
+    }
+
     fn addLive(self: *TrackingAllocator, amount: usize) void {
         self.live_bytes += amount;
         self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);

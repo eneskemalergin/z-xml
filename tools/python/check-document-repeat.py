@@ -16,6 +16,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from qualification_io import read_limited
+
 CORPUS_SCHEMA = "z-xml-document-repeat-v1"
 TARGET_SCHEMA = "z-xml-targets-v1"
 TARGET_HEADER = "name\texecutable\tprocessor_class\tfeatures\twork_lane\tinput_model"
@@ -98,7 +100,6 @@ REQUIRED_SCHEDULES = {
     "document-repeat-large": (8, None, 0),
     "document-repeat-large-small": (1, "mixed-16k.xml", 4096),
 }
-MAX_CONTROL_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 
 
@@ -127,16 +128,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=300.0)
     return parser.parse_args()
-
-
-def read_limited(path: Path, limit: int = MAX_CONTROL_BYTES) -> bytes:
-    if not path.is_file():
-        raise ValueError(f"{path}: expected a regular file")
-    with path.open("rb") as stream:
-        data = stream.read(limit + 1)
-    if len(data) > limit:
-        raise ValueError(f"{path}: exceeds the {limit}-byte control limit")
-    return data
 
 
 def file_identity(path: Path) -> tuple[int, int]:

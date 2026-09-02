@@ -7,27 +7,21 @@
 //! memory that their caller must release; inputs, callback contexts, and sinks remain
 //! caller-owned.
 //!
-//! Names containing `Profile` or ending in `For` expose compile-time specialized
-//! shapes. Values derived from one `Config` must be used with that same configuration.
+//! The package root exposes the caller-facing API. Compile-time parser shapes used
+//! by package tests and development probes remain private to the repository.
 
 const reader = @import("reader.zig");
 const dtd_module = @import("dtd.zig");
 const encoding = @import("encoding.zig");
-const io = @import("io.zig");
 const resolver = @import("resolver.zig");
 const external_subset = @import("external_subset.zig");
 const tree = @import("tree.zig");
 const writer = @import("writer.zig");
 
-pub const Config = reader.Config;
 pub const ResetMode = reader.ResetMode;
 pub const ExternalPolicy = reader.NormalExternalPolicy;
-pub const ProfileValidityAction = reader.ValidityAction;
-pub const ProfileValidationStatus = reader.ValidationStatus;
 pub const NormalizationPolicy = reader.NormalNormalizationPolicy;
-pub const ProfileNormalizationStatus = reader.NormalizationStatus;
 pub const NormalizationIssueKind = reader.NormalizationIssueKind;
-pub const ProfileLifecycle = reader.Lifecycle;
 pub const Limits = reader.NormalLimits;
 pub const MemoryUsage = reader.MemoryUsage;
 pub const DiagnosticCode = reader.DiagnosticCode;
@@ -42,13 +36,11 @@ pub const ResolverResult = resolver.Result;
 pub const ResolverSource = resolver.Source;
 pub const ResolverReadResult = resolver.ReadResult;
 pub const ExternalEntityKind = resolver.EntityKind;
-pub const ProfileSkippedEntityKind = reader.SkippedEntityKind;
 pub const RootedFilesystemResolver = resolver.RootedFilesystem;
 pub const TextOrigin = reader.TextOrigin;
 pub const ReadError = reader.NormalReadError;
 pub const ResetError = reader.NormalResetError;
 pub const InitError = reader.NormalInitError;
-pub const Configs = reader.Configs;
 
 pub const dtd = struct {
     pub const AttributeType = dtd_module.AttributeType;
@@ -96,23 +88,6 @@ pub const DocumentContent = reader.NormalDocumentContent;
 pub const DtdValidity = reader.NormalDtdValidity;
 pub const DocumentNormalization = reader.NormalDocumentNormalization;
 
-pub const ReaderFor = reader.Reader;
-pub const EventFor = reader.Event;
-pub const StepFor = reader.Step;
-pub const OptionsFor = reader.Options;
-pub const LocationFor = reader.Location;
-pub const DiagnosticFor = reader.Diagnostic;
-pub const NormalizationIssueFor = reader.NormalizationIssue;
-pub const NormalizationResultFor = reader.NormalizationResult;
-pub const ValiditySinkFor = reader.ValiditySink;
-pub const NameFor = reader.Name;
-pub const AttributeFor = reader.Attribute;
-pub const ProfileReadError = reader.ReadError;
-pub const ProfileSliceReader = io.SliceReader;
-pub const ProfileIoReader = io.IoReader;
-pub const ProfileDrainControl = io.DrainControl;
-pub const drainProfileSlice = io.drainSlice;
-pub const drainProfileIo = io.drainIo;
 pub const Node = tree.NodeIndex;
 pub const NodeKind = tree.NodeKind;
 pub const DocumentLimits = tree.DocumentLimits;
@@ -128,9 +103,3 @@ pub const WriterLimits = writer.WriterLimits;
 pub const WriterMemoryUsage = writer.WriterMemoryUsage;
 pub const WriterInitError = writer.WriterInitError;
 pub const WriterError = writer.WriterError;
-
-pub const ProfileTreeOptions = tree.Options;
-pub const ProfileTreeDtdRecordKind = tree.DtdRecordKind;
-pub const ProfileDocumentFor = tree.ProfileDocumentFor;
-pub const ProfileTreeBuilderFor = tree.ProfileBuilderFor;
-pub const buildProfileTreeFromPull = tree.buildProfileFromPull;

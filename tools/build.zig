@@ -30,12 +30,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const z_xml_profile = b.createModule(.{
+        .root_source_file = b.path("../src/profile.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+
     const test_step = b.step("test", "Run development tool tests");
     const reader_audit_step = b.step(
         "reader-audit",
         "Build and install the Reader resource and failure tests",
     );
-    const tree_adapter_step = b.step("tree-adapter", "Build and install the owned-tree adapter");
+    const tree_adapter_step = b.step("tree-adapter", "Build and install the Document adapter");
     const corpus_adapters_step = b.step(
         "corpus-adapters",
         "Build and install the focused corpus adapters",
@@ -61,7 +68,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
         .valgrind = true,
     });
-    reader_audit_module.addImport("z_xml", z_xml);
+    reader_audit_module.addImport("z_xml_profile", z_xml_profile);
     const reader_audit = b.addTest(.{
         .name = "z-xml-reader-audit",
         .root_module = reader_audit_module,
@@ -223,7 +230,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
     });
-    layout_module.addImport("z_xml", z_xml);
+    layout_module.addImport("z_xml_profile", z_xml_profile);
     const layout_probe = b.addExecutable(.{
         .name = "z-xml-layout",
         .root_module = layout_module,

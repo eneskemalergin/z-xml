@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import math
 import os
 import shutil
@@ -16,6 +15,8 @@ import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+
+from qualification_io import decode_json
 
 MAX_WORKLOAD_BYTES = 1024 * 1024 * 1024
 CORPUS_SCHEMA = "z-xml-generated-v3"
@@ -196,18 +197,6 @@ def result_path(args: argparse.Namespace) -> Path:
     ):
         raise ValueError("result path overlaps a checker input")
     return resolved
-
-
-def decode_json(value: str | bytes) -> object:
-    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        decoded: dict[str, object] = {}
-        for key, item in pairs:
-            if key in decoded:
-                raise ValueError(f"duplicate JSON field: {key}")
-            decoded[key] = item
-        return decoded
-
-    return json.loads(value, object_pairs_hook=unique_object)
 
 
 def read_targets(

@@ -408,7 +408,7 @@ fn run(init: std.process.Init) !u8 {
     var reader_live = true;
     defer if (reader_live) reader.deinit();
 
-    const after_reader_init_operations = allocatorOperations(reader_tracking);
+    const after_reader_init_operations = reader_tracking.operations();
     const first_start = if (options.report_timing)
         std.Io.Clock.awake.now(init.io)
     else
@@ -419,7 +419,7 @@ fn run(init: std.process.Init) !u8 {
             std.Io.Clock.awake.now(init.io),
         ).nanoseconds;
     }
-    const after_first_operations = allocatorOperations(reader_tracking);
+    const after_first_operations = reader_tracking.operations();
 
     const warm_start = if (options.report_timing and options.iterations > 1)
         std.Io.Clock.awake.now(init.io)
@@ -441,7 +441,7 @@ fn run(init: std.process.Init) !u8 {
             std.Io.Clock.awake.now(init.io),
         ).nanoseconds;
     }
-    const after_primary_operations = allocatorOperations(reader_tracking);
+    const after_primary_operations = reader_tracking.operations();
     const primary_usage = reader.memoryUsage();
 
     var next_result: ?DocumentResult = null;
@@ -474,7 +474,7 @@ fn run(init: std.process.Init) !u8 {
             std.Io.Clock.awake.now(init.io),
         ).nanoseconds;
     }
-    const after_next_operations = allocatorOperations(reader_tracking);
+    const after_next_operations = reader_tracking.operations();
     const final_usage = reader.memoryUsage();
     const reader_live_before_release = reader_tracking.live_bytes;
     const subset_live_after_documents = subset_tracking.live_bytes;
@@ -499,7 +499,7 @@ fn run(init: std.process.Init) !u8 {
             std.Io.Clock.awake.now(init.io),
         ).nanoseconds;
     }
-    const after_release_operations = allocatorOperations(reader_tracking);
+    const after_release_operations = reader_tracking.operations();
     const released_usage = reader.memoryUsage();
     const reader_live_after_release = reader_tracking.live_bytes;
     reader.deinit();
@@ -521,7 +521,7 @@ fn run(init: std.process.Init) !u8 {
         .subset_retained_bytes = subset_usage.declaration_capacity +|
             subset_usage.validation_capacity +| subset_usage.identifier_bytes +|
             subset_usage.source_capacity,
-        .subset_allocator_operations = allocatorOperations(subset_tracking),
+        .subset_allocator_operations = subset_tracking.operations(),
         .subset_requested_bytes = subset_tracking.requested_bytes,
         .subset_peak_live_bytes = subset_tracking.peak_live_bytes,
         .subset_live_after_compile = subset_live_after_compile,
@@ -553,7 +553,7 @@ fn run(init: std.process.Init) !u8 {
         .retained_capacity_after_release = released_usage.retained_capacity,
         .reader_live_after_release = reader_live_after_release,
         .reader_live_after_deinit = reader_live_after_deinit,
-        .resolver_allocator_operations = allocatorOperations(resolver_tracking),
+        .resolver_allocator_operations = resolver_tracking.operations(),
         .resolver_requested_bytes = resolver_tracking.requested_bytes,
         .resolver_peak_live_bytes = resolver_tracking.peak_live_bytes,
         .resolver_live_after_documents = resolver_live_after_documents,
@@ -610,10 +610,6 @@ fn drain(reader: *xml.Reader, findings: *FindingStats) !DocumentResult {
         .id_count = usage.id_count,
         .idref_count = usage.idref_count,
     };
-}
-
-fn allocatorOperations(tracking: TrackingAllocator) u64 {
-    return tracking.allocs + tracking.resizes + tracking.remaps;
 }
 
 fn grammarCapacity(usage: xml.MemoryUsage) usize {

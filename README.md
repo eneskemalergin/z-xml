@@ -117,15 +117,17 @@ The normal Reader, Document, Writer, resolver, transcoder, DTD, validation, and 
 - Other root and external-source encodings through a caller-provided `Transcoder`
 - Optional XML 1.1 Unicode normalization checks
 
-`Config`, `Configs`, and names exported by `src/root.zig` that contain `Profile` or end in `For` are explicit compile-time specialization surfaces. Package tests and development tools use them. Normal application code should use `Reader`, `Event`, `Document`, and `Writer` unless it has a measured need for a fixed shape.
-
 A validating Reader can reuse a compiled `dtd.ExternalSubset` across documents instead of parsing the same external declarations again.
 
 XSD, XPath, XSLT, XInclude, application object binding, implicit file discovery, and network fetching are outside the package. The Writer does not imply support for serializing every feature accepted by the Reader.
 
 ## Version and compatibility
 
-Package version `0.1.0` is the first frozen source-compatibility boundary. Every declaration exported by [`src/root.zig`](src/root.zig) is public. Within `0.1.x`, patch releases preserve exported names, call signatures, ownership rules, and documented successful behavior. An XML conformance correction may change acceptance of input that contradicted the documented standards boundary and will be identified as a correction.
+Package version `0.2.0` removes the compile-time profile and adapter names that `0.1.x` exported for package tests and development probes. This includes `Config`, `Configs`, every root name containing `Profile` or ending in `For`, and `drainProfileIo`. The normal Reader, Document, Writer, resolver, transcoder, and DTD contracts are unchanged.
+
+Code that used a compile-time profile for ordinary XML events should use `Reader`, `ReaderOptions`, `Source`, and `Event`. Profile tree callers should use `Document` and `parseDocument`. Profile I/O callers should give a slice or `std.Io.Reader` source to `Reader`. Code that requires profile-only DTD records or compile-time layouts has no `0.2.0` replacement and must remain on `0.1.x`.
+
+Package version `0.1.0` was the first frozen source-compatibility boundary. Within a minor release, patch releases preserve exported names, call signatures, ownership rules, and documented successful behavior. An XML conformance correction may change acceptance of input that contradicted the documented standards boundary and will be identified as a correction.
 
 Before 1.0, an intentional breaking change requires a minor version and a migration note. This is a Zig source-package contract, not a stable binary ABI. Changing the supported Zig version or target policy also requires an explicit compatibility decision.
 

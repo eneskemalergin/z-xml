@@ -14,10 +14,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from qualification_io import decode_json_object, file_identity, read_limited
+
 CORPUS_SCHEMA = "z-xml-dtd-generated-v1"
 TARGET_SCHEMA = "z-xml-targets-v1"
 TARGET_HEADER = "name\texecutable\tprocessor_class\tfeatures\twork_lane\tinput_model"
-MAX_CONTROL_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 MANIFEST_FIELDS = {
     "id",
@@ -110,36 +111,6 @@ class Workload:
     expected_result: dict[str, object]
 
 
-def read_limited(path: Path, limit: int = MAX_CONTROL_BYTES) -> bytes:
-    if not path.is_file():
-        raise ValueError(f"{path}: expected a regular file")
-    with path.open("rb") as stream:
-        data = stream.read(limit + 1)
-    if len(data) > limit:
-        raise ValueError(f"{path}: exceeds the {limit}-byte control limit")
-    return data
-
-
-def decode_json(value: str) -> dict[str, object]:
-    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, item in pairs:
-            if key in result:
-                raise ValueError(f"duplicate JSON field {key}")
-            result[key] = item
-        return result
-
-    decoded = json.loads(value, object_pairs_hook=unique_object)
-    if not isinstance(decoded, dict):
-        raise TypeError("expected a JSON object")
-    return decoded
-
-
-def file_identity(path: Path) -> tuple[int, int, int, int]:
-    status = path.stat()
-    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns
-
-
 def read_targets(path: Path, bin_dir: Path) -> dict[str, Target]:
     lines = read_limited(path).decode("utf-8").splitlines()
     if len(lines) < 3 or lines[0].removeprefix("#").strip() != TARGET_SCHEMA:
@@ -219,7 +190,7 @@ def read_workloads(path: Path) -> list[Workload]:
         classification = row["classification"]
         if classification not in {"benchmark-valid", "not-well-formed"}:
             raise ValueError(f"{path}:{line_number}: invalid classification")
-        expected_result = decode_json(row["expected_result"])
+        expected_result = decode_json_object(row["expected_result"])
         if set(expected_result) != SEMANTIC_FIELDS:
             raise ValueError(f"{path}:{line_number}: invalid expected result fields")
         workloads.append(
@@ -297,7 +268,7 @@ def check_result(
     if stderr:
         return None, "unexpected-stderr"
     try:
-        observed = decode_json(stdout)
+        observed = decode_json_object(stdout)
     except (TypeError, ValueError, json.JSONDecodeError):
         return None, "invalid-json"
     expected_fields = SEMANTIC_FIELDS | (MEMORY_FIELDS if memory else set())

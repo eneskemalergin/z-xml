@@ -11,7 +11,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-
 FNV_OFFSET = 14695981039346656037
 FNV_PRIME = 1099511628211
 DOCUMENT_OPEN = b"<root>"
@@ -178,9 +177,7 @@ def generate_corpus(output_dir: Path, sizes: list[int]) -> Path:
 
 def files(root: Path) -> dict[str, Path]:
     return {
-        str(path.relative_to(root)): path
-        for path in root.rglob("*")
-        if path.is_file()
+        str(path.relative_to(root)): path for path in root.rglob("*") if path.is_file()
     }
 
 
@@ -200,7 +197,9 @@ def check_corpus(output_dir: Path, sizes: list[int]) -> None:
                 details.append(f"missing {', '.join(missing)}")
             if extra:
                 details.append(f"unexpected {', '.join(extra)}")
-            raise ValueError("namespace benchmark corpus file set differs: " + "; ".join(details))
+            raise ValueError(
+                "namespace benchmark corpus file set differs: " + "; ".join(details)
+            )
         for relative in sorted(expected):
             if not filecmp.cmp(observed[relative], expected[relative], shallow=False):
                 raise ValueError(f"namespace benchmark corpus differs: {relative}")

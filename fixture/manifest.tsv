@@ -87,7 +87,7 @@ encoding-bad-utf16-high-final	invalid/encoding/utf16le-high-surrogate-final.xml	
 encoding-bad-declaration-utf16	invalid/encoding/declared-utf16-but-utf8.xml	not-well-formed	XML1.0-5e	utf16,check_encoding_declaration	UTF-8 bytes conflict with declared UTF-16 encoding
 encoding-bad-declaration-ascii	invalid/encoding/declared-ascii-with-high-byte.xml	not-well-formed	XML1.0-5e	ascii,check_encoding_declaration	Non-ASCII input conflicts with US-ASCII declaration
 bad-recursive-entity	invalid/not_well_formed/recursive_entity.xml	not-well-formed	XML1.0-5e	dtd,internal_entities,check_general_entity_recursion	Recursive internal general entity violates the no-recursion constraint
-bad-recursive-parameter-entity	invalid/not_well_formed/recursive_parameter_entity.xml	not-well-formed	XML1.0-5e	dtd,internal_parameter_entities,check_parameter_entity_recursion	Recursive internal parameter entity violates the no-recursion constraint
+bad-recursive-parameter-entity	invalid/not_well_formed/recursive_parameter_entity.xml	not-well-formed	XML1.0-5e	dtd,external_parameter_entities,check_parameter_entity_recursion	External parameter entity recursively includes itself
 bad-unparsed-entity-reference	invalid/not_well_formed/unparsed_entity_reference.xml	not-well-formed	XML1.0-5e	dtd,unparsed_entities,check_parsed_entity_reference	Reference to an unparsed entity in document content
 ns-bad-unbound-element	invalid/namespaces/unbound_element_prefix.xml	namespace-invalid	NS1.0-3e	check_namespaces	Unbound element prefix
 ns-bad-unbound-attribute	invalid/namespaces/unbound_attribute_prefix.xml	namespace-invalid	NS1.0-3e	check_namespaces	Unbound attribute prefix

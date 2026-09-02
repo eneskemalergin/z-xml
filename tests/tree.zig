@@ -3,7 +3,7 @@
 //! Each completed document is treated as an immutable owner. Source storage may be
 //! released after parsing, returned views remain document-scoped, and all retained
 //! storage is released by deinitialization. The suite covers the normal runtime
-//! Document and documents built for explicit Reader configurations.
+//! Document and private documents built for explicit Reader configurations.
 //!
 //! Public Reader event summaries provide a separate ordering and value oracle for
 //! tree traversal. Generated wide, deep, and large-text documents exercise bounds
@@ -11,27 +11,28 @@
 //! and one-time ownership transfer.
 
 const std = @import("std");
-const xml = @import("z_xml");
+const profile = @import("z_xml_profile");
+const xml = profile.api;
 
 fn parse(
-    comptime config: xml.Config,
+    comptime config: profile.Config,
     allocator: std.mem.Allocator,
     input: []const u8,
-    tree_options: xml.ProfileTreeOptions,
-) !xml.ProfileDocumentFor(config) {
+    tree_options: profile.ProfileTreeOptions,
+) !profile.ProfileDocumentFor(config) {
     return parseWithReaderOptions(config, allocator, .{}, input, tree_options);
 }
 
 fn parseWithReaderOptions(
-    comptime config: xml.Config,
+    comptime config: profile.Config,
     allocator: std.mem.Allocator,
-    reader_options: xml.OptionsFor(config),
+    reader_options: profile.OptionsFor(config),
     input: []const u8,
-    tree_options: xml.ProfileTreeOptions,
-) !xml.ProfileDocumentFor(config) {
-    var pull = try xml.ProfileSliceReader(config).init(allocator, reader_options, input);
+    tree_options: profile.ProfileTreeOptions,
+) !profile.ProfileDocumentFor(config) {
+    var pull = try profile.ProfileSliceReader(config).init(allocator, reader_options, input);
     defer pull.deinit();
-    return xml.buildProfileTreeFromPull(config, allocator, tree_options, &pull);
+    return profile.buildProfileTreeFromPull(config, allocator, tree_options, &pull);
 }
 
 fn parseTemporaryDocument(allocator: std.mem.Allocator) !xml.Document {
@@ -809,7 +810,7 @@ test "[integration] - [document]: does not carry capacity from a large document"
 }
 
 test "[integration] - [owned tree]: preserves document order and semantic values" {
-    const config = xml.Configs.XML10_UTF8_NO_DTD;
+    const config = profile.Configs.XML10_UTF8_NO_DTD;
     const input =
         "<?xml version='1.0' standalone='yes'?><!--before--><?go now?>" ++
         "<root a='1 &amp; 2'><child/>text<![CDATA[more]]></root><!--after-->";
@@ -852,7 +853,7 @@ test "[integration] - [owned tree]: preserves document order and semantic values
 }
 
 test "[integration] - [owned tree]: preserves XML 1.1 declaration and normalized text" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     var document = try parse(
         config,
         std.testing.allocator,
@@ -872,8 +873,8 @@ test "[integration] - [owned tree]: preserves XML 1.1 declaration and normalized
 }
 
 test "[integration] - [owned tree]: joins fragmented comments and processing instructions" {
-    const config = xml.Configs.XML10_UTF8_NO_DTD;
-    var reader_options: xml.OptionsFor(config) = .{};
+    const config = profile.Configs.XML10_UTF8_NO_DTD;
+    var reader_options: profile.OptionsFor(config) = .{};
     reader_options.limits.max_fragment_bytes = 2;
     var document = try parseWithReaderOptions(
         config,
@@ -893,7 +894,7 @@ test "[integration] - [owned tree]: joins fragmented comments and processing ins
 }
 
 test "[integration] - [owned tree]: retains detailed DTD reports in source order" {
-    const config: xml.Config = .{
+    const config: profile.Config = .{
         .profile = .xml10_nonvalidating,
         .report = .detailed,
     };
@@ -909,7 +910,7 @@ test "[integration] - [owned tree]: retains detailed DTD reports in source order
     defer document.deinit();
 
     try std.testing.expectEqual(@as(usize, 7), document.dtdRecordCount());
-    const expected = [_]xml.ProfileTreeDtdRecordKind{
+    const expected = [_]profile.ProfileTreeDtdRecordKind{
         .element,
         .attribute_list,
         .parsed_entity,
@@ -920,8 +921,8 @@ test "[integration] - [owned tree]: retains detailed DTD reports in source order
         try std.testing.expectEqual(kind, document.dtdRecordAt(index).?.kind);
     }
     try std.testing.expectEqualStrings("n", document.dtdRecordAt(4).?.notation_name.?);
-    try std.testing.expectEqual(xml.ProfileTreeDtdRecordKind.entity_start, document.dtdRecordAt(5).?.kind);
-    try std.testing.expectEqual(xml.ProfileTreeDtdRecordKind.entity_end, document.dtdRecordAt(6).?.kind);
+    try std.testing.expectEqual(profile.ProfileTreeDtdRecordKind.entity_start, document.dtdRecordAt(5).?.kind);
+    try std.testing.expectEqual(profile.ProfileTreeDtdRecordKind.entity_end, document.dtdRecordAt(6).?.kind);
     try std.testing.expectEqualStrings(
         "value",
         document.nodeValue(document.firstChild(document.documentElement())).?,
@@ -929,7 +930,7 @@ test "[integration] - [owned tree]: retains detailed DTD reports in source order
 }
 
 test "[integration] - [owned tree]: preserves skipped external entity boundaries" {
-    const config: xml.Config = .{
+    const config: profile.Config = .{
         .profile = .xml10_nonvalidating,
         .report = .detailed,
         .external_sources = true,
@@ -945,23 +946,23 @@ test "[integration] - [owned tree]: preserves skipped external entity boundaries
     const second = document.nextSibling(first);
     try std.testing.expectEqualStrings("b", document.nodeValue(second).?);
     const skipped = document.dtdRecordAt(document.dtdRecordCount() - 1).?;
-    try std.testing.expectEqual(xml.ProfileTreeDtdRecordKind.skipped_entity, skipped.kind);
-    try std.testing.expectEqual(xml.ProfileSkippedEntityKind.general_entity, skipped.skipped_entity_kind.?);
+    try std.testing.expectEqual(profile.ProfileTreeDtdRecordKind.skipped_entity, skipped.kind);
+    try std.testing.expectEqual(profile.ProfileSkippedEntityKind.general_entity, skipped.skipped_entity_kind.?);
 }
 
 test "[integration] - [owned tree]: retains validating whitespace classification" {
-    const config: xml.Config = .{ .profile = .xml10_dtd_validating };
+    const config: profile.Config = .{ .profile = .xml10_dtd_validating };
     const input = "<!DOCTYPE r [<!ELEMENT r (x)><!ELEMENT x EMPTY>]><r> \n<x/></r>";
     var document = try parse(config, std.testing.allocator, input, .{});
     defer document.deinit();
 
     const text = document.firstChild(document.documentElement());
     try std.testing.expect(document.isIgnorableWhitespace(text));
-    try std.testing.expectEqual(xml.ProfileValidationStatus.valid, document.validationStatus().?);
+    try std.testing.expectEqual(profile.ProfileValidationStatus.valid, document.validationStatus().?);
 }
 
 test "[integration] - [owned tree]: preserves namespaces and default attributes" {
-    const config = xml.Configs.XML10_NAMESPACES_NONVALIDATING_INTERNAL;
+    const config = profile.Configs.XML10_NAMESPACES_NONVALIDATING_INTERNAL;
     const input =
         "<!DOCTYPE p:r [" ++
         "<!ELEMENT p:r EMPTY>" ++
@@ -993,7 +994,7 @@ test "[integration] - [owned tree]: preserves namespaces and default attributes"
 }
 
 test "[integration] - [owned tree]: retains event locations when configured" {
-    const config = xml.Configs.XML10_UTF8_NO_DTD_LOCATED;
+    const config = profile.Configs.XML10_UTF8_NO_DTD_LOCATED;
     var document = try parse(config, std.testing.allocator, "\n<r><x/></r>", .{});
     defer document.deinit();
 
@@ -1004,7 +1005,7 @@ test "[integration] - [owned tree]: retains event locations when configured" {
 }
 
 test "[integration] - [owned tree]: owns normalized UTF-16 semantic content" {
-    const config = xml.Configs.XML10_NO_DTD;
+    const config = profile.Configs.XML10_NO_DTD;
     const input = [_]u8{
         0xff, 0xfe, '<', 0, 'r', 0, ' ', 0, 'a', 0, '=', 0, '\'', 0,
         'x',  0,    '&', 0, 'a', 0, 'm', 0, 'p', 0, ';', 0, 'y',  0,
@@ -1020,7 +1021,7 @@ test "[integration] - [owned tree]: owns normalized UTF-16 semantic content" {
 }
 
 test "[property] - [owned tree]: coalescing follows the configured text-origin boundary" {
-    const config = xml.Configs.XML10_UTF8_NO_DTD;
+    const config = profile.Configs.XML10_UTF8_NO_DTD;
     const input = "<r>a<![CDATA[b]]>c&amp;d</r>";
     var preserved = try parse(config, std.testing.allocator, input, .{});
     defer preserved.deinit();
@@ -1048,7 +1049,7 @@ test "[property] - [owned tree]: coalescing follows the configured text-origin b
 }
 
 test "[failure] - [owned tree]: reports independent count and memory limits" {
-    const config = xml.Configs.XML10_UTF8_NO_DTD;
+    const config = profile.Configs.XML10_UTF8_NO_DTD;
     try std.testing.expectError(
         error.TreeLimit,
         parse(config, std.testing.allocator, "<r><a/></r>", .{
@@ -1091,7 +1092,7 @@ test "[failure] - [owned tree]: reports independent count and memory limits" {
     );
     try std.testing.expectError(
         error.InvalidOptions,
-        xml.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{
+        profile.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{
             .limits = .{ .max_nodes = 0 },
         }),
     );
@@ -1100,7 +1101,7 @@ test "[failure] - [owned tree]: reports independent count and memory limits" {
         parse(config, std.testing.allocator, "<r>", .{}),
     );
 
-    const namespace_config = xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD;
+    const namespace_config = profile.Configs.XML10_UTF8_NAMESPACES_NO_DTD;
     try std.testing.expectError(
         error.TreeLimit,
         parse(namespace_config, std.testing.allocator, "<r xmlns='a' xmlns:p='b'/>", .{
@@ -1111,7 +1112,7 @@ test "[failure] - [owned tree]: reports independent count and memory limits" {
 
 fn allocationFailureCase(allocator: std.mem.Allocator) !void {
     var document = try parse(
-        xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD,
+        profile.Configs.XML10_UTF8_NAMESPACES_NO_DTD,
         allocator,
         "<!--x--><r xmlns='u' a='v'><x/>text<?p d?></r>",
         .{},
@@ -1120,7 +1121,7 @@ fn allocationFailureCase(allocator: std.mem.Allocator) !void {
 }
 
 fn metadataAllocationFailureCase(allocator: std.mem.Allocator) !void {
-    const config = xml.Configs.XML10_NAMESPACES_VALIDATING_DETAILED;
+    const config = profile.Configs.XML10_NAMESPACES_VALIDATING_DETAILED;
     const input =
         "<!DOCTYPE r [" ++
         "<!ELEMENT r EMPTY>" ++
@@ -1146,8 +1147,8 @@ test "[failure] - [owned tree]: releases every partial allocation" {
 }
 
 test "[failure] - [owned tree]: rejects an inconsistent public event stream" {
-    const config = xml.Configs.XML10_UTF8_NO_DTD;
-    var builder = try xml.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML10_UTF8_NO_DTD;
+    var builder = try profile.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
     defer builder.deinit();
     try builder.consume(.{ .document_start = .{} });
     try builder.consume(.{ .start_element = .{
@@ -1162,8 +1163,8 @@ test "[failure] - [owned tree]: rejects an inconsistent public event stream" {
 }
 
 test "[failure] - [owned tree]: rejects interrupted fragments and remains failed" {
-    const config = xml.Configs.XML10_UTF8_NO_DTD;
-    var builder = try xml.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML10_UTF8_NO_DTD;
+    var builder = try profile.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
     defer builder.deinit();
     try builder.consume(.{ .document_start = .{} });
     try builder.consume(.{ .comment = .{ .bytes = "part", .complete = false } });
@@ -1183,8 +1184,8 @@ test "[failure] - [owned tree]: rejects interrupted fragments and remains failed
 }
 
 test "[failure] - [owned tree]: transfers document storage only once" {
-    const config = xml.Configs.XML10_UTF8_NO_DTD;
-    var builder = try xml.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML10_UTF8_NO_DTD;
+    var builder = try profile.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
     defer builder.deinit();
     try builder.consume(.{ .document_start = .{} });
     try builder.consume(.{ .start_element = .{
@@ -1201,8 +1202,8 @@ test "[failure] - [owned tree]: transfers document storage only once" {
 }
 
 test "[failure] - [owned tree]: rejects a second document element" {
-    const config = xml.Configs.XML10_UTF8_NO_DTD;
-    var builder = try xml.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML10_UTF8_NO_DTD;
+    var builder = try profile.ProfileTreeBuilderFor(config).init(std.testing.allocator, .{});
     defer builder.deinit();
     try builder.consume(.{ .document_start = .{} });
     try builder.consume(.{ .start_element = .{
@@ -1232,7 +1233,7 @@ test "[property] - [owned tree]: retains a large shallow document with bounded i
     try input.appendSlice(std.testing.allocator, "</r>");
 
     var document = try parse(
-        xml.Configs.XML10_UTF8_NO_DTD_FAST,
+        profile.Configs.XML10_UTF8_NO_DTD_FAST,
         std.testing.allocator,
         input.items,
         .{},
@@ -1254,8 +1255,8 @@ const Summary = struct {
     processing_instructions: usize = 0,
 };
 
-fn eventSummary(comptime config: xml.Config, input: []const u8) !Summary {
-    var pull = try xml.ProfileSliceReader(config).init(std.testing.allocator, .{}, input);
+fn eventSummary(comptime config: profile.Config, input: []const u8) !Summary {
+    var pull = try profile.ProfileSliceReader(config).init(std.testing.allocator, .{}, input);
     defer pull.deinit();
     var result: Summary = .{};
     while (true) switch (try pull.next()) {
@@ -1297,7 +1298,7 @@ fn treeSummary(document: anytype) Summary {
 }
 
 test "[property] - [owned tree]: traversal summary matches the public event stream" {
-    const config = xml.Configs.XML10_UTF8_NO_DTD;
+    const config = profile.Configs.XML10_UTF8_NO_DTD;
     const cases = [_][]const u8{
         "<r/>",
         "<!--a--><r a='1'><x/>text&amp;more<?p value?></r><!--b-->",

@@ -12,19 +12,25 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const z_xml_profile = b.createModule(.{
+        .root_source_file = b.path("src/profile.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const reader_tests_module = b.createModule(.{
         .root_source_file = b.path("tests/reader.zig"),
         .target = target,
         .optimize = optimize,
     });
-    reader_tests_module.addImport("z_xml", z_xml);
+    reader_tests_module.addImport("z_xml_profile", z_xml_profile);
 
     const tree_tests_module = b.createModule(.{
         .root_source_file = b.path("tests/tree.zig"),
         .target = target,
         .optimize = optimize,
     });
-    tree_tests_module.addImport("z_xml", z_xml);
+    tree_tests_module.addImport("z_xml_profile", z_xml_profile);
 
     const writer_tests_module = b.createModule(.{
         .root_source_file = b.path("tests/writer.zig"),

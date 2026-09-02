@@ -11,7 +11,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-
 EXPECTED_FIELDS = {
     "engine",
     "input",
@@ -135,7 +134,9 @@ def main() -> int:
                             stdout_stream.tell() > args.max_output_bytes
                             or stderr_stream.tell() > args.max_output_bytes
                         ):
-                            print(f"{engine}: output exceeds byte limit", file=sys.stderr)
+                            print(
+                                f"{engine}: output exceeds byte limit", file=sys.stderr
+                            )
                             return 1
                         stdout_stream.seek(0)
                         stderr_stream.seek(0)
@@ -187,7 +188,9 @@ def main() -> int:
                         "value_bytes",
                         "fragments",
                     }
-                    if any(type(observed[field]) is not int for field in integer_fields):
+                    if any(
+                        type(observed[field]) is not int for field in integer_fields
+                    ):
                         print(f"{engine}: invalid numeric field", file=sys.stderr)
                         return 1
                     if any(

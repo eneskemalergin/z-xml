@@ -6,10 +6,10 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import shutil
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from generated_tree import default_output, generate_or_check, write_file, write_repeated
 
 SCHEMA = "z-xml-dtd-generated-v1"
 TARGET_BYTES = 64 * 1024 * 1024
@@ -135,16 +135,6 @@ def result(case: Case) -> dict[str, object]:
         "skipped_sources": case.sources.skipped_sources,
         "source_bytes": case.sources.source_bytes,
     }
-
-
-def write_repeated(stream, record: bytes, count: int) -> None:
-    per_block = max(1, (1024 * 1024) // len(record))
-    block = record * per_block
-    while count >= per_block:
-        stream.write(block)
-        count -= per_block
-    if count:
-        stream.write(record * count)
 
 
 def generate_declarations(path: Path) -> Stats:
@@ -274,11 +264,6 @@ def generate_markup(path: Path) -> Stats:
         stream.write(suffix)
     stats.end(b"root")
     return stats
-
-
-def write_file(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
 
 
 def simple_stats(root_text: bytes | None = None) -> Stats:
@@ -620,43 +605,12 @@ def build(output: Path) -> None:
             )
 
 
-def compare(expected: Path, actual: Path) -> list[str]:
-    errors: list[str] = []
-    expected_files = {
-        path.relative_to(expected) for path in expected.rglob("*") if path.is_file()
-    }
-    actual_files = {
-        path.relative_to(actual) for path in actual.rglob("*") if path.is_file()
-    }
-    for path in sorted(expected_files - actual_files):
-        errors.append(f"missing generated file: {path}")
-    for path in sorted(actual_files - expected_files):
-        errors.append(f"unexpected generated file: {path}")
-    for path in sorted(expected_files & actual_files):
-        if not files_equal(expected / path, actual / path):
-            errors.append(f"generated file differs: {path}")
-    return errors
-
-
-def files_equal(left: Path, right: Path) -> bool:
-    if left.stat().st_size != right.stat().st_size:
-        return False
-    with left.open("rb") as left_stream, right.open("rb") as right_stream:
-        while True:
-            left_bytes = left_stream.read(1024 * 1024)
-            right_bytes = right_stream.read(1024 * 1024)
-            if left_bytes != right_bytes:
-                return False
-            if not left_bytes:
-                return True
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(__file__).resolve().parents[2] / "data" / "generated" / SCHEMA,
+        default=default_output(SCHEMA),
     )
     parser.add_argument("--check", action="store_true")
     return parser.parse_args()
@@ -664,34 +618,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    output = args.output_dir.resolve()
-    generated_root = (
-        Path(__file__).resolve().parents[2] / "data" / "generated"
-    ).resolve()
-    if (
-        args.output_dir.is_symlink()
-        or output == generated_root
-        or not output.is_relative_to(generated_root)
-        or (output.exists() and not output.is_dir())
-    ):
-        raise ValueError("output directory must be a directory under data/generated")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="z-xml-dtd-", dir=output.parent) as name:
-        temporary = Path(name)
-        build(temporary)
-        if args.check:
-            if not output.is_dir():
-                raise ValueError(f"missing generated corpus: {output}")
-            errors = compare(temporary, output)
-            if errors:
-                raise ValueError("\n".join(errors))
-            print(f"verified DTD corpus at {output}")
-            return 0
-        if output.exists():
-            shutil.rmtree(output)
-        temporary.replace(output)
-    print(f"generated DTD corpus at {output}")
-    return 0
+    return generate_or_check(
+        args.output_dir,
+        check=args.check,
+        temporary_prefix="z-xml-dtd-",
+        label="DTD corpus",
+        build=build,
+    )
 
 
 if __name__ == "__main__":

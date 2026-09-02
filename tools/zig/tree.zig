@@ -245,8 +245,7 @@ fn run(init: std.process.Init) !u8 {
         try traverse(false, options.namespaces, traversal_tracking.allocator(), &document, &stats);
         if (traversal_tracking.live_bytes != 0) return error.TraversalMemoryLeak;
         traversal_peak = traversal_tracking.peak_live_bytes;
-        traversal_allocator_operations = traversal_tracking.allocs +
-            traversal_tracking.resizes + traversal_tracking.remaps;
+        traversal_allocator_operations = traversal_tracking.operations();
         traversal_live_after_deinit = traversal_tracking.live_bytes;
         active_owned_bytes = try activeDocumentBytes(owned_memory, stats);
         if (active_owned_bytes > owned_memory.total_capacity_bytes or
@@ -311,7 +310,7 @@ fn run(init: std.process.Init) !u8 {
                 tracking.requested_bytes,
                 construction_temporary_bytes,
                 tracking.peak_live_bytes,
-                tracking.allocs + tracking.resizes + tracking.remaps,
+                tracking.operations(),
                 reader_memory.requested_bytes,
                 reader_memory.temporary_bytes,
                 reader_memory.peak_bytes,
@@ -635,7 +634,7 @@ fn runRepeatPhase(
         result.parse_temporary_bytes = tracking.requested_bytes -
             result.retained_capacity_total_bytes;
         result.parse_peak_live_bytes = tracking.peak_live_bytes;
-        result.parse_allocator_operations = tracking.allocs + tracking.resizes + tracking.remaps;
+        result.parse_allocator_operations = tracking.operations();
         result.parse_live_after_deinit_bytes = tracking.live_bytes;
     }
     return result;
@@ -697,7 +696,7 @@ fn auditRepeatedReader(
         result.reader_requested_bytes = tracking.requested_bytes;
         result.reader_temporary_bytes = tracking.requested_bytes - retained_total;
         result.reader_peak_live_bytes = tracking.peak_live_bytes;
-        result.reader_allocator_operations = tracking.allocs + tracking.resizes + tracking.remaps;
+        result.reader_allocator_operations = tracking.operations();
         result.reader_live_after_deinit_bytes = tracking.live_bytes;
     }
 }
@@ -813,7 +812,7 @@ fn auditReaderMemory(init: std.process.Init, options: Options) !ReaderMemory {
         .temporary_bytes = tracking.requested_bytes - retained_bytes,
         .peak_bytes = tracking.peak_live_bytes,
         .retained_bytes = retained_bytes,
-        .allocator_operations = tracking.allocs + tracking.resizes + tracking.remaps,
+        .allocator_operations = tracking.operations(),
         .live_after_deinit_bytes = 0,
     };
     reader.deinit();

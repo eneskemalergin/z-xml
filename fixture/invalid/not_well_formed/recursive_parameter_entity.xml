@@ -1,6 +1,6 @@
 <!DOCTYPE root [
-  <!ELEMENT root EMPTY>
-  <!ENTITY % loop "%loop;">
+  <!ENTITY % loop SYSTEM "recursive_parameter_entity.ent">
   %loop;
+  <!ELEMENT root EMPTY>
 ]>
 <root/>

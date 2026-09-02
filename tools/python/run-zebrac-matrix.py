@@ -11,15 +11,22 @@ import json
 import os
 import platform
 import shlex
-import shutil
-import signal
 import statistics
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from zebrac_measurement import (
+    MAX_OUTPUT_BYTES,
+    file_information,
+    persistent_arguments,
+    read_limited,
+    resolve_zebrac,
+    run_process,
+    source_information,
+)
 
 GENERATED_SCHEMAS = {"z-xml-generated-v3"}
 NAMESPACE_SCHEMA = "z-xml-namespace-benchmark-v1"
@@ -40,8 +47,6 @@ TARGET_SCHEMAS = {
 }
 TARGET_HEADER = "name\texecutable\tprocessor_class\tfeatures\twork_lane\tinput_model"
 MAX_WORKLOAD_BYTES = 1024 * 1024 * 1024
-MAX_CONTROL_BYTES = 16 * 1024 * 1024
-MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 ELIGIBILITY_FIELDS = {"target", "workload", "verdict"}
 EVENT_ELIGIBILITY_FIELDS = {"classification", "work_lane", "input_model"}
 PERSISTENT_ELIGIBILITY_FIELDS = {
@@ -71,23 +76,6 @@ class Eligibility:
     path: Path
     mtime_ns: int
     kind: str
-
-
-def resolve_zebrac(explicit: Path | None) -> Path | None:
-    if explicit is not None:
-        return explicit.resolve()
-    command = shutil.which("zebrac")
-    return Path(command).resolve() if command is not None else None
-
-
-def read_limited(path: Path, limit: int = MAX_CONTROL_BYTES) -> bytes:
-    if not path.is_file():
-        raise ValueError(f"{path}: expected a regular file")
-    with path.open("rb") as stream:
-        data = stream.read(limit + 1)
-    if len(data) > limit:
-        raise ValueError(f"{path}: exceeds the {limit}-byte protocol limit")
-    return data
 
 
 def read_json(path: Path, limit: int) -> object:
@@ -271,31 +259,6 @@ def read_workloads(path: Path) -> tuple[dict[str, dict[str, str]], str]:
     return workloads, schema
 
 
-def source_information(root: Path) -> dict[str, object]:
-    try:
-        revision = run_process(["git", "-C", str(root), "rev-parse", "HEAD"], 5, 4096)
-        status = run_process(
-            [
-                "git",
-                "-C",
-                str(root),
-                "status",
-                "--porcelain",
-                "--untracked-files=no",
-            ],
-            5,
-            MAX_CONTROL_BYTES,
-        )
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return {"revision": None, "tracked_dirty": None}
-    revision_valid = revision[0] == 0 and not revision[3] and not revision[4]
-    status_valid = status[0] == 0 and not status[3] and not status[4]
-    return {
-        "revision": revision[1].strip() if revision_valid else None,
-        "tracked_dirty": bool(status[1]) if status_valid else None,
-    }
-
-
 def read_eligibility(path: Path) -> dict[tuple[str, str], list[Eligibility]]:
     path = path.resolve()
     mtime_ns = path.stat().st_mtime_ns
@@ -351,39 +314,6 @@ def read_eligibility(path: Path) -> dict[tuple[str, str], list[Eligibility]]:
     if path.stat().st_mtime_ns != mtime_ns:
         raise ValueError(f"{path}: eligibility report changed while reading")
     return eligibility
-
-
-def persistent_arguments(arguments: list[str]) -> tuple[dict[str, str], list[str]]:
-    options = {
-        "--input": "input",
-        "--consumer": "consumer",
-        "--chunk-bytes": "chunk_bytes",
-        "--iterations": "iterations",
-    }
-    values: dict[str, str] = {}
-    extra: list[str] = []
-    index = 0
-    while index < len(arguments):
-        argument = arguments[index]
-        for option, field in options.items():
-            if argument == option:
-                if index + 1 >= len(arguments):
-                    raise ValueError(f"missing value for {option}")
-                value = arguments[index + 1]
-                index += 2
-                break
-            if argument.startswith(option + "="):
-                value = argument.removeprefix(option + "=")
-                index += 1
-                break
-        else:
-            extra.append(argument)
-            index += 1
-            continue
-        if field in values or not value:
-            raise ValueError(f"invalid or duplicate {option}")
-        values[field] = value
-    return values, extra
 
 
 def eligibility_match(
@@ -576,55 +506,6 @@ def document_repeat_multiplier(
     if remainder or multiplier <= 0:
         raise ValueError("repeated Document work is not an exact input multiple")
     return multiplier
-
-
-def run_process(
-    command: list[str], timeout: float, max_output_bytes: int
-) -> tuple[int, str, str, bool, bool]:
-    prlimit = shutil.which("prlimit")
-    if prlimit is None:
-        raise ValueError("prlimit from util-linux is required")
-    limited_command = [prlimit, f"--fsize={max_output_bytes}", "--", *command]
-    with (
-        tempfile.TemporaryFile() as stdout_file,
-        tempfile.TemporaryFile() as stderr_file,
-    ):
-        process = subprocess.Popen(
-            limited_command,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            start_new_session=True,
-        )
-        timed_out = False
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-        except KeyboardInterrupt:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-            raise
-        stdout_file.seek(0)
-        stderr_file.seek(0)
-        stdout = stdout_file.read(max_output_bytes + 1)
-        stderr = stderr_file.read(max_output_bytes + 1)
-    overflow = len(stdout) > max_output_bytes or len(stderr) > max_output_bytes
-    return (
-        process.returncode,
-        stdout[:max_output_bytes].decode("utf-8", errors="replace"),
-        stderr[:max_output_bytes].decode("utf-8", errors="replace"),
-        timed_out,
-        overflow,
-    )
 
 
 def validate_zebrac_results(
@@ -1132,11 +1013,8 @@ def main() -> int:
         for target in targets.values():
             if target.name not in participating_targets:
                 continue
-            binary_stat = target.executable.stat()
             selected_binary_metadata[target.name] = {
-                "path": str(target.executable),
-                "size": binary_stat.st_size,
-                "mtime_ns": binary_stat.st_mtime_ns,
+                **file_information(target.executable),
                 "processor_class": target.processor_class,
                 "lane": target.work_lane,
                 "input_model": target.input_model,
@@ -1164,40 +1042,24 @@ def main() -> int:
             for item in items:
                 if item.path in eligibility_metadata:
                     continue
-                eligibility_stat = item.path.stat()
-                if eligibility_stat.st_mtime_ns != item.mtime_ns:
+                eligibility_info = file_information(item.path)
+                if eligibility_info["mtime_ns"] != item.mtime_ns:
                     raise ValueError(
                         f"eligibility changed before measurement: {item.path}"
                     )
-                eligibility_metadata[item.path] = {
-                    "path": str(item.path),
-                    "size": eligibility_stat.st_size,
-                    "mtime_ns": item.mtime_ns,
-                }
-        manifest_stat = manifest_path.stat()
-        zebrac_stat = zebrac.stat()
+                eligibility_metadata[item.path] = eligibility_info
+        manifest_info = file_information(manifest_path)
+        zebrac_info = file_information(zebrac)
         input_metadata = {
-            "manifest": {
-                "path": str(manifest_path),
-                "size": manifest_stat.st_size,
-                "mtime_ns": manifest_mtime_ns,
-            },
-            "zebrac": {
-                "path": str(zebrac),
-                "size": zebrac_stat.st_size,
-                "mtime_ns": zebrac_stat.st_mtime_ns,
-            },
+            "manifest": manifest_info,
+            "zebrac": zebrac_info,
         }
         resource_metadata = {
-            path: {
-                "path": str(path),
-                "size": path.stat().st_size,
-                "mtime_ns": path.stat().st_mtime_ns,
-            }
+            path: file_information(path)
             for group in groups
             for path in group["workload"]["resolved_resources"]
         }
-        if manifest_stat.st_mtime_ns != manifest_mtime_ns:
+        if manifest_info["mtime_ns"] != manifest_mtime_ns:
             raise ValueError("corpus manifest changed before measurement")
         target_manifest_mtimes = {
             target.manifest: target.manifest_mtime_ns for target in targets.values()
@@ -1205,19 +1067,15 @@ def main() -> int:
         target_set_metadata = []
         for target_path, bin_dir in target_sets:
             resolved_target_path = target_path.resolve()
-            target_stat = resolved_target_path.stat()
-            if target_stat.st_mtime_ns != target_manifest_mtimes[resolved_target_path]:
+            target_info = file_information(resolved_target_path)
+            if target_info["mtime_ns"] != target_manifest_mtimes[resolved_target_path]:
                 raise ValueError(
                     f"target manifest changed before measurement: "
                     f"{resolved_target_path}"
                 )
             target_set_metadata.append(
                 {
-                    "targets_manifest": {
-                        "path": str(resolved_target_path),
-                        "size": target_stat.st_size,
-                        "mtime_ns": target_stat.st_mtime_ns,
-                    },
+                    "targets_manifest": target_info,
                     "bin_dir": str(bin_dir.resolve()),
                 }
             )
@@ -1423,10 +1281,7 @@ def main() -> int:
     try:
         if manifest_path.stat().st_mtime_ns != manifest_mtime_ns:
             raise ValueError("corpus manifest changed during measurement")
-        if (
-            zebrac.stat().st_size != input_metadata["zebrac"]["size"]
-            or zebrac.stat().st_mtime_ns != input_metadata["zebrac"]["mtime_ns"]
-        ):
+        if file_information(zebrac) != input_metadata["zebrac"]:
             raise ValueError("Zebrac changed during measurement")
         checked_manifests: set[Path] = set()
         for target in targets.values():
@@ -1439,30 +1294,34 @@ def main() -> int:
                 )
         for metadata in selected_binary_metadata.values():
             path = Path(str(metadata["path"]))
+            current = file_information(path)
             if (
-                path.stat().st_size != metadata["size"]
-                or path.stat().st_mtime_ns != metadata["mtime_ns"]
+                current["size"] != metadata["size"]
+                or current["mtime_ns"] != metadata["mtime_ns"]
             ):
                 raise ValueError(f"target changed during measurement: {path}")
         for metadata in eligibility_metadata.values():
             path = Path(str(metadata["path"]))
+            current = file_information(path)
             if (
-                path.stat().st_size != metadata["size"]
-                or path.stat().st_mtime_ns != metadata["mtime_ns"]
+                current["size"] != metadata["size"]
+                or current["mtime_ns"] != metadata["mtime_ns"]
             ):
                 raise ValueError(f"eligibility changed during measurement: {path}")
         for group in groups:
             workload = group["workload"]
             path = Path(workload["resolved_path"])
-            if path.stat().st_size != int(
-                workload["actual_bytes"]
-            ) or path.stat().st_mtime_ns != int(workload["source_mtime_ns"]):
+            current = file_information(path)
+            if current["size"] != int(workload["actual_bytes"]) or current[
+                "mtime_ns"
+            ] != int(workload["source_mtime_ns"]):
                 raise ValueError(f"workload changed during measurement: {path}")
         for metadata in resource_metadata.values():
             path = Path(str(metadata["path"]))
+            current = file_information(path)
             if (
-                path.stat().st_size != metadata["size"]
-                or path.stat().st_mtime_ns != metadata["mtime_ns"]
+                current["size"] != metadata["size"]
+                or current["mtime_ns"] != metadata["mtime_ns"]
             ):
                 raise ValueError(f"resource changed during measurement: {path}")
         temporary = output_dir / "index.json.tmp"

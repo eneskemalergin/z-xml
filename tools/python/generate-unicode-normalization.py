@@ -7,7 +7,6 @@ import argparse
 import unicodedata
 from pathlib import Path
 
-
 UNICODE_VERSION = "15.1.0"
 MAX_CODEPOINT = 0x10FFFF
 
@@ -46,10 +45,7 @@ def known(codepoint: int) -> bool:
 
 
 def algorithmic_hangul_pair(first: int, second: int) -> bool:
-    return (
-        0x1100 <= first <= 0x1112
-        and 0x1161 <= second <= 0x1175
-    ) or (
+    return (0x1100 <= first <= 0x1112 and 0x1161 <= second <= 0x1175) or (
         0xAC00 <= first <= 0xD7A3
         and (first - 0xAC00) % 28 == 0
         and 0x11A8 <= second <= 0x11C2
@@ -207,7 +203,9 @@ def render() -> str:
     def append_ranges(name: str, entries: list[tuple[int, int]]) -> None:
         lines.append(f"const {name} = [_]Range{{")
         for first, last in entries:
-            lines.append(f"    .{{ .first = {hex_value(first)}, .last = {hex_value(last)} }},")
+            lines.append(
+                f"    .{{ .first = {hex_value(first)}, .last = {hex_value(last)} }},"
+            )
         lines.extend(("};", ""))
 
     append_ranges("KNOWN_CODEPOINTS", known_codepoints)
@@ -224,9 +222,7 @@ def render() -> str:
     lines.append("const COMPOSITIONS = [_]Composition{")
     for first, second, _ in compositions:
         lines.append(
-            "    .{ .first = "
-            f"{hex_value(first)}, .second = {hex_value(second)}"
-            " },"
+            f"    .{{ .first = {hex_value(first)}, .second = {hex_value(second)} }},"
         )
     lines.extend(("};", ""))
     return "\n".join(lines)

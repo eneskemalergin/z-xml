@@ -526,8 +526,7 @@ fn runDetailedReport(init: std.process.Init, command: Options) !u8 {
 
     const usage = reader.memoryUsage();
     const memory: MemoryStats = .{
-        .allocator_operations = reader_tracking.allocs + reader_tracking.resizes +
-            reader_tracking.remaps,
+        .allocator_operations = reader_tracking.operations(),
         .requested_bytes = reader_tracking.requested_bytes,
         .peak_live_bytes = reader_tracking.peak_live_bytes,
         .dtd_capacity = usage.dtd_capacity,
@@ -955,16 +954,16 @@ test "[unit] - [corpus adapter]: requires one balanced document" {
     try std.testing.expect(!stats.complete());
 }
 
-test "[unit] - [corpus adapter options]: keeps legacy and DTD commands distinct" {
-    const legacy = parseOptions(&.{ "z-xml-check", "input.xml" }).?;
-    try std.testing.expect(!legacy.dtd_report);
-    try std.testing.expectEqual(check_options.validation_report, legacy.validation_report);
-    try std.testing.expectEqualStrings("input.xml", legacy.path);
+test "[unit] - [corpus adapter options]: keeps default and DTD commands distinct" {
+    const default_command = parseOptions(&.{ "z-xml-check", "input.xml" }).?;
+    try std.testing.expect(!default_command.dtd_report);
+    try std.testing.expectEqual(check_options.validation_report, default_command.validation_report);
+    try std.testing.expectEqualStrings("input.xml", default_command.path);
 
     if (comptime check_options.validation_report) {
         try std.testing.expectEqual(
             if (check_options.resolve_external) ExternalMode.resolve else ExternalMode.forbid,
-            legacy.external.?,
+            default_command.external.?,
         );
         try std.testing.expect(parseOptions(&.{
             "z-xml-check",

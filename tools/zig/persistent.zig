@@ -291,7 +291,7 @@ fn run(init: std.process.Init) !u8 {
         first_document_start.durationTo(std.Io.Clock.awake.now(init.io)).nanoseconds
     else
         0;
-    const first_allocator_operations = allocatorOperations(tracking);
+    const first_allocator_operations = tracking.operations();
 
     const primary_warm_start = if (options.report_timing and options.iterations > 1)
         std.Io.Clock.awake.now(init.io)
@@ -306,7 +306,7 @@ fn run(init: std.process.Init) !u8 {
         primary_warm_start.durationTo(std.Io.Clock.awake.now(init.io)).nanoseconds
     else
         0;
-    const after_primary_operations = allocatorOperations(tracking);
+    const after_primary_operations = tracking.operations();
 
     const next_documents_start = if (options.report_timing and next_source != null)
         std.Io.Clock.awake.now(init.io)
@@ -325,7 +325,7 @@ fn run(init: std.process.Init) !u8 {
         next_documents_start.durationTo(std.Io.Clock.awake.now(init.io)).nanoseconds
     else
         0;
-    const after_next_operations = allocatorOperations(tracking);
+    const after_next_operations = tracking.operations();
 
     const usage = reader.memoryUsage();
     const live_bytes_before_release = tracking.live_bytes;
@@ -342,7 +342,7 @@ fn run(init: std.process.Init) !u8 {
         0;
     const released_usage = reader.memoryUsage();
     const live_bytes_after_release = tracking.live_bytes;
-    const after_release_operations = allocatorOperations(tracking);
+    const after_release_operations = tracking.operations();
     const live_bytes_before_deinit = tracking.live_bytes;
     reader.deinit();
     reader_live = false;
@@ -464,10 +464,6 @@ fn parseOptions(args: []const []const u8) ?Options {
 
 fn drain(reader: *xml.Reader, stats: *Stats) !void {
     while (try reader.next()) |event| stats.observe(event);
-}
-
-fn allocatorOperations(tracking: TrackingAllocator) u64 {
-    return tracking.allocs + tracking.resizes + tracking.remaps;
 }
 
 fn printStats(
@@ -695,6 +691,7 @@ test "[unit] - [tracking allocator]: tracks owned bytes and cleanup" {
     const first = try allocator.alloc(u8, 4);
     const second = try allocator.alloc(u8, 8);
     try std.testing.expectEqual(@as(u64, 2), tracking.allocs);
+    try std.testing.expectEqual(@as(u64, 2), tracking.operations());
     try std.testing.expectEqual(@as(u64, 12), tracking.requested_bytes);
     try std.testing.expectEqual(@as(usize, 12), tracking.live_bytes);
     try std.testing.expectEqual(@as(usize, 12), tracking.peak_live_bytes);

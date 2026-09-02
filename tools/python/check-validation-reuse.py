@@ -16,10 +16,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from qualification_io import file_identity, publish_tsv, read_limited
+
 CORPUS_SCHEMA = "z-xml-validation-reuse-v1"
 TARGET_SCHEMA = "z-xml-targets-v1"
 TARGET_HEADER = "name\texecutable\tprocessor_class\tfeatures\twork_lane\tinput_model"
-MAX_CONTROL_BYTES = 16 * 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 MANIFEST_FIELDS = {
     "id",
@@ -207,16 +208,6 @@ class Workload:
     next_name: str | None
     next_iterations: int
     expected: dict[str, object]
-
-
-def read_limited(path: Path, limit: int = MAX_CONTROL_BYTES) -> bytes:
-    if not path.is_file():
-        raise ValueError(f"{path}: expected a regular file")
-    with path.open("rb") as stream:
-        data = stream.read(limit + 1)
-    if len(data) > limit:
-        raise ValueError(f"{path}: exceeds the {limit}-byte control limit")
-    return data
 
 
 def decode_json(value: str) -> dict[str, object]:
@@ -659,11 +650,6 @@ def check_timing(
     return None
 
 
-def file_identity(path: Path) -> tuple[int, int, int, int]:
-    stat = path.stat()
-    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
-
-
 def command_result(
     target: Target,
     workload: Workload,
@@ -816,23 +802,7 @@ def main() -> int:
                 f"{row['target']}/{row['workload']}: {row['verdict']}", file=sys.stderr
             )
         return 1
-    results.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", newline="", dir=results.parent, delete=False
-        ) as stream:
-            temporary = Path(stream.name)
-            writer = csv.DictWriter(
-                stream, RESULT_FIELDS, delimiter="\t", lineterminator="\n"
-            )
-            writer.writeheader()
-            writer.writerows(rows)
-        temporary.replace(results)
-        temporary = None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    publish_tsv(results, RESULT_FIELDS, rows)
     print(f"qualified {len(rows)} validation reuse commands at {results}")
     return 0
 

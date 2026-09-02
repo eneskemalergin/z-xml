@@ -1,7 +1,8 @@
 //! Prints Reader and Document type layouts.
 
 const std = @import("std");
-const xml = @import("z_xml");
+const profile = @import("z_xml_profile");
+const xml = profile.api;
 
 pub fn main() void {
     std.debug.print(
@@ -13,12 +14,12 @@ pub fn main() void {
             @sizeOf(xml.Location),
         },
     );
-    printPrivate("no-dtd-byte-offset", xml.Configs.XML10_UTF8_NO_DTD_FAST);
-    printPrivate("no-dtd-line-column", xml.Configs.XML10_UTF8_NO_DTD);
-    printPrivate("no-dtd-namespaces", xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD);
-    printPrivate("dtd-process-raw", xml.Configs.XML11_NONVALIDATING);
-    printPrivate("dtd-process-namespaces", xml.Configs.XML11_NAMESPACES_NONVALIDATING);
-    printPrivate("dtd-validate-namespaces", xml.Configs.XML11_NAMESPACES_VALIDATING);
+    printPrivate("no-dtd-byte-offset", profile.Configs.XML10_UTF8_NO_DTD_FAST);
+    printPrivate("no-dtd-line-column", profile.Configs.XML10_UTF8_NO_DTD);
+    printPrivate("no-dtd-namespaces", profile.Configs.XML10_UTF8_NAMESPACES_NO_DTD);
+    printPrivate("dtd-process-raw", profile.Configs.XML11_NONVALIDATING);
+    printPrivate("dtd-process-namespaces", profile.Configs.XML11_NAMESPACES_NONVALIDATING);
+    printPrivate("dtd-validate-namespaces", profile.Configs.XML11_NAMESPACES_VALIDATING);
     std.debug.print(
         "document\tdocument={d}\tnode_index={d}\tnode={d}\telement={d}\t" ++
             "attribute={d}\tnamespace={d}\ttext={d}\ttext_origin={d}\t" ++
@@ -44,15 +45,15 @@ fn documentListItem(comptime field_name: []const u8) type {
     return std.meta.Elem(@FieldType(List, "items"));
 }
 
-fn printPrivate(comptime name: []const u8, comptime config: xml.Config) void {
+fn printPrivate(comptime name: []const u8, comptime config: profile.Config) void {
     std.debug.print(
         "{s}\treader={d}\tevent={d}\tattribute={d}\tlocation={d}\n",
         .{
             name,
-            @sizeOf(xml.ReaderFor(config)),
-            @sizeOf(xml.EventFor(config)),
-            @sizeOf(xml.AttributeFor(config)),
-            @sizeOf(xml.LocationFor(config)),
+            @sizeOf(profile.ReaderFor(config)),
+            @sizeOf(profile.EventFor(config)),
+            @sizeOf(profile.AttributeFor(config)),
+            @sizeOf(profile.LocationFor(config)),
         },
     );
 }

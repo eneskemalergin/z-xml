@@ -3,7 +3,7 @@
 //! Summary helpers copy event data before the next read and compare exact results
 //! across whole input, split input, one-byte feeds, and buffered sources. Tests for
 //! borrowed lifetimes inspect event views directly instead. The suite covers both
-//! the normal runtime-policy Reader and public specialized Reader configurations.
+//! the normal runtime-policy Reader and private specialized Reader configurations.
 //!
 //! Inputs are deterministic and self-contained. Byte-sensitive encoding inputs are
 //! embedded from `tests/data/encoding`, while resolvers, transcoders, external
@@ -11,17 +11,18 @@
 //! parser state remain in `src/reader.zig`.
 
 const std = @import("std");
-const xml = @import("z_xml");
+const profile = @import("z_xml_profile");
+const xml = profile.api;
 
-const CORE_CONFIG = xml.Configs.XML10_UTF8_NO_DTD;
-const FAST_CONFIG = xml.Configs.XML10_UTF8_NO_DTD_FAST;
-const NS_CONFIG = xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD;
-const GENERAL_CONFIG = xml.Configs.XML10_NO_DTD;
-const GENERAL_FAST_CONFIG = xml.Configs.XML10_NO_DTD_FAST;
-const DTD_CONFIG = xml.Configs.XML10_NONVALIDATING;
-const DTD_NS_CONFIG = xml.Configs.XML10_NAMESPACES_NONVALIDATING;
-const INTERNAL_DTD_CONFIG = xml.Configs.XML10_NONVALIDATING_INTERNAL;
-const CoreReader = xml.ReaderFor(CORE_CONFIG);
+const CORE_CONFIG = profile.Configs.XML10_UTF8_NO_DTD;
+const FAST_CONFIG = profile.Configs.XML10_UTF8_NO_DTD_FAST;
+const NS_CONFIG = profile.Configs.XML10_UTF8_NAMESPACES_NO_DTD;
+const GENERAL_CONFIG = profile.Configs.XML10_NO_DTD;
+const GENERAL_FAST_CONFIG = profile.Configs.XML10_NO_DTD_FAST;
+const DTD_CONFIG = profile.Configs.XML10_NONVALIDATING;
+const DTD_NS_CONFIG = profile.Configs.XML10_NAMESPACES_NONVALIDATING;
+const INTERNAL_DTD_CONFIG = profile.Configs.XML10_NONVALIDATING_INTERNAL;
+const CoreReader = profile.ReaderFor(CORE_CONFIG);
 
 const UTF16LE_BOM = @embedFile("data/encoding/utf16le-bom.xml");
 const UTF16BE_BOM = @embedFile("data/encoding/utf16be-bom.xml");
@@ -285,7 +286,7 @@ const PushContext = struct {
     cancel_after: ?usize = null,
 };
 
-fn pushObserve(context: *PushContext, event: xml.EventFor(CORE_CONFIG)) xml.ProfileDrainControl {
+fn pushObserve(context: *PushContext, event: profile.EventFor(CORE_CONFIG)) profile.ProfileDrainControl {
     context.events += 1;
     switch (event) {
         .start_element => |start| context.attributes += start.attributes.len,
@@ -296,12 +297,12 @@ fn pushObserve(context: *PushContext, event: xml.EventFor(CORE_CONFIG)) xml.Prof
 }
 
 fn parseParts(
-    comptime config: xml.Config,
+    comptime config: profile.Config,
     allocator: std.mem.Allocator,
-    options: xml.OptionsFor(config),
+    options: profile.OptionsFor(config),
     parts: []const []const u8,
 ) !Summary {
-    const Reader = xml.ReaderFor(config);
+    const Reader = profile.ReaderFor(config);
     var reader = try Reader.init(allocator, options);
     defer reader.deinit();
 
@@ -320,12 +321,12 @@ fn parseParts(
 }
 
 fn parseOneByteChunks(
-    comptime config: xml.Config,
+    comptime config: profile.Config,
     allocator: std.mem.Allocator,
-    options: xml.OptionsFor(config),
+    options: profile.OptionsFor(config),
     input: []const u8,
 ) !Summary {
-    const Reader = xml.ReaderFor(config);
+    const Reader = profile.ReaderFor(config);
     var reader = try Reader.init(allocator, options);
     defer reader.deinit();
 
@@ -344,13 +345,13 @@ fn parseOneByteChunks(
 }
 
 fn parseFixedChunks(
-    comptime config: xml.Config,
+    comptime config: profile.Config,
     allocator: std.mem.Allocator,
-    options: xml.OptionsFor(config),
+    options: profile.OptionsFor(config),
     input: []const u8,
     chunk_size: usize,
 ) !Summary {
-    const Reader = xml.ReaderFor(config);
+    const Reader = profile.ReaderFor(config);
     var reader = try Reader.init(allocator, options);
     defer reader.deinit();
 
@@ -372,15 +373,15 @@ fn parseFixedChunks(
 }
 
 fn parseRandomChunks(
-    comptime config: xml.Config,
+    comptime config: profile.Config,
     allocator: std.mem.Allocator,
-    options: xml.OptionsFor(config),
+    options: profile.OptionsFor(config),
     input: []const u8,
     seed: u64,
 ) !Summary {
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
-    const Reader = xml.ReaderFor(config);
+    const Reader = profile.ReaderFor(config);
     var reader = try Reader.init(allocator, options);
     defer reader.deinit();
 
@@ -408,8 +409,8 @@ fn expectSummarySchedules(input: []const u8, expected: Summary) !void {
 }
 
 fn expectSummarySchedulesWithOptions(
-    comptime config: xml.Config,
-    options: xml.OptionsFor(config),
+    comptime config: profile.Config,
+    options: profile.OptionsFor(config),
     input: []const u8,
     expected: Summary,
 ) !void {
@@ -564,7 +565,7 @@ fn allocationUtf16Parse(allocator: std.mem.Allocator) !void {
     _ = try parseParts(GENERAL_CONFIG, allocator, .{}, &parts);
 }
 
-fn drainGeneralChunks(reader: *xml.ReaderFor(GENERAL_FAST_CONFIG), input: []const u8) !void {
+fn drainGeneralChunks(reader: *profile.ReaderFor(GENERAL_FAST_CONFIG), input: []const u8) !void {
     var offset: usize = 0;
     while (offset < input.len) {
         const end = @min(offset + 257, input.len);
@@ -580,7 +581,7 @@ fn drainGeneralChunks(reader: *xml.ReaderFor(GENERAL_FAST_CONFIG), input: []cons
 }
 
 fn expectEvents(input: []const u8, expected: []const ExpectedEvent) !void {
-    const SliceReader = xml.ProfileSliceReader(CORE_CONFIG);
+    const SliceReader = profile.ProfileSliceReader(CORE_CONFIG);
     var reader = try SliceReader.init(std.testing.allocator, .{}, input);
     defer reader.deinit();
 
@@ -643,7 +644,7 @@ fn expectEvents(input: []const u8, expected: []const ExpectedEvent) !void {
 }
 
 fn expectCoreFailure(
-    options: xml.OptionsFor(FAST_CONFIG),
+    options: profile.OptionsFor(FAST_CONFIG),
     input: []const u8,
     expected_error: anyerror,
     code: xml.DiagnosticCode,
@@ -662,14 +663,14 @@ fn expectCoreFailure(
 }
 
 fn expectCoreFailureParts(
-    options: xml.OptionsFor(FAST_CONFIG),
+    options: profile.OptionsFor(FAST_CONFIG),
     parts: []const []const u8,
     expected_error: anyerror,
     code: xml.DiagnosticCode,
     offset: u64,
     related_offset: ?u64,
 ) !void {
-    const Reader = xml.ReaderFor(FAST_CONFIG);
+    const Reader = profile.ReaderFor(FAST_CONFIG);
     var reader = try Reader.init(std.testing.allocator, options);
     defer reader.deinit();
 
@@ -704,7 +705,7 @@ fn expectGeneralFailureParts(
     code: xml.DiagnosticCode,
     offset: u64,
 ) !void {
-    const Reader = xml.ReaderFor(GENERAL_FAST_CONFIG);
+    const Reader = profile.ReaderFor(GENERAL_FAST_CONFIG);
     var reader = try Reader.init(std.testing.allocator, .{});
     defer reader.deinit();
 
@@ -748,7 +749,7 @@ const FailureChunkSchedule = union(enum) {
 };
 
 fn expectCoreFailureChunked(
-    options: xml.OptionsFor(FAST_CONFIG),
+    options: profile.OptionsFor(FAST_CONFIG),
     input: []const u8,
     schedule: FailureChunkSchedule,
     expected_error: anyerror,
@@ -756,7 +757,7 @@ fn expectCoreFailureChunked(
     diagnostic_offset: u64,
     related_offset: ?u64,
 ) !void {
-    const Reader = xml.ReaderFor(FAST_CONFIG);
+    const Reader = profile.ReaderFor(FAST_CONFIG);
     var reader = try Reader.init(std.testing.allocator, options);
     defer reader.deinit();
 
@@ -819,7 +820,7 @@ fn expectCoreFailureSchedules(
 }
 
 fn expectCoreFailureSchedulesWithOptions(
-    options: xml.OptionsFor(FAST_CONFIG),
+    options: profile.OptionsFor(FAST_CONFIG),
     input: []const u8,
     expected_error: anyerror,
     code: xml.DiagnosticCode,
@@ -863,15 +864,15 @@ fn expectCoreFailureSchedulesWithOptions(
 }
 
 fn expectProfileFailureParts(
-    comptime config: xml.Config,
-    options: xml.OptionsFor(config),
+    comptime config: profile.Config,
+    options: profile.OptionsFor(config),
     parts: []const []const u8,
     expected_error: anyerror,
     code: xml.DiagnosticCode,
     offset: u64,
     related_offset: ?u64,
 ) !void {
-    const Reader = xml.ReaderFor(config);
+    const Reader = profile.ReaderFor(config);
     var reader = try Reader.init(std.testing.allocator, options);
     defer reader.deinit();
     for (parts, 0..) |part, index| {
@@ -901,8 +902,8 @@ fn expectProfileFailureParts(
 }
 
 fn expectProfileFailureSchedules(
-    comptime config: xml.Config,
-    options: xml.OptionsFor(config),
+    comptime config: profile.Config,
+    options: profile.OptionsFor(config),
     input: []const u8,
     expected_error: anyerror,
     code: xml.DiagnosticCode,
@@ -1095,12 +1096,12 @@ fn allocationNamespaceParse(allocator: std.mem.Allocator) !void {
 }
 
 fn allocationDtdParse(allocator: std.mem.Allocator) !void {
-    const config = xml.Configs.XML10_NAMESPACES_NONVALIDATING;
+    const config = profile.Configs.XML10_NAMESPACES_NONVALIDATING;
     const input = "<!DOCTYPE p:root [" ++
         "<!ENTITY % element '<!ELEMENT p:root (#PCDATA)>'>%element;" ++
         "<!ENTITY text 'expanded'><!ATTLIST p:root xmlns:p CDATA 'urn:test' " ++
         "tokens NMTOKENS ' one  two '>]><p:root>&text;</p:root>";
-    var reader = try xml.ReaderFor(config).init(allocator, .{});
+    var reader = try profile.ReaderFor(config).init(allocator, .{});
     defer reader.deinit();
     try reader.feed(input, true);
     var starts: usize = 0;
@@ -1130,7 +1131,7 @@ const DtdOutcome = struct {
     defaulted: usize = 0,
     namespace_declarations: usize = 0,
     text_hash: u64 = 14695981039346656037,
-    validation: ?xml.ProfileValidationStatus = null,
+    validation: ?profile.ProfileValidationStatus = null,
 };
 
 const DtdSchedule = union(enum) {
@@ -1140,8 +1141,8 @@ const DtdSchedule = union(enum) {
     random: u64,
 };
 
-fn dtdOutcome(comptime config: xml.Config, input: []const u8, schedule: DtdSchedule) !DtdOutcome {
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+fn dtdOutcome(comptime config: profile.Config, input: []const u8, schedule: DtdSchedule) !DtdOutcome {
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     var outcome: DtdOutcome = .{};
     var offset: usize = 0;
@@ -1195,12 +1196,12 @@ fn dtdOutcome(comptime config: xml.Config, input: []const u8, schedule: DtdSched
 }
 
 fn normalizationOutcome(
-    comptime config: xml.Config,
-    options: xml.OptionsFor(config),
+    comptime config: profile.Config,
+    options: profile.OptionsFor(config),
     input: []const u8,
     schedule: DtdSchedule,
-) !xml.NormalizationResultFor(config) {
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, options);
+) !profile.NormalizationResultFor(config) {
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, options);
     defer reader.deinit();
     var offset: usize = 0;
     var first = true;
@@ -1240,10 +1241,10 @@ fn strictNormalizationFailure(
     input: []const u8,
     chunk_size: usize,
 ) !NormalizationFailureOutcome {
-    const config = xml.Configs.XML11_NONVALIDATING;
-    var options: xml.OptionsFor(config) = .{};
+    const config = profile.Configs.XML11_NONVALIDATING;
+    var options: profile.OptionsFor(config) = .{};
     options.normalization = .require;
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, options);
     defer reader.deinit();
     var events: usize = 0;
     var offset: usize = 0;
@@ -1274,9 +1275,9 @@ fn strictNormalizationFailure(
 
 fn expectNormalizationSchedules(
     input: []const u8,
-    expected: xml.NormalizationResultFor(xml.Configs.XML11_NONVALIDATING),
+    expected: profile.NormalizationResultFor(profile.Configs.XML11_NONVALIDATING),
 ) !void {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     try std.testing.expectEqual(
         expected,
         try normalizationOutcome(config, .{}, input, .whole),
@@ -1302,7 +1303,7 @@ fn expectNormalizationSchedules(
 }
 
 fn expectExpandedName(
-    name: xml.NameFor(NS_CONFIG),
+    name: profile.NameFor(NS_CONFIG),
     raw: []const u8,
     prefix: ?[]const u8,
     local: []const u8,
@@ -1452,7 +1453,7 @@ fn drainCore(reader: *CoreReader) !Summary {
     }
 }
 
-fn drainNamespace(reader: *xml.ReaderFor(NS_CONFIG)) !Summary {
+fn drainNamespace(reader: *profile.ReaderFor(NS_CONFIG)) !Summary {
     var summary: Summary = .{};
     while (true) switch (try reader.next()) {
         .event => |event| try summary.observe(event),
@@ -1461,7 +1462,7 @@ fn drainNamespace(reader: *xml.ReaderFor(NS_CONFIG)) !Summary {
     };
 }
 
-const NORMAL_ENGINE_CONFIG: xml.Config = .{
+const NORMAL_ENGINE_CONFIG: profile.Config = .{
     .profile = .xml11_ns_nonvalidating,
     .event_locations = true,
     .external_sources = true,
@@ -1985,6 +1986,98 @@ fn expectReaderSourceSpans(
         else => {},
     };
     try std.testing.expect(saw_start and saw_text and saw_end);
+}
+
+test "[integration] - [package facade]: exposes only accepted declarations" {
+    try std.testing.expectEqual(@as(usize, 70), std.meta.declarations(xml).len);
+    try std.testing.expectEqual(@as(usize, 11), std.meta.declarations(xml.dtd).len);
+
+    inline for ([_][]const u8{
+        "ResetMode",
+        "ExternalPolicy",
+        "NormalizationPolicy",
+        "NormalizationIssueKind",
+        "Limits",
+        "MemoryUsage",
+        "DiagnosticCode",
+        "XmlVersion",
+        "SourceEncoding",
+        "TextOrigin",
+        "ReadError",
+        "ResetError",
+        "InitError",
+        "Source",
+        "Reader",
+        "ReaderOptions",
+        "NamespacePolicy",
+        "DtdPolicy",
+        "DtdValidationOptions",
+        "Event",
+        "EventData",
+        "SourceSpan",
+        "Location",
+        "Diagnostic",
+        "DiagnosticSink",
+        "NormalizationFinding",
+        "Name",
+        "ExpandedName",
+        "Attribute",
+        "NamespaceDeclaration",
+        "XmlDeclaration",
+        "DocumentStart",
+        "DocumentType",
+        "StartElement",
+        "EndElement",
+        "Text",
+        "Comment",
+        "ProcessingInstruction",
+        "SkippedExternalSource",
+        "SkippedExternalSourceKind",
+        "DocumentEnd",
+        "DocumentContent",
+        "DtdValidity",
+        "DocumentNormalization",
+        "Node",
+        "NodeKind",
+        "DocumentLimits",
+        "DocumentOptions",
+        "DocumentMemoryUsage",
+        "DocumentNamespaceDeclaration",
+        "ParseDocumentError",
+        "Document",
+        "parseDocument",
+        "Writer",
+        "WriterOptions",
+        "WriterLimits",
+        "WriterMemoryUsage",
+        "WriterInitError",
+        "WriterError",
+        "Transcoder",
+        "TranscodeStep",
+        "TranscoderError",
+        "Resolver",
+        "ResolverRequest",
+        "ResolverResult",
+        "ResolverSource",
+        "ResolverReadResult",
+        "ExternalEntityKind",
+        "RootedFilesystemResolver",
+        "dtd",
+    }) |name| try std.testing.expect(@hasDecl(xml, name));
+
+    inline for ([_][]const u8{
+        "AttributeType",
+        "Finding",
+        "FindingAction",
+        "FindingSink",
+        "ExternalSubset",
+        "ExternalSubsetOptions",
+        "ExternalSubsetProvider",
+        "ExternalSubsetProviderError",
+        "ExternalSubsetRequest",
+        "ExternalSubsetResult",
+        "ExternalSubsetContent",
+    }) |name| try std.testing.expect(@hasDecl(xml.dtd, name));
 }
 
 test "[integration] - [Reader spans]: source locations survive adapters and entities" {
@@ -2689,7 +2782,7 @@ fn progressThenUnsupported(
 }
 
 fn summarizeSelectedEngine(input: []const u8) ![]u8 {
-    const Reader = xml.ReaderFor(NORMAL_ENGINE_CONFIG);
+    const Reader = profile.ReaderFor(NORMAL_ENGINE_CONFIG);
     var reader = try Reader.init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed(input, true);
@@ -2759,7 +2852,7 @@ test "[integration] - [Reader]: matches selected engine output and first failure
     }
     try std.testing.expectEqual(error.InvalidXml, normal_failure.?);
 
-    const SelectedReader = xml.ReaderFor(NORMAL_ENGINE_CONFIG);
+    const SelectedReader = profile.ReaderFor(NORMAL_ENGINE_CONFIG);
     var selected_reader = try SelectedReader.init(std.testing.allocator, .{});
     defer selected_reader.deinit();
     try selected_reader.feed("<root>", true);
@@ -5503,50 +5596,50 @@ test "[integration] - [Reader]: errors keep their public class and line policy" 
 
 test "config - representative profiles: compile specialized public types" {
     inline for (.{
-        xml.Configs.XML10_UTF8_NO_DTD_FAST,
-        xml.Configs.XML10_UTF8_NO_DTD,
-        xml.Configs.XML10_UTF8_NO_DTD_LOCATED,
-        xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD,
-        xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST,
-        xml.Configs.XML10_NO_DTD,
-        xml.Configs.XML10_NO_DTD_FAST,
-        xml.Configs.XML10_NAMESPACES_NO_DTD,
-        xml.Configs.XML10_NAMESPACES_NO_DTD_FAST,
-        xml.Configs.XML10_NONVALIDATING,
-        xml.Configs.XML10_NAMESPACES_NONVALIDATING,
-        xml.Configs.XML10_VALIDATING,
-        xml.Configs.XML10_NAMESPACES_VALIDATING_DETAILED,
-        xml.Configs.XML11_NONVALIDATING,
-        xml.Configs.XML11_NAMESPACES_NONVALIDATING,
-        xml.Configs.XML11_VALIDATING,
-        xml.Configs.XML11_NAMESPACES_VALIDATING,
+        profile.Configs.XML10_UTF8_NO_DTD_FAST,
+        profile.Configs.XML10_UTF8_NO_DTD,
+        profile.Configs.XML10_UTF8_NO_DTD_LOCATED,
+        profile.Configs.XML10_UTF8_NAMESPACES_NO_DTD,
+        profile.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST,
+        profile.Configs.XML10_NO_DTD,
+        profile.Configs.XML10_NO_DTD_FAST,
+        profile.Configs.XML10_NAMESPACES_NO_DTD,
+        profile.Configs.XML10_NAMESPACES_NO_DTD_FAST,
+        profile.Configs.XML10_NONVALIDATING,
+        profile.Configs.XML10_NAMESPACES_NONVALIDATING,
+        profile.Configs.XML10_VALIDATING,
+        profile.Configs.XML10_NAMESPACES_VALIDATING_DETAILED,
+        profile.Configs.XML11_NONVALIDATING,
+        profile.Configs.XML11_NAMESPACES_NONVALIDATING,
+        profile.Configs.XML11_VALIDATING,
+        profile.Configs.XML11_NAMESPACES_VALIDATING,
     }) |config| {
-        _ = xml.ReaderFor(config);
-        _ = xml.EventFor(config);
-        _ = xml.StepFor(config);
-        _ = xml.OptionsFor(config);
-        _ = xml.DiagnosticFor(config);
-        _ = xml.NameFor(config);
-        _ = xml.AttributeFor(config);
-        _ = xml.ProfileSliceReader(config);
-        _ = xml.ProfileIoReader(config);
+        _ = profile.ReaderFor(config);
+        _ = profile.EventFor(config);
+        _ = profile.StepFor(config);
+        _ = profile.OptionsFor(config);
+        _ = profile.DiagnosticFor(config);
+        _ = profile.NameFor(config);
+        _ = profile.AttributeFor(config);
+        _ = profile.ProfileSliceReader(config);
+        _ = profile.ProfileIoReader(config);
     }
 }
 
 test "config - excluded capabilities: specialized types omit impossible fields" {
-    const fast_config = xml.Configs.XML10_UTF8_NO_DTD_FAST;
-    const full_config = xml.Configs.XML10_NONVALIDATING;
+    const fast_config = profile.Configs.XML10_UTF8_NO_DTD_FAST;
+    const full_config = profile.Configs.XML10_NONVALIDATING;
 
-    try std.testing.expect(!@hasField(xml.EventFor(fast_config), "document_type"));
-    try std.testing.expect(@hasField(xml.EventFor(full_config), "document_type"));
+    try std.testing.expect(!@hasField(profile.EventFor(fast_config), "document_type"));
+    try std.testing.expect(@hasField(profile.EventFor(full_config), "document_type"));
     try std.testing.expect(
-        @sizeOf(xml.LocationFor(fast_config)) <
-            @sizeOf(xml.LocationFor(xml.Configs.XML10_UTF8_NO_DTD)),
+        @sizeOf(profile.LocationFor(fast_config)) <
+            @sizeOf(profile.LocationFor(profile.Configs.XML10_UTF8_NO_DTD)),
     );
 }
 
 test "[unit] - [XML version]: XML 1.1 profiles select declared document rules" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const cases = .{
         .{ "<root/>", xml.XmlVersion.xml10, "" },
         .{ "<?xml version='1.0'?><root/>", xml.XmlVersion.xml10, "1.0" },
@@ -5554,7 +5647,7 @@ test "[unit] - [XML version]: XML 1.1 profiles select declared document rules" {
         .{ "<?xml version='1.1'?><root/>", xml.XmlVersion.xml11, "1.1" },
     };
     inline for (cases) |case| {
-        var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+        var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
         defer reader.deinit();
         try reader.feed(case[0], true);
         const event = (try reader.next()).event;
@@ -5573,25 +5666,25 @@ test "[unit] - [XML version]: XML 1.1 profiles select declared document rules" {
 }
 
 test "[unit] - [XML 1.1 normalization]: policy reports final verification state" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const normalized = "<?xml version='1.1'?><root>caf\xc3\xa9</root>";
     try std.testing.expectEqual(
-        xml.NormalizationResultFor(config){ .status = .normalized, .issue = null },
+        profile.NormalizationResultFor(config){ .status = .normalized, .issue = null },
         try normalizationOutcome(config, .{}, normalized, .whole),
     );
 
-    var unchecked: xml.OptionsFor(config) = .{};
+    var unchecked: profile.OptionsFor(config) = .{};
     unchecked.normalization = .unchecked;
     try std.testing.expectEqual(
-        xml.NormalizationResultFor(config){ .status = .unchecked, .issue = null },
+        profile.NormalizationResultFor(config){ .status = .unchecked, .issue = null },
         try normalizationOutcome(config, unchecked, normalized, .whole),
     );
     try std.testing.expectEqual(
-        xml.NormalizationResultFor(config){ .status = .unchecked, .issue = null },
+        profile.NormalizationResultFor(config){ .status = .unchecked, .issue = null },
         try normalizationOutcome(config, .{}, "<root/>", .whole),
     );
 
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed("<?xml version='1.1'?><root>e\xcc\x81</root>", true);
     var text_bytes: [3]u8 = undefined;
@@ -5609,13 +5702,13 @@ test "[unit] - [XML 1.1 normalization]: policy reports final verification state"
     };
     try std.testing.expectEqualStrings("e\xcc\x81", text_bytes[0..text_len]);
     try std.testing.expectEqual(
-        xml.ProfileNormalizationStatus.not_normalized,
+        profile.ProfileNormalizationStatus.not_normalized,
         reader.normalizationResult().status,
     );
 }
 
 test "[property] - [XML 1.1 normalization]: source NFC is stable across schedules" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const input = "<?xml version='1.1'?><root>e\xcc\x81</root>";
     const offset = std.mem.indexOf(u8, input, "\xcc\x81").?;
     try expectNormalizationSchedules(input, .{
@@ -5631,7 +5724,7 @@ test "[property] - [XML 1.1 normalization]: source NFC is stable across schedule
         },
     });
 
-    var strict: xml.OptionsFor(config) = .{};
+    var strict: profile.OptionsFor(config) = .{};
     strict.normalization = .require;
     try expectProfileFailureSchedules(
         config,
@@ -5662,7 +5755,7 @@ test "[property] - [XML 1.1 normalization]: source NFC is stable across schedule
 }
 
 test "[unit] - [XML 1.1 normalization]: canonical forms cover composition and ordering" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const cases = .{
         "<?xml version='1.1'?><root>\xe2\x84\xab</root>",
         "<?xml version='1.1'?><root>\xe1\x84\x80\xe1\x85\xa1</root>",
@@ -5670,13 +5763,13 @@ test "[unit] - [XML 1.1 normalization]: canonical forms cover composition and or
     };
     inline for (cases) |input| {
         const result = try normalizationOutcome(config, .{}, input, .whole);
-        try std.testing.expectEqual(xml.ProfileNormalizationStatus.not_normalized, result.status);
+        try std.testing.expectEqual(profile.ProfileNormalizationStatus.not_normalized, result.status);
         try std.testing.expectEqual(xml.NormalizationIssueKind.not_nfc, result.issue.?.kind);
     }
 
     const normalized = "<?xml version='1.1'?><root>\xea\xb0\x80a\xcc\x95</root>";
     try std.testing.expectEqual(
-        xml.NormalizationResultFor(config){ .status = .normalized, .issue = null },
+        profile.NormalizationResultFor(config){ .status = .normalized, .issue = null },
         try normalizationOutcome(config, .{}, normalized, .whole),
     );
     try expectNormalizationSchedules(
@@ -5686,11 +5779,11 @@ test "[unit] - [XML 1.1 normalization]: canonical forms cover composition and or
 }
 
 test "[unit] - [XML 1.1 normalization]: expanded references preserve construct rules" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const composing = "<?xml version='1.1'?><root>\xcc\x81x</root>";
     const composing_offset = std.mem.indexOf(u8, composing, "\xcc\x81").?;
     try std.testing.expectEqual(
-        xml.NormalizationResultFor(config){
+        profile.NormalizationResultFor(config){
             .status = .not_normalized,
             .issue = .{
                 .kind = .composing_start,
@@ -5708,7 +5801,7 @@ test "[unit] - [XML 1.1 normalization]: expanded references preserve construct r
     const reference = "<?xml version='1.1'?><root>A&#x30A;</root>";
     const reference_offset = std.mem.indexOf(u8, reference, "&#x30A;").?;
     try std.testing.expectEqual(
-        xml.NormalizationResultFor(config){
+        profile.NormalizationResultFor(config){
             .status = .not_normalized,
             .issue = .{
                 .kind = .not_nfc,
@@ -5726,7 +5819,7 @@ test "[unit] - [XML 1.1 normalization]: expanded references preserve construct r
     const attribute = "<?xml version='1.1'?><root a='A&#x30A;'/>";
     const attribute_offset = std.mem.indexOf(u8, attribute, "a=").?;
     try std.testing.expectEqual(
-        xml.NormalizationResultFor(config){
+        profile.NormalizationResultFor(config){
             .status = .not_normalized,
             .issue = .{
                 .kind = .not_nfc,
@@ -5744,7 +5837,7 @@ test "[unit] - [XML 1.1 normalization]: expanded references preserve construct r
     const cdata = "<?xml version='1.1'?><root><![CDATA[\xcc\x81x]]></root>";
     const cdata_offset = std.mem.indexOf(u8, cdata, "\xcc\x81").?;
     try std.testing.expectEqual(
-        xml.NormalizationResultFor(config){
+        profile.NormalizationResultFor(config){
             .status = .not_normalized,
             .issue = .{
                 .kind = .composing_start,
@@ -5762,7 +5855,7 @@ test "[unit] - [XML 1.1 normalization]: expanded references preserve construct r
     const name = "<?xml version='1.1'?><\xe1\x85\xa1/>";
     const name_offset = std.mem.indexOf(u8, name, "\xe1\x85\xa1").?;
     try std.testing.expectEqual(
-        xml.NormalizationResultFor(config){
+        profile.NormalizationResultFor(config){
             .status = .not_normalized,
             .issue = .{
                 .kind = .composing_start,
@@ -5779,20 +5872,20 @@ test "[unit] - [XML 1.1 normalization]: expanded references preserve construct r
 }
 
 test "[property] - [XML 1.1 normalization]: UTF-16 source findings retain byte offsets" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const utf8 = "<?xml version='1.1'?><root>e\xcc\x81</root>";
     const encoded = try encodeUtf16(std.testing.allocator, utf8, .little, true);
     defer std.testing.allocator.free(encoded);
     const expected_offset = 2 + 2 * std.mem.indexOf(u8, utf8, "\xcc\x81").?;
     const result = try normalizationOutcome(config, .{}, encoded, .{ .fixed = 1 });
-    try std.testing.expectEqual(xml.ProfileNormalizationStatus.not_normalized, result.status);
+    try std.testing.expectEqual(profile.ProfileNormalizationStatus.not_normalized, result.status);
     try std.testing.expectEqual(xml.NormalizationIssueKind.not_nfc, result.issue.?.kind);
     try std.testing.expectEqual(@as(u64, expected_offset), result.issue.?.location.byte_offset);
 }
 
 test "[unit] - [XML 1.1 normalization]: reset clears verification state" {
-    const config = xml.Configs.XML11_NONVALIDATING;
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML11_NONVALIDATING;
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed("<?xml version='1.1'?><root>e\xcc\x81</root>", true);
     while (true) switch (try reader.next()) {
@@ -5800,7 +5893,7 @@ test "[unit] - [XML 1.1 normalization]: reset clears verification state" {
         .need_input => return error.UnexpectedNeedInput,
         .done => break,
     };
-    try std.testing.expectEqual(xml.ProfileNormalizationStatus.not_normalized, reader.normalizationResult().status);
+    try std.testing.expectEqual(profile.ProfileNormalizationStatus.not_normalized, reader.normalizationResult().status);
 
     try reader.reset(.retain_capacity);
     try reader.feed("<?xml version='1.1'?><root/>", true);
@@ -5809,15 +5902,15 @@ test "[unit] - [XML 1.1 normalization]: reset clears verification state" {
         .need_input => return error.UnexpectedNeedInput,
         .done => break,
     };
-    try std.testing.expectEqual(xml.ProfileNormalizationStatus.normalized, reader.normalizationResult().status);
+    try std.testing.expectEqual(profile.ProfileNormalizationStatus.normalized, reader.normalizationResult().status);
 }
 
 test "[unit] - [XML 1.1 normalization]: unknown properties remain explicit" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const input = "<?xml version='1.1'?><root>\xcd\xb8</root>";
     const offset = std.mem.indexOf(u8, input, "\xcd\xb8").?;
     try std.testing.expectEqual(
-        xml.NormalizationResultFor(config){
+        profile.NormalizationResultFor(config){
             .status = .indeterminate,
             .issue = .{
                 .kind = .unknown_character,
@@ -5832,7 +5925,7 @@ test "[unit] - [XML 1.1 normalization]: unknown properties remain explicit" {
         try normalizationOutcome(config, .{}, input, .whole),
     );
 
-    var strict: xml.OptionsFor(config) = .{};
+    var strict: profile.OptionsFor(config) = .{};
     strict.normalization = .require;
     try expectProfileFailureSchedules(
         config,
@@ -5845,7 +5938,7 @@ test "[unit] - [XML 1.1 normalization]: unknown properties remain explicit" {
     );
 
     try std.testing.expectEqual(
-        xml.NormalizationResultFor(config){ .status = .normalized, .issue = null },
+        profile.NormalizationResultFor(config){ .status = .normalized, .issue = null },
         try normalizationOutcome(
             config,
             .{},
@@ -5856,22 +5949,22 @@ test "[unit] - [XML 1.1 normalization]: unknown properties remain explicit" {
 }
 
 test "[integration] - [XML 1.1 normalization]: DTD values and Nmtokens are verified" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const entity = "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e '&#x301;'>]><r/>";
     const entity_result = try normalizationOutcome(config, .{}, entity, .whole);
-    try std.testing.expectEqual(xml.ProfileNormalizationStatus.not_normalized, entity_result.status);
+    try std.testing.expectEqual(profile.ProfileNormalizationStatus.not_normalized, entity_result.status);
     try std.testing.expectEqual(xml.NormalizationIssueKind.composing_start, entity_result.issue.?.kind);
 
     const token = "<?xml version='1.1'?><!DOCTYPE r [" ++
         "<!ATTLIST r n NMTOKEN #IMPLIED>]><r n='\xcc\x81x'/>";
     const token_result = try normalizationOutcome(config, .{}, token, .whole);
-    try std.testing.expectEqual(xml.ProfileNormalizationStatus.not_normalized, token_result.status);
+    try std.testing.expectEqual(profile.ProfileNormalizationStatus.not_normalized, token_result.status);
     try std.testing.expectEqual(xml.NormalizationIssueKind.composing_start, token_result.issue.?.kind);
 
     const boundary = "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e 'x'>]>" ++
         "<r>&e;\xcc\x81</r>";
     const boundary_result = try normalizationOutcome(config, .{}, boundary, .{ .fixed = 1 });
-    try std.testing.expectEqual(xml.ProfileNormalizationStatus.not_normalized, boundary_result.status);
+    try std.testing.expectEqual(profile.ProfileNormalizationStatus.not_normalized, boundary_result.status);
     try std.testing.expectEqual(
         xml.NormalizationIssueKind.composing_start,
         boundary_result.issue.?.kind,
@@ -5886,7 +5979,7 @@ test "[integration] - [XML 1.1 normalization]: DTD values and Nmtokens are verif
         .whole,
     );
     try std.testing.expectEqual(
-        xml.ProfileNormalizationStatus.not_normalized,
+        profile.ProfileNormalizationStatus.not_normalized,
         processing_instruction_result.status,
     );
     try std.testing.expectEqual(
@@ -5900,8 +5993,8 @@ test "[integration] - [XML 1.1 normalization]: DTD values and Nmtokens are verif
 }
 
 test "[integration] - [XML 1.1 characters]: references admit restricted controls" {
-    const config = xml.Configs.XML11_NONVALIDATING;
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML11_NONVALIDATING;
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed("<?xml version='1.1'?><root>&#x1;&#x7f;</root>", true);
 
@@ -5920,7 +6013,7 @@ test "[integration] - [XML 1.1 characters]: references admit restricted controls
     };
     try std.testing.expectEqualSlices(u8, &.{ 0x1, 0x7f }, text[0..text_len]);
 
-    var literal = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    var literal = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer literal.deinit();
     try literal.feed("<?xml version='1.1'?><root>\x01</root>", true);
     while (true) switch (literal.next() catch |err| {
@@ -5938,7 +6031,7 @@ test "[integration] - [XML 1.1 characters]: references admit restricted controls
 }
 
 test "[property] - [XML 1.1 line endings]: semantic values agree across schedules" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const input =
         "<?xml version='1.1'?><root a='A\xc2\x85B\xe2\x80\xa8C\r\xc2\x85D'>" ++
         "T\xc2\x85U\xe2\x80\xa8V\r\xc2\x85W" ++
@@ -5961,7 +6054,7 @@ test "[property] - [XML 1.1 line endings]: semantic values agree across schedule
 }
 
 test "[property] - [XML 1.1 UTF-16]: line endings agree across byte schedules" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const encoded = try encodeUtf16(
         std.testing.allocator,
         "<?xml version='1.1'?><root>A\xc2\x85B\xe2\x80\xa8C\r\xc2\x85D</root>",
@@ -5977,8 +6070,8 @@ test "[property] - [XML 1.1 UTF-16]: line endings agree across byte schedules" {
 }
 
 test "[unit] - [XML 1.1 reset]: pending line scalar does not cross documents" {
-    const config = xml.Configs.XML11_NONVALIDATING;
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML11_NONVALIDATING;
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed("<?xml version='1.1'?><root>\xc2", false);
     while (true) switch (try reader.next()) {
@@ -6006,7 +6099,7 @@ test "[unit] - [XML 1.1 reset]: pending line scalar does not cross documents" {
 }
 
 test "[integration] - [XML 1.1 DTD]: declaration references use document character rules" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const input =
         "<?xml version='1.1'?><!DOCTYPE r [" ++
         "<!ENTITY e '&#x1;&#xD;&#x85;&#x2028;'>]><r>&e;</r>";
@@ -6020,17 +6113,17 @@ test "[integration] - [XML 1.1 DTD]: declaration references use document charact
 }
 
 test "[integration] - [XML 1.1 validation]: internal replacement whitespace remains ignorable" {
-    const config = xml.Configs.XML11_VALIDATING;
+    const config = profile.Configs.XML11_VALIDATING;
     const declarations =
         "<!ENTITY data '&#x9;&#xA;&#xD;'>" ++
         "<!ELEMENT root (child)><!ELEMENT child EMPTY>";
     const valid = "<?xml version='1.1'?><!DOCTYPE root [" ++ declarations ++
         "]><root>&data;<child/></root>";
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed(valid, true);
     var saw_ignorable = false;
-    var status: ?xml.ProfileValidationStatus = null;
+    var status: ?profile.ProfileValidationStatus = null;
     while (true) switch (try reader.next()) {
         .event => |event| switch (event) {
             .text => |text| saw_ignorable = saw_ignorable or text.ignorable_whitespace,
@@ -6041,7 +6134,7 @@ test "[integration] - [XML 1.1 validation]: internal replacement whitespace rema
         .done => break,
     };
     try std.testing.expect(saw_ignorable);
-    try std.testing.expectEqual(xml.ProfileValidationStatus.valid, status.?);
+    try std.testing.expectEqual(profile.ProfileValidationStatus.valid, status.?);
 
     const invalid = "<?xml version='1.1'?><!DOCTYPE root [" ++ declarations ++
         "]><root>&#x20;<child/></root>";
@@ -6058,9 +6151,9 @@ test "[integration] - [XML 1.1 validation]: internal replacement whitespace rema
 }
 
 test "[integration] - [XML 1.1 namespaces]: prefixed bindings can be undeclared" {
-    const config = xml.Configs.XML11_NAMESPACES_NONVALIDATING;
+    const config = profile.Configs.XML11_NAMESPACES_NONVALIDATING;
     const valid = "<?xml version='1.1'?><r xmlns:p='urn:p'><a xmlns:p=''/></r>";
-    var valid_reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    var valid_reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer valid_reader.deinit();
     try valid_reader.feed(valid, true);
     while (true) switch (try valid_reader.next()) {
@@ -6074,7 +6167,7 @@ test "[integration] - [XML 1.1 namespaces]: prefixed bindings can be undeclared"
         "<?xml version='1.1'?><r xmlns:p='urn:p'><a xmlns:p=''><p:b/></a></r>",
     };
     inline for (cases) |input| {
-        var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+        var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
         defer reader.deinit();
         try reader.feed(input, true);
         while (true) switch (reader.next() catch |err| {
@@ -6089,16 +6182,16 @@ test "[integration] - [XML 1.1 namespaces]: prefixed bindings can be undeclared"
 }
 
 test "[integration] - [DTD validation]: accepts declared sequence and attributes" {
-    const config = xml.Configs.XML10_VALIDATING;
+    const config = profile.Configs.XML10_VALIDATING;
     const input = "<!DOCTYPE root [" ++
         "<!ELEMENT root (item+)>" ++
         "<!ELEMENT item (#PCDATA)>" ++
         "<!ATTLIST item id ID #REQUIRED refs IDREFS #IMPLIED kind (a|b) #FIXED 'a'>" ++
         "]><root><item id='one'/><item id='two' refs='one' kind='a'>text</item></root>";
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed(input, true);
-    var status: ?xml.ProfileValidationStatus = null;
+    var status: ?profile.ProfileValidationStatus = null;
     while (true) switch (try reader.next()) {
         .event => |event| switch (event) {
             .document_end => |document| status = document.validation,
@@ -6107,15 +6200,15 @@ test "[integration] - [DTD validation]: accepts declared sequence and attributes
         .done => break,
         .need_input => unreachable,
     };
-    try std.testing.expectEqual(xml.ProfileValidationStatus.valid, status.?);
+    try std.testing.expectEqual(profile.ProfileValidationStatus.valid, status.?);
     try std.testing.expect(reader.diagnostic() == null);
 }
 
 test "[failure] - [DTD validation]: stop-first reports content mismatch" {
-    const config = xml.Configs.XML10_VALIDATING;
+    const config = profile.Configs.XML10_VALIDATING;
     const input = "<!DOCTYPE root [<!ELEMENT root (a,b)><!ELEMENT a EMPTY><!ELEMENT b EMPTY>]>" ++
         "<root><b/></root>";
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed(input, true);
     while (true) {
@@ -6131,15 +6224,15 @@ test "[failure] - [DTD validation]: stop-first reports content mismatch" {
 }
 
 test "[integration] - [DTD validation]: collection reaches explicit invalid result" {
-    const config = xml.Configs.XML10_VALIDATING;
+    const config = profile.Configs.XML10_VALIDATING;
     const input = "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root needed CDATA #REQUIRED>]>" ++
         "<root><child/></root>";
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{
         .validation = .{ .collect_validity_errors = true },
     });
     defer reader.deinit();
     try reader.feed(input, true);
-    var status: ?xml.ProfileValidationStatus = null;
+    var status: ?profile.ProfileValidationStatus = null;
     while (true) switch (try reader.next()) {
         .event => |event| switch (event) {
             .document_end => |document| status = document.validation,
@@ -6148,7 +6241,7 @@ test "[integration] - [DTD validation]: collection reaches explicit invalid resu
         .done => break,
         .need_input => unreachable,
     };
-    try std.testing.expectEqual(xml.ProfileValidationStatus.invalid, status.?);
+    try std.testing.expectEqual(profile.ProfileValidationStatus.invalid, status.?);
     try std.testing.expectEqual(
         xml.DiagnosticCode.validity_required_attribute,
         reader.diagnostic().?.code,
@@ -6160,11 +6253,11 @@ const ValidityLog = struct {
     len: usize = 0,
     cancel_after: ?usize = null,
 
-    fn sink(self: *@This()) xml.ValiditySinkFor(xml.Configs.XML10_VALIDATING) {
+    fn sink(self: *@This()) profile.ValiditySinkFor(profile.Configs.XML10_VALIDATING) {
         return .{ .context = self, .reportFn = report };
     }
 
-    fn report(context: ?*anyopaque, diagnostic: xml.DiagnosticFor(xml.Configs.XML10_VALIDATING)) xml.ProfileValidityAction {
+    fn report(context: ?*anyopaque, diagnostic: profile.DiagnosticFor(profile.Configs.XML10_VALIDATING)) profile.ProfileValidityAction {
         const self: *@This() = @ptrCast(@alignCast(context.?));
         if (self.len < self.codes.len) self.codes[self.len] = diagnostic.code;
         self.len += 1;
@@ -6174,11 +6267,11 @@ const ValidityLog = struct {
 };
 
 test "[integration] - [validity collection]: first error agrees and independent checks continue" {
-    const config = xml.Configs.XML10_VALIDATING;
+    const config = profile.Configs.XML10_VALIDATING;
     const input = "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root needed CDATA #REQUIRED>]>" ++
         "<root><child/></root>";
     var log: ValidityLog = .{};
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{
         .validation = .{
             .collect_validity_errors = true,
             .sink = log.sink(),
@@ -6186,7 +6279,7 @@ test "[integration] - [validity collection]: first error agrees and independent 
     });
     defer reader.deinit();
     try reader.feed(input, true);
-    var status: ?xml.ProfileValidationStatus = null;
+    var status: ?profile.ProfileValidationStatus = null;
     while (true) switch (try reader.next()) {
         .event => |event| switch (event) {
             .document_end => |document| status = document.validation,
@@ -6195,12 +6288,12 @@ test "[integration] - [validity collection]: first error agrees and independent 
         .done => break,
         .need_input => return error.UnexpectedNeedInput,
     };
-    try std.testing.expectEqual(xml.ProfileValidationStatus.invalid, status.?);
+    try std.testing.expectEqual(profile.ProfileValidationStatus.invalid, status.?);
     try std.testing.expect(log.len >= 2);
     try std.testing.expectEqual(xml.DiagnosticCode.validity_required_attribute, log.codes[0]);
     try std.testing.expectEqual(log.codes[0], reader.diagnostic().?.code);
 
-    var stop = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    var stop = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer stop.deinit();
     try stop.feed(input, true);
     while (true) {
@@ -6213,19 +6306,19 @@ test "[integration] - [validity collection]: first error agrees and independent 
 }
 
 test "[edge] - [validity collection]: diagnostic ceiling keeps the invalid result" {
-    const config = xml.Configs.XML10_VALIDATING;
+    const config = profile.Configs.XML10_VALIDATING;
     var log: ValidityLog = .{};
-    var options: xml.OptionsFor(config) = .{};
+    var options: profile.OptionsFor(config) = .{};
     options.validation.collect_validity_errors = true;
     options.validation.sink = log.sink();
     options.validation.limits.max_errors = 1;
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed(
         "<!DOCTYPE root [<!ELEMENT root EMPTY><!ATTLIST root first CDATA #REQUIRED second CDATA #REQUIRED>]><root/>",
         true,
     );
-    var status: ?xml.ProfileValidationStatus = null;
+    var status: ?profile.ProfileValidationStatus = null;
     while (true) switch (try reader.next()) {
         .event => |event| switch (event) {
             .document_end => |document| status = document.validation,
@@ -6235,13 +6328,13 @@ test "[edge] - [validity collection]: diagnostic ceiling keeps the invalid resul
         .need_input => return error.UnexpectedNeedInput,
     };
     try std.testing.expectEqual(@as(usize, 1), log.len);
-    try std.testing.expectEqual(xml.ProfileValidationStatus.invalid, status.?);
+    try std.testing.expectEqual(profile.ProfileValidationStatus.invalid, status.?);
 }
 
 test "[failure] - [validity sink]: cancellation is sticky" {
-    const config = xml.Configs.XML10_VALIDATING;
+    const config = profile.Configs.XML10_VALIDATING;
     var log: ValidityLog = .{ .cancel_after = 1 };
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{
         .validation = .{
             .collect_validity_errors = true,
             .sink = log.sink(),
@@ -6260,8 +6353,8 @@ test "[failure] - [validity sink]: cancellation is sticky" {
 }
 
 fn validationAllocationAttempt(allocator: std.mem.Allocator) !void {
-    const config = xml.Configs.XML10_VALIDATING;
-    var reader = try xml.ReaderFor(config).init(allocator, .{});
+    const config = profile.Configs.XML10_VALIDATING;
+    var reader = try profile.ReaderFor(config).init(allocator, .{});
     defer reader.deinit();
     try reader.feed(
         "<!DOCTYPE root [" ++
@@ -6286,11 +6379,11 @@ test "[failure] - [validation storage]: every allocation failure cleans up" {
 }
 
 test "[unit] - [validation storage]: retained reset clears identity state and reuses capacity" {
-    const config = xml.Configs.XML10_VALIDATING;
+    const config = profile.Configs.XML10_VALIDATING;
     const input = "<!DOCTYPE root [<!ELEMENT root (item+)><!ELEMENT item EMPTY>" ++
         "<!ATTLIST item id ID #REQUIRED ref IDREF #IMPLIED>]>" ++
         "<root><item id='one'/><item id='two' ref='one'/></root>";
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
 
     try reader.feed(input, true);
@@ -6324,8 +6417,8 @@ test "[unit] - [validation storage]: retained reset clears identity state and re
 }
 
 test "[integration] - [internal DTD]: applies defaults normalization and entity replacement" {
-    const config = xml.Configs.XML10_NONVALIDATING;
-    const Reader = xml.ReaderFor(config);
+    const config = profile.Configs.XML10_NONVALIDATING;
+    const Reader = profile.ReaderFor(config);
     const input = "<!DOCTYPE root [<!ELEMENT root (#PCDATA)>" ++
         "<!ATTLIST root mode NMTOKENS '  one   two  '>" ++
         "<!ENTITY hello 'Hello'>]><root>&hello;</root>";
@@ -6366,8 +6459,8 @@ test "[integration] - [internal DTD]: applies defaults normalization and entity 
 }
 
 test "[integration] - [document type event]: header precedes internal subset input" {
-    const config = xml.Configs.XML10_NONVALIDATING;
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML10_NONVALIDATING;
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root PUBLIC 'public-id' 'system-id' [", false);
 
@@ -6403,8 +6496,8 @@ test "[integration] - [document type event]: header precedes internal subset inp
 }
 
 test "[integration] - [document type event]: default policy reports and skips external subset" {
-    const config = xml.Configs.XML10_NONVALIDATING;
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML10_NONVALIDATING;
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
 
@@ -6422,12 +6515,12 @@ test "[integration] - [document type event]: default policy reports and skips ex
         .done => break,
     };
     try std.testing.expect(saw_doctype);
-    try std.testing.expectEqual(@as(?xml.DiagnosticFor(config), null), reader.diagnostic());
+    try std.testing.expectEqual(@as(?profile.DiagnosticFor(config), null), reader.diagnostic());
 }
 
 test "[integration] - [internal DTD namespaces]: default declaration precedes expansion" {
-    const config = xml.Configs.XML10_NAMESPACES_NONVALIDATING;
-    const Reader = xml.ReaderFor(config);
+    const config = profile.Configs.XML10_NAMESPACES_NONVALIDATING;
+    const Reader = profile.ReaderFor(config);
     const input = "<!DOCTYPE p:root [<!ELEMENT p:root EMPTY>" ++
         "<!ATTLIST p:root xmlns:p CDATA 'urn:defaulted'>]><p:root/>";
     var reader = try Reader.init(std.testing.allocator, .{});
@@ -6451,8 +6544,8 @@ test "[integration] - [internal DTD namespaces]: default declaration precedes ex
 }
 
 test "[integration] - [internal DTD chunking]: one-byte input preserves declaration effects" {
-    const config = xml.Configs.XML10_NONVALIDATING;
-    const Reader = xml.ReaderFor(config);
+    const config = profile.Configs.XML10_NONVALIDATING;
+    const Reader = profile.ReaderFor(config);
     const input = "<!DOCTYPE root [<!ELEMENT root (child)>" ++
         "<!ELEMENT child (#PCDATA)><!ENTITY value '<child>text</child>'>]><root>&value;</root>";
     var reader = try Reader.init(std.testing.allocator, .{});
@@ -6490,8 +6583,8 @@ test "[property] - [internal DTD chunking]: schedules preserve raw and namespace
         "<!ATTLIST p:root xmlns:p CDATA 'urn:p' words NMTOKENS ' one   two '>]>" ++
         "<p:root>&outer;</p:root>";
     inline for (.{
-        xml.Configs.XML10_NONVALIDATING,
-        xml.Configs.XML10_NAMESPACES_NONVALIDATING,
+        profile.Configs.XML10_NONVALIDATING,
+        profile.Configs.XML10_NAMESPACES_NONVALIDATING,
     }) |config| {
         const whole = try dtdOutcome(config, input, .whole);
         for (1..input.len) |split| {
@@ -6509,11 +6602,11 @@ test "[property] - [validating chunking]: schedules preserve events and final va
         "<!ATTLIST item id ID #REQUIRED ref IDREF #IMPLIED>]>" ++
         "<root><item id='one'/><item id='two' ref='one'>text</item></root>";
     inline for (.{
-        xml.Configs.XML10_VALIDATING,
-        xml.Configs.XML10_NAMESPACES_VALIDATING,
+        profile.Configs.XML10_VALIDATING,
+        profile.Configs.XML10_NAMESPACES_VALIDATING,
     }) |config| {
         const whole = try dtdOutcome(config, input, .whole);
-        try std.testing.expectEqual(xml.ProfileValidationStatus.valid, whole.validation.?);
+        try std.testing.expectEqual(profile.ProfileValidationStatus.valid, whole.validation.?);
         for (1..input.len) |split| {
             try std.testing.expectEqual(whole, try dtdOutcome(config, input, .{ .split = split }));
         }
@@ -6525,8 +6618,8 @@ test "[property] - [validating chunking]: schedules preserve events and final va
 }
 
 test "[failure] - [internal entities]: recursion and expansion limits fail" {
-    const config = xml.Configs.XML10_NONVALIDATING;
-    const Reader = xml.ReaderFor(config);
+    const config = profile.Configs.XML10_NONVALIDATING;
+    const Reader = profile.ReaderFor(config);
     {
         var reader = try Reader.init(std.testing.allocator, .{});
         defer reader.deinit();
@@ -6561,16 +6654,16 @@ test "[failure] - [internal entities]: recursion and expansion limits fail" {
 }
 
 test "[edge] - [entity expansion ratio]: accepts the boundary and rejects one byte over" {
-    const config = xml.Configs.XML10_NONVALIDATING;
+    const config = profile.Configs.XML10_NONVALIDATING;
     inline for (.{
         .{ "123456789", false },
         .{ "1234567890", true },
     }) |case| {
-        var options: xml.OptionsFor(config) = .{};
+        var options: profile.OptionsFor(config) = .{};
         options.dtd_limits.max_expanded_bytes = 100;
         options.dtd_limits.max_expansion_ratio = 3;
         options.dtd_limits.expansion_ratio_minimum_bytes = 0;
-        var reader = try xml.ReaderFor(config).init(std.testing.allocator, options);
+        var reader = try profile.ReaderFor(config).init(std.testing.allocator, options);
         defer reader.deinit();
         const input = try std.mem.concat(std.testing.allocator, u8, &.{
             "<!DOCTYPE root [<!ENTITY a '",
@@ -6596,9 +6689,9 @@ test "[edge] - [entity expansion ratio]: accepts the boundary and rejects one by
 }
 
 test "[failure] - [DTD declaration limit]: rejects before declaration publication" {
-    const config = xml.Configs.XML10_NONVALIDATING;
+    const config = profile.Configs.XML10_NONVALIDATING;
     const input = "<!DOCTYPE root [<!ELEMENT root EMPTY>]><root/>";
-    var options: xml.OptionsFor(config) = .{};
+    var options: profile.OptionsFor(config) = .{};
     options.dtd_limits.max_declaration_bytes = "<!ELEMENT root EMPTY>".len - 1;
 
     try expectProfileFailureSchedules(
@@ -6613,7 +6706,7 @@ test "[failure] - [DTD declaration limit]: rejects before declaration publicatio
 }
 
 test "[failure] - [predefined entities]: invalid declarations are fatal" {
-    const config = xml.Configs.XML10_NONVALIDATING;
+    const config = profile.Configs.XML10_NONVALIDATING;
     const input = "<!DOCTYPE root [<!ENTITY lt '&#60;'>]><root/>";
 
     try expectProfileFailureSchedules(
@@ -6628,7 +6721,7 @@ test "[failure] - [predefined entities]: invalid declarations are fatal" {
 }
 
 test "[property] - [DTD diagnostics]: malformed grammar location is schedule invariant" {
-    const config = xml.Configs.XML10_NONVALIDATING;
+    const config = profile.Configs.XML10_NONVALIDATING;
     const input = "<!DOCTYPE root [<!ELEMENT root (a|)>]><root/>";
     try expectProfileFailureSchedules(
         config,
@@ -6642,7 +6735,7 @@ test "[property] - [DTD diagnostics]: malformed grammar location is schedule inv
 }
 
 test "[property] - [DTD diagnostics]: declaration value locations are schedule invariant" {
-    const config = xml.Configs.XML10_NONVALIDATING;
+    const config = profile.Configs.XML10_NONVALIDATING;
     const attribute_input =
         "<!DOCTYPE root [<!ATTLIST root mode CDATA '&#x110000;'>]><root/>";
     try expectProfileFailureSchedules(
@@ -6669,9 +6762,9 @@ test "[property] - [DTD diagnostics]: declaration value locations are schedule i
 }
 
 test "[failure] - [DTD replacement bytes limit]: reports the rejected value byte" {
-    const config = xml.Configs.XML10_NONVALIDATING;
+    const config = profile.Configs.XML10_NONVALIDATING;
     const input = "<!DOCTYPE root [<!ENTITY value 'ab'>]><root/>";
-    var options: xml.OptionsFor(config) = .{};
+    var options: profile.OptionsFor(config) = .{};
     options.dtd_limits.max_entity_replacement_bytes = 1;
     try expectProfileFailureSchedules(
         config,
@@ -6693,8 +6786,8 @@ test "[failure] - [DTD storage]: every allocation failure cleans up" {
 }
 
 test "[unit] - [DTD reset]: declarations and active entity state never cross documents" {
-    const config = xml.Configs.XML10_NONVALIDATING;
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML10_NONVALIDATING;
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed(
         "<!DOCTYPE root [<!ENTITY value 'text'>]><root>&value;</root>",
@@ -6721,11 +6814,11 @@ test "[unit] - [DTD reset]: declarations and active entity state never cross doc
 }
 
 test "[integration] - [detailed DTD events]: declarations and entity boundaries retain order" {
-    const config: xml.Config = .{
+    const config: profile.Config = .{
         .profile = .xml10_nonvalidating,
         .report = .detailed,
     };
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed(
         "<!DOCTYPE root [<!--dtd--><?inside data?>" ++
@@ -6771,7 +6864,7 @@ test "[integration] - [detailed DTD events]: declarations and entity boundaries 
 }
 
 test "[integration] - [standalone DTD effects]: undeclared entity exception requires non-standalone input" {
-    const config = xml.Configs.XML10_NONVALIDATING;
+    const config = profile.Configs.XML10_NONVALIDATING;
     const body = "<!DOCTYPE root [<!ENTITY % marker '<!ELEMENT root ANY>'>%marker;]>" ++
         "<root>&undeclared;</root>";
     inline for (.{
@@ -6779,7 +6872,7 @@ test "[integration] - [standalone DTD effects]: undeclared entity exception requ
         .{ "<?xml version='1.0' standalone='no'?>", false },
         .{ "<?xml version='1.0' standalone='yes'?>", true },
     }) |case| {
-        var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+        var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
         defer reader.deinit();
         const input = try std.mem.concat(std.testing.allocator, u8, &.{ case[0], body });
         defer std.testing.allocator.free(input);
@@ -6797,8 +6890,8 @@ test "[integration] - [standalone DTD effects]: undeclared entity exception requ
 }
 
 test "[integration] - [DTD attribute defaults]: nested entities normalize before publication" {
-    const config = xml.Configs.XML10_NONVALIDATING;
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML10_NONVALIDATING;
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed(
         "<!DOCTYPE root [<!ENTITY % marker 'literal'><!ENTITY inner 'one  two'>" ++
@@ -6822,8 +6915,8 @@ test "[integration] - [DTD attribute defaults]: nested entities normalize before
 }
 
 test "[property] - [entity memory]: repeated expansion retains a fixed active shape" {
-    const config = xml.Configs.XML10_NONVALIDATING;
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, .{});
+    const config = profile.Configs.XML10_NONVALIDATING;
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, .{});
     defer reader.deinit();
     var baseline: xml.MemoryUsage = .{};
     inline for (.{ @as(usize, 10), @as(usize, 10_000) }, 0..) |count, pass| {
@@ -6858,13 +6951,13 @@ test "[property] - [entity memory]: repeated expansion retains a fixed active sh
 }
 
 test "reader - lifecycle: feed reset and deinit preserve state contract" {
-    const Reader = xml.ReaderFor(xml.Configs.XML10_UTF8_NO_DTD);
+    const Reader = profile.ReaderFor(profile.Configs.XML10_UTF8_NO_DTD);
     var reader = try Reader.init(std.testing.allocator, .{});
     defer if (reader.lifecycle != .deinitialized) reader.deinit();
 
-    try std.testing.expectEqual(xml.ProfileLifecycle.ready, reader.lifecycle);
+    try std.testing.expectEqual(profile.ProfileLifecycle.ready, reader.lifecycle);
     try reader.feed("<root/>", true);
-    try std.testing.expectEqual(xml.ProfileLifecycle.producing, reader.lifecycle);
+    try std.testing.expectEqual(profile.ProfileLifecycle.producing, reader.lifecycle);
     try std.testing.expectError(error.InvalidState, reader.feed("", true));
 
     while (true) {
@@ -6877,7 +6970,7 @@ test "reader - lifecycle: feed reset and deinit preserve state contract" {
     try std.testing.expect(reader.memoryUsage().retained_capacity > 0);
 
     try reader.reset(.retain_capacity);
-    try std.testing.expectEqual(xml.ProfileLifecycle.ready, reader.lifecycle);
+    try std.testing.expectEqual(profile.ProfileLifecycle.ready, reader.lifecycle);
     try std.testing.expect(reader.diagnostic() == null);
     try std.testing.expect(reader.memoryUsage().retained_capacity > 0);
 
@@ -6885,7 +6978,7 @@ test "reader - lifecycle: feed reset and deinit preserve state contract" {
     try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().retained_capacity);
 
     reader.deinit();
-    try std.testing.expectEqual(xml.ProfileLifecycle.deinitialized, reader.lifecycle);
+    try std.testing.expectEqual(profile.ProfileLifecycle.deinitialized, reader.lifecycle);
     try std.testing.expectError(error.InvalidState, reader.reset(.release_memory));
 }
 
@@ -7156,7 +7249,7 @@ test "diagnostic - final input: structural and token truncation remain distinct"
 }
 
 test "adapter - whole slice: uses the same event and lifetime contract" {
-    const SliceReader = xml.ProfileSliceReader(CORE_CONFIG);
+    const SliceReader = profile.ProfileSliceReader(CORE_CONFIG);
     var slice = try SliceReader.init(std.testing.allocator, .{}, "<root><item key='value'/></root>");
     defer slice.deinit();
 
@@ -7181,7 +7274,7 @@ test "adapter - std Io Reader: greedy buffered refill handles one-byte source re
     });
     source.artificial_limit = .limited(1);
 
-    const IoReader = xml.ProfileIoReader(CORE_CONFIG);
+    const IoReader = profile.ProfileIoReader(CORE_CONFIG);
     var input = try IoReader.init(std.testing.allocator, .{}, &source.interface);
     defer input.deinit();
 
@@ -7201,7 +7294,7 @@ test "[failure] - [buffered reader]: source failure is stable and allocation-fre
     var source_buffer: [1]u8 = undefined;
     var source = std.Io.Reader.failing;
     source.buffer = &source_buffer;
-    var input = try xml.ProfileIoReader(CORE_CONFIG).init(
+    var input = try profile.ProfileIoReader(CORE_CONFIG).init(
         std.testing.allocator,
         .{},
         &source,
@@ -7218,7 +7311,7 @@ test "[failure] - [buffered reader]: source failure is stable and allocation-fre
 
 test "adapter - push drain: preserves event order and explicit cancellation" {
     var complete: PushContext = .{};
-    try xml.drainProfileSlice(
+    try profile.drainProfileSlice(
         CORE_CONFIG,
         std.testing.allocator,
         .{},
@@ -7230,7 +7323,7 @@ test "adapter - push drain: preserves event order and explicit cancellation" {
     try std.testing.expectEqual(@as(usize, 0), complete.attributes);
 
     var markup: PushContext = .{};
-    try xml.drainProfileSlice(
+    try profile.drainProfileSlice(
         CORE_CONFIG,
         std.testing.allocator,
         .{},
@@ -7241,7 +7334,7 @@ test "adapter - push drain: preserves event order and explicit cancellation" {
     try std.testing.expectEqual(@as(usize, 7), markup.events);
 
     var attributed: PushContext = .{};
-    try xml.drainProfileSlice(
+    try profile.drainProfileSlice(
         CORE_CONFIG,
         std.testing.allocator,
         .{},
@@ -7255,7 +7348,7 @@ test "adapter - push drain: preserves event order and explicit cancellation" {
     var cancelled: PushContext = .{ .cancel_after = 2 };
     try std.testing.expectError(
         error.Cancelled,
-        xml.drainProfileSlice(
+        profile.drainProfileSlice(
             CORE_CONFIG,
             std.testing.allocator,
             .{},
@@ -7268,8 +7361,8 @@ test "adapter - push drain: preserves event order and explicit cancellation" {
 }
 
 test "reader - vertical slice: whitespace and event spans use source positions" {
-    const located_config = xml.Configs.XML10_UTF8_NO_DTD_LOCATED;
-    const Reader = xml.ReaderFor(located_config);
+    const located_config = profile.Configs.XML10_UTF8_NO_DTD_LOCATED;
+    const Reader = profile.ReaderFor(located_config);
     var reader = try Reader.init(std.testing.allocator, .{});
     defer reader.deinit();
 
@@ -7295,8 +7388,8 @@ test "reader - vertical slice: whitespace and event spans use source positions" 
 }
 
 test "location - nested elements: explicit end spans use closing markup positions" {
-    const located_config = xml.Configs.XML10_UTF8_NO_DTD_LOCATED;
-    const Reader = xml.ReaderFor(located_config);
+    const located_config = profile.Configs.XML10_UTF8_NO_DTD_LOCATED;
+    const Reader = profile.ReaderFor(located_config);
     var reader = try Reader.init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed("<root><item/></root>", true);
@@ -7322,7 +7415,7 @@ test "location - nested elements: explicit end spans use closing markup position
 }
 
 test "reader - diagnostics: invalid document categories are sticky and exact" {
-    const Reader = xml.ReaderFor(xml.Configs.XML10_UTF8_NO_DTD_FAST);
+    const Reader = profile.ReaderFor(profile.Configs.XML10_UTF8_NO_DTD_FAST);
     var reader = try Reader.init(std.testing.allocator, .{});
     defer reader.deinit();
 
@@ -7350,7 +7443,7 @@ test "reader - diagnostics: invalid document categories are sticky and exact" {
 }
 
 test "reader - diagnostics: line and byte column survive CRLF and whitespace" {
-    const Reader = xml.ReaderFor(xml.Configs.XML10_UTF8_NO_DTD);
+    const Reader = profile.ReaderFor(profile.Configs.XML10_UTF8_NO_DTD);
     var reader = try Reader.init(std.testing.allocator, .{});
     defer reader.deinit();
 
@@ -7366,7 +7459,7 @@ test "reader - diagnostics: line and byte column survive CRLF and whitespace" {
 }
 
 test "location - mismatch diagnostic: primary and related locations retain line detail" {
-    const Reader = xml.ReaderFor(CORE_CONFIG);
+    const Reader = profile.ReaderFor(CORE_CONFIG);
     var reader = try Reader.init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed("\r\n<root><item></root>", true);
@@ -7400,7 +7493,7 @@ test "reader - diagnostics: empty text-only malformed and incomplete inputs diff
     };
 
     inline for (cases) |case| {
-        const Reader = xml.ReaderFor(xml.Configs.XML10_UTF8_NO_DTD_FAST);
+        const Reader = profile.ReaderFor(profile.Configs.XML10_UTF8_NO_DTD_FAST);
         var reader = try Reader.init(std.testing.allocator, .{});
         defer reader.deinit();
 
@@ -7550,7 +7643,7 @@ test "[property] - [attributes]: syntax whitespace is legal across every chunk b
 test "[edge] - [attributes]: nonquadratic duplicate path preserves source order" {
     var input_buffer: [2048]u8 = undefined;
     const input = try makeAttributeInput(&input_buffer, 65, false);
-    const SliceReader = xml.ProfileSliceReader(CORE_CONFIG);
+    const SliceReader = profile.ProfileSliceReader(CORE_CONFIG);
     var reader = try SliceReader.init(std.testing.allocator, .{}, input);
     defer reader.deinit();
 
@@ -7845,7 +7938,7 @@ test "[property] - [general UTF-8]: direct source path agrees across schedules" 
     try std.testing.expectEqualStrings("x\ny🙂", summary.text_bytes[0..summary.text_bytes_len]);
     try expectSummarySchedulesWithOptions(GENERAL_CONFIG, .{}, input, summary);
 
-    var reader = try xml.ReaderFor(GENERAL_FAST_CONFIG).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(GENERAL_FAST_CONFIG).init(std.testing.allocator, .{});
     defer reader.deinit();
     try drainGeneralChunks(&reader, input);
     try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().decoder_capacity);
@@ -7948,7 +8041,7 @@ test "[integration] - [buffered UTF-16]: one-byte source reads preserve semantic
     var io_buffer: [5]u8 = undefined;
     var source: std.testing.Reader = .init(&io_buffer, &.{.{ .buffer = UTF16LE_BOM }});
     source.artificial_limit = .limited(1);
-    var input = try xml.ProfileIoReader(GENERAL_CONFIG).init(
+    var input = try profile.ProfileIoReader(GENERAL_CONFIG).init(
         std.testing.allocator,
         .{},
         &source.interface,
@@ -7970,7 +8063,7 @@ test "[integration] - [UTF-16 namespaces]: decoded names use the namespace reade
     defer std.testing.allocator.free(encoded);
     const parts = [_][]const u8{encoded};
     const summary = try parseParts(
-        xml.Configs.XML10_NAMESPACES_NO_DTD,
+        profile.Configs.XML10_NAMESPACES_NO_DTD,
         std.testing.allocator,
         .{},
         &parts,
@@ -8002,7 +8095,7 @@ test "[property] - [UTF-16 memory]: decoded storage is independent of document l
     );
     defer std.testing.allocator.free(encoded);
 
-    var reader = try xml.ReaderFor(GENERAL_FAST_CONFIG).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(GENERAL_FAST_CONFIG).init(std.testing.allocator, .{});
     defer reader.deinit();
     try drainGeneralChunks(&reader, encoded);
     const capacity = reader.memoryUsage().decoder_capacity;
@@ -8031,7 +8124,7 @@ test "[failure] - [UTF-16 locations]: grammar diagnostics use original byte offs
     );
 
     const parts = [_][]const u8{encoded};
-    const Reader = xml.ReaderFor(GENERAL_CONFIG);
+    const Reader = profile.ReaderFor(GENERAL_CONFIG);
     var reader = try Reader.init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed(parts[0], true);
@@ -8054,7 +8147,7 @@ test "[integration] - [buffered UTF-8]: one-byte source reads preserve semantics
     var source: std.testing.Reader = .init(&io_buffer, &.{.{ .buffer = source_bytes }});
     source.artificial_limit = .limited(1);
 
-    var input = try xml.ProfileIoReader(CORE_CONFIG).init(
+    var input = try profile.ProfileIoReader(CORE_CONFIG).init(
         std.testing.allocator,
         .{},
         &source.interface,
@@ -8090,7 +8183,7 @@ test "[integration] - [buffered markup]: one-byte source reads preserve markup s
     );
     source.artificial_limit = .limited(1);
 
-    var input = try xml.ProfileIoReader(CORE_CONFIG).init(
+    var input = try profile.ProfileIoReader(CORE_CONFIG).init(
         std.testing.allocator,
         .{},
         &source.interface,
@@ -8342,8 +8435,8 @@ test "[failure] - [line diagnostics]: normalized endings retain source-byte loca
 }
 
 test "[integration] - [text locations]: source spans cover borrowed and transformed input" {
-    const located_config = xml.Configs.XML10_UTF8_NO_DTD_LOCATED;
-    const Reader = xml.ReaderFor(located_config);
+    const located_config = profile.Configs.XML10_UTF8_NO_DTD_LOCATED;
+    const Reader = profile.ReaderFor(located_config);
     const expected = [_]struct {
         text: []const u8,
         start: u64,
@@ -8383,9 +8476,9 @@ test "[integration] - [text locations]: source spans cover borrowed and transfor
 }
 
 test "[integration] - [event locations]: declaration span and PI target lifetime are exact" {
-    const located_config = xml.Configs.XML10_UTF8_NO_DTD_LOCATED;
-    const Reader = xml.ReaderFor(located_config);
-    var options: xml.OptionsFor(located_config) = .{};
+    const located_config = profile.Configs.XML10_UTF8_NO_DTD_LOCATED;
+    const Reader = profile.ReaderFor(located_config);
+    var options: profile.OptionsFor(located_config) = .{};
     options.limits.max_fragment_bytes = 4;
     const input = "<?xml version='1.0'?><?target abcdef?><r/>";
 
@@ -8437,7 +8530,7 @@ test "[integration] - [event locations]: declaration span and PI target lifetime
 }
 
 test "[edge] - [text fragments]: limits preserve scalars and expose schedule counts" {
-    var core_options: xml.OptionsFor(CORE_CONFIG) = .{};
+    var core_options: profile.OptionsFor(CORE_CONFIG) = .{};
     core_options.limits.max_fragment_bytes = 4;
     const input = "<r>abcdefghij</r>";
 
@@ -8464,7 +8557,7 @@ test "[edge] - [text fragments]: limits preserve scalars and expose schedule cou
     try std.testing.expectEqual(@as(usize, 10), byte_run.bytes);
     try std.testing.expectEqual(@as(usize, 10), byte_run.fragments);
 
-    var failure_options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var failure_options: profile.OptionsFor(FAST_CONFIG) = .{};
     failure_options.limits.max_fragment_bytes = 1;
     try expectCoreFailureSchedulesWithOptions(
         failure_options,
@@ -8485,7 +8578,7 @@ test "[edge] - [text fragments]: limits preserve scalars and expose schedule cou
 }
 
 test "[edge] - [reference limits]: partial and normalized value boundaries are exact" {
-    var options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var options: profile.OptionsFor(FAST_CONFIG) = .{};
     options.limits.max_partial_token_bytes = 5;
     const input = "<r>&amp;</r>";
     const parts = [_][]const u8{input};
@@ -8948,7 +9041,7 @@ test "[failure] - [document characters]: malformed UTF-8 and forbidden bytes win
 }
 
 test "[edge] - [markup fragments]: limits preserve complete comments processing instructions and CDATA" {
-    var options: xml.OptionsFor(CORE_CONFIG) = .{};
+    var options: profile.OptionsFor(CORE_CONFIG) = .{};
     options.limits.max_fragment_bytes = 4;
     const input = "<?target abcdefgh?><r><!--abcdefgh--><![CDATA[abcdefgh]]></r>";
     const parts = [_][]const u8{input};
@@ -8967,7 +9060,7 @@ test "[edge] - [markup fragments]: limits preserve complete comments processing 
     );
     try expectSummarySchedulesWithOptions(CORE_CONFIG, options, input, expected);
 
-    var target_options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var target_options: profile.OptionsFor(FAST_CONFIG) = .{};
     target_options.limits.max_processing_instruction_target_bytes = 3;
     try expectCoreFailureSchedulesWithOptions(
         target_options,
@@ -8978,7 +9071,7 @@ test "[edge] - [markup fragments]: limits preserve complete comments processing 
         null,
     );
 
-    var delimiter_options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var delimiter_options: profile.OptionsFor(FAST_CONFIG) = .{};
     delimiter_options.limits.max_partial_token_bytes = 2;
     try expectCoreFailureSchedulesWithOptions(
         delimiter_options,
@@ -9163,7 +9256,7 @@ test "[failure] - [markup delimiters]: every proper final prefix has a stable ca
 }
 
 test "[edge] - [markup limits]: at-limit values pass and multibyte excess fails" {
-    var short_target_options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var short_target_options: profile.OptionsFor(FAST_CONFIG) = .{};
     short_target_options.limits.max_processing_instruction_target_bytes = 1;
     const declaration_with_short_target_limit = "<?xml version='1.0'?><r/>";
     const declaration_with_short_target_parts = [_][]const u8{
@@ -9213,7 +9306,7 @@ test "[edge] - [markup limits]: at-limit values pass and multibyte excess fails"
         null,
     );
 
-    var options: xml.OptionsFor(CORE_CONFIG) = .{};
+    var options: profile.OptionsFor(CORE_CONFIG) = .{};
     options.limits.max_processing_instruction_target_bytes = 4;
     options.limits.max_fragment_bytes = 2;
     const valid = "<?abcd é?><r><!--é--><![CDATA[é]]></r>";
@@ -9226,7 +9319,7 @@ test "[edge] - [markup limits]: at-limit values pass and multibyte excess fails"
     try std.testing.expectEqualStrings("é", summary.comment_bytes[0..summary.comment_bytes_len]);
     try std.testing.expectEqualStrings("é", summary.cdata_bytes[0..summary.cdata_bytes_len]);
 
-    var unicode_target_options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var unicode_target_options: profile.OptionsFor(FAST_CONFIG) = .{};
     unicode_target_options.limits.max_processing_instruction_target_bytes = 2;
     const unicode_target_parts = [_][]const u8{"<?é?><r/>"};
     _ = try parseParts(
@@ -9245,7 +9338,7 @@ test "[edge] - [markup limits]: at-limit values pass and multibyte excess fails"
         null,
     );
 
-    var delimiter_options: xml.OptionsFor(CORE_CONFIG) = .{};
+    var delimiter_options: profile.OptionsFor(CORE_CONFIG) = .{};
     delimiter_options.limits.max_partial_token_bytes = 3;
     const comment_parts = [_][]const u8{"<r><!----></r>"};
     _ = try parseParts(
@@ -9255,7 +9348,7 @@ test "[edge] - [markup limits]: at-limit values pass and multibyte excess fails"
         &comment_parts,
     );
 
-    var cdata_delimiter_options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var cdata_delimiter_options: profile.OptionsFor(FAST_CONFIG) = .{};
     cdata_delimiter_options.limits.max_partial_token_bytes = 8;
     const cdata_delimiter_parts = [_][]const u8{"<r><![CDATA[x]]></r>"};
     _ = try parseParts(
@@ -9274,7 +9367,7 @@ test "[edge] - [markup limits]: at-limit values pass and multibyte excess fails"
         null,
     );
 
-    var declaration_options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var declaration_options: profile.OptionsFor(FAST_CONFIG) = .{};
     declaration_options.limits.max_partial_token_bytes = 21;
     const declaration_parts = [_][]const u8{"<?xml version='1.0'?><r/>"};
     _ = try parseParts(
@@ -9315,7 +9408,7 @@ test "[edge] - [markup limits]: at-limit values pass and multibyte excess fails"
         );
     }
 
-    var bracket_options: xml.OptionsFor(CORE_CONFIG) = .{};
+    var bracket_options: profile.OptionsFor(CORE_CONFIG) = .{};
     bracket_options.limits.max_fragment_bytes = 1;
     const bracket_input = "<r><![CDATA[]]x]]]></r>";
     const bracket_parts = [_][]const u8{bracket_input};
@@ -9336,7 +9429,7 @@ test "[edge] - [markup limits]: at-limit values pass and multibyte excess fails"
         bracket_summary,
     );
 
-    var fragment_options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var fragment_options: profile.OptionsFor(FAST_CONFIG) = .{};
     fragment_options.limits.max_fragment_bytes = 1;
     inline for (.{
         "<r><!--é--></r>",
@@ -9449,7 +9542,7 @@ test "[failure] - [attribute diagnostics]: duplicate locations retain line detai
 }
 
 test "[edge] - [attribute limits]: exact boundaries pass and one over fails" {
-    var options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var options: profile.OptionsFor(FAST_CONFIG) = .{};
     options.limits.max_attributes_per_element = 2;
     try expectSummarySchedulesWithOptions(FAST_CONFIG, options, "<r a='' b=''/>", .{
         .sequence = 1234,
@@ -9554,7 +9647,7 @@ test "[edge] - [attribute limits]: exact boundaries pass and one over fails" {
 }
 
 test "[edge] - [attribute limits]: specific limits win tied boundaries" {
-    var options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var options: profile.OptionsFor(FAST_CONFIG) = .{};
     options.limits.max_attribute_name_bytes = 1;
     options.limits.max_attribute_bytes_per_element = 1;
     try expectCoreFailure(
@@ -9592,9 +9685,9 @@ test "[edge] - [attribute limits]: specific limits win tied boundaries" {
 }
 
 test "[failure] - [attribute limits]: excess bytes are not stored" {
-    var options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var options: profile.OptionsFor(FAST_CONFIG) = .{};
     options.limits.max_attribute_name_bytes = 3;
-    const Reader = xml.ReaderFor(FAST_CONFIG);
+    const Reader = profile.ReaderFor(FAST_CONFIG);
     var reader = try Reader.init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<r abcd='value'/>", true);
@@ -9671,9 +9764,9 @@ test "[unit] - [attribute storage]: warm fixed shape performs no allocator opera
 }
 
 test "reader - limits: partial name fails before consuming the excess byte" {
-    var options: xml.OptionsFor(xml.Configs.XML10_UTF8_NO_DTD_FAST) = .{};
+    var options: profile.OptionsFor(profile.Configs.XML10_UTF8_NO_DTD_FAST) = .{};
     options.limits.max_partial_token_bytes = 3;
-    const Reader = xml.ReaderFor(xml.Configs.XML10_UTF8_NO_DTD_FAST);
+    const Reader = profile.ReaderFor(profile.Configs.XML10_UTF8_NO_DTD_FAST);
     var reader = try Reader.init(std.testing.allocator, options);
     defer reader.deinit();
 
@@ -9685,7 +9778,7 @@ test "reader - limits: partial name fails before consuming the excess byte" {
 }
 
 test "limit - closing name: partial-token limit precedes a later mismatch" {
-    var options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var options: profile.OptionsFor(FAST_CONFIG) = .{};
     options.limits.max_partial_token_bytes = 3;
     try expectCoreFailure(
         options,
@@ -9698,11 +9791,11 @@ test "limit - closing name: partial-token limit precedes a later mismatch" {
 }
 
 test "limit - open elements: depth succeeds at the boundary and fails before growth" {
-    var options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var options: profile.OptionsFor(FAST_CONFIG) = .{};
     options.limits.max_depth = 2;
 
     {
-        const Reader = xml.ReaderFor(FAST_CONFIG);
+        const Reader = profile.ReaderFor(FAST_CONFIG);
         var reader = try Reader.init(std.testing.allocator, options);
         defer reader.deinit();
         try reader.feed("<a><b/></a>", true);
@@ -9732,7 +9825,7 @@ test "limit - open elements: depth succeeds at the boundary and fails before gro
         null,
     );
 
-    const Reader = xml.ReaderFor(FAST_CONFIG);
+    const Reader = profile.ReaderFor(FAST_CONFIG);
     var limited = try Reader.init(std.testing.allocator, options);
     defer limited.deinit();
     try limited.feed("<a><b><c/></b></a>", true);
@@ -9745,7 +9838,7 @@ test "limit - open elements: depth succeeds at the boundary and fails before gro
 }
 
 test "limit - open names: cumulative active bytes succeed at limit and fail one over" {
-    var at_limit: xml.OptionsFor(FAST_CONFIG) = .{};
+    var at_limit: profile.OptionsFor(FAST_CONFIG) = .{};
     at_limit.limits.max_open_name_bytes = 5;
     try expectCoreFailure(
         at_limit,
@@ -9757,7 +9850,7 @@ test "limit - open names: cumulative active bytes succeed at limit and fail one 
     );
 
     {
-        const LimitedReader = xml.ReaderFor(FAST_CONFIG);
+        const LimitedReader = profile.ReaderFor(FAST_CONFIG);
         var limited = try LimitedReader.init(std.testing.allocator, at_limit);
         defer limited.deinit();
         try limited.feed("<root><ab/></root>", true);
@@ -9769,7 +9862,7 @@ test "limit - open names: cumulative active bytes succeed at limit and fail one 
         try std.testing.expectEqual(@as(usize, 5), limited.memoryUsage().open_name_bytes);
     }
 
-    const Reader = xml.ReaderFor(FAST_CONFIG);
+    const Reader = profile.ReaderFor(FAST_CONFIG);
     var reader = try Reader.init(std.testing.allocator, at_limit);
     defer reader.deinit();
     try reader.feed("<root><a/><b/><c/></root>", true);
@@ -9787,7 +9880,7 @@ test "limit - open names: cumulative active bytes succeed at limit and fail one 
 }
 
 test "limit - open names: partial-token precedence is stable when limits tie" {
-    var options: xml.OptionsFor(FAST_CONFIG) = .{};
+    var options: profile.OptionsFor(FAST_CONFIG) = .{};
     options.limits.max_open_name_bytes = 3;
     options.limits.max_partial_token_bytes = 3;
     try expectCoreFailure(
@@ -9957,7 +10050,7 @@ test "reader - retained capacity: warm nested parse performs no allocator operat
 }
 
 test "reader - retained ceiling: retain reset releases exceptional capacity" {
-    var options: xml.OptionsFor(CORE_CONFIG) = .{};
+    var options: profile.OptionsFor(CORE_CONFIG) = .{};
     options.limits.max_retained_bytes = 1;
     var reader = try CoreReader.init(std.testing.allocator, options);
     defer reader.deinit();
@@ -9982,7 +10075,7 @@ test "[edge] - [retained capacity]: exact boundary retains and one below release
     };
     try std.testing.expect(retained > 0);
 
-    var at_options: xml.OptionsFor(CORE_CONFIG) = .{};
+    var at_options: profile.OptionsFor(CORE_CONFIG) = .{};
     at_options.limits.max_retained_bytes = retained;
     var at = try CoreReader.init(std.testing.allocator, at_options);
     defer at.deinit();
@@ -9992,7 +10085,7 @@ test "[edge] - [retained capacity]: exact boundary retains and one below release
     try at.reset(.retain_capacity);
     try std.testing.expectEqual(retained, at.memoryUsage().retained_capacity);
 
-    var over_options: xml.OptionsFor(CORE_CONFIG) = .{};
+    var over_options: profile.OptionsFor(CORE_CONFIG) = .{};
     over_options.limits.max_retained_bytes = retained - 1;
     var over = try CoreReader.init(std.testing.allocator, over_options);
     defer over.deinit();
@@ -10042,7 +10135,7 @@ test "[property] - [reader schedules]: generated valid shapes agree across sched
 }
 
 test "[property] - [persistent reader]: success failure limit and resets remain bounded" {
-    var options: xml.OptionsFor(CORE_CONFIG) = .{};
+    var options: profile.OptionsFor(CORE_CONFIG) = .{};
     options.limits.max_attributes_per_element = 2;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     {
@@ -10107,8 +10200,8 @@ const FuzzOutcome = struct {
     text_bytes: usize = 0,
 };
 
-fn arbitraryOutcome(comptime config: xml.Config, input: []const u8, seed: ?u64) !FuzzOutcome {
-    var options: xml.OptionsFor(config) = .{};
+fn arbitraryOutcome(comptime config: profile.Config, input: []const u8, seed: ?u64) !FuzzOutcome {
+    var options: profile.OptionsFor(config) = .{};
     options.limits.max_depth = 16;
     options.limits.max_open_name_bytes = 256;
     options.limits.max_partial_token_bytes = 256;
@@ -10130,7 +10223,7 @@ fn arbitraryOutcome(comptime config: xml.Config, input: []const u8, seed: ?u64) 
         options.dtd_limits.max_comparison_work = 4096;
     }
 
-    const Reader = xml.ReaderFor(config);
+    const Reader = profile.ReaderFor(config);
     var reader = try Reader.init(std.testing.allocator, options);
     defer reader.deinit();
     var outcome: FuzzOutcome = .{ .disposition = .accept };
@@ -10398,7 +10491,7 @@ test "[property] - [arbitrary bytes]: deterministic campaign is bounded and sche
 
 test "[regression] - [source refill]: malformed UTF-8 offset survives refill" {
     inline for (.{ FAST_CONFIG, GENERAL_FAST_CONFIG }) |config| {
-        const Reader = xml.ReaderFor(config);
+        const Reader = profile.ReaderFor(config);
         var reader = try Reader.init(std.testing.allocator, .{});
         defer reader.deinit();
         try reader.feed("<?\xe9\xa5", false);
@@ -10415,8 +10508,8 @@ test "[regression] - [source refill]: malformed UTF-8 offset survives refill" {
 }
 
 test "[failure] - [reader initialization]: zero required limits fail without allocation" {
-    const Reader = xml.ReaderFor(xml.Configs.XML10_UTF8_NO_DTD);
-    var options: xml.OptionsFor(xml.Configs.XML10_UTF8_NO_DTD) = .{};
+    const Reader = profile.ReaderFor(profile.Configs.XML10_UTF8_NO_DTD);
+    var options: profile.OptionsFor(profile.Configs.XML10_UTF8_NO_DTD) = .{};
     options.limits.max_depth = 0;
 
     try std.testing.expectError(error.InvalidOptions, Reader.init(std.testing.allocator, options));
@@ -10440,8 +10533,8 @@ test "[failure] - [reader initialization]: zero required limits fail without all
         try std.testing.expectError(error.InvalidOptions, Reader.init(std.testing.allocator, options));
     }
 
-    const NamespaceReader = xml.ReaderFor(NS_CONFIG);
-    var namespace_options: xml.OptionsFor(NS_CONFIG) = .{};
+    const NamespaceReader = profile.ReaderFor(NS_CONFIG);
+    var namespace_options: profile.OptionsFor(NS_CONFIG) = .{};
     inline for (.{
         "max_declarations_per_element",
         "max_active_bindings",
@@ -10457,8 +10550,8 @@ test "[failure] - [reader initialization]: zero required limits fail without all
         );
     }
 
-    const DtdReader = xml.ReaderFor(xml.Configs.XML10_NONVALIDATING);
-    var dtd_options: xml.OptionsFor(xml.Configs.XML10_NONVALIDATING) = .{};
+    const DtdReader = profile.ReaderFor(profile.Configs.XML10_NONVALIDATING);
+    var dtd_options: profile.OptionsFor(profile.Configs.XML10_NONVALIDATING) = .{};
     inline for (.{
         "max_dtd_bytes",
         "max_declarations",
@@ -10497,8 +10590,8 @@ test "[failure] - [reader initialization]: zero required limits fail without all
         );
     }
 
-    const ValidatingReader = xml.ReaderFor(xml.Configs.XML10_VALIDATING);
-    var validating_options: xml.OptionsFor(xml.Configs.XML10_VALIDATING) = .{};
+    const ValidatingReader = profile.ReaderFor(profile.Configs.XML10_VALIDATING);
+    var validating_options: profile.OptionsFor(profile.Configs.XML10_VALIDATING) = .{};
     inline for (.{
         "max_content_positions",
         "max_content_states",
@@ -10532,7 +10625,7 @@ test "[failure] - [reader initialization]: zero required limits fail without all
 }
 
 test "[edge] - [validation limits]: report the exact exhausted resource" {
-    const config = xml.Configs.XML10_VALIDATING;
+    const config = profile.Configs.XML10_VALIDATING;
     const LimitCase = enum {
         content_positions,
         content_states,
@@ -10591,7 +10684,7 @@ test "[edge] - [validation limits]: report the exact exhausted resource" {
     };
 
     for (cases) |case| {
-        var options: xml.OptionsFor(config) = .{};
+        var options: profile.OptionsFor(config) = .{};
         switch (case.kind) {
             .content_positions => options.validation.limits.max_content_positions = 1,
             .content_states => options.validation.limits.max_content_states = 1,
@@ -10602,7 +10695,7 @@ test "[edge] - [validation limits]: report the exact exhausted resource" {
             .identity_bytes => options.validation.limits.max_id_bytes = 1,
             .comparison_work => options.validation.limits.max_comparison_work = 1,
         }
-        var reader = try xml.ReaderFor(config).init(std.testing.allocator, options);
+        var reader = try profile.ReaderFor(config).init(std.testing.allocator, options);
         defer reader.deinit();
         try reader.feed(case.input, true);
         while (true) {
@@ -10621,10 +10714,10 @@ test "[edge] - [validation limits]: report the exact exhausted resource" {
 }
 
 test "[edge] - [validation limits]: nested operators preserve the position boundary" {
-    const config = xml.Configs.XML10_VALIDATING;
-    var options: xml.OptionsFor(config) = .{};
+    const config = profile.Configs.XML10_VALIDATING;
+    var options: profile.OptionsFor(config) = .{};
     options.validation.limits.max_content_positions = 1;
-    var reader = try xml.ReaderFor(config).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(config).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed(
         "<!DOCTYPE root [" ++
@@ -10634,7 +10727,7 @@ test "[edge] - [validation limits]: nested operators preserve the position bound
         true,
     );
 
-    var status: ?xml.ProfileValidationStatus = null;
+    var status: ?profile.ProfileValidationStatus = null;
     while (true) switch (try reader.next()) {
         .event => |event| switch (event) {
             .document_end => |end| status = end.validation,
@@ -10643,14 +10736,14 @@ test "[edge] - [validation limits]: nested operators preserve the position bound
         .done => break,
         .need_input => return error.UnexpectedNeedInput,
     };
-    try std.testing.expectEqual(xml.ProfileValidationStatus.valid, status.?);
+    try std.testing.expectEqual(profile.ProfileValidationStatus.valid, status.?);
 }
 
 test "[unit] - [namespace expansion]: declarations and ordinary attributes are distinct" {
     const input =
         "<root xmlns=\"urn:elements\" attribute=\"no-namespace\" " ++
         "xmlns:p=\"urn:attributes\" p:attribute=\"namespaced\"/>\n";
-    const Reader = xml.ProfileSliceReader(NS_CONFIG);
+    const Reader = profile.ProfileSliceReader(NS_CONFIG);
     var reader = try Reader.init(std.testing.allocator, .{}, input);
     defer reader.deinit();
 
@@ -10687,7 +10780,7 @@ test "[unit] - [namespace expansion]: declarations and ordinary attributes are d
 
 test "[unit] - [namespace event lifetime]: slices survive source-buffer reuse" {
     var input: [32]u8 = undefined;
-    var reader = try xml.ReaderFor(NS_CONFIG).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(NS_CONFIG).init(std.testing.allocator, .{});
     defer reader.deinit();
 
     const first = "<p:r xmlns:p='urn:";
@@ -10753,7 +10846,7 @@ test "[unit] - [namespace scope]: rebinding undeclaration and predefined xml res
         _ = try parseParts(NS_CONFIG, std.testing.allocator, .{}, &parts);
     }
 
-    var reader = try xml.ProfileSliceReader(NS_CONFIG).init(
+    var reader = try profile.ProfileSliceReader(NS_CONFIG).init(
         std.testing.allocator,
         .{},
         rebinding,
@@ -10786,7 +10879,7 @@ test "[unit] - [namespace scope]: rebinding undeclaration and predefined xml res
     try std.testing.expectEqual(expected_uris.len, item_index);
     try std.testing.expectEqual(expected_uris.len, end_item_index);
 
-    var undeclare_reader = try xml.ProfileSliceReader(NS_CONFIG).init(
+    var undeclare_reader = try profile.ProfileSliceReader(NS_CONFIG).init(
         std.testing.allocator,
         .{},
         default_undeclaration,
@@ -10820,10 +10913,10 @@ test "[unit] - [namespace scope]: rebinding undeclaration and predefined xml res
     try std.testing.expectEqual(@as(usize, 3), start_index);
     try std.testing.expectEqual(@as(usize, 3), end_index);
 
-    var options: xml.OptionsFor(NS_CONFIG) = .{};
+    var options: profile.OptionsFor(NS_CONFIG) = .{};
     options.namespace_limits.max_active_bindings = 1;
     options.namespace_limits.max_binding_bytes = 2;
-    var static_reader = try xml.ReaderFor(NS_CONFIG).init(std.testing.allocator, options);
+    var static_reader = try profile.ReaderFor(NS_CONFIG).init(std.testing.allocator, options);
     defer static_reader.deinit();
     try static_reader.feed(
         "<r xmlns:xml='http://www.w3.org/XML/1998/namespace' xmlns:p='u' xml:lang='en'/>",
@@ -10858,7 +10951,7 @@ test "[unit] - [namespace normalization]: reference-expanded URI values resolve 
     const input =
         "<root xmlns:a=\"urn:example&amp;value\" xmlns:b=\"urn:example&#38;value\">" ++
         "<a:item/><b:item/></root>\n";
-    var reader = try xml.ProfileSliceReader(NS_CONFIG).init(
+    var reader = try profile.ProfileSliceReader(NS_CONFIG).init(
         std.testing.allocator,
         .{},
         input,
@@ -11009,7 +11102,7 @@ test "[failure] - [namespace storage]: every allocation failure cleans up" {
 test "[edge] - [namespace limits]: each boundary accepts at limit and rejects one over" {
     {
         const input = "<r xmlns:a='u' xmlns:b='v'/>";
-        var options: xml.OptionsFor(NS_CONFIG) = .{};
+        var options: profile.OptionsFor(NS_CONFIG) = .{};
         options.namespace_limits.max_declarations_per_element = 2;
         const parts = [_][]const u8{input};
         _ = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
@@ -11026,7 +11119,7 @@ test "[edge] - [namespace limits]: each boundary accepts at limit and rejects on
     }
     {
         const input = "<r xmlns:a='u'><c xmlns:b='v'/></r>";
-        var options: xml.OptionsFor(NS_CONFIG) = .{};
+        var options: profile.OptionsFor(NS_CONFIG) = .{};
         options.namespace_limits.max_active_bindings = 2;
         const parts = [_][]const u8{input};
         _ = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
@@ -11043,7 +11136,7 @@ test "[edge] - [namespace limits]: each boundary accepts at limit and rejects on
     }
     {
         const input = "<r xmlns:a='urn'/>";
-        var options: xml.OptionsFor(NS_CONFIG) = .{};
+        var options: profile.OptionsFor(NS_CONFIG) = .{};
         options.namespace_limits.max_binding_bytes = 4;
         const parts = [_][]const u8{input};
         _ = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
@@ -11060,7 +11153,7 @@ test "[edge] - [namespace limits]: each boundary accepts at limit and rejects on
     }
     {
         const input = "<root></root>";
-        var options: xml.OptionsFor(NS_CONFIG) = .{};
+        var options: profile.OptionsFor(NS_CONFIG) = .{};
         options.namespace_limits.max_qname_bytes = 4;
         const parts = [_][]const u8{input};
         _ = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
@@ -11077,7 +11170,7 @@ test "[edge] - [namespace limits]: each boundary accepts at limit and rejects on
     }
     {
         const input = "<r></root>";
-        var options: xml.OptionsFor(NS_CONFIG) = .{};
+        var options: profile.OptionsFor(NS_CONFIG) = .{};
         options.namespace_limits.max_qname_bytes = 3;
         try expectProfileFailureSchedules(
             NS_CONFIG,
@@ -11091,7 +11184,7 @@ test "[edge] - [namespace limits]: each boundary accepts at limit and rejects on
     }
     {
         const input = "<r></🙂>";
-        var options: xml.OptionsFor(NS_CONFIG) = .{};
+        var options: profile.OptionsFor(NS_CONFIG) = .{};
         options.namespace_limits.max_qname_bytes = 3;
         try expectProfileFailureSchedules(
             NS_CONFIG,
@@ -11105,7 +11198,7 @@ test "[edge] - [namespace limits]: each boundary accepts at limit and rejects on
     }
     {
         const input = "<r xmlns:a='u' a:x='1'/>";
-        var options: xml.OptionsFor(NS_CONFIG) = .{};
+        var options: profile.OptionsFor(NS_CONFIG) = .{};
         options.namespace_limits.max_comparison_work = 5;
         const parts = [_][]const u8{input};
         _ = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
@@ -11157,7 +11250,7 @@ test "[failure] - [qualified names]: local parts must begin with NCName characte
 }
 
 test "[unit] - [namespace rollback]: closed scopes release active bytes and reset obeys policy" {
-    var reader = try xml.ReaderFor(NS_CONFIG).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(NS_CONFIG).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed("<r xmlns:a='outer'><c xmlns:a='inner'/></r>", true);
     var peak_namespace_capacity: usize = 0;
@@ -11182,10 +11275,10 @@ test "[unit] - [namespace rollback]: closed scopes release active bytes and rese
 
 test "[unit] - [namespace specialization]: raw readers own no namespace state" {
     try std.testing.expect(
-        @sizeOf(xml.ReaderFor(xml.Configs.XML10_UTF8_NO_DTD_FAST)) <
-            @sizeOf(xml.ReaderFor(xml.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST)),
+        @sizeOf(profile.ReaderFor(profile.Configs.XML10_UTF8_NO_DTD_FAST)) <
+            @sizeOf(profile.ReaderFor(profile.Configs.XML10_UTF8_NAMESPACES_NO_DTD_FAST)),
     );
-    var reader = try xml.ReaderFor(xml.Configs.XML10_UTF8_NO_DTD_FAST).init(
+    var reader = try profile.ReaderFor(profile.Configs.XML10_UTF8_NO_DTD_FAST).init(
         std.testing.allocator,
         .{},
     );
@@ -11202,7 +11295,7 @@ test "[unit] - [namespace specialization]: raw readers own no namespace state" {
 
 test "[unit] - [namespace storage]: warm fixed scope performs no allocator operation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var reader = try xml.ReaderFor(NS_CONFIG).init(failing.allocator(), .{});
+    var reader = try profile.ReaderFor(NS_CONFIG).init(failing.allocator(), .{});
     defer reader.deinit();
 
     try reader.feed(NAMESPACE_CHURN_INPUT, true);
@@ -11243,7 +11336,7 @@ test "[property] - [namespace scope]: deep rebinding churn rolls back under targ
         try parseRandomChunks(NS_CONFIG, std.testing.allocator, .{}, input, 0x6e73),
     );
 
-    var reader = try xml.ReaderFor(NS_CONFIG).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(NS_CONFIG).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed(input, true);
     var peak_bindings: usize = 0;
@@ -11270,7 +11363,7 @@ test "[property] - [expanded attributes]: sorted duplicate path preserves source
     const valid_parts = [_][]const u8{valid};
     const summary = try parseParts(NS_CONFIG, std.testing.allocator, .{}, &valid_parts);
     try std.testing.expectEqual(@as(usize, 66), summary.attributes);
-    var limited_options: xml.OptionsFor(NS_CONFIG) = .{};
+    var limited_options: profile.OptionsFor(NS_CONFIG) = .{};
     limited_options.namespace_limits.max_comparison_work = 1000;
     try expectProfileFailureParts(
         NS_CONFIG,
@@ -11301,7 +11394,7 @@ test "[property] - [expanded attributes]: sorted duplicate path preserves source
 
 test "[edge] - [expanded attributes]: unprefixed names skip comparisons without hiding duplicates" {
     const input = "<r first='1' second='2' third='3'/>";
-    var options: xml.OptionsFor(NS_CONFIG) = .{};
+    var options: profile.OptionsFor(NS_CONFIG) = .{};
     options.namespace_limits.max_comparison_work = 1;
     const parts = [_][]const u8{input};
     const summary = try parseParts(NS_CONFIG, std.testing.allocator, options, &parts);
@@ -11904,14 +11997,14 @@ test "[integration] - [Reader reset]: disabling external sources releases inclus
 }
 
 test "[integration] - [XML 1.1 external entity]: text declarations and lines are processed" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const external =
         "<?xml version='1.1' encoding='UTF-8'?>A\xc2\x85B\xe2\x80\xa8C\r\xc2\x85D";
     const resources = [_]TestExternalResource{
         .{ .system_id = "text.xml", .bytes = external, .source_id = 81 },
     };
     var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
-    var options: xml.OptionsFor(config) = .{};
+    var options: profile.OptionsFor(config) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
     const document =
         "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e SYSTEM 'text.xml'>]><r>&e;</r>";
@@ -11922,14 +12015,14 @@ test "[integration] - [XML 1.1 external entity]: text declarations and lines are
 }
 
 test "[integration] - [XML 1.1 external subset]: document rules apply to declarations" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const external =
         "<?xml version='1.1' encoding='UTF-8'?><!ENTITY e '&#x1;'>\xc2\x85";
     const resources = [_]TestExternalResource{
         .{ .system_id = "schema.dtd", .bytes = external, .source_id = 82 },
     };
     var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
-    var options: xml.OptionsFor(config) = .{};
+    var options: profile.OptionsFor(config) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
     const document =
         "<?xml version='1.1'?><!DOCTYPE r SYSTEM 'schema.dtd'><r>&e;</r>";
@@ -11940,18 +12033,18 @@ test "[integration] - [XML 1.1 external subset]: document rules apply to declara
 }
 
 test "[integration] - [XML 1.1 normalization]: external entities retain source findings" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const external = "e\xcc\x81";
     const resources = [_]TestExternalResource{
         .{ .system_id = "text.xml", .bytes = external, .source_id = 181 },
     };
     var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
-    var options: xml.OptionsFor(config) = .{};
+    var options: profile.OptionsFor(config) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
     const document =
         "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e SYSTEM 'text.xml'>]><r>&e;</r>";
     const result = try normalizationOutcome(config, options, document, .{ .fixed = 1 });
-    try std.testing.expectEqual(xml.ProfileNormalizationStatus.not_normalized, result.status);
+    try std.testing.expectEqual(profile.ProfileNormalizationStatus.not_normalized, result.status);
     try std.testing.expectEqual(xml.NormalizationIssueKind.not_nfc, result.issue.?.kind);
     try std.testing.expectEqual(@as(u32, 181), result.issue.?.location.source_id);
     try std.testing.expectEqual(@as(u64, 1), result.issue.?.location.byte_offset);
@@ -11959,7 +12052,7 @@ test "[integration] - [XML 1.1 normalization]: external entities retain source f
 }
 
 test "[integration] - [XML 1.1 normalization]: external UTF-16 is checked incrementally" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const external = try encodeUtf16(std.testing.allocator, "e\xcc\x81", .little, true);
     defer std.testing.allocator.free(external);
     const resources = [_]TestExternalResource{
@@ -11971,30 +12064,30 @@ test "[integration] - [XML 1.1 normalization]: external UTF-16 is checked increm
         },
     };
     var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
-    var options: xml.OptionsFor(config) = .{};
+    var options: profile.OptionsFor(config) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
     const document =
         "<?xml version='1.1'?><!DOCTYPE r [<!ENTITY e SYSTEM 'text.xml'>]><r>&e;</r>";
     const result = try normalizationOutcome(config, options, document, .whole);
-    try std.testing.expectEqual(xml.ProfileNormalizationStatus.not_normalized, result.status);
+    try std.testing.expectEqual(profile.ProfileNormalizationStatus.not_normalized, result.status);
     try std.testing.expectEqual(xml.NormalizationIssueKind.not_nfc, result.issue.?.kind);
     try std.testing.expectEqual(@as(u32, 184), result.issue.?.location.source_id);
     try std.testing.expectEqual(@as(u64, 4), result.issue.?.location.byte_offset);
 }
 
 test "[integration] - [XML 1.1 normalization]: external DTD and compiled sources are verified" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const declarations = "<!--e\xcc\x81--><!ENTITY e 'ok'>";
     const resources = [_]TestExternalResource{
         .{ .system_id = "schema.dtd", .bytes = declarations, .source_id = 182 },
     };
     var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
-    var options: xml.OptionsFor(config) = .{};
+    var options: profile.OptionsFor(config) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
     const document =
         "<?xml version='1.1'?><!DOCTYPE r SYSTEM 'schema.dtd'><r>&e;</r>";
     const result = try normalizationOutcome(config, options, document, .whole);
-    try std.testing.expectEqual(xml.ProfileNormalizationStatus.not_normalized, result.status);
+    try std.testing.expectEqual(profile.ProfileNormalizationStatus.not_normalized, result.status);
     try std.testing.expectEqual(xml.NormalizationIssueKind.not_nfc, result.issue.?.kind);
     try std.testing.expectEqual(@as(u32, 182), result.issue.?.location.source_id);
     try std.testing.expectEqual(
@@ -12002,7 +12095,7 @@ test "[integration] - [XML 1.1 normalization]: external DTD and compiled sources
         result.issue.?.location.byte_offset,
     );
 
-    const validating_config = xml.Configs.XML11_VALIDATING;
+    const validating_config = profile.Configs.XML11_VALIDATING;
     const reusable_declarations = "<?\xe1\x85\xa1?><!ELEMENT r EMPTY>";
     var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
@@ -12011,7 +12104,7 @@ test "[integration] - [XML 1.1 normalization]: external DTD and compiled sources
         .{ .version = .xml11, .source_id = 183 },
     );
     defer subset.deinit();
-    var validating_options: xml.OptionsFor(validating_config) = .{};
+    var validating_options: profile.OptionsFor(validating_config) = .{};
     validating_options.validation.external_subset = &subset;
     const reused = try normalizationOutcome(
         validating_config,
@@ -12019,7 +12112,7 @@ test "[integration] - [XML 1.1 normalization]: external DTD and compiled sources
         "<?xml version='1.1'?><!DOCTYPE r SYSTEM 'schema.dtd'><r/>",
         .whole,
     );
-    try std.testing.expectEqual(xml.ProfileNormalizationStatus.not_normalized, reused.status);
+    try std.testing.expectEqual(profile.ProfileNormalizationStatus.not_normalized, reused.status);
     try std.testing.expectEqual(
         xml.NormalizationIssueKind.composing_start,
         reused.issue.?.kind,
@@ -12029,7 +12122,7 @@ test "[integration] - [XML 1.1 normalization]: external DTD and compiled sources
 }
 
 test "[failure] - [XML 1.1 external sources]: restricted literals and malformed declarations fail" {
-    const config = xml.Configs.XML11_NONVALIDATING;
+    const config = profile.Configs.XML11_NONVALIDATING;
     const cases = .{
         .{
             "schema.dtd",
@@ -12061,9 +12154,9 @@ test "[failure] - [XML 1.1 external sources]: restricted literals and malformed 
             .{ .system_id = case[0], .bytes = case[1], .source_id = 90 + index },
         };
         var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
-        var options: xml.OptionsFor(config) = .{};
+        var options: profile.OptionsFor(config) = .{};
         options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-        var reader = try xml.ReaderFor(config).init(std.testing.allocator, options);
+        var reader = try profile.ReaderFor(config).init(std.testing.allocator, options);
         defer reader.deinit();
         try reader.feed(case[2], true);
         while (true) {
@@ -12613,9 +12706,9 @@ test "[failure] - [non-validating standalone]: externally declared entity is und
         },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed(
         "<?xml version='1.0' standalone='yes'?><!DOCTYPE root SYSTEM 'schema.dtd'><root>&message;</root>",
@@ -12662,7 +12755,7 @@ test "[integration] - [Reader compiled subset]: internal declarations retain pre
 }
 
 test "[integration] - [compiled external subset]: content position limits remain per model" {
-    const config = xml.Configs.XML10_VALIDATING;
+    const config = profile.Configs.XML10_VALIDATING;
     const cases = [_]struct {
         declarations: []const u8,
         document: []const u8,
@@ -12688,13 +12781,13 @@ test "[integration] - [compiled external subset]: content position limits remain
         );
         defer subset.deinit();
 
-        var options: xml.OptionsFor(config) = .{};
+        var options: profile.OptionsFor(config) = .{};
         options.validation.limits.max_content_positions = 2;
         options.validation.external_subset = &subset;
-        var reader = try xml.ReaderFor(config).init(std.testing.allocator, options);
+        var reader = try profile.ReaderFor(config).init(std.testing.allocator, options);
         defer reader.deinit();
         try reader.feed(case.document, true);
-        var status: ?xml.ProfileValidationStatus = null;
+        var status: ?profile.ProfileValidationStatus = null;
         while (true) switch (try reader.next()) {
             .event => |event| switch (event) {
                 .document_end => |end| status = end.validation,
@@ -12703,10 +12796,10 @@ test "[integration] - [compiled external subset]: content position limits remain
             .done => break,
             .need_input => return error.UnexpectedNeedInput,
         };
-        try std.testing.expectEqual(xml.ProfileValidationStatus.valid, status.?);
+        try std.testing.expectEqual(profile.ProfileValidationStatus.valid, status.?);
 
         options.validation.limits.max_content_positions = 1;
-        var strict_reader = try xml.ReaderFor(config).init(std.testing.allocator, options);
+        var strict_reader = try profile.ReaderFor(config).init(std.testing.allocator, options);
         defer strict_reader.deinit();
         try strict_reader.feed(case.document, true);
         while (true) {
@@ -12788,8 +12881,8 @@ fn testIdentityTranscoder(
 }
 
 test "[integration] - [internal DTD profile]: has no resolver option or external acquisition path" {
-    try std.testing.expect(!@hasField(xml.OptionsFor(INTERNAL_DTD_CONFIG), "resolver"));
-    var reader = try xml.ReaderFor(INTERNAL_DTD_CONFIG).init(std.testing.allocator, .{});
+    try std.testing.expect(!@hasField(profile.OptionsFor(INTERNAL_DTD_CONFIG), "resolver"));
+    var reader = try profile.ReaderFor(INTERNAL_DTD_CONFIG).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root [<!ENTITY local 'ok'>]><root>&local;</root>", true);
     var text_bytes: usize = 0;
@@ -12805,7 +12898,7 @@ test "[integration] - [internal DTD profile]: has no resolver option or external
 }
 
 test "[integration] - [external policy]: skipped general entity reports identifiers and reference" {
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, .{});
     defer reader.deinit();
     const input = "<!DOCTYPE root [<!ENTITY message PUBLIC 'public' 'message.ent'>]><root>&message;</root>";
     try reader.feed(input, true);
@@ -12814,7 +12907,7 @@ test "[integration] - [external policy]: skipped general entity reports identifi
         .event => |event| switch (event) {
             .skipped_entity => |skipped| {
                 observed = true;
-                try std.testing.expectEqual(xml.ProfileSkippedEntityKind.general_entity, skipped.kind);
+                try std.testing.expectEqual(profile.ProfileSkippedEntityKind.general_entity, skipped.kind);
                 try std.testing.expectEqualStrings("message", skipped.name.?);
                 try std.testing.expectEqualStrings("public", skipped.public_id.?);
                 try std.testing.expectEqualStrings("message.ent", skipped.system_id.?);
@@ -12832,7 +12925,7 @@ test "[integration] - [external policy]: skipped general entity reports identifi
 }
 
 test "[integration] - [external policy]: skipped subset and parameter entity are explicit" {
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, .{});
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, .{});
     defer reader.deinit();
     try reader.feed(
         "<!DOCTYPE root SYSTEM 'external.dtd' [<!ENTITY % declarations SYSTEM 'declarations.ent'>%declarations;]><root/>",
@@ -12885,9 +12978,9 @@ test "[integration] - [external entities]: resolves subset, parameter, and gener
         },
     };
     var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root>&message;</root>", true);
     var text: [16]u8 = undefined;
@@ -12922,9 +13015,9 @@ test "[integration] - [external encoding]: decodes UTF-16 general entity and tra
         .{ .system_id = "message.ent", .bytes = utf16, .source_id = 27 },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>", true);
     var external_text: [8]u8 = undefined;
@@ -12957,9 +13050,9 @@ test "[integration] - [external encoding]: caller transcoder keeps short source 
         },
     };
     var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed(
         "<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>",
@@ -12993,9 +13086,9 @@ test "[integration] - [external encoding]: buffered source receives its final wi
         },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
     while (true) switch (try reader.next()) {
@@ -13028,9 +13121,9 @@ test "[integration] - [external encoding]: explicit transcoder owns byte zero an
             .transcoder = case.transcoder,
         }};
         var resolver = TestResolver{ .resources = &resources };
-        var options: xml.OptionsFor(DTD_CONFIG) = .{};
+        var options: profile.OptionsFor(DTD_CONFIG) = .{};
         options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-        var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+        var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
         defer reader.deinit();
         try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
         while (true) switch (try reader.next()) {
@@ -13053,9 +13146,9 @@ test "[integration] - [external encoding]: transcoder cancellation keeps its sou
         },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
 
@@ -13105,9 +13198,9 @@ test "[integration] - [external diagnostics]: malformed subset identifies its so
         .{ .system_id = "external.dtd", .bytes = "<!ELEMENT root", .source_id = 42 },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
     while (true) {
@@ -13125,9 +13218,9 @@ test "[integration] - [external diagnostics]: malformed source encoding identifi
         .{ .system_id = "external.dtd", .bytes = "\xff\xfe<", .source_id = 46 },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
     while (true) {
@@ -13155,9 +13248,9 @@ test "[integration] - [external diagnostics]: unavailable caller encoding remain
         },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
     while (true) {
@@ -13179,9 +13272,9 @@ test "[integration] - [external diagnostics]: text declaration encoding conflict
         .{ .system_id = "external.dtd", .bytes = external, .source_id = 48 },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
     while (true) {
@@ -13213,9 +13306,9 @@ test "[integration] - [external diagnostics]: UTF-16 DTD offsets remain original
         .{ .system_id = "external.dtd", .bytes = &utf16, .source_id = 43 },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
     while (true) {
@@ -13244,9 +13337,9 @@ test "[integration] - [external diagnostics]: caller transcoder supplies exact p
         },
     };
     var resolver = TestResolver{ .resources = &resources, .max_read_len = external.len };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
     while (true) {
@@ -13274,9 +13367,9 @@ test "[integration] - [external diagnostics]: caller-transcoded general entity k
         },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed(
         "<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>",
@@ -13305,9 +13398,9 @@ test "[integration] - [external diagnostics]: nested DTD failures retain the imm
         .{ .system_id = "nested.ent", .bytes = "<!ELEMENT root", .source_id = 102 },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root SYSTEM 'external.dtd'><root/>", true);
     while (true) {
@@ -13361,9 +13454,9 @@ test "[integration] - [external diagnostics]: nested general-entity failure reta
         .{ .system_id = "inner.ent", .bytes = "<", .source_id = 105 },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     const document = "<!DOCTYPE root [" ++
         "<!ENTITY outer SYSTEM 'outer.ent'>" ++
@@ -13389,11 +13482,11 @@ test "[integration] - [external limits]: streamed expansion stops at the semanti
         .{ .system_id = "message.ent", .bytes = "hello", .source_id = 5 },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.dtd_limits.max_expanded_bytes = 4;
     options.dtd_limits.expansion_ratio_minimum_bytes = 1024;
     options.resolver = .{ .policy = .resolve, .resolver = resolver.resolver() };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>", true);
     while (true) {
@@ -13412,13 +13505,13 @@ test "[integration] - [external limits]: acquisition count and source bytes fail
         .{ .system_id = "external.dtd", .bytes = "<!ENTITY message SYSTEM 'message.ent'>", .source_id = 9 },
     };
     var resolver = TestResolver{ .resources = &resources };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.resolver = .{
         .policy = .resolve,
         .resolver = resolver.resolver(),
         .max_source_bytes = 4,
     };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     const input = "<!DOCTYPE root [<!ENTITY message SYSTEM 'message.ent'>]><root>&message;</root>";
     try reader.feed(input, true);
@@ -13524,7 +13617,7 @@ test "[integration] - [external memory]: large generated entity keeps reader sto
     };
     const generated_bytes = 2 * 1024 * 1024;
     var resolver = GeneratedResolver{ .remaining = generated_bytes };
-    var options: xml.OptionsFor(DTD_CONFIG) = .{};
+    var options: profile.OptionsFor(DTD_CONFIG) = .{};
     options.dtd_limits.max_expanded_bytes = generated_bytes;
     options.dtd_limits.max_expansion_ratio = generated_bytes;
     options.dtd_limits.expansion_ratio_minimum_bytes = generated_bytes;
@@ -13534,7 +13627,7 @@ test "[integration] - [external memory]: large generated entity keeps reader sto
         .max_source_bytes = generated_bytes,
         .max_total_bytes = generated_bytes,
     };
-    var reader = try xml.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
+    var reader = try profile.ReaderFor(DTD_CONFIG).init(std.testing.allocator, options);
     defer reader.deinit();
     try reader.feed("<!DOCTYPE root [<!ENTITY data SYSTEM 'generated.ent'>]><root>&data;</root>", true);
     var text_bytes: usize = 0;
