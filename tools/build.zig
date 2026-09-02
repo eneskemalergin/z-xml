@@ -186,6 +186,12 @@ pub fn build(b: *std.Build) void {
             .namespace_summary = true,
         },
         .{
+            .name = "z-xml-namespace-reject-persistent",
+            .namespaces = true,
+            .default_options = false,
+            .namespace_summary = false,
+        },
+        .{
             .name = "z-xml-default-persistent",
             .namespaces = true,
             .default_options = true,
