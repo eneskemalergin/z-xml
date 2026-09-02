@@ -8369,6 +8369,22 @@ test "[failure] - [UTF-8]: invalid sequence diagnostics identify the first inval
             null,
         );
     }
+
+    var boundary_input: [73]u8 = undefined;
+    @memcpy(boundary_input[0..3], "<r>");
+    @memset(boundary_input[3..66], 'x');
+    @memcpy(boundary_input[66..69], "\xed\xa0\x80");
+    @memcpy(boundary_input[69..], "</r>");
+    var boundary_options: profile.OptionsFor(FAST_CONFIG) = .{};
+    boundary_options.limits.max_fragment_bytes = 64;
+    try expectCoreFailureSchedulesWithOptions(
+        boundary_options,
+        &boundary_input,
+        error.InvalidXml,
+        .malformed_utf8,
+        67,
+        null,
+    );
 }
 
 test "[failure] - [UTF-8 contexts]: markup, names, values, and references validate first" {
@@ -8556,6 +8572,26 @@ test "[edge] - [text fragments]: limits preserve scalars and expose schedule cou
     }
     try std.testing.expectEqual(@as(usize, 10), byte_run.bytes);
     try std.testing.expectEqual(@as(usize, 10), byte_run.fragments);
+
+    var unicode_input: [73]u8 = undefined;
+    @memcpy(unicode_input[0..3], "<r>");
+    @memset(unicode_input[3..66], 'x');
+    @memcpy(unicode_input[66..69], "\xe2\x82\xac");
+    @memcpy(unicode_input[69..], "</r>");
+    var unicode_options: profile.OptionsFor(CORE_CONFIG) = .{};
+    unicode_options.limits.max_fragment_bytes = 64;
+
+    var unicode_reader = try CoreReader.init(std.testing.allocator, unicode_options);
+    defer unicode_reader.deinit();
+    try unicode_reader.feed(unicode_input[0..67], false);
+    var unicode_run: TextRun = .{};
+    try std.testing.expect(!try drainTextBoundary(&unicode_reader, &unicode_run));
+    try std.testing.expectEqual(@as(usize, 63), unicode_run.bytes);
+    try std.testing.expectEqual(@as(usize, 1), unicode_run.fragments);
+    try unicode_reader.feed(unicode_input[67..], true);
+    try std.testing.expect(try drainTextBoundary(&unicode_reader, &unicode_run));
+    try std.testing.expectEqual(@as(usize, 66), unicode_run.bytes);
+    try std.testing.expectEqual(@as(usize, 2), unicode_run.fragments);
 
     var failure_options: profile.OptionsFor(FAST_CONFIG) = .{};
     failure_options.limits.max_fragment_bytes = 1;

@@ -6086,12 +6086,16 @@ pub fn Reader(comptime config: Config) type {
             )) |index| {
                 fast_len = index;
             }
-            const fast_run = candidate[0..fast_len];
+            var fast_run = candidate[0..fast_len];
+            const has_non_ascii = if (scan) |result|
+                result.has_non_ascii
+            else
+                hasNonAscii(fast_run);
+            if (has_non_ascii) {
+                fast_run = fast_run[0..completeUtf8PrefixLen(fast_run)];
+            }
             if (fast_run.len == 0 or
-                !contentRunCanUseBulkPath(
-                    fast_run,
-                    if (scan) |result| result.has_non_ascii else hasNonAscii(fast_run),
-                )) return false;
+                !contentRunCanUseBulkPath(fast_run, has_non_ascii)) return false;
             self.consumeRun(fast_run);
             self.text_close_brackets = contentTrailingCloseBrackets(
                 self.text_close_brackets,
@@ -11813,6 +11817,31 @@ fn utf8ExpectedLength(lead: u8) ?u3 {
     return null;
 }
 
+fn completeUtf8PrefixLen(bytes: []const u8) usize {
+    if (bytes.len == 0 or bytes[bytes.len - 1] < 0x80) return bytes.len;
+
+    var start = bytes.len - 1;
+    var continuation_count: u2 = 0;
+    while (start > 0 and continuation_count < 3 and
+        bytes[start] >= 0x80 and bytes[start] <= 0xbf)
+    {
+        start -= 1;
+        continuation_count += 1;
+    }
+
+    const expected = utf8ExpectedLength(bytes[start]) orelse return bytes.len;
+    const available = bytes.len - start;
+    if (available >= expected) return bytes.len;
+    for (bytes[start + 1 ..], 1..) |byte, index| {
+        if (byte < 0x80 or byte > 0xbf or
+            (index == 1 and !validUtf8SecondByte(bytes[start], byte)))
+        {
+            return bytes.len;
+        }
+    }
+    return start;
+}
+
 fn referenceDigit(byte: u8, kind: ReferenceKind) ?u32 {
     return switch (kind) {
         .decimal => if (byte >= '0' and byte <= '9') byte - '0' else null,
@@ -12005,5 +12034,44 @@ test "[unit] - [content SIMD]: structural scan matches scalar boundaries" {
             }
             bytes[position] = 'x';
         }
+    }
+}
+
+test "[unit] - [content UTF-8]: trims only valid incomplete suffixes" {
+    const incomplete = [_]struct {
+        bytes: []const u8,
+        prefix_len: usize,
+    }{
+        .{ .bytes = "\xc2", .prefix_len = 0 },
+        .{ .bytes = "a\xdf", .prefix_len = 1 },
+        .{ .bytes = "\xe0", .prefix_len = 0 },
+        .{ .bytes = "a\xe0\xa0", .prefix_len = 1 },
+        .{ .bytes = "a\xed\x9f", .prefix_len = 1 },
+        .{ .bytes = "\xf0", .prefix_len = 0 },
+        .{ .bytes = "a\xf0\x90", .prefix_len = 1 },
+        .{ .bytes = "a\xf0\x90\x80", .prefix_len = 1 },
+        .{ .bytes = "a\xf4\x8f\xbf", .prefix_len = 1 },
+    };
+    for (incomplete) |case| {
+        try std.testing.expectEqual(case.prefix_len, completeUtf8PrefixLen(case.bytes));
+    }
+
+    const unchanged = [_][]const u8{
+        "",
+        "ascii",
+        "a\xc2\x80",
+        "a\x80",
+        "a\xc0",
+        "a\xc1",
+        "a\xc2x",
+        "a\xe0\x9f",
+        "a\xed\xa0",
+        "a\xf0\x8f",
+        "a\xf4\x90",
+        "a\xf5",
+        "a\xf0\x90\x80\x80",
+    };
+    for (unchanged) |bytes| {
+        try std.testing.expectEqual(bytes.len, completeUtf8PrefixLen(bytes));
     }
 }
