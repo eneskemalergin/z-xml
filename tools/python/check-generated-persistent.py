@@ -299,12 +299,26 @@ def read_workloads(
     with manifest.open(encoding="utf-8", newline="") as stream:
         lines = list(stream)
     comments = [line[1:].strip() for line in lines if line.startswith("#")]
-    expected_comments = (
-        [NAMESPACE_SCHEMA]
-        if namespace
-        else [CORPUS_SCHEMA, f"size ceiling: {MAX_WORKLOAD_BYTES} bytes"]
-    )
-    if comments != expected_comments:
+    if namespace:
+        valid_identity = comments == [NAMESPACE_SCHEMA]
+    else:
+        metadata = comments[2:]
+        metadata_parts = [value.partition(": ") for value in metadata]
+        metadata_keys = tuple(part[0] for part in metadata_parts)
+        valid_identity = (
+            comments[:2] == [CORPUS_SCHEMA, f"size ceiling: {MAX_WORKLOAD_BYTES} bytes"]
+            and metadata_keys
+            in (
+                (),
+                ("plan_name",),
+                ("summary_program",),
+                ("plan_name", "summary_program"),
+            )
+            and all(
+                separator and value.strip() for _, separator, value in metadata_parts
+            )
+        )
+    if not valid_identity:
         raise ValueError(f"{manifest}: invalid generated-corpus identity")
     reader = csv.DictReader(
         (line for line in lines if not line.startswith("#")), delimiter="\t"

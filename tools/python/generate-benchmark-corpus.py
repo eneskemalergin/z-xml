@@ -684,6 +684,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sizes-mib", default="1")
     parser.add_argument("--sizes-kib")
     parser.add_argument("--depths", default="16,256,2048")
+    parser.add_argument("--no-depth", action="store_true")
     parser.add_argument(
         "--shapes",
         default=",".join(shape for shape in SHAPES if shape != "utf16-text"),
@@ -702,7 +703,7 @@ def select_workloads(
     dict[tuple[str, int], list[int]],
     list[int],
 ]:
-    depths = parse_positive_csv(args.depths, "depths")
+    depths = [] if args.no_depth else parse_positive_csv(args.depths, "depths")
     if args.plan:
         if args.sizes_kib is not None:
             raise ValueError("--sizes-kib cannot be combined with --plan")
