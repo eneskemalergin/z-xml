@@ -141,6 +141,28 @@ test "[integration] - [document]: owns retained XML after the source expires" {
     );
 }
 
+test "[integration] - [document]: retains one namespace URI copy per start tag" {
+    var document = try xml.parseDocument(
+        std.testing.allocator,
+        .{ .slice = "<p:r xmlns:p='urn:x' p:a='v'/>" },
+        .{},
+    );
+    defer document.deinit();
+
+    const element = document.documentElement();
+    try std.testing.expectEqualStrings(
+        "urn:x",
+        document.nodeName(element).?.expanded.?.namespace_uri.?,
+    );
+    try std.testing.expectEqualStrings(
+        "urn:x",
+        document.attribute(element, "urn:x", "a").?.name.expanded.?.namespace_uri.?,
+    );
+    var declarations = document.namespaceDeclarations(element);
+    try std.testing.expectEqualStrings("urn:x", declarations.next().?.namespace_uri);
+    try std.testing.expectEqual(@as(usize, 13), document.memoryUsage().string_bytes);
+}
+
 test "[integration] - [document]: joins fragments from caller-owned stream input" {
     const input = "<r>ab<!--cd--><?p ef?></r>";
     var input_buffer: [1]u8 = undefined;

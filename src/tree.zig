@@ -1678,12 +1678,27 @@ const DocumentBuilder = struct {
         const name = try self.copyName(value.name);
         try self.reserveOwned(&self.attributes, value.attributes.len);
         try self.reserveOwned(&self.namespaces, value.namespace_declarations.len);
-        for (value.attributes) |attribute| try self.appendAttribute(attribute);
-        for (value.namespace_declarations) |declaration| {
-            try self.appendOwned(&self.namespaces, .{
-                .prefix = try self.copyOptional(declaration.prefix),
-                .namespace_uri = try self.copy(declaration.namespace_uri),
-            });
+        if (name.namespace_uri.offset == std.math.maxInt(u32)) {
+            for (value.attributes) |attribute| try self.appendAttribute(attribute);
+            for (value.namespace_declarations) |declaration| {
+                try self.appendOwned(&self.namespaces, .{
+                    .prefix = try self.copyOptional(declaration.prefix),
+                    .namespace_uri = try self.copy(declaration.namespace_uri),
+                });
+            }
+        } else {
+            for (value.attributes) |attribute| {
+                try self.appendAttributeReusing(attribute, name.namespace_uri);
+            }
+            for (value.namespace_declarations) |declaration| {
+                try self.appendOwned(&self.namespaces, .{
+                    .prefix = try self.copyOptional(declaration.prefix),
+                    .namespace_uri = try self.copyNamespaceUri(
+                        declaration.namespace_uri,
+                        name.namespace_uri,
+                    ),
+                });
+            }
         }
         try self.appendOwned(&self.elements, .{
             .name = name,
@@ -1860,6 +1875,20 @@ const DocumentBuilder = struct {
         });
     }
 
+    fn appendAttributeReusing(
+        self: *Self,
+        value: reader.NormalAttribute,
+        reusable_namespace_uri: StringRef,
+    ) BuildError!void {
+        try self.appendOwned(&self.attributes, .{
+            .name = try self.copyNameReusing(value.name, reusable_namespace_uri),
+            .value = try self.copy(value.value),
+            .specified = value.specified,
+            .declared_type = if (value.declared_type) |kind| @intFromEnum(kind) else 0,
+            .has_declared_type = value.declared_type != null,
+        });
+    }
+
     fn appendNode(self: *Self, kind: NodeKind, payload: u32) BuildError!NodeIndex {
         if (self.nodes.items.len >= self.options.limits.max_nodes or
             self.nodes.items.len >= std.math.maxInt(u32)) return error.TreeLimit;
@@ -1904,6 +1933,39 @@ const DocumentBuilder = struct {
             result.namespace_uri = try self.copyOptional(expanded.namespace_uri);
         }
         return result;
+    }
+
+    fn copyNameReusing(
+        self: *Self,
+        value: reader.NormalName,
+        reusable_namespace_uri: StringRef,
+    ) BuildError!DocumentNameRecord {
+        const raw = try self.copy(value.raw);
+        var result: DocumentNameRecord = .{ .raw = raw };
+        if (value.expanded) |expanded| {
+            if (expanded.prefix) |prefix| {
+                result.prefix = .{ .offset = raw.offset, .len = @intCast(prefix.len) };
+            }
+            result.local = .{
+                .offset = raw.offset + raw.len - @as(u32, @intCast(expanded.local.len)),
+                .len = @intCast(expanded.local.len),
+            };
+            if (expanded.namespace_uri) |uri| {
+                result.namespace_uri = try self.copyNamespaceUri(uri, reusable_namespace_uri);
+            }
+        }
+        return result;
+    }
+
+    inline fn copyNamespaceUri(
+        self: *Self,
+        value: []const u8,
+        reusable: StringRef,
+    ) BuildError!StringRef {
+        if (reusable.offset != std.math.maxInt(u32) and
+            std.mem.eql(u8, self.poolBytes(reusable), value))
+            return reusable;
+        return self.copy(value);
     }
 
     fn copy(self: *Self, bytes: []const u8) BuildError!StringRef {
