@@ -353,6 +353,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--targets", type=Path, required=True)
     parser.add_argument("--bin-dir", type=Path, required=True)
     parser.add_argument("--target", action="append", default=[])
+    parser.add_argument("--workload", action="append", default=[])
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=120.0)
     return parser.parse_args()
@@ -382,6 +383,18 @@ def main() -> int:
                 "manifest uses unknown targets: "
                 + ",".join(sorted(unknown_workload_targets))
             )
+        if args.workload:
+            selected_names = set(args.workload)
+            unknown_names = selected_names.difference(
+                workload.name for workload in workloads
+            )
+            if unknown_names:
+                raise ValueError(
+                    "unknown workloads: " + ",".join(sorted(unknown_names))
+                )
+            workloads = [
+                workload for workload in workloads if workload.name in selected_names
+            ]
         selected_workloads = [
             workload for workload in workloads if workload.target in selected
         ]

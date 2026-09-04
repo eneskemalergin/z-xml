@@ -305,6 +305,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bin-dir", type=Path, default=root / "tools" / "zig-out" / "bin"
     )
+    parser.add_argument("--workload", action="append", default=[])
     parser.add_argument("--results", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=120.0)
     return parser.parse_args()
@@ -321,6 +322,24 @@ def main() -> int:
     try:
         targets = read_targets(targets_path, args.bin_dir)
         workloads = read_workloads(manifest)
+        unknown_targets = {
+            target_name
+            for workload in workloads
+            for target_name in workload.targets
+            if target_name not in targets
+        }
+        if unknown_targets:
+            raise ValueError(
+                "manifest uses unknown targets: " + ",".join(sorted(unknown_targets))
+            )
+        if args.workload:
+            selected = set(args.workload)
+            unknown = selected.difference(workload.name for workload in workloads)
+            if unknown:
+                raise ValueError("unknown workloads: " + ",".join(sorted(unknown)))
+            workloads = [
+                workload for workload in workloads if workload.name in selected
+            ]
         input_paths = {
             manifest,
             targets_path,

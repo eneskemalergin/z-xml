@@ -310,7 +310,20 @@ def read_workloads(
         CORPUS_SCHEMA,
         f"size ceiling: {MAX_WORKLOAD_BYTES} bytes",
     ]
-    if comments != expected_comments:
+    plan_name = (
+        comments[2].removeprefix("plan_name:").strip()
+        if len(comments) == 3 and comments[2].startswith("plan_name:")
+        else None
+    )
+    if (
+        comments[:2] != expected_comments
+        or len(comments) not in {2, 3}
+        or (len(comments) == 3 and plan_name is None)
+        or (
+            plan_name is not None
+            and (not plan_name or Path(plan_name).name != plan_name)
+        )
+    ):
         raise ValueError(f"{manifest}: invalid generated-corpus identity")
     reader = csv.DictReader(
         (line for line in lines if not line.startswith("#")), delimiter="\t"
