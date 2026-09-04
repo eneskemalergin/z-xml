@@ -1,6 +1,6 @@
 # Tools
 
-Status: **Active** (last updated: 2026-09-01)
+Status: **Active** (last updated: 2026-09-04)
 
 `tools/` contains development commands and XML adapters. It is excluded from the Zig package.
 
@@ -21,7 +21,7 @@ Use `make -C ref` for commands that work with fixtures, generated XML, or refere
 
 ## Ownership map
 
-The implementation and declaration set contains 39 files: 21 Python commands, 3 Python support modules, 7 Zig files, 6 target manifests, 1 shell command, and 1 build file. This README is the 40th project file under `tools/` and owns the map. A command entry is its CLI or build step. A declaration entry is its manifest path. Support modules enter through imports. Each item names its input, output, entry path or caller, and focused check. An unversioned result is identified by the exact field constant that owns its header.
+The implementation and declaration set contains 40 files: 22 Python commands, 3 Python support modules, 7 Zig files, 6 target manifests, 1 shell command, and 1 build file. This README is the 41st project file under `tools/` and owns the map. A command entry is its CLI or build step. A declaration entry is its manifest path. Support modules enter through imports. Each item names its input, output, entry path or caller, and focused check. An unversioned result is identified by the exact field constant that owns its header.
 
 Build and declarations:
 
@@ -65,23 +65,71 @@ Python support modules:
 Correctness and conformance:
 
 - `python/check-persistent-adapters.py` enters directly or through `ref/build.sh persistent`. It reads installed peer or z-xml adapters and one bounded smoke input, then checks one resident and three stream schedules for minimal and full consumers. It bounds input size, process output, and run time, prints pass or fail, and writes no result file. `python3 tools/python/check-persistent-adapters.py --z-xml-bin-dir tools/zig-out/bin` is its focused z-xml check.
-- `python/check-generated-corpus.py` enters through generated event, limited, and Document Make targets. It reads a `z-xml-generated-v3` or `z-xml-namespace-benchmark-v1` manifest, `z-xml-targets-v1` or `z-xml-targets-v2` declarations, installed adapters, and an optional Document oracle. Event mode checks the common summary. Explicit subset and partial-DOM modes remain outside event and Document eligibility. Document mode checks complete traversal, construction-only execution, one-traversal timing, retained memory, and allocator closure. Namespace mode also checks independent declaration counts and expanded-name checksums. Every mode validates the complete manifest before selection, bounds each process, and atomically publishes an unversioned eligibility TSV whose exact header is its mode-specific `fieldnames` list only after every executed row passes. `make -C ref check-generated` and `make -C ref check-generated-document` are its focused event and Document checks.
+- `python/check-generated-corpus.py` enters through generated event, limited, and Document Make targets. It reads a `z-xml-generated-v3` or `z-xml-namespace-benchmark-v1` manifest, including optional plan-name provenance, `z-xml-targets-v1` or `z-xml-targets-v2` declarations, installed adapters, and an optional Document oracle. Event mode checks the common summary. Explicit subset and partial-DOM modes remain outside event and Document eligibility. Document mode checks complete traversal, construction-only execution, one-traversal timing, retained memory, and allocator closure. Namespace mode also checks independent declaration counts and expanded-name checksums. Every mode validates the complete manifest before selection, bounds each process, and atomically publishes an unversioned eligibility TSV whose exact header is its mode-specific `fieldnames` list only after every executed row passes. `make -C ref check-generated` and `make -C ref check-generated-document` are its focused event and Document checks.
 - `python/check-generated-persistent.py` enters through generated persistent and Reader scale Make targets. It reads a generated or namespace manifest, one `z-xml-persistent-targets-v1` declaration, one installed adapter, and one exact schedule. It checks lane, input model, consumer features, corpus identity, source schedules, semantic output, consumer parity, process limits, optional timing, parser memory, caller input storage, and explicit release. It atomically publishes an unversioned eligibility TSV whose exact header is `RESULT_FIELDS` plus enabled report fields only after the complete run passes. `make -C ref check-generated-persistent` is its focused check.
-- `python/check-dtd-benchmark.py` is the direct DTD qualification entry. It reads `z-xml-dtd-generated-v1`, `z-xml-targets-v1`, and installed adapters. It runs every manifest command with separate semantic and memory reports, requires the expected status and complete JSON fields, and checks Reader and caller-source cleanup. It atomically publishes an unversioned eligibility TSV with header `RESULT_FIELDS` only after all commands pass. The DTD processing qualification command below is its focused check.
-- `python/check-validation-benchmark.py` is the direct fresh-validation qualification entry. It reads `z-xml-validation-generated-v1`, `z-xml-targets-v1`, and installed adapters. It bounds every command with and without memory reporting and checks validity, finding order, events, diagnostics, source results, identity counts, Reader memory, and cleanup. It atomically publishes an unversioned eligibility TSV with header `RESULT_FIELDS` only after all commands pass. The fresh validation qualification command below is its focused check.
-- `python/check-validation-reuse.py` is the direct repeated-validation qualification entry. It reads `z-xml-validation-reuse-v1`, `z-xml-targets-v1`, and both installed adapters. It bounds every fixed schedule, checks parity across iterations and modes, and verifies subset, Reader, resolver, timing, capacity, release, and deinitialization fields. It atomically publishes an unversioned eligibility TSV with header `RESULT_FIELDS` only after all commands pass. The validation reuse qualification command below is its focused check.
+- `python/check-dtd-benchmark.py` is the direct DTD qualification entry. It reads `z-xml-dtd-generated-v1`, `z-xml-targets-v1`, and installed adapters. It validates the complete manifest, optionally selects repeatable `--workload` names, runs each selected command with separate semantic and memory reports, requires the expected status and complete JSON fields, and checks Reader and caller-source cleanup. It atomically publishes an unversioned eligibility TSV with header `RESULT_FIELDS` only after all commands pass. The DTD processing qualification command below is its focused check.
+- `python/check-validation-benchmark.py` is the direct fresh-validation qualification entry. It reads `z-xml-validation-generated-v1`, `z-xml-targets-v1`, and installed adapters. It validates the complete manifest, optionally selects repeatable `--workload` names, bounds every selected command with and without memory reporting, and checks validity, finding order, events, diagnostics, source results, identity counts, Reader memory, and cleanup. It atomically publishes an unversioned eligibility TSV with header `RESULT_FIELDS` only after all commands pass. The fresh validation qualification command below is its focused check.
+- `python/check-validation-reuse.py` is the direct repeated-validation qualification entry. It reads `z-xml-validation-reuse-v1`, `z-xml-targets-v1`, and both installed adapters. It validates the complete manifest, optionally selects repeatable `--workload` names, bounds every selected schedule, checks parity across iterations and modes, and verifies subset, Reader, resolver, timing, capacity, release, and deinitialization fields. It atomically publishes an unversioned eligibility TSV with header `RESULT_FIELDS` only after all commands pass. The validation reuse qualification command below is its focused check.
 - `python/check-document-repeat.py` is the direct repeated-Document qualification entry. It reads `z-xml-document-repeat-v1`, `z-xml-targets-v1`, and `z-xml-tree`. It bounds summary, semantic, memory, and timing runs, then checks generated summaries, fresh versus post-large ownership, public-path and Reader allocation work, input identity, and deinitialization. It atomically publishes an unversioned eligibility TSV with header `RESULT_FIELDS` only after all schedules pass. The repeated Document qualification command below is its focused check.
 - `fetch-w3c-xmlconf.sh` enters through `make -C ref fetch-xmlconf`. It reads the pinned archive from its cache or W3C, checks its digest and paths, and publishes the extracted suite under `data/conformance/`; it has no result schema. Re-running `make -C ref fetch-xmlconf` against the pinned cache is its focused check.
 - `python/run-w3c-xmlconf.py` enters through peer or Reader conformance Make targets. It reads the pinned W3C catalog, follows its 21 manifests, and runs declared installed adapters. Every target and case receives one `pass`, `fail`, `skip`, `mismatch`, `timeout`, or `tool-error` row. Skips keep the W3C applicability class and a reason. Partial validated targets admit valid DTD documents only; other classes remain explicit exclusions. External paths above the configured root require `external_parent_paths`. A complete run atomically publishes `z-xml-w3c-results-v1`; structural failure removes stale results, and the command returns zero only with no failure, mismatch, timeout, or tool error. `make -C ref check-reader-conformance` is its focused z-xml check; `make -C ref check-xmlconf` checks peers.
 
 Resource and measurement commands:
 
+- `python/component-evidence.py` is the small component entry for `qualify`, `baseline`, and `compare`. It delegates XML semantics to the existing generators and qualifiers and delegates timing to `run-zebrac-aa.py`, `run-zebrac-matrix.py`, and `summarize-zebrac.py`. Quick qualification writes under `evidence/quick/` and cannot authorize timing. Full qualification writes a `z-xml-component-qualification-v1` index at the component root. Baseline and compare require that index from the same clean revision and require one of its exact eligibility files. They publish compact `z-xml-component-controls-v1`, `z-xml-component-metrics-v1`, `z-xml-component-status-v1`, or existing `z-xml-zebrac-summary-v1` rows while bounded raw records stay under `evidence/`. Running quick qualification for all five components and the failure commands in the component evidence section are its focused checks.
 - `python/run-valgrind.py` is the bounded Memcheck entry. It reads one standalone executable or a supported manifest, fresh eligibility TSV, target declarations, and installed adapters. Standalone mode expects status zero; corpus mode requires an exact passing correctness row for every selected command. It writes bounded per-case logs, `z-xml-valgrind-v4` metadata, and an unversioned corpus `results.tsv` with header `RESULT_FIELDS`. Metadata keeps semantic status, process status, Valgrind status, error counts, and descriptor counts separate; it does not claim parser-owned bytes or timing RSS. The `/usr/bin/true` and `/usr/bin/false` commands below are its focused pass and failure checks.
 - `python/run-zebrac-aa.py` is the one-command A/A entry. It reads one supported workload manifest, fresh eligibility TSV, target declarations, an installed executable, and exact program arguments. It derives companion and transition sources from the manifest and rejects stale or mismatched qualification. It writes bounded raw output, logs, and `z-xml-zebrac-aa-v3` under `--output-dir`. The smallest event A/A command below is its focused check; `--dry-run` checks qualification without timing.
 - `python/run-zebrac-matrix.py` is the matched measurement entry. It reads one supported workload manifest, one or more fresh eligibility reports, matching target declarations and binary directories, exact lanes, and program arguments. Repeated target and binary pairs keep z-xml and peers in one workload group. Companion and transition sources are measured inputs. It writes bounded raw output and `z-xml-zebrac-matrix-v4`; reported traversal mode rotates exact qualified commands, requires equal traversal results per sample, and writes `z-xml-reported-traversal-v1` records inside `z-xml-zebrac-matrix-v5`. The smallest event matrix command below is its focused check; `--dry-run` checks qualification without timing.
 - `python/summarize-zebrac.py` is the result calculation entry. It reads `z-xml-zebrac-matrix-v4` or `z-xml-zebrac-matrix-v5` indexes and one baseline per lane, validates traversal records, and writes `z-xml-zebrac-summary-v1` row, aggregate, JSON, and text reports under `--output-dir`. It rejects failed rows, unmatched work, lane drift, missing metrics, and wrong units. It does not mix lanes, treat adapter traversal time as a process metric, or calculate aggregate ratios from incomplete coverage. The summary command below is its focused check.
 
 Generation, correctness, conformance, resource checking, and timing remain separate because they produce different evidence. `bench/` and `data/` are ignored. `bench/` contains local plans and small benchmark inputs. `data/` contains generated XML, downloaded test suites, and results. Benchmark results remain local until the reproduction and comparison commands are qualified.
+
+## Component evidence
+
+Use one explicit qualification command for each component:
+
+```sh
+python3 tools/python/component-evidence.py qualify reader
+python3 tools/python/component-evidence.py qualify document
+python3 tools/python/component-evidence.py qualify writer
+python3 tools/python/component-evidence.py qualify dtd
+python3 tools/python/component-evidence.py qualify validation
+```
+
+These are quick checks. They build fresh portable ReleaseFast artifacts and run bounded small-input semantics, ownership, and resource checks. Writer qualification also validates the complete shape, oracle, plan, fixture, and target declarations before running selected shapes. Quick reports are written under `data/results/COMPONENT-baseline/evidence/quick/`. They do not run Zebrac and cannot authorize a baseline or peer comparison. Starting a qualification invalidates the prior index for the same scope, so a failed refresh cannot authorize later measurement.
+
+Add `--full` to run the complete component qualification. Full qualification writes `qualification-index.json` and its eligibility reports directly under the component root. The index records source revision and dirty state, target, optimization mode, artifact identities, exact commands, and report row counts. Full Reader and Document qualification includes general and namespace data. Full Document also includes repeated construction. Full Writer checks every ready shape, value, and sink. Full DTD and validation qualification runs their complete generated manifests.
+
+Baseline and compare require a full qualification from the same clean revision. They also require explicit manifests, eligibility reports, target declarations, artifact directories, targets, workloads, program arguments, and sample controls. This example runs one Reader exact-binary control and publishes compact control and metric rows:
+
+```sh
+python3 tools/python/component-evidence.py baseline reader \
+    --manifest data/generated/z-xml-generated-v3-reader/manifest.tsv \
+    --qualification-index data/results/reader-baseline/qualification-index.json \
+    --eligibility data/results/reader-baseline/qualification.tsv \
+    --targets tools/targets.tsv \
+    --bin-dir tmp/component-evidence/reader/bin \
+    --target z-xml-raw-reject \
+    --workload text-64m \
+    --work-bytes 67108864
+```
+
+This example compares the same qualified work with an eligible Expat build. The existing matrix and summary commands still make all feature, lane, input-model, program-argument, and semantic decisions:
+
+```sh
+python3 tools/python/component-evidence.py compare reader \
+    --manifest data/generated/z-xml-generated-v3-reader/manifest.tsv \
+    --qualification-index data/results/reader-baseline/qualification-index.json \
+    --eligibility data/results/reader-baseline/qualification.tsv \
+    --eligibility /tmp/reader-peer-qualification.tsv \
+    --targets tools/targets.tsv --bin-dir tmp/component-evidence/reader/bin \
+    --targets ref/targets.tsv --bin-dir ref/build/bin \
+    --target z-xml-raw-reject --target expat \
+    --workload text-64m \
+    --baseline event=z-xml-raw-reject
+```
+
+`--not-entered REASON` publishes the required DTD or validation no-entry decision without timing. `compare --no-eligible-peer REASON` publishes an explicit peer exclusion. These status operations do not require dummy workloads or artifacts and remove a superseded compact result for the same operation. Raw evidence remains available. Successful timing clears the corresponding status file. Baseline and comparison use warm filesystem-cache measurements after the declared warmups; there is no cold-cache mode. Component stages choose their final workload lanes and profile commands; this front end does not freeze them.
 
 ## Generated correctness
 
