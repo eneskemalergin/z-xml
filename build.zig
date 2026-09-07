@@ -73,6 +73,16 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run z-xml package tests");
+    const workflow_module = b.createModule(.{
+        .root_source_file = b.path("tests/workflows.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    workflow_module.addImport("z_xml", z_xml);
+    const workflow_tests = b.addTest(.{ .root_module = workflow_module });
+    const workflow_run = b.addRunArtifact(workflow_tests);
+    b.step("test-workflows", "Run public XML workflow tests").dependOn(&workflow_run.step);
+    test_step.dependOn(&workflow_run.step);
     test_step.dependOn(&b.addRunArtifact(reader_tests).step);
     test_step.dependOn(&b.addRunArtifact(tree_tests).step);
     test_step.dependOn(&b.addRunArtifact(writer_tests).step);
