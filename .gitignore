@@ -3,6 +3,7 @@ zig-out/
 zig-cache/
 .zig-cache/
 .zig-global-cache/
+zig-pkg/
 
 # Editor
 .vscode/
