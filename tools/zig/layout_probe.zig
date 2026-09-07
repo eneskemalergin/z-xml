@@ -1,4 +1,4 @@
-//! Prints Reader and Document type layouts.
+//! Prints Reader, Writer, and Document type layouts.
 
 const std = @import("std");
 const profile = @import("z_xml_profile");
@@ -14,6 +14,7 @@ pub fn main() void {
             @sizeOf(xml.Location),
         },
     );
+    std.debug.print("writer\twriter={d}\n", .{@sizeOf(xml.Writer)});
     printPrivate("no-dtd-byte-offset", profile.Configs.XML10_UTF8_NO_DTD_FAST);
     printPrivate("no-dtd-line-column", profile.Configs.XML10_UTF8_NO_DTD);
     printPrivate("no-dtd-namespaces", profile.Configs.XML10_UTF8_NAMESPACES_NO_DTD);
