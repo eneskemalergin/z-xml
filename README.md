@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="#verification"><img src="https://img.shields.io/badge/tests-362%2F362%20pass-2D7D46?style=flat-square" alt="362 of 362 tests pass"></a>
+  <a href="#verification"><img src="https://img.shields.io/badge/tests-383%2F383%20pass-2D7D46?style=flat-square" alt="383 of 383 tests pass"></a>
   <a href="build.zig.zon"><img src="https://img.shields.io/badge/version-v0.2.0-8B5CF6?style=flat-square" alt="v0.2.0"></a>
   <a href="#requirements-and-support"><img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
   <a href="#xml-support"><img src="https://img.shields.io/badge/XML-1.0%20%2B%201.1-0066CC?style=flat-square" alt="XML 1.0 and XML 1.1"></a>
@@ -256,9 +256,21 @@ The implementation targets these XML contracts:
 - Namespaces in XML 1.1 Second Edition
 - W3C XML conformance cases relevant to the supported parser modes
 
-Package version `0.2.0` is the current compatibility boundary. The normal `Reader`, `Document`, `Writer`, resolver, transcoder, and DTD contracts are the supported package surface. Before 1.0, an intentional breaking change requires a minor version and a migration note. A conformance correction may change acceptance of input that contradicts the documented XML boundary.
+Package version `0.2.0` is the current unreleased development label. The first public release is not ready. The normal `Reader`, `Document`, `Writer`, resolver, transcoder, and DTD contracts are the supported package surface, but may change during development. A conformance correction may change acceptance of input that contradicts the documented XML boundary.
 
 This is a source-package contract, not a stable binary ABI promise.
+
+## Combining the APIs
+
+For selected metadata, walk from the beginning with one Reader. Copy any values you keep, and call `skipElement` immediately on unwanted start events. This preserves inherited namespaces and physical source positions while checking skipped XML. A selected source span is not a self-contained parse context.
+
+To rewrite supported content, pass names, namespace declarations, attributes, and logical text to a separate Writer before advancing the Reader. Text can arrive in several fragments even from a byte slice. Process every fragment, including an empty final fragment; use `final_fragment` to finish caller-owned text processing. The Writer emits UTF-8, so compare logical values rather than original quoting, CDATA boundaries, or offsets. DTD declarations cannot be serialized by Writer.
+
+For indexed output, record `writer.byteOffset()` immediately after `startElement`, while the tag is pending. Keep indexes and checksums in the caller. A checksum sink must hash only its defined physical-byte range, including bytes drained later from a buffer. `endDocument` completes XML, not delivery: flush the caller's sink afterwards and handle that failure separately. A Writer write failure makes its offset unknown and leaves any partial destination for the caller to handle.
+
+For source-preserving edits, validate the complete input and retain the checked replacement span. Copy untouched bytes from the original source outside Writer, and use Writer to build the replacement. Check the span's source ID before indexing source bytes. The replacement must use the surrounding encoding and namespace context; a standalone subtree is not automatically valid in its new location.
+
+Use `parseDocument` when the selected result needs repeated navigation. It owns its copied strings after construction, so the input buffer can then be reused. Reuse a Reader with `reset`; use a fresh Writer for each output document. Base64 decoding, compression, schema validation, and destination commit policy stay outside the XML package.
 
 ## Verification
 
@@ -269,7 +281,7 @@ zig build test -Dtarget=x86_64-linux --summary all
 zig build test -Dtarget=x86_64-linux -Doptimize=ReleaseFast --summary all
 ```
 
-The package tests cover the public reader, owned document, writer, XML rules, DTDs, encodings, namespaces, limits, ownership, and round trips.
+The package tests cover the public reader, owned document, writer, XML rules, DTDs, encodings, namespaces, limits, ownership, and round trips. The public workflow suite combines selection, encoding, multi-megabyte fragmented text, source-preserving replacement, indexed/checksummed output, retained metadata, validation, and failure cleanup. Run just that suite with `zig build test-workflows -Dtarget=x86_64-linux`.
 
 ---
 
