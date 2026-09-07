@@ -19,6 +19,9 @@
 //! Fatal failures are sticky until reset. Construction validates options without
 //! reading or allocating. Runtime limits bound retained memory, token size, nesting,
 //! namespace and DTD work, entity expansion, external input, and validation.
+//! Normal Reader sources are capped at `u64_max - 1` physical bytes so one-based
+//! EOF locations remain representable. An extra byte produces sticky `LimitExceeded`
+//! with `source_position_limit`; configured external limits still apply separately.
 
 const std = @import("std");
 const encoding_module = @import("encoding.zig");
@@ -512,6 +515,7 @@ pub const DiagnosticCode = enum {
     validity_standalone_external_default,
     validity_standalone_external_normalization,
     validity_standalone_external_whitespace,
+    source_position_limit,
 };
 
 pub fn Location(comptime config: Config) type {
@@ -1515,6 +1519,11 @@ const Failure = enum {
 
 const decoded_input_capacity = 16 * 1024;
 const transcoder_input_capacity = std.math.maxInt(u8);
+const MAX_SOURCE_BYTES: u64 = std.math.maxInt(u64) - 1;
+
+fn remainingSourceBytes(offset: u64, pending: usize) u64 {
+    return MAX_SOURCE_BYTES -| offset -| pending;
+}
 
 const EncodingFailure = struct {
     code: DiagnosticCode,
@@ -4315,6 +4324,9 @@ pub fn Reader(comptime config: Config) type {
             var chunk: [16 * 1024]u8 = undefined;
             while (true) switch (source.read(&chunk)) {
                 .bytes => |len| {
+                    if (len > remainingSourceBytes(0, raw.items.len)) {
+                        return self.externalProviderFailure(.source_position_limit, error.LimitExceeded);
+                    }
                     if (len > self.options.resolver.max_source_bytes -| raw.items.len or
                         len > self.options.resolver.max_total_bytes -| self.dtd_state.external_resource_bytes)
                     {
@@ -8453,12 +8465,18 @@ pub fn Reader(comptime config: Config) type {
                 decoder.external.needs_input = false;
                 while (true) {
                     const old_len = decoder.external.raw.items.len;
-                    decoder.external.raw.ensureUnusedCapacity(self.allocator, 16 * 1024) catch
+                    const remaining = remainingSourceBytes(decoder.raw_offset, old_len);
+                    const read_capacity: usize = @intCast(@min(16 * 1024, @max(1, remaining)));
+                    decoder.external.raw.ensureUnusedCapacity(self.allocator, read_capacity) catch
                         return self.failOutOfMemory();
-                    decoder.external.raw.items.len = old_len + 16 * 1024;
+                    decoder.external.raw.items.len = old_len + read_capacity;
                     const result = source.read(decoder.external.raw.items[old_len..]);
                     switch (result) {
                         .bytes => |len| {
+                            if (len > remaining) {
+                                decoder.external.raw.items.len = old_len;
+                                return self.failAt(.source_position_limit, .limit_exceeded, self.locationAtCurrentLine(MAX_SOURCE_BYTES));
+                            }
                             decoder.external.raw.items.len = old_len + len;
                             if (len > self.options.resolver.max_source_bytes -|
                                 (@as(usize, @intCast(decoder.raw_offset)) +| old_len) or
@@ -10276,7 +10294,7 @@ fn externalRawStartReady(
         if (externalAsciiByte(raw, cursor, encoding) == '?' and
             externalAsciiByte(raw, cursor + width, encoding) == '>') return true;
     }
-    return raw.len >= start + max_declaration_bytes * width;
+    return (raw.len - start) / width >= max_declaration_bytes;
 }
 
 const DetectedExternalEncoding = struct {
@@ -10755,6 +10773,9 @@ pub const NormalReader = struct {
         switch (self.source) {
             .slice => |input| {
                 if (self.source_started) return error.InvalidState;
+                if (input.len > MAX_SOURCE_BYTES) {
+                    return parser.failAt(.source_position_limit, .limit_exceeded, parser.currentLocation());
+                }
                 self.source_started = true;
                 parser.feed(input, true) catch return error.InvalidState;
             },
@@ -10770,7 +10791,7 @@ pub const NormalReader = struct {
                     };
                     const pending = AdapterAccess(config).transcoderPendingInput(parser);
                     std.debug.assert(pending < transcoder_input_capacity);
-                    const len = @min(bytes.len, transcoder_input_capacity - pending);
+                    const len = try self.rootInputLength(config, parser, @min(bytes.len, transcoder_input_capacity - pending));
                     try AdapterAccess(config).feedTranscodedRoot(parser, bytes[0..len], false);
                     input.toss(len);
                     self.source_tossed += @intCast(len);
@@ -10792,10 +10813,19 @@ pub const NormalReader = struct {
                     error.ReadFailed => return AdapterAccess(config).recordReadFailure(parser),
                 };
                 self.source_started = true;
-                parser.feed(bytes, false) catch return error.InvalidState;
-                self.pending_toss = bytes.len;
+                const len = try self.rootInputLength(config, parser, bytes.len);
+                parser.feed(bytes[0..len], false) catch return error.InvalidState;
+                self.pending_toss = len;
             },
         }
+    }
+
+    fn rootInputLength(self: *const Self, comptime config: Config, parser: *Reader(config), available: usize) ReadError!usize {
+        const remaining = remainingSourceBytes(self.source_tossed, 0);
+        if (remaining == 0) {
+            return parser.failAt(.source_position_limit, .limit_exceeded, parser.locationAtCurrentLine(MAX_SOURCE_BYTES));
+        }
+        return @intCast(@min(available, remaining));
     }
 
     fn convertEvent(
@@ -11896,7 +11926,312 @@ fn nameFromRaw(comptime config: Config, raw: []const u8) Name(config) {
     return .{ .raw = raw };
 }
 
+fn transcodeBytePairs(_: ?*anyopaque, input: []const u8, final: bool, output: []u8, advances: []u8) encoding_module.TranscodeStep {
+    if (input.len < 2) return if (final and input.len != 0) .{ .malformed = 0 } else .need_input;
+    if (input[0] != 0) return .{ .malformed = 0 };
+    if (output.len == 0) return .need_output;
+    output[0] = input[1];
+    advances[0] = 2;
+    return .{ .progress = .{ .consumed = 2, .produced = 1 } };
+}
+
 // --- Tests ---
+
+test "[edge] - [external declaration limit]: compares encoded extents without overflow" {
+    for ([_][]const u8{
+        "\xef\xbb\xbf<?xml ",
+        "\xfe\xff\x00<\x00?\x00x\x00m\x00l\x00 ",
+        "\xff\xfe<\x00?\x00x\x00m\x00l\x00 \x00",
+    }) |partial| {
+        try std.testing.expect(externalRawStartReady(partial, null, 6));
+        try std.testing.expect(!externalRawStartReady(partial, null, 7));
+        try std.testing.expect(!externalRawStartReady(partial, null, std.math.maxInt(usize)));
+    }
+}
+
+test "[edge] - [normal Reader positions]: preserves large physical spans across refills" {
+    for ([_]struct { prefix: []const u8, suffix: []const u8, width: u64 }{
+        .{ .prefix = "<r>", .suffix = "x</r>", .width = 1 },
+        .{ .prefix = "\xfe\xff\x00<\x00r\x00>", .suffix = "\x00x\x00<\x00/\x00r\x00>", .width = 2 },
+    }) |encoded| {
+        const suffix = encoded.suffix;
+        for ([_]u64{ 4_043_576_372, std.math.maxInt(u32) - 1, std.math.maxInt(u64) - 1 - suffix.len }) |offset| {
+            for ([_]NormalReaderOptions{
+                .{ .dtd = .reject, .namespaces = .raw },
+                .{ .dtd = .reject },
+                .{ .namespaces = .raw },
+                .{},
+                .{ .namespaces = .raw, .dtd = .{ .validate = .{} } },
+                .{ .dtd = .{ .validate = .{} } },
+            }) |options| {
+                var input = std.Io.Reader.fixed(encoded.prefix);
+                var parser = try NormalReader.init(std.testing.allocator, .{ .stream = &input }, options);
+                defer parser.deinit();
+                _ = try parser.next();
+                try std.testing.expectEqual(.start_element, std.meta.activeTag((try parser.next()).?.data));
+                try std.testing.expectEqual(@as(usize, 0), parser.pending_toss);
+
+                // A synthetic position must keep parser, decoder, and source consumption consistent.
+                parser.source_tossed = offset;
+                switch (parser.engine) {
+                    inline else => |*engine| {
+                        engine.source_byte_offset = offset;
+                        engine.source_state.raw_offset = offset;
+                    },
+                }
+                input = std.Io.Reader.fixed(suffix);
+                var text_bytes: usize = 0;
+                var final_fragments: usize = 0;
+                var end_seen = false;
+                while (try parser.next()) |event| {
+                    try std.testing.expectEqual(@as(u32, 0), event.span.source_id);
+                    switch (event.data) {
+                        .text => |value| {
+                            try std.testing.expectEqualStrings("x"[text_bytes .. text_bytes + value.bytes.len], value.bytes);
+                            try std.testing.expectEqual(offset + text_bytes * encoded.width, event.span.start);
+                            try std.testing.expectEqual(offset + encoded.width, event.span.end);
+                            if (value.bytes.len == 0) try std.testing.expect(value.final_fragment);
+                            final_fragments += @intFromBool(value.final_fragment);
+                            text_bytes += value.bytes.len;
+                        },
+                        .end_element => {
+                            try std.testing.expectEqual(offset + encoded.width, event.span.start);
+                            try std.testing.expectEqual(offset + suffix.len, event.span.end);
+                            end_seen = true;
+                        },
+                        else => {},
+                    }
+                }
+                try std.testing.expectEqual(@as(usize, 1), text_bytes);
+                try std.testing.expectEqual(@as(usize, 1), final_fragments);
+                try std.testing.expect(end_seen);
+                try std.testing.expectEqual(offset + suffix.len, parser.source_tossed);
+                switch (parser.engine) {
+                    inline else => |*engine| {
+                        const location = engine.currentLocation();
+                        try std.testing.expectEqual(offset + suffix.len, location.byte_offset);
+                        const bom_bytes: u64 = if (encoded.width == 2) 2 else 0;
+                        try std.testing.expectEqual(offset + suffix.len - bom_bytes + 1, location.byte_column);
+                        try std.testing.expectEqual(@as(u64, 1), location.line);
+                    },
+                }
+            }
+        }
+    }
+}
+
+test "[edge] - [normal Reader positions]: bounds received and pending byte counts" {
+    try std.testing.expectEqual(MAX_SOURCE_BYTES, remainingSourceBytes(0, 0));
+    try std.testing.expectEqual(@as(u64, 1), remainingSourceBytes(MAX_SOURCE_BYTES - 3, 2));
+    try std.testing.expectEqual(@as(u64, 0), remainingSourceBytes(MAX_SOURCE_BYTES - 3, 3));
+    try std.testing.expectEqual(@as(u64, 0), remainingSourceBytes(MAX_SOURCE_BYTES - 3, 4));
+    try std.testing.expectEqual(@as(u64, 0), remainingSourceBytes(std.math.maxInt(u64), std.math.maxInt(usize)));
+}
+
+test "[edge] - [normal Reader positions]: rejects the first unrepresentable source byte" {
+    const Reports = struct {
+        count: usize = 0,
+
+        fn report(context: ?*anyopaque, _: NormalDiagnostic) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.count += 1;
+        }
+    };
+    for ([_]struct { prefix: []const u8, suffix: []const u8 }{
+        .{ .prefix = "<r>", .suffix = "x</r> " },
+        .{ .prefix = "\xfe\xff\x00<\x00r\x00>", .suffix = "\x00x\x00<\x00/\x00r\x00>\x00 " },
+    }) |encoded| {
+        for ([_]bool{ false, true }) |track_lines| {
+            var input = std.Io.Reader.fixed(encoded.prefix);
+            var reports: Reports = .{};
+            var parser = try NormalReader.init(std.testing.allocator, .{ .stream = &input }, .{
+                .track_lines = track_lines,
+                .diagnostic_sink = .{ .context = &reports, .report_fn = Reports.report },
+            });
+            defer parser.deinit();
+            _ = try parser.next();
+            try std.testing.expectEqual(.start_element, std.meta.activeTag((try parser.next()).?.data));
+            try std.testing.expectEqual(@as(usize, 0), parser.pending_toss);
+            const offset = MAX_SOURCE_BYTES - (encoded.suffix.len - 1);
+            parser.source_tossed = offset;
+            switch (parser.engine) {
+                inline else => |*engine| {
+                    engine.source_byte_offset = offset;
+                    engine.source_state.raw_offset = offset;
+                },
+            }
+            input = std.Io.Reader.fixed(encoded.suffix);
+            var end_seen = false;
+            while (parser.next()) |maybe_event| {
+                const event = maybe_event orelse return error.ExpectedSourceLimit;
+                if (event.data == .end_element) end_seen = true;
+            } else |err| {
+                try std.testing.expectEqual(error.LimitExceeded, err);
+            }
+            try std.testing.expect(end_seen);
+            const diagnostic = parser.diagnostic().?;
+            try std.testing.expectEqual(.source_position_limit, diagnostic.code);
+            try std.testing.expectEqual(@as(u32, 0), diagnostic.primary.source_id);
+            try std.testing.expectEqual(MAX_SOURCE_BYTES, diagnostic.primary.byte_offset);
+            if (track_lines) {
+                try std.testing.expectEqual(@as(?u64, 1), diagnostic.primary.line);
+                const bom_bytes: u64 = if (encoded.prefix[0] == 0xfe) 2 else 0;
+                try std.testing.expectEqual(@as(?u64, MAX_SOURCE_BYTES - bom_bytes + 1), diagnostic.primary.byte_column);
+            } else {
+                try std.testing.expectEqual(null, diagnostic.primary.line);
+                try std.testing.expectEqual(null, diagnostic.primary.byte_column);
+            }
+            try std.testing.expectEqual(@as(usize, 1), input.buffered().len);
+            try std.testing.expectError(error.LimitExceeded, parser.next());
+            try std.testing.expectEqual(@as(usize, 1), reports.count);
+            try parser.reset(.{ .slice = "<ok/>" }, .{}, .retain_capacity);
+            while (try parser.next()) |_| {}
+            try std.testing.expectEqual(null, parser.diagnostic());
+        }
+    }
+}
+
+test "[edge] - [normal Reader positions]: bounds transcoded refills and permits exact-limit EOF" {
+    for ([_]usize{ 0, 1, 2 }) |excluded| {
+        for ([_]usize{ 1, 3, 16 }) |chunk_size| {
+            var input = std.Io.Reader.fixed("\x00<\x00r\x00>");
+            var parser = try NormalReader.init(std.testing.allocator, .{ .stream = &input }, .{
+                .transcoder = .{ .context = null, .runFn = transcodeBytePairs },
+            });
+            defer parser.deinit();
+            _ = try parser.next();
+            try std.testing.expectEqual(.start_element, std.meta.activeTag((try parser.next()).?.data));
+            const suffix = "\x00x\x00<\x00/\x00r\x00>\x00 ";
+            const offset = MAX_SOURCE_BYTES - (suffix.len - excluded);
+            parser.source_tossed = offset;
+            switch (parser.engine) {
+                inline else => |*engine| {
+                    engine.source_byte_offset = offset;
+                    engine.source_state.raw_offset = offset;
+                },
+            }
+            var buffer: [16]u8 = undefined;
+            var remaining: std.testing.Reader = .init(buffer[0..chunk_size], &.{.{ .buffer = suffix }});
+            remaining.artificial_limit = .limited(chunk_size);
+            parser.source = .{ .stream = &remaining.interface };
+            var end_seen = false;
+            var failed = false;
+            while (parser.next()) |maybe_event| {
+                const event = maybe_event orelse break;
+                if (event.data == .end_element) end_seen = true;
+            } else |err| {
+                try std.testing.expectEqual(error.LimitExceeded, err);
+                failed = true;
+            }
+            try std.testing.expect(end_seen);
+            try std.testing.expectEqual(excluded != 0, failed);
+            try std.testing.expectEqual(MAX_SOURCE_BYTES, parser.source_tossed);
+            if (failed) {
+                const diagnostic = parser.diagnostic().?;
+                try std.testing.expectEqual(.source_position_limit, diagnostic.code);
+                try std.testing.expectEqual(MAX_SOURCE_BYTES, diagnostic.primary.byte_offset);
+                try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), diagnostic.primary.byte_column);
+                try std.testing.expectError(error.LimitExceeded, parser.next());
+            } else {
+                try std.testing.expectEqual(null, parser.diagnostic());
+            }
+        }
+    }
+}
+
+test "[edge] - [normal Reader positions]: bounds external refills and closes each source once" {
+    const ExternalInput = struct {
+        bytes: []const u8,
+        chunk_size: usize,
+        transcoder: ?encoding_module.Transcoder,
+        closes: usize = 0,
+
+        fn resolve(context: ?*anyopaque, _: resolver_module.Request) resolver_module.Result {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return .{ .source = .{ .context = context, .source_id = 7, .transcoder = self.transcoder, .readFn = read, .closeFn = close } };
+        }
+
+        fn read(context: ?*anyopaque, output: []u8) resolver_module.ReadResult {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.bytes.len == 0) return .end;
+            const len = @min(output.len, self.chunk_size, self.bytes.len);
+            @memcpy(output[0..len], self.bytes[0..len]);
+            self.bytes = self.bytes[len..];
+            return .{ .bytes = len };
+        }
+
+        fn close(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.closes += 1;
+        }
+    };
+    const root = "<!DOCTYPE r [<!ENTITY e SYSTEM 'e'>]><r>&e;</r>";
+    for ([_]struct { prefix: []const u8, suffix: []const u8, width: u64, transcoder: ?encoding_module.Transcoder = null }{
+        .{ .prefix = "<p   >", .suffix = "x</p> ", .width = 1 },
+        .{ .prefix = "\xfe\xff\x00<\x00p\x00 \x00 \x00 \x00>", .suffix = "\x00x\x00<\x00/\x00p\x00>\x00 ", .width = 2 },
+        .{ .prefix = "\x00<\x00p\x00 \x00 \x00 \x00>", .suffix = "\x00x\x00<\x00/\x00p\x00>\x00 ", .width = 2, .transcoder = .{ .context = null, .runFn = transcodeBytePairs } },
+    }) |encoded| {
+        for ([_]usize{ 0, 1 }) |excluded| {
+            for ([_]usize{ 1, 3, 16 }) |chunk_size| {
+                var source: ExternalInput = .{ .bytes = encoded.prefix, .chunk_size = chunk_size, .transcoder = encoded.transcoder };
+                var options: NormalReaderOptions = .{
+                    .external = .resolve,
+                    .resolver = .{ .context = &source, .resolveFn = ExternalInput.resolve },
+                };
+                options.limits.max_external_source_bytes = std.math.maxInt(usize);
+                options.limits.max_external_total_bytes = std.math.maxInt(usize);
+                var parser = try NormalReader.init(std.testing.allocator, .{ .slice = root }, options);
+                defer parser.deinit();
+                while (try parser.next()) |event| {
+                    if (event.span.source_id == 7 and event.data == .start_element) break;
+                } else return error.ExpectedExternalStart;
+                try std.testing.expectEqual(@as(usize, 0), source.closes);
+                try std.testing.expectEqual(@as(usize, 0), source.bytes.len);
+                const offset = MAX_SOURCE_BYTES - (encoded.suffix.len - excluded);
+                switch (parser.engine) {
+                    inline else => |*engine| {
+                        engine.source_byte_offset = offset;
+                        engine.source_state.raw_offset = offset;
+                    },
+                }
+                source.bytes = encoded.suffix;
+                var external_end_seen = false;
+                var failed = false;
+                while (parser.next()) |maybe_event| {
+                    const event = maybe_event orelse break;
+                    if (event.span.source_id == 7 and event.data == .end_element) {
+                        external_end_seen = true;
+                        try std.testing.expectEqual(offset + encoded.suffix.len - encoded.width, event.span.end);
+                    }
+                } else |err| {
+                    try std.testing.expectEqual(error.LimitExceeded, err);
+                    failed = true;
+                }
+                try std.testing.expect(external_end_seen);
+                try std.testing.expectEqual(excluded != 0, failed);
+                try std.testing.expectEqual(@as(usize, 1), source.closes);
+                if (failed) {
+                    const diagnostic = parser.diagnostic().?;
+                    try std.testing.expectEqual(.source_position_limit, diagnostic.code);
+                    try std.testing.expectEqual(@as(u32, 7), diagnostic.primary.source_id);
+                    try std.testing.expectEqual(MAX_SOURCE_BYTES, diagnostic.primary.byte_offset);
+                    const bom_bytes: u64 = if (encoded.prefix[0] == 0xfe) 2 else 0;
+                    try std.testing.expectEqual(@as(?u64, MAX_SOURCE_BYTES - bom_bytes + 1), diagnostic.primary.byte_column);
+                    try std.testing.expectEqual(@as(usize, 1), diagnostic.inclusion_trace.len);
+                    try std.testing.expectEqual(@as(u32, 0), diagnostic.inclusion_trace[0].source_id);
+                    try std.testing.expectEqual(@as(u64, std.mem.indexOf(u8, root, "&e;").?), diagnostic.inclusion_trace[0].byte_offset);
+                    try std.testing.expectError(error.LimitExceeded, parser.next());
+                } else {
+                    try std.testing.expectEqual(null, parser.diagnostic());
+                }
+                try parser.reset(.{ .slice = "<ok/>" }, .{}, .release_memory);
+                while (try parser.next()) |_| {}
+                try std.testing.expectEqual(@as(usize, 1), source.closes);
+                try std.testing.expectEqual(null, parser.diagnostic());
+            }
+        }
+    }
+}
 
 test "[unit] - [normal Reader DTD policy]: rejection selects no-DTD engines" {
     var namespace_rejecting = try NormalReader.init(
