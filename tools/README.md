@@ -1,6 +1,6 @@
 # Tools
 
-Status: **Active** (last updated: 2026-09-06)
+Status: **Active** (last updated: 2026-09-07)
 
 `tools/` contains development commands and XML adapters. It is excluded from the Zig package.
 
@@ -21,7 +21,7 @@ Use `make -C ref` for commands that work with fixtures, generated XML, or refere
 
 ## Ownership map
 
-The implementation and declaration set contains 41 files: 22 Python commands, 3 Python support modules, 8 Zig files, 6 target manifests, 1 shell command, and 1 build file. This README is the 42nd project file under `tools/` and owns the map. A command entry is its CLI or build step. A declaration entry is its manifest path. Support modules enter through imports. Each item names its input, output, entry path or caller, and focused check. An unversioned result is identified by the exact field constant that owns its header.
+The implementation and declaration set contains 42 files: 23 Python commands, 3 Python support modules, 8 Zig files, 6 target manifests, 1 shell command, and 1 build file. This README is the 43rd project file under `tools/` and owns the map. A command entry is its CLI or build step. A declaration entry is its manifest path. Support modules enter through imports. Each item names its input, output, entry path or caller, and focused check. An unversioned result is identified by the exact field constant that owns its header.
 
 Build and declarations:
 
@@ -44,6 +44,10 @@ Zig sources:
 - `zig/validation_repeat.zig` enters through `z-xml-validation-fresh` and `z-xml-validation-reused`, built by `validation-bench`. It reads an external DTD, one streamed XML path, an optional transition path, and schedule or report flags. One Reader handles each fixed repeated or large-to-small schedule. Optional reports separate subset setup, document phases, immutable subset memory, Reader memory, resolver memory, release, and deinitialization. It writes one unversioned validation-reuse JSON result to standard output. `check-validation-reuse.py`, `run-zebrac-aa.py`, and `run-zebrac-matrix.py` call its executables. The validation reuse qualification command below is its focused check.
 - `zig/layout_probe.zig` enters through the `layout` build step. It reads the compiled Reader, Writer, and Document types and prints unversioned tab-separated size rows to standard error without installing an adapter. `zig build --build-file tools/build.zig layout -Dtarget=x86_64-linux` is its focused check.
 - `zig/tracking_allocator.zig` enters through the imported `TrackingAllocator` type. It has no CLI, persisted schema, or output. `check.zig`, `persistent.zig`, `tree.zig`, `validation_repeat.zig`, and `writer.zig` are its five callers. The development tool test step is its focused check.
+
+Package qualification:
+
+- `python/check-package-workflows.py` runs with `python3 tools/python/check-package-workflows.py`. It stages the current four package roots (`build.zig`, `build.zig.zon`, `src`, and `tests`) in a temporary directory, asks Zig to package that copy, checks the archive's top-level paths, copies `tests/workflows.zig` from that archive, and uses a temporary consumer with `b.dependency("z_xml", ...)`. Both Debug and ReleaseFast run against an isolated package/build cache, not a private profile or development adapter. It prints build/test results and removes its temporary consumer and cache on success or failure. Each build has a 600-second timeout; it creates no retained result schema. Keep the staged roots aligned with `build.zig.zon` when package admission changes. This command is the clean dependent-package gate; `zig build test-workflows -Dtarget=x86_64-linux` is the faster in-repository edit loop for the same suite.
 
 Generated inputs and declarations:
 
