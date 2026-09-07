@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="#verification"><img src="https://img.shields.io/badge/tests-356%2F356%20pass-2D7D46?style=flat-square" alt="356 of 356 tests pass"></a>
+  <a href="#verification"><img src="https://img.shields.io/badge/tests-359%2F359%20pass-2D7D46?style=flat-square" alt="359 of 359 tests pass"></a>
   <a href="build.zig.zon"><img src="https://img.shields.io/badge/version-v0.2.0-8B5CF6?style=flat-square" alt="v0.2.0"></a>
   <a href="#requirements-and-support"><img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
   <a href="#xml-support"><img src="https://img.shields.io/badge/XML-1.0%20%2B%201.1-0066CC?style=flat-square" alt="XML 1.0 and XML 1.1"></a>
@@ -212,6 +212,12 @@ Reader fragments never split a UTF-8 scalar. Each Writer call must also contain 
 ## Ownership and limits
 
 `Reader`, `Document`, `Writer`, and `dtd.ExternalSubset` own allocations after successful initialization or construction. Deinitialize each owning value exactly once. Allocators, sources, callback contexts, resolvers, transcoders, and sinks remain caller-owned and must outlive the operations that use them.
+
+Reader reset replaces the source and options, not the allocator. The allocator stays valid until `deinit`. Rejected reset preserves the current state and borrows. Stopping the event loop does not validate unread input; reset or deinitialize the reader to abandon it. The reader closes acquired external sources, never the caller's root source.
+
+Fatal Reader diagnostics remain borrowed until successful reset or `deinit`. To retain one from a `DiagnosticSink`, copy both the struct and its `inclusion_trace` elements during the callback. This also works for Reader failures inside `parseDocument`; Document builder errors such as `DocumentLimit` do not invoke that sink.
+
+Writer completion does not flush the sink. Its offset counts accepted XML bytes, excluding preexisting sink bytes, and does not prove delivery or durability. A write failure inside a Writer call makes its offset unknown. A later caller flush failure is separate from the completed Writer result and must be handled by the caller.
 
 Limits are finite and checked before governed storage grows or data is published. At-limit work succeeds. The first item or byte over a configured limit fails with the corresponding error. There is no unlimited preset.
 
