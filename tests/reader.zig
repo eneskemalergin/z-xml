@@ -2341,6 +2341,105 @@ test "[integration] - [Reader skipping]: nested and empty elements retain source
     try std.testing.expectEqual(@as(usize, 2), resolver.closes);
 }
 
+test "[integration] - [Reader selection]: sequential context preserves nested names and physical spans" {
+    const prefix = "<?xml version='1.1'?><root xmlns='urn:outer' xmlns:p='urn:p'>" ++
+        "<ignored/><scope xmlns='urn:inner'>";
+    const selected = "<item id='v'><p:child/></item>";
+    const input = prefix ++ selected ++ "</scope></root>";
+    for (0..3) |encoding| {
+        const encoded = switch (encoding) {
+            0 => try std.testing.allocator.dupe(u8, input),
+            1 => try encodeUtf16(std.testing.allocator, input, .little, true),
+            else => blk: {
+                const bytes = try std.testing.allocator.alloc(u8, input.len * 2);
+                pairEncode(bytes, input);
+                break :blk bytes;
+            },
+        };
+        defer std.testing.allocator.free(encoded);
+        for ([_]usize{ 0, 1, 7 }) |chunk| {
+            for ([_]bool{ false, true }) |skip_selected| {
+                var buffer: [7]u8 = undefined;
+                var stream: std.testing.Reader = .init(buffer[0..chunk], &.{.{ .buffer = encoded }});
+                stream.artificial_limit = .limited(chunk);
+                var reader = try xml.Reader.init(std.testing.allocator, if (chunk == 0)
+                    .{ .slice = encoded }
+                else
+                    .{ .stream = &stream.interface }, .{
+                    .transcoder = if (encoding == 2) pairTranscoder() else null,
+                });
+                defer reader.deinit();
+                const document = (try reader.next()).?.data.document_start;
+                try std.testing.expectEqual(xml.XmlVersion.xml11, document.effective_version);
+                const bom: u64 = if (encoding == 1) 2 else 0;
+                const scale: u64 = if (encoding == 0) 1 else 2;
+                const ignored = try nextStartNamed(&reader, "ignored");
+                try std.testing.expect(ignored.data.start_element.name.eql("urn:outer", "ignored"));
+                _ = try reader.skipElement();
+                const start = try nextStartNamed(&reader, "item");
+                const element = start.data.start_element;
+                try std.testing.expect(element.name.eql("urn:inner", "item"));
+                try std.testing.expectEqual(@as(usize, 0), element.namespace_declarations.len);
+                try std.testing.expectEqualStrings("v", element.attribute(null, "id").?.value);
+                try std.testing.expectEqual(physicalSpan(prefix.len, prefix.len + "<item id='v'>".len, bom, scale), start.span);
+                const wanted = physicalSpan(prefix.len, prefix.len + selected.len, bom, scale);
+                if (skip_selected) {
+                    try std.testing.expectEqual(wanted, try reader.skipElement());
+                } else {
+                    const child = try nextStartNamed(&reader, "p:child");
+                    try std.testing.expect(child.data.start_element.name.eql("urn:p", "child"));
+                    _ = try reader.next();
+                    const end = (try reader.next()).?;
+                    try std.testing.expect(end.data.end_element.name.eql("urn:inner", "item"));
+                    try std.testing.expectEqual(wanted.end, end.span.end);
+                }
+                const parent_end = (try reader.next()).?;
+                try std.testing.expect(parent_end.data.end_element.name.eql("urn:inner", "scope"));
+                while (try reader.next()) |_| {}
+            }
+        }
+    }
+
+    var detached = try xml.Reader.init(std.testing.allocator, .{ .slice = selected }, .{});
+    defer detached.deinit();
+    _ = try detached.next();
+    const root = (try detached.next()).?;
+    try std.testing.expect(root.data.start_element.name.eql(null, "item"));
+    try std.testing.expectEqual(@as(u64, 0), root.span.start);
+    try std.testing.expectError(error.InvalidXml, detached.next());
+    try std.testing.expectEqual(xml.DiagnosticCode.unbound_prefix, detached.diagnostic().?.code);
+
+    for ([_][]const u8{ "<item><p:child></wrong>", "<item><p:child/>" }) |broken| {
+        const malformed = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, broken });
+        defer std.testing.allocator.free(malformed);
+        for ([_]bool{ false, true }) |skip_selected| {
+            var stream_buffer: [1]u8 = undefined;
+            var stream: std.testing.Reader = .init(&stream_buffer, &.{.{ .buffer = malformed }});
+            stream.artificial_limit = .limited(1);
+            var reader = try xml.Reader.init(std.testing.allocator, .{ .stream = &stream.interface }, .{});
+            defer reader.deinit();
+            _ = try nextStartNamed(&reader, "item");
+            if (skip_selected) {
+                try std.testing.expectError(error.InvalidXml, reader.skipElement());
+            } else {
+                while (true) {
+                    const event = reader.next() catch |err| {
+                        try std.testing.expectEqual(error.InvalidXml, err);
+                        break;
+                    };
+                    if (event == null) return error.ExpectedFailure;
+                }
+            }
+            const diagnostic = reader.diagnostic().?;
+            const mismatch = std.mem.indexOf(u8, malformed, "wrong");
+            try std.testing.expectEqual(if (mismatch != null) xml.DiagnosticCode.mismatched_end_tag else .unclosed_element, diagnostic.code);
+            try std.testing.expectEqual(@as(u32, 0), diagnostic.primary.source_id);
+            try std.testing.expectEqual(@as(u64, mismatch orelse malformed.len), diagnostic.primary.byte_offset);
+            try std.testing.expectError(error.InvalidXml, reader.next());
+        }
+    }
+}
+
 test "[integration] - [Reader skipping]: invalid calls preserve parser progress" {
     const input = "<root>text<item/><after/></root>";
     var reader = try xml.Reader.init(
@@ -3985,6 +4084,178 @@ test "[integration] - [Reader namespaces]: expanded names and declarations follo
     };
     try std.testing.expectEqual(@as(usize, 1), raw_starts);
     try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().namespace_capacity);
+}
+
+test "[integration] - [Reader attributes]: defaults lookup order and spans agree across encodings" {
+    const input = "<!DOCTYPE r [<!ATTLIST r tokens NMTOKENS #IMPLIED " ++
+        "mode CDATA 'auto' xmlns:q CDATA 'urn:q'>]>" ++
+        "<r z='last' xmlns:p='urn:p' p:a='A&amp;B' xmlns='urn:root' tokens='  a&#x20; b  '/>";
+    const source_names = [_][]const u8{ "z", "xmlns:p", "p:a", "xmlns", "tokens" };
+    const source_spellings = [_][]const u8{ "z='last'", "xmlns:p='urn:p'", "p:a='A&amp;B'", "xmlns='urn:root'", "tokens='  a&#x20; b  '" };
+    const values = [_][]const u8{ "last", "urn:p", "A&B", "urn:root", "a b" };
+    for ([_]xml.NamespacePolicy{ .raw, .process }) |policy| {
+        for (0..3) |encoding| {
+            const encoded = if (encoding == 0)
+                try std.testing.allocator.dupe(u8, input)
+            else
+                try encodeUtf16(std.testing.allocator, input, if (encoding == 1) .little else .big, true);
+            defer std.testing.allocator.free(encoded);
+            for ([_]usize{ 0, 1, 7 }) |chunk| {
+                var buffer: [7]u8 = undefined;
+                var stream: std.testing.Reader = .init(buffer[0..chunk], &.{.{ .buffer = encoded }});
+                stream.artificial_limit = .limited(chunk);
+                var reader = try xml.Reader.init(std.testing.allocator, if (chunk == 0)
+                    .{ .slice = encoded }
+                else
+                    .{ .stream = &stream.interface }, .{ .namespaces = policy });
+                defer reader.deinit();
+                const event = try nextStartNamed(&reader, "r");
+                const element = event.data.start_element;
+                try std.testing.expect(element.name.eqlRaw("r"));
+                try std.testing.expectEqual(policy == .process, element.name.eql("urn:root", "r"));
+                try std.testing.expectEqual(@as(usize, if (policy == .raw) 7 else 4), element.attributes.len);
+                var attribute_index: usize = 0;
+                var declaration_index: usize = 0;
+                for (source_names, source_spellings, values) |name, spelling, value| {
+                    const start = std.mem.indexOf(u8, input, spelling).?;
+                    const span = physicalSpan(start, start + spelling.len, if (encoding == 0) 0 else 2, if (encoding == 0) 1 else 2);
+                    if (policy == .process and std.mem.startsWith(u8, name, "xmlns")) {
+                        const declaration = element.namespace_declarations[declaration_index];
+                        try std.testing.expect(declaration.specified);
+                        try std.testing.expectEqual(span, declaration.span.?);
+                        try std.testing.expectEqualStrings(value, declaration.namespace_uri);
+                        if (declaration_index == 0) {
+                            try std.testing.expectEqualStrings("p", declaration.prefix.?);
+                        } else try std.testing.expect(declaration.prefix == null);
+                        declaration_index += 1;
+                        try std.testing.expect(element.attributeRaw(name) == null);
+                    } else {
+                        const attribute = element.attributes[attribute_index];
+                        try std.testing.expectEqualStrings(name, attribute.name.raw);
+                        try std.testing.expectEqualStrings(value, attribute.value);
+                        try std.testing.expect(attribute.specified);
+                        try std.testing.expectEqual(span, attribute.span.?);
+                        try std.testing.expectEqualDeep(attribute, element.attributeRaw(name).?);
+                        attribute_index += 1;
+                    }
+                }
+                const mode = element.attributeRaw("mode").?;
+                try std.testing.expectEqualStrings("auto", mode.value);
+                try std.testing.expect(!mode.specified and mode.span == null);
+                try std.testing.expectEqual(xml.dtd.AttributeType.cdata, mode.declared_type.?);
+                try std.testing.expectEqual(xml.dtd.AttributeType.nmtokens, element.attributeRaw("tokens").?.declared_type.?);
+                try std.testing.expect(element.attributeRaw("missing") == null);
+                try std.testing.expect(element.attributeRaw("Z") == null);
+                try std.testing.expect(element.attribute("", "z") == null);
+                try std.testing.expect(element.attribute("urn:root", "z") == null);
+                if (policy == .process) {
+                    try std.testing.expectEqualStrings("last", element.attribute(null, "z").?.value);
+                    try std.testing.expectEqualStrings("A&B", element.attribute("urn:p", "a").?.value);
+                    try std.testing.expectEqual(@as(usize, 3), element.namespace_declarations.len);
+                    const defaulted = element.namespace_declarations[2];
+                    try std.testing.expectEqualStrings("q", defaulted.prefix.?);
+                    try std.testing.expectEqualStrings("urn:q", defaulted.namespace_uri);
+                    try std.testing.expect(!defaulted.specified and defaulted.span == null);
+                } else {
+                    try std.testing.expect(element.attribute(null, "z") == null);
+                    try std.testing.expectEqual(@as(usize, 0), element.namespace_declarations.len);
+                    const defaulted = element.attributeRaw("xmlns:q").?;
+                    try std.testing.expect(!defaulted.specified and defaulted.span == null);
+                }
+                while (try reader.next()) |_| {}
+            }
+        }
+    }
+}
+
+test "[integration] - [Reader names]: long names and wide Unicode attributes preserve lookup order" {
+    const shapes = [_]struct { name_len: usize, attributes: usize }{
+        .{ .name_len = 1, .attributes = 0 },
+        .{ .name_len = 63, .attributes = 1 },
+        .{ .name_len = 64, .attributes = 33 },
+        .{ .name_len = 65, .attributes = 65 },
+        .{ .name_len = 4095, .attributes = 1 },
+        .{ .name_len = 4096, .attributes = 1 },
+        .{ .name_len = 4097, .attributes = 256 },
+    };
+    for (shapes) |shape| {
+        const local = try std.testing.allocator.alloc(u8, shape.name_len);
+        defer std.testing.allocator.free(local);
+        @memset(local, 'a');
+        var storage: [32768]u8 = undefined;
+        var output = std.Io.Writer.fixed(&storage);
+        try output.print("<p:{s} xmlns:p='urn:p'", .{local});
+        const declarations: usize = if (shape.attributes >= 65) 64 else 1;
+        for (1..declarations) |i| try output.print(" xmlns:n{d}='urn:unused'", .{i});
+        for (0..shape.attributes) |i| try output.print(" p:{s}{d}='{d}'", .{
+            if (i % 2 == 0) "\xc3\xa9" else "\xf0\x90\x80\x80", i, i,
+        });
+        try output.writeAll("/>");
+        const input = output.buffered();
+        for ([_]xml.NamespacePolicy{ .raw, .process }) |policy| {
+            for ([_]usize{ 0, 1, 31, 4096 }) |chunk| {
+                var buffer: [4096]u8 = undefined;
+                var stream: std.testing.Reader = .init(buffer[0..chunk], &.{.{ .buffer = input }});
+                stream.artificial_limit = .limited(chunk);
+                var options: xml.ReaderOptions = .{
+                    .namespaces = policy,
+                    .limits = .{
+                        .max_attributes_per_element = shape.attributes + declarations,
+                        .max_qname_bytes = @max(shape.name_len + 2, 16),
+                    },
+                };
+                var reader = try xml.Reader.init(std.testing.allocator, if (chunk == 0)
+                    .{ .slice = input }
+                else
+                    .{ .stream = &stream.interface }, options);
+                defer reader.deinit();
+                _ = try reader.next();
+                const event = (try reader.next()).?;
+                const element = event.data.start_element;
+                try std.testing.expectEqualStrings(input[1 .. 3 + local.len], element.name.raw);
+                try std.testing.expectEqual(policy == .process, element.name.eql("urn:p", local));
+                const offset: usize = if (policy == .raw) declarations else 0;
+                try std.testing.expectEqual(shape.attributes + offset, element.attributes.len);
+                try std.testing.expectEqual(if (policy == .raw) @as(usize, 0) else declarations, element.namespace_declarations.len);
+                for (1..declarations) |i| {
+                    var declaration_buffer: [32]u8 = undefined;
+                    const prefix = try std.fmt.bufPrint(&declaration_buffer, "n{d}", .{i});
+                    if (policy == .process) {
+                        try std.testing.expectEqualStrings(prefix, element.namespace_declarations[i].prefix.?);
+                        try std.testing.expectEqualStrings("urn:unused", element.namespace_declarations[i].namespace_uri);
+                    }
+                }
+                for (0..shape.attributes) |i| {
+                    var name_buffer: [32]u8 = undefined;
+                    const name = try std.fmt.bufPrint(&name_buffer, "p:{s}{d}", .{
+                        if (i % 2 == 0) "\xc3\xa9" else "\xf0\x90\x80\x80", i,
+                    });
+                    var value_buffer: [16]u8 = undefined;
+                    const value = try std.fmt.bufPrint(&value_buffer, "{d}", .{i});
+                    const attribute = element.attributes[offset + i];
+                    try std.testing.expectEqualStrings(name, attribute.name.raw);
+                    try std.testing.expectEqualStrings(value, attribute.value);
+                    try std.testing.expectEqualDeep(attribute, element.attributeRaw(name).?);
+                    if (policy == .process) try std.testing.expectEqualDeep(attribute, element.attribute("urn:p", name[2..]).?);
+                    try std.testing.expect(attribute.specified and attribute.declared_type == null);
+                    const start = std.mem.indexOf(u8, input, name).?;
+                    try std.testing.expectEqual(physicalSpan(start, start + name.len + value.len + 3, 0, 1), attribute.span.?);
+                }
+                try std.testing.expect(element.attributeRaw("p:missing") == null);
+                while (try reader.next()) |_| {}
+                var limited_stream: std.testing.Reader = .init(buffer[0..chunk], &.{.{ .buffer = input }});
+                limited_stream.artificial_limit = .limited(chunk);
+                if (shape.attributes != 0) {
+                    options.limits.max_attributes_per_element -= 1;
+                    try reader.reset(if (chunk == 0) .{ .slice = input } else .{ .stream = &limited_stream.interface }, options, .release_memory);
+                    _ = try reader.next();
+                    try std.testing.expectError(error.LimitExceeded, reader.next());
+                    try std.testing.expectEqual(xml.DiagnosticCode.attribute_count_limit, reader.diagnostic().?.code);
+                    try std.testing.expectEqual(@as(u64, std.mem.lastIndexOf(u8, input, " p:").? + 1), reader.diagnostic().?.primary.byte_offset);
+                }
+            }
+        }
+    }
 }
 
 test "[property] - [Reader namespaces]: each policy agrees across source schedules" {
