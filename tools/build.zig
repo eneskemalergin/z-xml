@@ -230,6 +230,23 @@ pub fn build(b: *std.Build) void {
     writer_adapter_step.dependOn(&b.addInstallArtifact(writer_adapter, .{}).step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = writer_module })).step);
 
+    const name_access_module = b.createModule(.{
+        .root_source_file = b.path("zig/name_access.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+    });
+    name_access_module.addImport("z_xml", z_xml);
+    const name_access = b.addExecutable(.{
+        .name = "z-xml-name-access",
+        .root_module = name_access_module,
+    });
+    const name_access_step = b.step("name-access", "Build and install the attribute access probe");
+    name_access_step.dependOn(&b.addInstallArtifact(name_access, .{}).step);
+    const verify_name_access = b.addRunArtifact(name_access);
+    verify_name_access.addArg("--verify");
+    test_step.dependOn(&verify_name_access.step);
+
     const layout_module = b.createModule(.{
         .root_source_file = b.path("zig/layout_probe.zig"),
         .target = target,
