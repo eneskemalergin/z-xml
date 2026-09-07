@@ -225,7 +225,11 @@ Writer completion does not flush the sink. Its offset counts accepted XML bytes,
 
 Limits are finite and checked before governed storage grows or data is published. At-limit work succeeds. The first item or byte over a configured limit fails with the corresponding error. There is no unlimited preset.
 
+Each Reader source can contain at most `u64_max - 1` physical bytes, leaving room for one-based EOF locations. An extra byte returns sticky `LimitExceeded` with `source_position_limit`. Configured external-source limits apply separately and usually stop input much earlier.
+
 Reader `max_retained_bytes` controls capacity kept at reset, not peak parsing memory. Its other limits bound individual XML storage and work categories. Document and Writer have separate limits on retained allocation capacity during construction and output.
+
+Use Reader for large sequential inputs. Document copies retained strings and records, so its memory can exceed the input size several times over. Its defaults allow 32 Mi nodes, 1 GiB of copied strings, 64 MiB per coalesced text value, and 2 GiB of retained allocation capacity. These are separate limits, not a maximum source-file size. Temporary construction storage, caller buffers, and allocator overhead are outside the retained-capacity limit. Increasing limits does not remove Document's `u32` node and string-reference bounds.
 
 An initialized owning value must not be copied and then independently used or deinitialized. These values are not thread-safe and do not support concurrent or recursive entry.
 
