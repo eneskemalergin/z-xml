@@ -3154,6 +3154,108 @@ test "[property] - [Reader decoder]: built-in encodings preserve events across s
     );
 }
 
+test "[property] - [Reader fragments]: encoded schedules preserve scalars origins and completion" {
+    const logical = "<!DOCTYPE r [<!ENTITY e SYSTEM 'text.ent'>]>" ++
+        "<r a='x\r\ny&#x9;'>A\xc3\xa9\xe2\x82\xac\xf0\x9f\x99\x82\r\n&amp;" ++
+        "<![CDATA[B\xc3\xa9\xe2\x82\xac\xf0\x9f\x99\x82]]>&e;" ++
+        "<!--D\xc3\xa9\xe2\x82\xac\xf0\x9f\x99\x82--><?p E\xc3\xa9\xe2\x82\xac\xf0\x9f\x99\x82?></r>";
+    const external = "C\xc3\xa9\xe2\x82\xac\xf0\x9f\x99\x82";
+    const expected_text = "A\xc3\xa9\xe2\x82\xac\xf0\x9f\x99\x82\n&B\xc3\xa9\xe2\x82\xac\xf0\x9f\x99\x82" ++ external;
+    const little = try encodeUtf16(std.testing.allocator, logical, .little, true);
+    defer std.testing.allocator.free(little);
+    const big = try encodeUtf16(std.testing.allocator, logical, .big, true);
+    defer std.testing.allocator.free(big);
+    var paired: [logical.len * 2]u8 = undefined;
+    pairEncode(&paired, logical);
+    const variants = [_]struct { bytes: []const u8, transcoder: ?xml.Transcoder = null }{
+        .{ .bytes = logical },
+        .{ .bytes = little },
+        .{ .bytes = big },
+        .{ .bytes = &paired, .transcoder = pairTranscoder() },
+    };
+    for (variants) |variant| {
+        for ([_]usize{ 0, 1, 2, 3, 7, 255, 256, 257 }) |chunk| {
+            const resources = [_]TestExternalResource{
+                .{ .system_id = "text.ent", .bytes = external, .source_id = 77 },
+            };
+            var resolver = TestResolver{ .resources = &resources, .max_read_len = 1 };
+            var input_buffer: [257]u8 = undefined;
+            var input: std.testing.Reader = .init(input_buffer[0..@max(1, chunk)], &.{.{ .buffer = variant.bytes }});
+            input.artificial_limit = .limited(@max(1, chunk));
+            var reader = try xml.Reader.init(std.testing.allocator, if (chunk == 0)
+                .{ .slice = variant.bytes }
+            else
+                .{ .stream = &input.interface }, .{
+                .limits = .{ .max_fragment_bytes = 4 },
+                .transcoder = variant.transcoder,
+                .external = .resolve,
+                .resolver = resolver.resolver(),
+            });
+            defer reader.deinit();
+            var text_buffer: [64]u8 = undefined;
+            var text = std.Io.Writer.fixed(&text_buffer);
+            var comment_buffer: [32]u8 = undefined;
+            var comment = std.Io.Writer.fixed(&comment_buffer);
+            var pi_buffer: [32]u8 = undefined;
+            var pi = std.Io.Writer.fixed(&pi_buffer);
+            var finals: [3]usize = @splat(0);
+            var cdata_bytes: usize = 0;
+            var external_bytes: usize = 0;
+            var saw_start = false;
+            var saw_end = false;
+            while (try reader.next()) |event| {
+                try std.testing.expect(event.span.start <= event.span.end);
+                try std.testing.expect(event.span.end <= if (event.span.source_id == 0) variant.bytes.len else external.len);
+                switch (event.data) {
+                    .start_element => |element| {
+                        saw_start = true;
+                        try std.testing.expectEqualStrings("x y\t", element.attributeRaw("a").?.value);
+                    },
+                    .text => |value| {
+                        try std.testing.expectEqual(@as(usize, 0), finals[0]);
+                        try std.testing.expect(value.bytes.len <= 4 and std.unicode.utf8ValidateSlice(value.bytes));
+                        if (value.origin == .cdata) cdata_bytes += value.bytes.len;
+                        if (event.span.source_id != 0) {
+                            try std.testing.expectEqual(@as(u32, 77), event.span.source_id);
+                            try std.testing.expectEqual(@as(u64, external_bytes), event.span.start);
+                            external_bytes += value.bytes.len;
+                            try std.testing.expectEqual(@as(u64, external_bytes), event.span.end);
+                        }
+                        try text.writeAll(value.bytes);
+                        if (value.final_fragment) finals[0] += 1;
+                    },
+                    .comment => |value| {
+                        try std.testing.expectEqual(@as(usize, 0), finals[1]);
+                        try std.testing.expect(value.bytes.len <= 4 and std.unicode.utf8ValidateSlice(value.bytes));
+                        try comment.writeAll(value.bytes);
+                        if (value.final_fragment) finals[1] += 1;
+                    },
+                    .processing_instruction => |value| {
+                        try std.testing.expectEqual(@as(usize, 0), finals[2]);
+                        try std.testing.expectEqualStrings("p", value.target);
+                        try std.testing.expect(value.data.len <= 4 and std.unicode.utf8ValidateSlice(value.data));
+                        try pi.writeAll(value.data);
+                        if (value.final_fragment) finals[2] += 1;
+                    },
+                    .document_end => |value| {
+                        saw_end = true;
+                        try std.testing.expectEqual(xml.DocumentContent.complete, value.content);
+                    },
+                    else => {},
+                }
+            }
+            try std.testing.expect(saw_start and saw_end);
+            try std.testing.expectEqualStrings(expected_text, text.buffered());
+            try std.testing.expectEqualStrings("D\xc3\xa9\xe2\x82\xac\xf0\x9f\x99\x82", comment.buffered());
+            try std.testing.expectEqualStrings("E\xc3\xa9\xe2\x82\xac\xf0\x9f\x99\x82", pi.buffered());
+            try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1 }, &finals);
+            try std.testing.expectEqual(@as(usize, 10), cdata_bytes);
+            try std.testing.expectEqual(external.len, external_bytes);
+            try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+        }
+    }
+}
+
 test "[unit] - [Transcoder]: validates bounded callback results" {
     var output: [4]u8 = undefined;
     var source_advances: [4]u8 = undefined;
@@ -3242,6 +3344,15 @@ test "[property] - [Reader transcoder]: root bytes preserve events across source
         latin1_expected.events,
         .other,
         "ISO-8859-1",
+    );
+
+    const mislabeled_latin1 = "<?xml version='1.0' encoding='UTF-8'?><r>\xe9</r>";
+    try expectNormalEncodingSchedulesWithOptions(
+        mislabeled_latin1,
+        .{ .transcoder = latin1Transcoder() },
+        latin1_expected.events,
+        .other,
+        "UTF-8",
     );
 
     const final_logical = "<r/>";
@@ -5661,6 +5772,73 @@ test "[unit] - [XML version]: XML 1.1 profiles select declared document rules" {
                 }
             },
             else => return error.UnexpectedEvent,
+        }
+    }
+}
+
+test "[property] - [Reader normalization]: policies report or reject without rewriting text" {
+    const cases = [_]struct {
+        text: []const u8,
+        status: xml.DocumentNormalization,
+        kind: ?xml.NormalizationIssueKind = null,
+        finding_byte: usize = 0,
+    }{
+        .{ .text = "caf\xc3\xa9", .status = .normalized },
+        .{ .text = "e\xcc\x81", .status = .not_normalized, .kind = .not_nfc, .finding_byte = 1 },
+        .{ .text = "\xcd\xb8", .status = .indeterminate, .kind = .unknown_character },
+    };
+    for (cases) |case| {
+        for ([_][]const u8{ "1.0", "1.1" }) |version| {
+            var storage: [128]u8 = undefined;
+            const input = try std.fmt.bufPrint(&storage, "<?xml version='{s}'?><r>{s}</r>", .{ version, case.text });
+            const xml11 = std.mem.eql(u8, version, "1.1");
+            for ([_]xml.NormalizationPolicy{ .report, .require, .unchecked }) |policy| {
+                for ([_]usize{ 0, 1, 3 }) |chunk| {
+                    var input_buffer: [3]u8 = undefined;
+                    var stream: std.testing.Reader = .init(input_buffer[0..@max(1, chunk)], &.{.{ .buffer = input }});
+                    stream.artificial_limit = .limited(@max(1, chunk));
+                    var reader = try xml.Reader.init(std.testing.allocator, if (chunk == 0)
+                        .{ .slice = input }
+                    else
+                        .{ .stream = &stream.interface }, .{ .normalization = policy, .limits = .{ .max_fragment_bytes = 4 } });
+                    defer reader.deinit();
+                    var text_buffer: [16]u8 = undefined;
+                    var text = std.Io.Writer.fixed(&text_buffer);
+                    var status: ?xml.DocumentNormalization = null;
+                    var failure: ?xml.ReadError = null;
+                    while (reader.next() catch |err| {
+                        failure = err;
+                        break;
+                    }) |event| switch (event.data) {
+                        .text => |value| try text.writeAll(value.bytes),
+                        .document_end => |value| status = value.normalization,
+                        else => {},
+                    };
+                    if (xml11 and policy == .require and case.kind != null) {
+                        try std.testing.expectEqual(error.NotNormalized, failure.?);
+                        try std.testing.expect(status == null);
+                        try std.testing.expectError(error.NotNormalized, reader.next());
+                    } else {
+                        try std.testing.expect(failure == null);
+                        const expected_status: xml.DocumentNormalization = if (!xml11)
+                            .not_applicable
+                        else if (policy == .unchecked)
+                            .unchecked
+                        else
+                            case.status;
+                        try std.testing.expectEqual(expected_status, status.?);
+                        try std.testing.expectEqualStrings(case.text, text.buffered());
+                    }
+                    if (xml11 and policy != .unchecked and case.kind != null) {
+                        const finding = reader.normalizationFinding().?;
+                        try std.testing.expectEqual(case.kind.?, finding.kind);
+                        const start = std.mem.indexOf(u8, input, "<r>").? + 3;
+                        try std.testing.expectEqual(@as(u64, start + case.finding_byte), finding.location.byte_offset);
+                    } else {
+                        try std.testing.expect(reader.normalizationFinding() == null);
+                    }
+                }
+            }
         }
     }
 }

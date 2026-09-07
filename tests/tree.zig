@@ -184,6 +184,48 @@ test "[integration] - [document]: joins fragments from caller-owned stream input
     try std.testing.expectEqual(@as(?xml.Node, null), children.next());
 }
 
+test "[integration] - [document text]: owns decoded UTF-16 values without Unicode rewriting" {
+    for ([_]bool{ false, true }) |streamed| {
+        var encoded = std.unicode.utf8ToUtf16LeStringLiteral(
+            "\u{feff}<?xml version='1.1' encoding='UTF-16'?>" ++
+                "<\u{e9} a='x\r\ny&#x9;'>e\u{301}<![CDATA[\u{20ac}]]><!--\u{1f642}--><?p ok?></\u{e9}>",
+        ).*;
+        const bytes = std.mem.sliceAsBytes(&encoded);
+        var input_buffer: [1]u8 = undefined;
+        var input: std.testing.Reader = .init(&input_buffer, &.{.{ .buffer = bytes }});
+        input.artificial_limit = .limited(1);
+        var document = try xml.parseDocument(std.testing.allocator, if (streamed)
+            .{ .stream = &input.interface }
+        else
+            .{ .slice = bytes }, .{
+            .reader = .{ .limits = .{ .max_fragment_bytes = 4 } },
+            .retain_text_origin = true,
+        });
+        defer document.deinit();
+        @memset(bytes, 0);
+
+        const root = document.documentElement();
+        try std.testing.expectEqualStrings("\xc3\xa9", document.nodeName(root).?.raw);
+        try std.testing.expectEqualStrings("x y\t", document.attributeRaw(root, "a").?.value);
+        try std.testing.expectEqual(xml.SourceEncoding.utf16_le, document.documentStart().source_encoding);
+        try std.testing.expectEqualStrings("UTF-16", document.documentStart().declaration.?.encoding.?);
+        try std.testing.expectEqual(xml.DocumentNormalization.not_normalized, document.documentEnd().normalization);
+        try std.testing.expectEqual(xml.NormalizationIssueKind.not_nfc, document.normalizationFinding().?.kind);
+        var children = document.children(root);
+        const text = children.next().?;
+        try std.testing.expectEqualStrings("e\xcc\x81", document.nodeValue(text).?);
+        try std.testing.expectEqual(xml.TextOrigin.character_data, document.textOrigin(text).?);
+        const cdata = children.next().?;
+        try std.testing.expectEqualStrings("\xe2\x82\xac", document.nodeValue(cdata).?);
+        try std.testing.expectEqual(xml.TextOrigin.cdata, document.textOrigin(cdata).?);
+        try std.testing.expectEqualStrings("\xf0\x9f\x99\x82", document.nodeValue(children.next().?).?);
+        const pi = document.processingInstruction(children.next().?).?;
+        try std.testing.expectEqualStrings("p", pi.target);
+        try std.testing.expectEqualStrings("ok", pi.data);
+        try std.testing.expect(children.next() == null);
+    }
+}
+
 test "[integration] - [document]: keeps skipped external content as a text boundary" {
     const input = "<!DOCTYPE r [<!ENTITY ext SYSTEM 'external.ent'>]><r>a&ext;b</r>";
     var document = try xml.parseDocument(std.testing.allocator, .{ .slice = input }, .{

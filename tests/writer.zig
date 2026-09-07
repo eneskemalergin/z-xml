@@ -1436,6 +1436,116 @@ test "[property] - [writer memory]: stays bounded across output and construction
     }
 }
 
+test "[integration] - [payload text]: streams text shapes with fixed caller and XML storage" {
+    const base64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const shapes = [_]struct { logical: []const u8, encoded: []const u8 }{
+        .{ .logical = base64, .encoded = base64 },
+        .{ .logical = "A&<\r]]>", .encoded = "A&amp;&lt;&#xD;]]&gt;" },
+        .{ .logical = "\xc3\xa9\xe2\x82\xac\xf0\x9f\x99\x82", .encoded = "\xc3\xa9\xe2\x82\xac\xf0\x9f\x99\x82" },
+        .{ .logical = "e\xcc\x81", .encoded = "e\xcc\x81" },
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (shapes) |shape| {
+        var reader_final_usage: ?usize = null;
+        var writer_final_usage: ?usize = null;
+        for ([_]usize{ 1024, 65536 }) |repetitions| {
+            const payload_bytes = repetitions * shape.logical.len;
+            const output_bytes = repetitions * shape.encoded.len + 7;
+            const file = try tmp.dir.createFile(std.testing.io, "payload.xml", .{ .read = true });
+            defer file.close(std.testing.io);
+            var output_buffer: [4096]u8 = undefined;
+            var output = file.writer(std.testing.io, &output_buffer);
+            var writer_storage: [16 * 1024]u8 = undefined;
+            var writer_allocator = std.heap.FixedBufferAllocator.init(&writer_storage);
+            var writer = try xml.Writer.init(writer_allocator.allocator(), &output.interface, .{
+                .emit_declaration = false,
+                .limits = .{ .max_retained_bytes = writer_storage.len },
+            });
+            defer writer.deinit();
+            try writer.startDocument();
+            try writer.startElement("r");
+            var chunk: [257]u8 = undefined;
+            var written: usize = 0;
+            while (written < payload_bytes) {
+                const len = @min(chunk.len / shape.logical.len * shape.logical.len, payload_bytes - written);
+                for (chunk[0..len], 0..) |*byte, index| byte.* = shape.logical[(written + index) % shape.logical.len];
+                try writer.text(chunk[0..len]);
+                written += len;
+            }
+            try writer.endElement();
+            try writer.endDocument();
+            try std.testing.expectEqual(@as(?u64, output_bytes), writer.byteOffset());
+            try output.interface.flush();
+            if (writer_final_usage) |usage| {
+                try std.testing.expectEqual(usage, writer_allocator.end_index);
+            } else writer_final_usage = writer_allocator.end_index;
+
+            var input_buffer: [4096]u8 = undefined;
+            var input = file.reader(std.testing.io, &input_buffer);
+            try std.testing.expectEqualStrings("<r>", try input.interface.take(3));
+            for (0..repetitions) |_| {
+                try std.testing.expectEqualStrings(shape.encoded, try input.interface.take(shape.encoded.len));
+            }
+            try std.testing.expectEqualStrings("</r>", try input.interface.take(4));
+            try std.testing.expectError(error.EndOfStream, input.interface.takeByte());
+            try input.seekTo(0);
+
+            var reader_storage: [64 * 1024]u8 = undefined;
+            var reader_allocator = std.heap.FixedBufferAllocator.init(&reader_storage);
+            var reader = try xml.Reader.init(reader_allocator.allocator(), .{ .stream = &input.interface }, .{
+                .dtd = .reject,
+                .limits = .{ .max_fragment_bytes = 31 },
+            });
+            defer reader.deinit();
+            var consumed: usize = 0;
+            var finals: usize = 0;
+            var starts: usize = 0;
+            var ends: usize = 0;
+            var completed = false;
+            while (try reader.next()) |event| switch (event.data) {
+                .start_element => |element| {
+                    starts += 1;
+                    try std.testing.expectEqualStrings("r", element.name.raw);
+                },
+                .text => |value| {
+                    try std.testing.expectEqual(@as(usize, 0), finals);
+                    try std.testing.expect(value.bytes.len <= 31 and std.unicode.utf8ValidateSlice(value.bytes));
+                    try std.testing.expectEqual(xml.TextOrigin.character_data, value.origin);
+                    if (std.mem.eql(u8, shape.logical, shape.encoded)) {
+                        try std.testing.expectEqual(@as(u64, 3 + consumed), event.span.start);
+                    }
+                    for (value.bytes) |byte| {
+                        try std.testing.expectEqual(shape.logical[consumed % shape.logical.len], byte);
+                        consumed += 1;
+                    }
+                    if (std.mem.eql(u8, shape.logical, shape.encoded)) {
+                        try std.testing.expectEqual(@as(u64, 3 + consumed), event.span.end);
+                    }
+                    if (value.final_fragment) finals += 1;
+                },
+                .end_element => |element| {
+                    ends += 1;
+                    try std.testing.expectEqualStrings("r", element.name.raw);
+                },
+                .document_end => |end| {
+                    completed = true;
+                    try std.testing.expectEqual(xml.DocumentContent.complete, end.content);
+                },
+                else => {},
+            };
+            try std.testing.expect(completed);
+            try std.testing.expectEqual(payload_bytes, consumed);
+            try std.testing.expectEqual(@as(usize, 1), finals);
+            try std.testing.expectEqual(@as(usize, 1), starts);
+            try std.testing.expectEqual(@as(usize, 1), ends);
+            if (reader_final_usage) |usage| {
+                try std.testing.expectEqual(usage, reader_allocator.end_index);
+            } else reader_final_usage = reader_allocator.end_index;
+        }
+    }
+}
+
 test "[failure] - [writer allocation]: releases every partial allocation" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
