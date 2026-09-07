@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="#verification"><img src="https://img.shields.io/badge/tests-352%2F352%20pass-2D7D46?style=flat-square" alt="352 of 352 tests pass"></a>
+  <a href="#verification"><img src="https://img.shields.io/badge/tests-356%2F356%20pass-2D7D46?style=flat-square" alt="356 of 356 tests pass"></a>
   <a href="build.zig.zon"><img src="https://img.shields.io/badge/version-v0.2.0-8B5CF6?style=flat-square" alt="v0.2.0"></a>
   <a href="#requirements-and-support"><img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
   <a href="#xml-support"><img src="https://img.shields.io/badge/XML-1.0%20%2B%201.1-0066CC?style=flat-square" alt="XML 1.0 and XML 1.1"></a>
@@ -203,7 +203,11 @@ Built-in source handling includes:
 - XML declarations and BOM detection
 - XML 1.0 and XML 1.1 character rules
 
-Other source encodings require a caller-provided `Transcoder`. The writer always emits UTF-8.
+Other source encodings require a caller-provided `Transcoder`, selected before parsing. It handles bytes from the beginning of the source, including any BOM. It receives no declared-encoding label; the reader reports the declaration but does not verify its agreement with that callback.
+
+Names use decoded UTF-8 spelling. Attribute values and text use logical UTF-8 after XML normalization and reference expansion where applicable. Source spans still refer to original physical encoded bytes, not positions in those strings. XML 1.1 full-normalization reporting checks Unicode requirements without rewriting text. Owned documents copy the selected decoded names and logical values, not the original encoded source.
+
+Reader fragments never split a UTF-8 scalar. Each Writer call must also contain complete UTF-8 scalars. The writer escapes logical values and always emits UTF-8 XML; it does not reproduce original byte spelling. Base64 and other payload codecs remain caller-owned and can stream through text fragments without retaining a complete payload.
 
 ## Ownership and limits
 
