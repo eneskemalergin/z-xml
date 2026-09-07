@@ -4409,9 +4409,11 @@ const NormalDiagnosticLog = struct {
     code: ?xml.DiagnosticCode = null,
     reader: ?*xml.Reader = null,
     reset_error: ?xml.ResetError = null,
+    reentry: ?*CallbackReentry = null,
 
     fn report(context: ?*anyopaque, diagnostic: xml.Diagnostic) void {
         const self: *NormalDiagnosticLog = @ptrCast(@alignCast(context.?));
+        if (self.reentry) |probe| probe.check(.diagnostic);
         self.calls += 1;
         self.code = diagnostic.code;
         if (self.reader) |reader| {
@@ -4798,12 +4800,14 @@ const NormalFindingLog = struct {
     trace_lengths: [8]usize = undefined,
     trace_sources: [8][8]u32 = undefined,
     cancel_on_call: ?usize = null,
+    reentry: ?*CallbackReentry = null,
 
     fn report(
         context: ?*anyopaque,
         finding: xml.dtd.Finding,
     ) xml.dtd.FindingAction {
         const self: *NormalFindingLog = @ptrCast(@alignCast(context.?));
+        if (self.reentry) |probe| probe.check(.finding);
         std.debug.assert(self.calls < self.codes.len);
         std.debug.assert(finding.inclusion_trace.len <= self.trace_sources[0].len);
         self.codes[self.calls] = finding.code;
@@ -5529,29 +5533,30 @@ test "[integration] - [Reader lifecycle]: early stop ignores unread input" {
 
 test "[integration] - [Reader lifecycle]: stream reset starts after the last event" {
     const input = "<one/><two/>";
-    var input_buffer: [1]u8 = undefined;
-    var source: std.testing.Reader = .init(
-        &input_buffer,
-        &.{.{ .buffer = input }},
-    );
-    source.artificial_limit = .limited(1);
-    var reader = try xml.Reader.init(
-        std.testing.allocator,
-        .{ .stream = &source.interface },
-        .{},
-    );
-    defer reader.deinit();
+    for ([_]usize{ 1, input.len }) |chunk| {
+        var input_buffer: [input.len]u8 = undefined;
+        var source: std.testing.Reader = .init(input_buffer[0..chunk], &.{.{ .buffer = input }});
+        source.artificial_limit = .limited(chunk);
+        var reader = try xml.Reader.init(std.testing.allocator, .{ .stream = &source.interface }, .{});
+        defer reader.deinit();
 
-    _ = try reader.next();
-    _ = try reader.next();
-    const first_end = (try reader.next()).?.data.end_element;
-    try std.testing.expectEqualStrings("one", first_end.name.raw);
+        _ = try reader.next();
+        _ = try reader.next();
+        const first_end = (try reader.next()).?;
+        try std.testing.expectEqualStrings("one", first_end.data.end_element.name.raw);
+        try std.testing.expectEqual(@as(u64, 6), first_end.span.end);
+        if (chunk == input.len) {
+            try std.testing.expectEqual(@as(usize, 1), source.next_call_index);
+            try std.testing.expectEqualStrings("<two/>", source.interface.buffered());
+        }
 
-    try reader.reset(.{ .stream = &source.interface }, .{}, .retain_capacity);
-    _ = try reader.next();
-    const second_start = (try reader.next()).?.data.start_element;
-    try std.testing.expectEqualStrings("two", second_start.name.raw);
-    while (try reader.next()) |_| {}
+        try reader.reset(.{ .stream = &source.interface }, .{}, .retain_capacity);
+        _ = try reader.next();
+        const second_start = (try reader.next()).?;
+        try std.testing.expectEqualStrings("two", second_start.data.start_element.name.raw);
+        try std.testing.expectEqual(xml.SourceSpan{ .source_id = 0, .start = 0, .end = 6 }, second_start.span);
+        while (try reader.next()) |_| {}
+    }
 }
 
 test "[failure] - [Reader source]: final input and read failure are sticky" {
@@ -11678,6 +11683,95 @@ test "[unit] - [resolver source]: bounds callback reads and delegates close" {
     }
 }
 
+const CallbackReentry = struct {
+    const Kind = enum { resolve, read, close, transcode, finding, diagnostic };
+
+    reader: ?*xml.Reader = null,
+    calls: [6]usize = @splat(0),
+    rejected: bool = true,
+
+    fn check(self: *@This(), kind: Kind) void {
+        self.calls[@intFromEnum(kind)] += 1;
+        const reader = self.reader.?;
+        std.testing.expectError(error.InvalidState, reader.next()) catch {
+            self.rejected = false;
+        };
+        std.testing.expectError(error.InvalidState, reader.skipElement()) catch {
+            self.rejected = false;
+        };
+        std.testing.expectError(error.InvalidState, reader.reset(
+            .{ .slice = "<replacement/>" },
+            .{},
+            .release_memory,
+        )) catch {
+            self.rejected = false;
+        };
+    }
+
+    fn transcode(context: ?*anyopaque, input: []const u8, _: bool, output: []u8, advances: []u8) xml.TranscodeStep {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.check(.transcode);
+        if (input.len == 0) return .need_input;
+        const len = @min(input.len, output.len);
+        if (len == 0) return .need_output;
+        @memcpy(output[0..len], input[0..len]);
+        @memset(advances[0..len], 1);
+        return .{ .progress = .{ .consumed = len, .produced = len } };
+    }
+};
+
+test "[integration] - [Reader callbacks]: reject reentry without replacing the outer failure" {
+    const document = "<!DOCTYPE r [<!ELEMENT r EMPTY><!ENTITY e SYSTEM 'e.ent'>]><r>&e;</wrong>";
+    for ([_]bool{ false, true }) |streamed| {
+        var probe: CallbackReentry = .{};
+        const transcoder: xml.Transcoder = .{ .context = &probe, .runFn = CallbackReentry.transcode };
+        const resources = [_]TestExternalResource{
+            .{ .system_id = "e.ent", .bytes = "payload", .source_id = 73, .transcoder = transcoder },
+        };
+        var resolver = TestResolver{ .resources = &resources, .reentry = &probe, .max_read_len = 1 };
+        var findings: NormalFindingLog = .{ .reentry = &probe };
+        var diagnostics: NormalDiagnosticLog = .{ .reentry = &probe };
+        var input_buffer: [1]u8 = undefined;
+        var input: std.testing.Reader = .init(&input_buffer, &.{.{ .buffer = document }});
+        input.artificial_limit = .limited(1);
+        var reader = try xml.Reader.init(std.testing.allocator, if (streamed)
+            .{ .stream = &input.interface }
+        else
+            .{ .slice = document }, .{
+            .external = .resolve,
+            .resolver = resolver.resolver(),
+            .transcoder = transcoder,
+            .dtd = .{ .validate = .{ .finding_sink = .{ .context = &findings, .report_fn = NormalFindingLog.report } } },
+            .diagnostic_sink = .{ .context = &diagnostics, .report_fn = NormalDiagnosticLog.report },
+        });
+        defer reader.deinit();
+        probe.reader = &reader;
+        while (true) {
+            const event = reader.next() catch |err| {
+                try std.testing.expectEqual(error.InvalidXml, err);
+                break;
+            };
+            if (event == null) return error.ExpectedFailure;
+        }
+        try std.testing.expect(probe.rejected);
+        for (probe.calls) |calls| try std.testing.expect(calls > 0);
+        try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+        try std.testing.expectEqual(@as(usize, 1), diagnostics.calls);
+        const diagnostic = reader.diagnostic().?;
+        try std.testing.expectEqual(xml.DiagnosticCode.mismatched_end_tag, diagnostic.code);
+        try std.testing.expectEqual(@as(u64, std.mem.indexOf(u8, document, "wrong").?), diagnostic.primary.byte_offset);
+        const calls = probe.calls;
+        try std.testing.expectError(error.InvalidXml, reader.next());
+        try std.testing.expectError(error.InvalidOptions, reader.reset(.{ .slice = "" }, .{ .external = .resolve }, .release_memory));
+        try std.testing.expectEqualDeep(diagnostic, reader.diagnostic().?);
+        try std.testing.expectEqualSlices(usize, &calls, &probe.calls);
+        try reader.reset(.{ .slice = "<ok/>" }, .{}, .release_memory);
+        try std.testing.expect(reader.diagnostic() == null);
+        while (try reader.next()) |_| {}
+        try std.testing.expectEqualSlices(usize, &calls, &probe.calls);
+    }
+}
+
 const TestExternalResource = struct {
     system_id: []const u8,
     bytes: []const u8,
@@ -11699,9 +11793,8 @@ const TestResolver = struct {
     max_read_len: usize = 3,
     parameter_inclusion_source_id: ?u32 = null,
     parameter_inclusion_offset: ?u64 = null,
-    reader: ?*xml.Reader = null,
-    close_reset_error: ?xml.ResetError = null,
     resolve_result: ?xml.ResolverResult = null,
+    reentry: ?*CallbackReentry = null,
 
     fn resolver(self: *@This()) xml.Resolver {
         return .{ .context = self, .resolveFn = resolve };
@@ -11709,6 +11802,7 @@ const TestResolver = struct {
 
     fn resolve(context: ?*anyopaque, request: xml.ResolverRequest) xml.ResolverResult {
         const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.reentry) |probe| probe.check(.resolve);
         self.resolves += 1;
         if (request.kind == .parameter_entity) {
             self.parameter_inclusion_source_id = request.inclusion.source_id;
@@ -11734,6 +11828,7 @@ const TestResolver = struct {
 
     fn read(context: ?*anyopaque, output: []u8) xml.ResolverReadResult {
         const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.reentry) |probe| probe.check(.read);
         if (self.fail_read_after != null and self.reads == self.fail_read_after.?) return .io_failure;
         if (self.cancel_read_after != null and self.reads == self.cancel_read_after.?) return .cancelled;
         self.reads += 1;
@@ -11747,13 +11842,9 @@ const TestResolver = struct {
 
     fn close(context: ?*anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.reentry) |probe| probe.check(.close);
         self.closes += 1;
         self.active = null;
-        if (self.reader) |reader| {
-            reader.reset(.{ .slice = "<replacement/>" }, .{}, .retain_capacity) catch |failure| {
-                self.close_reset_error = failure;
-            };
-        }
     }
 };
 
@@ -12125,7 +12216,8 @@ test "[integration] - [Reader lifecycle]: reset and deinit close active external
     const resources = [_]TestExternalResource{
         .{ .system_id = "message.ent", .bytes = "long external text", .source_id = 6 },
     };
-    var resolver = TestResolver{ .resources = &resources };
+    var probe: CallbackReentry = .{};
+    var resolver = TestResolver{ .resources = &resources, .reentry = &probe };
     const options: xml.ReaderOptions = .{
         .external = .resolve,
         .resolver = resolver.resolver(),
@@ -12137,6 +12229,7 @@ test "[integration] - [Reader lifecycle]: reset and deinit close active external
     );
     var reader_live = true;
     defer if (reader_live) reader.deinit();
+    probe.reader = &reader;
 
     var saw_first_text = false;
     first: while (try reader.next()) |event| switch (event.data) {
@@ -12159,6 +12252,8 @@ test "[integration] - [Reader lifecycle]: reset and deinit close active external
     try std.testing.expectEqual(@as(usize, 0), resolver.closes);
     try reader.reset(.{ .slice = document }, options, .retain_capacity);
     try std.testing.expectEqual(@as(usize, 1), resolver.closes);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls[@intFromEnum(CallbackReentry.Kind.close)]);
+    try std.testing.expect(probe.rejected);
 
     var saw_second_text = false;
     second: while (try reader.next()) |event| switch (event.data) {
@@ -12169,11 +12264,11 @@ test "[integration] - [Reader lifecycle]: reset and deinit close active external
         else => {},
     };
     try std.testing.expect(saw_second_text);
-    resolver.reader = &reader;
     reader.deinit();
     reader_live = false;
     try std.testing.expectEqual(@as(usize, 2), resolver.closes);
-    try std.testing.expectEqual(error.InvalidState, resolver.close_reset_error.?);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls[@intFromEnum(CallbackReentry.Kind.close)]);
+    try std.testing.expect(probe.rejected);
 }
 
 test "[integration] - [Reader reset]: disabling external sources releases inclusion storage" {
@@ -12441,15 +12536,27 @@ test "[integration] - [Reader compiled subset]: fresh and reused validation agre
 }
 
 test "[integration] - [Reader compiled subset]: shared subset remains unchanged" {
-    const declarations = "<!ELEMENT root (item*)><!ELEMENT item EMPTY>";
+    var declarations = "<!ELEMENT root (item*)><!ELEMENT item EMPTY>".*;
+    var root_declarations = "<!ENTITY % child SYSTEM 'child.dtd'>%child;".*;
+    var system_id = "schema.dtd".*;
+    var child_id = "child.dtd".*;
+    const resources = [_]TestExternalResource{
+        .{ .system_id = &child_id, .bytes = &declarations, .source_id = 71 },
+    };
+    var provider = TestSubsetProvider{ .resources = &resources };
     const document = "<!DOCTYPE root SYSTEM 'schema.dtd'><root><item/></root>";
     var subset = try xml.dtd.ExternalSubset.compileDecoded(
         std.testing.allocator,
-        "schema.dtd",
-        declarations,
-        .{},
+        &system_id,
+        &root_declarations,
+        .{ .provider = provider.provider() },
     );
     defer subset.deinit();
+    @memset(&declarations, 0);
+    @memset(&root_declarations, 0);
+    @memset(&system_id, 0);
+    @memset(&child_id, 0);
+    provider.resources = &.{};
     const before = subset.memoryUsage();
     const options: xml.ReaderOptions = .{
         .dtd = .{ .validate = .{ .external_subset = &subset } },
@@ -12490,6 +12597,7 @@ test "[integration] - [Reader compiled subset]: shared subset remains unchanged"
     try std.testing.expect(first.firstDtdFinding() == null);
     try std.testing.expect(second.firstDtdFinding() == null);
     try std.testing.expectEqualDeep(before, subset.memoryUsage());
+    try std.testing.expectEqual(@as(usize, 1), provider.resolves);
 }
 
 test "[integration] - [XML 1.1 compiled subset]: edition must match the document" {
@@ -13881,6 +13989,10 @@ fn externalAllocationAttempt(allocator: std.mem.Allocator) !void {
         const event = reader.next() catch |failure| {
             try std.testing.expectEqual(resolver.resolves, resolver.closes);
             const closes = resolver.closes;
+            const reads = resolver.reads;
+            try std.testing.expectError(failure, reader.next());
+            try std.testing.expectEqual(closes, resolver.closes);
+            try std.testing.expectEqual(reads, resolver.reads);
             reader.deinit();
             reader_live = false;
             try std.testing.expectEqual(closes, resolver.closes);

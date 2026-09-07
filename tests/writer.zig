@@ -32,6 +32,7 @@ const CountingSink = struct {
     },
     written_bytes: usize = 0,
     flush_count: usize = 0,
+    fail_flush: bool = false,
 
     fn drain(
         writer: *std.Io.Writer,
@@ -48,6 +49,9 @@ const CountingSink = struct {
     fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         const self: *CountingSink = @alignCast(@fieldParentPtr("interface", writer));
         self.flush_count += 1;
+        if (self.fail_flush) return error.WriteFailed;
+        self.written_bytes += writer.end;
+        writer.end = 0;
     }
 };
 
@@ -1609,4 +1613,64 @@ test "[integration] - [writer ownership]: leaves sink flushing to the caller" {
     try std.testing.expectEqual(@as(usize, 0), sink.flush_count);
     try sink.interface.flush();
     try std.testing.expectEqual(@as(usize, 1), sink.flush_count);
+}
+
+test "[integration] - [writer ownership]: buffered completion and flush failure have separate results" {
+    const expected = "<r>a&amp;b</r>";
+    var buffer: [128]u8 = undefined;
+    var sink: CountingSink = .{ .fail_flush = true };
+    sink.interface.buffer = &buffer;
+    try sink.interface.writeAll("prefix");
+    {
+        var writer = try xml.Writer.init(std.testing.allocator, &sink.interface, .{ .emit_declaration = false });
+        defer writer.deinit();
+        try writer.startDocument();
+        try writer.startElement("r");
+        try std.testing.expectEqual(@as(?u64, 0), writer.byteOffset());
+        try std.testing.expectEqualStrings("prefix", sink.interface.buffered());
+        var text = "a&b".*;
+        try writer.text(&text);
+        @memset(&text, 0);
+        try writer.endElement();
+        try writer.endDocument();
+        try std.testing.expectEqual(@as(?u64, expected.len), writer.byteOffset());
+        try std.testing.expectEqualStrings("prefix" ++ expected, sink.interface.buffered());
+        try std.testing.expectEqual(@as(usize, 0), sink.written_bytes);
+        try std.testing.expectEqual(@as(usize, 0), sink.flush_count);
+
+        try std.testing.expectError(error.WriteFailed, sink.interface.flush());
+        try std.testing.expectEqual(@as(?u64, expected.len), writer.byteOffset());
+        try std.testing.expectEqual(@as(usize, 0), sink.written_bytes);
+        try std.testing.expectEqualStrings("prefix" ++ expected, sink.interface.buffered());
+    }
+    try std.testing.expectEqual(@as(usize, 1), sink.flush_count);
+    sink.fail_flush = false;
+    try sink.interface.flush();
+    try std.testing.expectEqual(@as(usize, ("prefix" ++ expected).len), sink.written_bytes);
+    try std.testing.expectEqual(@as(usize, 0), sink.interface.buffered().len);
+
+    {
+        var failed = try xml.Writer.init(std.testing.allocator, &sink.interface, .{ .emit_declaration = false });
+        defer failed.deinit();
+        try failed.startDocument();
+        try failed.startElement("bad");
+        try std.testing.expectError(error.InvalidCharacter, failed.text("\x00"));
+        try std.testing.expectError(error.InvalidCharacter, failed.endDocument());
+        try std.testing.expectEqual(@as(?u64, 0), failed.byteOffset());
+        try std.testing.expectEqual(@as(usize, 0), sink.interface.buffered().len);
+    }
+    {
+        var fresh = try xml.Writer.init(std.testing.allocator, &sink.interface, .{ .emit_declaration = false });
+        defer fresh.deinit();
+        try fresh.startDocument();
+        try fresh.startElement("ok");
+        try fresh.endElement();
+        try fresh.endDocument();
+        try std.testing.expectEqual(@as(?u64, 5), fresh.byteOffset());
+        try std.testing.expectEqualStrings("<ok/>", sink.interface.buffered());
+    }
+    try std.testing.expectEqual(@as(usize, 2), sink.flush_count);
+    try sink.interface.flush();
+    try std.testing.expectEqual(@as(usize, 3), sink.flush_count);
+    try std.testing.expectEqual(@as(usize, ("prefix" ++ expected ++ "<ok/>").len), sink.written_bytes);
 }

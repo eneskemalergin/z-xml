@@ -392,6 +392,103 @@ test "[failure] - [document]: reports option, source, XML, and document limit er
     );
 }
 
+const DocumentFailureCapture = struct {
+    bytes: []u8,
+    cursor: usize = 0,
+    acquired: usize = 0,
+    closes: usize = 0,
+    reports: usize = 0,
+    diagnostic: ?xml.Diagnostic = null,
+    trace: [1]xml.Location = undefined,
+
+    fn resolve(context: ?*anyopaque, _: xml.ResolverRequest) xml.ResolverResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.acquired += 1;
+        return .{ .source = .{
+            .context = context,
+            .source_id = 73,
+            .readFn = read,
+            .closeFn = close,
+        } };
+    }
+
+    fn read(context: ?*anyopaque, output: []u8) xml.ResolverReadResult {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        if (self.cursor == self.bytes.len) return .end;
+        output[0] = self.bytes[self.cursor];
+        self.cursor += 1;
+        return .{ .bytes = 1 };
+    }
+
+    fn close(context: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.closes += 1;
+        @memset(self.bytes, 0);
+    }
+
+    fn report(context: ?*anyopaque, diagnostic: xml.Diagnostic) void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.reports += 1;
+        self.diagnostic = diagnostic;
+        @memcpy(self.trace[0..diagnostic.inclusion_trace.len], diagnostic.inclusion_trace);
+        self.diagnostic.?.inclusion_trace = self.trace[0..diagnostic.inclusion_trace.len];
+    }
+};
+
+fn documentDiagnosticFailureCase(allocator: std.mem.Allocator) !void {
+    const document = "<!DOCTYPE r [<!ENTITY e SYSTEM 'e.ent'>]><r>&e;</r>";
+    for ([_]bool{ false, true }) |streamed| {
+        for ([_]bool{ false, true }) |track_lines| {
+            var external = "<x></wrong>".*;
+            var capture: DocumentFailureCapture = .{ .bytes = &external };
+            var input_buffer: [1]u8 = undefined;
+            var input: std.testing.Reader = .init(&input_buffer, &.{.{ .buffer = document }});
+            input.artificial_limit = .limited(1);
+            var result = xml.parseDocument(allocator, if (streamed)
+                .{ .stream = &input.interface }
+            else
+                .{ .slice = document }, .{ .reader = .{
+                .track_lines = track_lines,
+                .external = .resolve,
+                .resolver = .{ .context = &capture, .resolveFn = DocumentFailureCapture.resolve },
+                .diagnostic_sink = .{ .context = &capture, .report_fn = DocumentFailureCapture.report },
+            } }) catch |err| {
+                try std.testing.expectEqual(capture.acquired, capture.closes);
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.InvalidXml, err);
+                try std.testing.expectEqual(@as(usize, 1), capture.closes);
+                try std.testing.expectEqual(@as(usize, 1), capture.reports);
+                const diagnostic = capture.diagnostic.?;
+                try std.testing.expectEqual(xml.DiagnosticCode.mismatched_end_tag, diagnostic.code);
+                try std.testing.expectEqual(@as(u32, 73), diagnostic.primary.source_id);
+                try std.testing.expectEqual(@as(u64, 5), diagnostic.primary.byte_offset);
+                try std.testing.expectEqual(@as(u32, 73), diagnostic.related.?.source_id);
+                try std.testing.expectEqual(@as(u64, 0), diagnostic.related.?.byte_offset);
+                try std.testing.expectEqual(@as(?u64, if (track_lines) 1 else null), diagnostic.primary.line);
+                try std.testing.expectEqual(@as(?u64, if (track_lines) 6 else null), diagnostic.primary.byte_column);
+                try std.testing.expectEqual(@as(usize, 1), diagnostic.inclusion_trace.len);
+                try std.testing.expectEqual(@as(u32, 0), diagnostic.inclusion_trace[0].source_id);
+                try std.testing.expectEqual(@as(u64, std.mem.indexOf(u8, document, "&e;").?), diagnostic.inclusion_trace[0].byte_offset);
+                continue;
+            };
+            result.deinit();
+            return error.ExpectedFailure;
+        }
+    }
+}
+
+test "[integration] - [document diagnostics]: copied external failure survives cleanup and allocation failures" {
+    try documentDiagnosticFailureCase(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, documentDiagnosticFailureCase, .{});
+    var bytes: [0]u8 = .{};
+    var capture: DocumentFailureCapture = .{ .bytes = &bytes };
+    try std.testing.expectError(error.DocumentLimit, xml.parseDocument(std.testing.allocator, .{ .slice = "<r/>" }, .{
+        .limits = .{ .max_nodes = 1 },
+        .reader = .{ .diagnostic_sink = .{ .context = &capture, .report_fn = DocumentFailureCapture.report } },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), capture.reports);
+}
+
 fn documentAllocationFailureCase(allocator: std.mem.Allocator) !void {
     const input =
         "<?xml version='1.1'?>" ++
