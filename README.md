@@ -115,7 +115,7 @@ pub fn main() !void {
 
 `Source` accepts either a caller-owned byte slice or a buffered `std.Io.Reader`. The normal reader detects the XML declaration and built-in UTF-8 or UTF-16 encoding. Namespace processing, DTD processing, external-resource blocking, line tracking, and XML 1.1 normalization reporting are controlled by `ReaderOptions`.
 
-Event names, attributes, namespace declarations, and text borrow reader-owned storage. They remain valid until the next read begins, a valid `skipElement` call begins, a successful reset, or `deinit`. Copy borrowed data before that invalidating operation when it must be retained.
+Event names, attributes, namespace declarations, and text borrow source or reader-owned storage. They remain valid until the next read begins, a valid `skipElement` call begins, a successful reset, or `deinit`. Copy borrowed data before that invalidating operation when it must be retained.
 
 The reader reports fatal failures through `ReadError`. Diagnostics and DTD findings can also be retained or sent to caller-provided callbacks. Callbacks are synchronous and cannot re-enter or reset the reader.
 
@@ -143,7 +143,7 @@ pub fn readDocument(input: []const u8) !void {
 
 `Document` owns its retained strings, nodes, attributes, namespace declarations, comments, and processing instructions. It exposes indexed navigation through `documentElement`, `children`, `attributes`, `nodeKind`, `nodeName`, and `nodeValue`. The normal document is immutable after construction.
 
-The document retains the structure needed for navigation, not every field produced by the reader. Use reader events when you need event-level source spans, detailed DTD records, or transient event data.
+The document retains the structure needed for navigation, not every field produced by the reader. Use reader events when you need physical source spans, source attribute spans, or empty-element spelling. Neither public component exposes detailed DTD declaration or entity-boundary records. Exact source preservation requires caller-owned original bytes; logical XML values cannot reproduce the original spelling.
 
 ## Write XML
 
@@ -210,6 +210,8 @@ Other source encodings require a caller-provided `Transcoder`. The writer always
 `Reader`, `Document`, `Writer`, and `dtd.ExternalSubset` own allocations after successful initialization or construction. Deinitialize each owning value exactly once. Allocators, sources, callback contexts, resolvers, transcoders, and sinks remain caller-owned and must outlive the operations that use them.
 
 Limits are finite and checked before governed storage grows or data is published. At-limit work succeeds. The first item or byte over a configured limit fails with the corresponding error. There is no unlimited preset.
+
+Reader `max_retained_bytes` controls capacity kept at reset, not peak parsing memory. Its other limits bound individual XML storage and work categories. Document and Writer have separate limits on retained allocation capacity during construction and output.
 
 An initialized owning value must not be copied and then independently used or deinitialized. These values are not thread-safe and do not support concurrent or recursive entry.
 
