@@ -1890,8 +1890,7 @@ const DocumentBuilder = struct {
     }
 
     fn appendNode(self: *Self, kind: NodeKind, payload: u32) BuildError!NodeIndex {
-        if (self.nodes.items.len >= self.options.limits.max_nodes or
-            self.nodes.items.len >= std.math.maxInt(u32)) return error.TreeLimit;
+        try self.requireCount(self.nodes.items.len, 1, self.options.limits.max_nodes);
         const parent = if (self.open_elements.items.len == 0)
             0
         else
@@ -1969,14 +1968,18 @@ const DocumentBuilder = struct {
     }
 
     fn copy(self: *Self, bytes: []const u8) BuildError!StringRef {
-        const end = std.math.add(usize, self.strings.items.len, bytes.len) catch
-            return error.TreeLimit;
-        if (end > self.options.limits.max_string_bytes or end >= std.math.maxInt(u32))
-            return error.TreeLimit;
+        _ = try self.stringEnd(self.strings.items.len, bytes.len);
         const offset = self.strings.items.len;
         try self.reserveOwned(&self.strings, bytes.len);
         self.strings.appendSliceAssumeCapacity(bytes);
         return .{ .offset = @intCast(offset), .len = @intCast(bytes.len) };
+    }
+
+    fn stringEnd(self: *const Self, current: usize, added: usize) BuildError!usize {
+        const end = std.math.add(usize, current, added) catch return error.TreeLimit;
+        if (end > self.options.limits.max_string_bytes or end >= std.math.maxInt(u32))
+            return error.TreeLimit;
+        return end;
     }
 
     fn copyOptional(self: *Self, value: ?[]const u8) BuildError!StringRef {
@@ -2102,4 +2105,44 @@ pub fn buildProfileFromPull(
 fn optionalEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+// --- Tests ---
+
+test "[edge] - [document widths]: checks compact counts and string sentinels before allocation" {
+    const maximum = std.math.maxInt(usize);
+    const compact: usize = std.math.maxInt(u32);
+    var builder = try DocumentBuilder.init(std.testing.failing_allocator, .{
+        .limits = .{ .max_string_bytes = maximum },
+    });
+    defer builder.deinit();
+
+    try builder.requireCount(compact - 1, 1, maximum);
+    try std.testing.expectError(error.TreeLimit, builder.requireCount(compact, 1, maximum));
+    try std.testing.expectError(error.TreeLimit, builder.requireCount(maximum, 1, maximum));
+    try builder.requireCount(7, 1, 8);
+    try std.testing.expectError(error.TreeLimit, builder.requireCount(8, 1, 8));
+    try std.testing.expectEqual(compact - 1, try builder.stringEnd(compact - 2, 1));
+    try std.testing.expectError(error.TreeLimit, builder.stringEnd(compact - 1, 1));
+    try std.testing.expectError(error.TreeLimit, builder.stringEnd(maximum, 1));
+    builder.options.limits.max_string_bytes = 8;
+    try std.testing.expectEqual(@as(usize, 8), try builder.stringEnd(7, 1));
+    try std.testing.expectError(error.TreeLimit, builder.stringEnd(8, 1));
+}
+
+test "[edge] - [document capacity]: rejects arithmetic overflow before allocation" {
+    const maximum = std.math.maxInt(usize);
+    var total: usize = maximum - 8;
+    try addCapacity(&total, 2, 4);
+    try std.testing.expectEqual(maximum, total);
+    try std.testing.expectError(error.Overflow, addCapacity(&total, 1, 1));
+    try std.testing.expectEqual(maximum, total);
+    total = 0;
+    try std.testing.expectError(error.Overflow, addCapacity(&total, maximum, 2));
+    try std.testing.expectEqual(@as(usize, 0), total);
+
+    var builder = try DocumentBuilder.init(std.testing.failing_allocator, .{});
+    defer builder.deinit();
+    try std.testing.expectError(error.TreeLimit, builder.reserveOwned(&builder.nodes, maximum));
+    try std.testing.expectEqual(@as(usize, 0), try builder.ownedCapacity());
 }

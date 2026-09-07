@@ -1322,7 +1322,22 @@ fn capacityTotal(
 
 // --- Tests ---
 
-test "[edge] - [writer logical offset]: rejects overflow arithmetic" {
+test "[edge] - [writer logical offset]: preserves large positions and rejects overflow" {
+    for ([_]u64{ 4_043_576_373, std.math.maxInt(u32) - 3, std.math.maxInt(u64) - 7 }) |start| {
+        var sink_buffer: [16]u8 = undefined;
+        var sink = std.Io.Writer.fixed(&sink_buffer);
+        var writer = try Writer.init(std.testing.allocator, &sink, .{
+            .emit_declaration = false,
+        });
+        defer writer.deinit();
+        writer.lifecycle = .prolog;
+        writer.logical_byte_offset = start;
+
+        try writer.comment("");
+        try std.testing.expectEqual(@as(?u64, start + 7), writer.byteOffset());
+        try std.testing.expectEqualStrings("<!---->", sink.buffered());
+    }
+
     var sink_buffer: [8]u8 = undefined;
     var sink = std.Io.Writer.fixed(&sink_buffer);
     var writer = try Writer.init(std.testing.allocator, &sink, .{
@@ -1335,6 +1350,18 @@ test "[edge] - [writer logical offset]: rejects overflow arithmetic" {
     try std.testing.expectError(error.WriterLimit, writer.comment(""));
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), writer.byteOffset());
     try std.testing.expectEqualStrings("", sink.buffered());
+    try std.testing.expectError(error.WriterLimit, writer.comment(""));
+}
+
+test "[edge] - [writer retained capacity]: rejects count and byte arithmetic overflow" {
+    const maximum = std.math.maxInt(usize);
+    try std.testing.expectEqual(maximum, checkedSum(&.{ maximum - 1, 1 }).?);
+    try std.testing.expectEqual(null, checkedSum(&.{ maximum, 1 }));
+    try std.testing.expectEqual(maximum, capacityTotal(maximum, 0, 0, 0, 0, 0).?);
+    try std.testing.expectEqual(null, capacityTotal(maximum, 0, 1, 0, 0, 0));
+    try std.testing.expectEqual(null, capacityTotal(0, maximum, 0, 0, 0, 0));
+    try std.testing.expectEqual(null, capacityTotal(0, 0, 0, maximum, 0, 0));
+    try std.testing.expectEqual(null, capacityTotal(0, 0, 0, 0, 0, maximum));
 }
 
 test "[edge] - [writer retained capacity]: accepts exact storage and rejects one byte less" {

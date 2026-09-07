@@ -14336,3 +14336,83 @@ test "[integration] - [rooted resolver]: normal Reader rejects escapes and symli
         }
     }
 }
+
+test "[edge] - [rooted resolver]: exhausts source identities without reusing zero" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(io, .{ .sub_path = "part.xml", .data = "<part/>" });
+    var rooted = xml.RootedFilesystemResolver.init(std.testing.allocator, io, temporary.dir);
+    rooted.next_source_id = std.math.maxInt(u32);
+    const resolver = rooted.resolver();
+    const request: xml.ResolverRequest = .{
+        .kind = .general_entity,
+        .name = "part",
+        .public_id = null,
+        .system_id = "part.xml",
+        .base_id = null,
+        .inclusion = .{ .source_id = 0, .byte_offset = 4_043_576_373 },
+    };
+    const result = resolver.resolve(request);
+    try std.testing.expectEqual(.source, std.meta.activeTag(result));
+    const source = result.source;
+    defer source.close();
+    try std.testing.expectEqual(std.math.maxInt(u32), source.source_id);
+    var bytes: [16]u8 = undefined;
+    const read = source.read(&bytes);
+    try std.testing.expectEqual(.bytes, std.meta.activeTag(read));
+    try std.testing.expectEqualStrings("<part/>", bytes[0..read.bytes]);
+    try std.testing.expectEqual(.resource_limit, std.meta.activeTag(resolver.resolve(request)));
+    try std.testing.expectEqual(.resource_limit, std.meta.activeTag(resolver.resolve(request)));
+}
+
+test "[edge] - [Reader retention]: applies the exact reset ceiling to engine and facade storage" {
+    const input = "<r xmlns:p='urn:p' p:a='value'><p:item/></r>";
+    var reader = try xml.Reader.init(std.testing.allocator, .{ .slice = input }, .{});
+    defer reader.deinit();
+    while (try reader.next()) |_| {}
+    const retained = reader.memoryUsage().retained_capacity;
+    try std.testing.expect(retained > 1);
+
+    try reader.reset(.{ .slice = input }, .{
+        .limits = .{ .max_retained_bytes = retained },
+    }, .retain_capacity);
+    try std.testing.expectEqual(retained, reader.memoryUsage().retained_capacity);
+    while (try reader.next()) |_| {}
+    try std.testing.expectEqual(retained, reader.memoryUsage().retained_capacity);
+
+    for ([_]usize{ retained - 1, 0 }) |ceiling| {
+        try reader.reset(.{ .slice = input }, .{
+            .limits = .{ .max_retained_bytes = ceiling },
+        }, .retain_capacity);
+        try std.testing.expectEqual(@as(usize, 0), reader.memoryUsage().retained_capacity);
+        while (try reader.next()) |_| {}
+        try std.testing.expect(reader.memoryUsage().retained_capacity > ceiling);
+    }
+}
+
+test "[edge] - [Reader general limits]: accepts depth 256 and rejects depth 257" {
+    for ([_]usize{ 256, 257 }) |depth| {
+        var storage: [7 * 257]u8 = undefined;
+        var output = std.Io.Writer.fixed(&storage);
+        for (0..depth) |_| try output.writeAll("<r>");
+        for (0..depth) |_| try output.writeAll("</r>");
+        var reader = try xml.Reader.init(std.testing.allocator, .{ .slice = output.buffered() }, .{});
+        defer reader.deinit();
+        var starts: usize = 0;
+        while (true) {
+            const event = reader.next() catch |err| {
+                try std.testing.expectEqual(@as(usize, 257), depth);
+                try std.testing.expectEqual(error.LimitExceeded, err);
+                try std.testing.expectEqual(xml.DiagnosticCode.depth_limit, reader.diagnostic().?.code);
+                try std.testing.expectError(error.LimitExceeded, reader.next());
+                break;
+            } orelse {
+                try std.testing.expectEqual(@as(usize, 256), depth);
+                break;
+            };
+            if (event.data == .start_element) starts += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 256), starts);
+    }
+}
