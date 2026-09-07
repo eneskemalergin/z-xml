@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="#verification"><img src="https://img.shields.io/badge/tests-359%2F359%20pass-2D7D46?style=flat-square" alt="359 of 359 tests pass"></a>
+  <a href="#verification"><img src="https://img.shields.io/badge/tests-362%2F362%20pass-2D7D46?style=flat-square" alt="362 of 362 tests pass"></a>
   <a href="build.zig.zon"><img src="https://img.shields.io/badge/version-v0.2.0-8B5CF6?style=flat-square" alt="v0.2.0"></a>
   <a href="#requirements-and-support"><img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&amp;logo=zig&amp;logoColor=white" alt="Zig 0.16.0"></a>
   <a href="#xml-support"><img src="https://img.shields.io/badge/XML-1.0%20%2B%201.1-0066CC?style=flat-square" alt="XML 1.0 and XML 1.1"></a>
@@ -194,6 +194,10 @@ External resources are forbidden by default. To resolve an external subset or en
 ## Namespaces and encodings
 
 Namespace processing is enabled by default. Processed names expose their raw spelling and their expanded prefix, local name, and namespace URI. Set `.namespaces = .raw` when the application needs XML names without Namespaces in XML resolution.
+
+Expanded-name lookup uses `null` for no namespace. Default namespaces apply to unprefixed elements, not unprefixed attributes. Name comparisons are case-sensitive. Attribute lookup is linear; iterate the attributes when you need them all. In raw mode, use `attributeRaw`; expanded-name lookup returns null.
+
+To select nested records with inherited namespaces and original offsets, read from the document's beginning and keep the Reader alive. `skipElement` checks unwanted subtrees and returns their source spans; it does not seek past unchecked bytes. Detached fragment input cannot supply inherited namespace bindings or a physical base offset. This API supports sequential selection, not context-preserving random-access parsing.
 
 Built-in source handling includes:
 
