@@ -8993,11 +8993,10 @@ pub fn Reader(comptime config: Config) type {
                     final,
                     output,
                     source_advances,
-                ) catch return self.failAt(
-                    .malformed_encoding,
-                    .invalid_xml,
-                    self.locationAtCurrentLine(source.raw_offset),
-                );
+                ) catch {
+                    source.failure = .{ .code = .malformed_encoding, .offset = source.raw_offset };
+                    break :decode;
+                };
                 switch (step) {
                     .progress => |progress| {
                         source.external.needs_input = false;
@@ -9024,11 +9023,7 @@ pub fn Reader(comptime config: Config) type {
                         if (final) {
                             source.external.finished = true;
                         } else if (bounded_input.len == transcoder_input_capacity) {
-                            return self.failAt(
-                                .malformed_encoding,
-                                .invalid_xml,
-                                self.locationAtCurrentLine(source.raw_offset),
-                            );
+                            source.failure = .{ .code = .malformed_encoding, .offset = source.raw_offset };
                         } else {
                             source.external.needs_input = true;
                         }
@@ -9036,29 +9031,22 @@ pub fn Reader(comptime config: Config) type {
                     },
                     .need_output => {
                         if (source.decoded.items.len == 0) {
-                            return self.failAt(
-                                .malformed_encoding,
-                                .invalid_xml,
-                                self.locationAtCurrentLine(source.raw_offset),
-                            );
+                            source.failure = .{ .code = .malformed_encoding, .offset = source.raw_offset };
                         }
                         break :decode;
                     },
-                    .malformed => |offset| return self.failAt(
-                        .malformed_encoding,
-                        .invalid_xml,
-                        self.locationAtCurrentLine(source.raw_offset + offset),
-                    ),
-                    .unsupported => return self.failAt(
-                        .unsupported_encoding,
-                        .unsupported_feature,
-                        self.locationAtCurrentLine(source.raw_offset),
-                    ),
-                    .cancelled => return self.failAt(
-                        .transcoder_cancelled,
-                        .cancelled,
-                        self.locationAtCurrentLine(source.raw_offset),
-                    ),
+                    .malformed => |offset| {
+                        source.failure = .{ .code = .malformed_encoding, .offset = source.raw_offset + offset };
+                        break :decode;
+                    },
+                    .unsupported => {
+                        source.failure = .{ .code = .unsupported_encoding, .offset = source.raw_offset, .failure = .unsupported_feature };
+                        break :decode;
+                    },
+                    .cancelled => {
+                        source.failure = .{ .code = .transcoder_cancelled, .offset = source.raw_offset, .failure = .cancelled };
+                        break :decode;
+                    },
                 }
                 if (source.raw_cursor == source.raw_input.len and !source.raw_final) break;
                 if (source.raw_final and source.raw_cursor == source.raw_input.len and

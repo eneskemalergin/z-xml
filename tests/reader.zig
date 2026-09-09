@@ -3665,6 +3665,72 @@ test "[failure] - [Reader transcoder]: final and callback failures are exact" {
     );
 }
 
+test "[regression] - [Reader transcoder]: malformed tails include pending decoded line positions" {
+    const Tail = struct {
+        fn transcode(context: ?*anyopaque, input: []const u8, final: bool, output: []u8, advances: []u8) xml.TranscodeStep {
+            if (final and input.len == 1) {
+                const step: *const xml.TranscodeStep = @ptrCast(@alignCast(context.?));
+                return step.*;
+            }
+            return pairTranscode(null, input, final, output, advances);
+        }
+    };
+    inline for (.{
+        "<r>\néλ🙂",
+        "<r>\réλ🙂",
+        "<r>\r\néλ🙂",
+        "<?xml version='1.1'?><r>\xc2\x85éλ🙂",
+        "<?xml version='1.1'?><r>\xe2\x80\xa8éλ🙂",
+        "<?xml version='1.1'?><r>\r\xc2\x85éλ🙂",
+    }) |logical| {
+        var input: [logical.len * 2 + 1]u8 = undefined;
+        pairEncode(input[0 .. input.len - 1], logical);
+        input[input.len - 1] = 0;
+        const tails = [_]struct { step: xml.TranscodeStep, category: xml.ReadError, code: xml.DiagnosticCode }{
+            .{ .step = .{ .malformed = 0 }, .category = error.InvalidEncoding, .code = .malformed_encoding },
+            .{ .step = .unsupported, .category = error.UnsupportedEncoding, .code = .unsupported_encoding },
+            .{ .step = .cancelled, .category = error.Cancelled, .code = .transcoder_cancelled },
+        };
+        for (tails) |tail| {
+            var step = tail.step;
+            try expectNormalStartsBeforeFailureSchedules(
+                &input,
+                .{ .transcoder = .{ .context = &step, .runFn = Tail.transcode } },
+                1,
+            );
+            for ([_]bool{ true, false }) |track_lines| {
+                try expectNormalFailureSchedulesWithOptions(
+                    &input,
+                    .{ .transcoder = .{ .context = &step, .runFn = Tail.transcode }, .track_lines = track_lines },
+                    .{
+                        .category = tail.category,
+                        .code = tail.code,
+                        .byte_offset = input.len - 1,
+                        .related_byte_offset = null,
+                        .line = if (track_lines) 2 else null,
+                        .byte_column = if (track_lines) 17 else null,
+                    },
+                );
+            }
+        }
+    }
+}
+
+test "[regression] - [Reader transcoder]: earlier XML failures precede malformed encoded tails" {
+    const logical = "<r>\n<a></b>";
+    var input: [logical.len * 2 + 1]u8 = undefined;
+    pairEncode(input[0 .. input.len - 1], logical);
+    input[input.len - 1] = 0;
+    try expectNormalFailureSchedulesWithOptions(&input, .{ .transcoder = pairTranscoder() }, .{
+        .category = error.InvalidXml,
+        .code = .mismatched_end_tag,
+        .byte_offset = 18,
+        .related_byte_offset = 8,
+        .line = 2,
+        .byte_column = 11,
+    });
+}
+
 test "[integration] - [Reader transcoder]: cancellation is sticky and reset replaces the callback" {
     var counter: TranscodeCallCounter = .{};
     var reader = try xml.Reader.init(
